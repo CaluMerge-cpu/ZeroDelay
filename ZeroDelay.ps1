@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.9.0'
+$AppVersion = '1.9.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -178,6 +178,33 @@ public static class AccessKeys {
         var f = new FK(); f.cb = 24; SystemParametersInfo(GetFilter, 24, ref f, 0); f.cb = 24; f.flags = filter;
         var t = new SK(); t.cb = 8; t.flags = toggle;
         return SystemParametersInfo(SetSticky, 8, ref a, Send) & SystemParametersInfo(SetFilter, 24, ref f, Send) & SystemParametersInfo(SetToggle, 8, ref t, Send);
+    }
+}
+
+// Which monitor (PnP instance path) is on which Windows display (\\.\DISPLAYn), and which one is the main screen.
+public static class DisplayMap {
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    struct DD { public int cb; [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 32)] public string Name;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 128)] public string String; public int Flags;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 128)] public string Id;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 128)] public string Key; }
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] static extern bool EnumDisplayDevices(string dev, uint i, ref DD dd, uint flags);
+    // "\\.\DISPLAY1|DISPLAY\XMI2001\5&...&UID4355|1" per attached monitor (last field 1 = main screen)
+    public static string[] List() {
+        var res = new System.Collections.Generic.List<string>();
+        for (uint i = 0; ; i++) {
+            var a = new DD(); a.cb = System.Runtime.InteropServices.Marshal.SizeOf(a);
+            if (!EnumDisplayDevices(null, i, ref a, 0)) break;
+            if ((a.Flags & 1) == 0) continue;   // not attached to the desktop
+            var m = new DD(); m.cb = System.Runtime.InteropServices.Marshal.SizeOf(m);
+            if (!EnumDisplayDevices(a.Name, 0, ref m, 1)) continue;   // EDD_GET_DEVICE_INTERFACE_NAME
+            // \\?\DISPLAY#XMI2001#5&60f9dea&0&UID4355#{...} -> DISPLAY\XMI2001\5&60f9dea&0&UID4355
+            string id = m.Id ?? "";
+            if (id.StartsWith("\\\\?\\")) id = id.Substring(4);
+            int brace = id.IndexOf("#{"); if (brace > 0) id = id.Substring(0, brace);
+            res.Add(a.Name + "|" + id.Replace('#', '\\') + "|" + ((a.Flags & 4) != 0 ? "1" : "0"));
+        }
+        return res.ToArray();
     }
 }
 
@@ -537,6 +564,17 @@ public static class NvDrs {
         try {
             if (F<Fn0>(0x0150E828)() != 0) return -1;
             uint disp; if (F<FnOutU>(0x1E9D8A31)(out disp) != 0) return -1;
+            var info = new byte[24]; BitConverter.GetBytes((uint)(24 | (1 << 16))).CopyTo(info, 0);
+            if (F<FnVrr>(0xDF8FDA57)(disp, info) != 0) return -1;
+            return (int)BitConverter.ToUInt32(info, 4);
+        } catch (Exception) { return -1; }
+    }
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int FnByName([MarshalAs(UnmanagedType.LPStr)] string name, out uint id);
+    // NV_GET_VRR_INFO flags for one display by its Windows name (\\.\DISPLAY1): bit0 G-SYNC on for it, bit1 it can do VRR. -1 on error.
+    public static int VrrFlagsFor(string gdiName) {
+        try {
+            if (F<Fn0>(0x0150E828)() != 0) return -1;
+            uint disp; if (F<FnByName>(0xAE457190)(gdiName, out disp) != 0) return -1;
             var info = new byte[24]; BitConverter.GetBytes((uint)(24 | (1 << 16))).CopyTo(info, 0);
             if (F<FnVrr>(0xDF8FDA57)(disp, info) != 0) return -1;
             return (int)BitConverter.ToUInt32(info, 4);
@@ -3339,31 +3377,31 @@ $Tweaks = @(
        Title = 'Smooth 4K timelines in Premiere (advice)'
        Desc  = 'The GPU renderer, preview at 1/2 resolution and proxies make heavy footage play smoothly without changing export quality. These live inside Premiere, so here is where to find them.'
        Warn  = ''
-       Run   = { [void][Windows.MessageBox]::Show("1. GPU renderer: File > Project Settings > General > Renderer: 'Mercury Playback Engine GPU Acceleration (CUDA)' on NVIDIA, '(OpenCL)' on AMD. Never 'Software only'.`n`n2. Playback resolution: Program Monitor > the drop-down at the bottom right > 1/2 (or 1/4 for 6K/8K). Export quality is not affected.`n`n3. Proxies for heavy camera files: Project panel > select clips > right-click > Proxy > Create Proxies, then turn on 'Toggle Proxies' in the Program Monitor.`n`n4. Camera footage in 10-bit 4:2:2 (many Sony, Canon, Panasonic cameras): RTX 50 graphics cards and Intel 11th-gen-or-newer integrated graphics decode it in hardware; RTX 40 and older, and AMD, decode it on the CPU, so use proxies there.", 'Premiere Pro playback', 'OK', 'Information'); 'Shown.' } }
+       Run   = { [void](Show-ZdDialog ("1. GPU renderer: File > Project Settings > General > Renderer: 'Mercury Playback Engine GPU Acceleration (CUDA)' on NVIDIA, '(OpenCL)' on AMD. Never 'Software only'.`n`n2. Playback resolution: Program Monitor > the drop-down at the bottom right > 1/2 (or 1/4 for 6K/8K). Export quality is not affected.`n`n3. Proxies for heavy camera files: Project panel > select clips > right-click > Proxy > Create Proxies, then turn on 'Toggle Proxies' in the Program Monitor.`n`n4. Camera footage in 10-bit 4:2:2 (many Sony, Canon, Panasonic cameras): RTX 50 graphics cards and Intel 11th-gen-or-newer integrated graphics decode it in hardware; RTX 40 and older, and AMD, decode it on the CPU, so use proxies there.") ('Premiere Pro playback') ('OK') ('Information')); 'Shown.' } }
 
     @{ Id = 'cr-adv-cache'; Cat = 'Creator'; Icon = [char]0xE74D; Action = 'Show how'; Requires = { Test-Path "$env:APPDATA\Adobe\Common" }
        Title = 'Keep the Adobe media cache in check (advice)'
        Desc  = 'Adobe never deletes its media cache by default, so it grows forever. Let Premiere clean files older than 90 days, and move the cache to a fast second SSD if you have one. Clean up files can empty it now.'
        Warn  = ''
-       Run   = { [void][Windows.MessageBox]::Show("In Premiere Pro: Edit > Preferences > Media Cache.`n`n- Media Cache Management: choose 'Automatically delete cache files older than 90 days' (or 'when cache exceeds' a size). Restart Premiere.`n- Media Cache Files > Browse: pick a folder on a fast SSD that is not the Windows drive, if you have one.`n`nAfter Effects: Edit > Preferences > Media & Disk Cache: Disk Cache on, on a fast SSD, 100 GB or more.`n`nTo empty the caches now, use Tools > Clean up files with the Adobe apps closed: they rebuild what they need on the next open.", 'Adobe media cache', 'OK', 'Information'); 'Shown.' } }
+       Run   = { [void](Show-ZdDialog ("In Premiere Pro: Edit > Preferences > Media Cache.`n`n- Media Cache Management: choose 'Automatically delete cache files older than 90 days' (or 'when cache exceeds' a size). Restart Premiere.`n- Media Cache Files > Browse: pick a folder on a fast SSD that is not the Windows drive, if you have one.`n`nAfter Effects: Edit > Preferences > Media & Disk Cache: Disk Cache on, on a fast SSD, 100 GB or more.`n`nTo empty the caches now, use Tools > Clean up files with the Adobe apps closed: they rebuild what they need on the next open.") ('Adobe media cache') ('OK') ('Information')); 'Shown.' } }
 
     @{ Id = 'cr-adv-photoshop'; Cat = 'Creator'; Icon = [char]0xE91B; Action = 'Show how'; Requires = { @(Get-CreatorExes | Where-Object { $_ -like '*Photoshop.exe' }).Count -gt 0 }
        Title = 'Photoshop performance settings (advice)'
        Desc  = 'Photoshop keeps its performance settings in a binary file that is not safe to edit from outside, so here are the values to set yourself.'
        Warn  = ''
-       Run   = { [void][Windows.MessageBox]::Show("Edit > Preferences > Performance:`n- Let Photoshop use: 70-80% of RAM.`n- History states: 20-50 (fewer uses less RAM).`n- Cache levels: 4 (5-8 for very large images, 1-2 for small images with many layers).`n- Use Graphics Processor: on; Advanced Settings: Normal.`n`nEdit > Preferences > Scratch Disks: tick a fast SSD that is not the Windows drive first.", 'Photoshop performance', 'OK', 'Information'); 'Shown.' } }
+       Run   = { [void](Show-ZdDialog ("Edit > Preferences > Performance:`n- Let Photoshop use: 70-80% of RAM.`n- History states: 20-50 (fewer uses less RAM).`n- Cache levels: 4 (5-8 for very large images, 1-2 for small images with many layers).`n- Use Graphics Processor: on; Advanced Settings: Normal.`n`nEdit > Preferences > Scratch Disks: tick a fast SSD that is not the Windows drive first.") ('Photoshop performance') ('OK') ('Information')); 'Shown.' } }
 
     @{ Id = 'cr-adv-driver'; Cat = 'Creator'; Icon = [char]0xE896; Action = 'Show how'; Requires = { Test-CreatorPc -and (Test-NvAvailable) }
        Title = 'Studio or Game Ready driver? (advice)'
        Desc  = 'Both come from the same code. Studio drivers are released less often and get extra testing in creative apps; no measured speed difference exists. If you mostly game, keep Game Ready.'
        Warn  = ''
-       Run   = { [void][Windows.MessageBox]::Show("Game Ready: day-one fixes for new games. Best if you mostly play.`n`nStudio: the same driver code, released less often after extra testing in Premiere, After Effects, DaVinci Resolve and others. Switch to it if an Adobe app crashes or shows GPU errors, or before a big deadline.`n`nSwitch in the NVIDIA App: Drivers > the menu next to the driver > Studio Driver. Choose a clean install. Fortnite and ZeroDelay settings are not affected.", 'NVIDIA driver type', 'OK', 'Information'); 'Shown.' } }
+       Run   = { [void](Show-ZdDialog ("Game Ready: day-one fixes for new games. Best if you mostly play.`n`nStudio: the same driver code, released less often after extra testing in Premiere, After Effects, DaVinci Resolve and others. Switch to it if an Adobe app crashes or shows GPU errors, or before a big deadline.`n`nSwitch in the NVIDIA App: Drivers > the menu next to the driver > Studio Driver. Choose a clean install. Fortnite and ZeroDelay settings are not affected.") ('NVIDIA driver type') ('OK') ('Information')); 'Shown.' } }
 
     @{ Id = 'cr-adv-obs'; Cat = 'Creator'; Icon = [char]0xE714; Action = 'Show how'; Requires = { Test-Path $ObsIni }
        Title = 'Record and stream without lag in OBS (advice)'
        Desc  = 'Use the graphics card''s encoder (NVENC), Game Capture instead of Display Capture, and cap your game FPS so the GPU has room for OBS.'
        Warn  = ''
-       Run   = { [void][Windows.MessageBox]::Show("Settings > Output > Video Encoder: 'NVIDIA NVENC' (H.264, HEVC or AV1). x264 uses the CPU and competes with the game.`n`nIf OBS says 'Encoding overloaded' or 'Rendering lag':`n- use preset P4 or faster and turn off multipass / Psycho Visual Tuning,`n- cap your game FPS a little below what you reach, so the GPU has room for OBS,`n- use Game Capture for games, not Display Capture,`n- in Game Capture properties, untick 'Multi-adapter Compatibility' on desktops with one graphics card,`n- run OBS as administrator (right-click > Properties > Compatibility): it can then reserve GPU time for itself.", 'OBS performance', 'OK', 'Information'); 'Shown.' } }
+       Run   = { [void](Show-ZdDialog ("Settings > Output > Video Encoder: 'NVIDIA NVENC' (H.264, HEVC or AV1). x264 uses the CPU and competes with the game.`n`nIf OBS says 'Encoding overloaded' or 'Rendering lag':`n- use preset P4 or faster and turn off multipass / Psycho Visual Tuning,`n- cap your game FPS a little below what you reach, so the GPU has room for OBS,`n- use Game Capture for games, not Display Capture,`n- in Game Capture properties, untick 'Multi-adapter Compatibility' on desktops with one graphics card,`n- run OBS as administrator (right-click > Properties > Compatibility): it can then reserve GPU time for itself.") ('OBS performance') ('OK') ('Information')); 'Shown.' } }
 
     # ======================================================= GTX 1080 Ti tab (1.6)
     @{ Id = 'gtx-preset'; Cat = 'Gtx1080Ti'; Icon = [char]0xE7F4; Action = 'Apply'; Gtx = $true; Extra = 'preset'; Requires = { Test-Gtx1080Ti }
@@ -3384,7 +3422,7 @@ $Tweaks = @(
        Desc  = 'A 1080 Ti lowers its clock as it heats up. Owners commonly lock it at about 1900-1950 MHz at 0.90-0.95 V in MSI Afterburner: cooler, quieter and steadier than stock. ZeroDelay never changes voltages itself.'
        Warn  = 'Every chip is different: test stability in a few matches and step the voltage up if it crashes.'
        Run   = {
-           [void][Windows.MessageBox]::Show("Undervolting a GTX 1080 Ti with MSI Afterburner:`n`n1. Open Afterburner and press Ctrl+F to open the voltage/frequency curve.`n2. Lower the whole curve by about 150 to 200 MHz (Shift+drag), then raise the point at 0.950 V to about 1900 MHz and press L to lock it there. Click Apply.`n3. Play a few matches. If the game crashes, raise the voltage one step (0.962 or 0.975 V), or lower the clock by 13 MHz.`n4. Click the save icon and enable 'Apply at startup' once it is stable.`n`nTypical owner results: about 1900-1950 MHz at 0.90-0.95 V, often 70-75 C instead of 80+ C, with clocks that no longer drop mid-match. These are user reports, not lab data.", 'Undervolting a GTX 1080 Ti', 'OK', 'Information')
+           [void](Show-ZdDialog ("Undervolting a GTX 1080 Ti with MSI Afterburner:`n`n1. Open Afterburner and press Ctrl+F to open the voltage/frequency curve.`n2. Lower the whole curve by about 150 to 200 MHz (Shift+drag), then raise the point at 0.950 V to about 1900 MHz and press L to lock it there. Click Apply.`n3. Play a few matches. If the game crashes, raise the voltage one step (0.962 or 0.975 V), or lower the clock by 13 MHz.`n4. Click the save icon and enable 'Apply at startup' once it is stable.`n`nTypical owner results: about 1900-1950 MHz at 0.90-0.95 V, often 70-75 C instead of 80+ C, with clocks that no longer drop mid-match. These are user reports, not lab data.") ('Undervolting a GTX 1080 Ti') ('OK') ('Information'))
            'Undervolt guide shown.' } }
 
     @{ Id = 'gtx-cooling'; Cat = 'Gtx1080Ti'; Icon = [char]0xE9CA; Action = 'Show how'; Gtx = $true; Requires = { Test-Gtx1080Ti }
@@ -3392,7 +3430,7 @@ $Tweaks = @(
        Desc  = 'The thermal paste on a 2017 card is often dried out. Owners report 3-4 C better temperatures from a fresh repaste, and 15 C or more when the old paste was bad. Match reports show when your GPU slowed down from heat.'
        Warn  = 'Opening the card can void any warranty left. Thermal pads must match the original thickness.'
        Run   = {
-           [void][Windows.MessageBox]::Show("Signs the card needs attention: it reaches 83 C or more in matches, the fans run near full speed, or Match reports say the GPU slowed down because it got too hot.`n`nIn order of effort:`n1. Blow the dust out of the cooler and case fans (compressed air, hold the fans still).`n2. Set a stronger fan curve in MSI Afterburner (for example 60% at 65 C, 80% at 75 C).`n3. Undervolt (see the card next to this one).`n4. Repaste: replace the thermal paste on the GPU die, and the memory and VRM pads if they are crumbling. Use pads of the same thickness as the originals.`n`nPascal cards drop their clock about 13 MHz at a time as they warm up, and harder above about 83 C, which makes FPS less steady.", 'Cooling a GTX 1080 Ti', 'OK', 'Information')
+           [void](Show-ZdDialog ("Signs the card needs attention: it reaches 83 C or more in matches, the fans run near full speed, or Match reports say the GPU slowed down because it got too hot.`n`nIn order of effort:`n1. Blow the dust out of the cooler and case fans (compressed air, hold the fans still).`n2. Set a stronger fan curve in MSI Afterburner (for example 60% at 65 C, 80% at 75 C).`n3. Undervolt (see the card next to this one).`n4. Repaste: replace the thermal paste on the GPU die, and the memory and VRM pads if they are crumbling. Use pads of the same thickness as the originals.`n`nPascal cards drop their clock about 13 MHz at a time as they warm up, and harder above about 83 C, which makes FPS less steady.") ('Cooling a GTX 1080 Ti') ('OK') ('Information'))
            'Cooling guide shown.' } }
 
     @{ Id = 'gtx-limits'; Cat = 'Gtx1080Ti'; Icon = [char]0xE946; Action = 'See list'; Gtx = $true; Requires = { Test-Gtx1080Ti }
@@ -3400,7 +3438,7 @@ $Tweaks = @(
        Desc  = 'No DLSS, frame generation, Smooth Motion or RTX HDR (they need RTX hardware), no hardware ray tracing, no DSC for very high refresh at 4K, no HDMI VRR. ZeroDelay hides the cards for these on this PC.'
        Warn  = ''
        Run   = {
-           [void][Windows.MessageBox]::Show("Not available on a GTX 1080 Ti:`n`n- DLSS and DLSS Frame Generation: need RTX Tensor cores. Use Fortnite's 3D resolution slider instead.`n- NVIDIA Smooth Motion, RTX HDR, RTX Video, Broadcast: RTX only.`n- Hardware ray tracing and Lumen: need an RTX card; keep them off.`n- Resizable BAR: RTX 30 and newer only.`n- DSC (Display Stream Compression): the card cannot drive 4K above 120 Hz or 1440p above 240 Hz at full colour. Pick the highest refresh it offers at full RGB.`n- HDMI VRR: the card has HDMI 2.0b; use G-SYNC or G-SYNC Compatible over DisplayPort.`n- AV1 recording: the card records H.264 and HEVC (ShadowPlay works), not AV1.`n- New Game Ready drivers: only security updates on the 580 branch until October 2028.`n`nReported since spring 2026 (not confirmed by Microsoft or NVIDIA): some Windows 11 users with GTX 10 cards see glitches with Windows HDR on. If that happens, turn Windows HDR off.", 'GTX 1080 Ti limits', 'OK', 'Information')
+           [void](Show-ZdDialog ("Not available on a GTX 1080 Ti:`n`n- DLSS and DLSS Frame Generation: need RTX Tensor cores. Use Fortnite's 3D resolution slider instead.`n- NVIDIA Smooth Motion, RTX HDR, RTX Video, Broadcast: RTX only.`n- Hardware ray tracing and Lumen: need an RTX card; keep them off.`n- Resizable BAR: RTX 30 and newer only.`n- DSC (Display Stream Compression): the card cannot drive 4K above 120 Hz or 1440p above 240 Hz at full colour. Pick the highest refresh it offers at full RGB.`n- HDMI VRR: the card has HDMI 2.0b; use G-SYNC or G-SYNC Compatible over DisplayPort.`n- AV1 recording: the card records H.264 and HEVC (ShadowPlay works), not AV1.`n- New Game Ready drivers: only security updates on the 580 branch until October 2028.`n`nReported since spring 2026 (not confirmed by Microsoft or NVIDIA): some Windows 11 users with GTX 10 cards see glitches with Windows HDR on. If that happens, turn Windows HDR off.") ('GTX 1080 Ti limits') ('OK') ('Information'))
            'List shown.' } }
 
     # ======================================================= vendor software (1.5): shown only when installed
@@ -3727,6 +3765,7 @@ function Add-PendingRestart($t) {
 function Update-PendingLive {
     $keep = @(foreach ($title in @($script:Pending.Items)) {
         $t = $Tweaks | Where-Object { $_.Title -eq $title } | Select-Object -First 1
+        if (-not $t -and $title -eq $GsyncPendingTitle) { $t = @{ Title = $title; Live = { Test-MainVrrOn }; State = $true } }
         $live = $false
         if ($t -and $t.Live) { try { $live = [bool](& $t.Live) } catch {} }
         if ($t -and $t.State -eq $false) { $live = $true }    # switched off again: nothing pending
@@ -3744,6 +3783,7 @@ function Test-AfterBoot {
     if (-not @($script:VerifyAfterBoot).Count) { return }
     $bad = @(foreach ($title in $script:VerifyAfterBoot) {
         $t = $Tweaks | Where-Object { $_.Title -eq $title } | Select-Object -First 1
+        if (-not $t -and $title -eq $GsyncPendingTitle) { $t = @{ Title = $title; Live = { Test-MainVrrOn }; State = $true } }
         if ($t -and $t.Live -and $t.State -eq $true) { try { if (-not (& $t.Live)) { $title } } catch {} }
     })
     $n = @($script:VerifyAfterBoot).Count
@@ -4935,6 +4975,83 @@ function New-Card($t) {
     $card
 }
 
+# --------------------------------------------------------------- dialog ---
+# ZeroDelay's own question box instead of the grey Windows one. Same inputs and answers as MessageBox::Show
+# (buttons 'OK', 'OKCancel', 'YesNo', 'YesNoCancel'; icon 'Question', 'Warning', 'Error', 'Information'),
+# returns 'Yes', 'No', 'Cancel' or 'OK'. Enter picks the main button, Esc the way out.
+function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$Buttons = 'OK', [string]$Icon = 'Information') {
+    $look = switch ($Icon) { 'Question' { @(0xE9CE, '#0A84FF') } 'Warning' { @(0xE7BA, '#FF9F0A') } 'Error' { @(0xEA39, '#FF453A') } default { @(0xE946, '#0A84FF') } }
+    $btns = switch ($Buttons) { 'YesNo' { @('No', 'Yes') } 'YesNoCancel' { @('Cancel', 'No', 'Yes') } 'OKCancel' { @('Cancel', 'OK') } default { @('OK') } }
+    $main = $btns[-1]
+    $escape = if ($btns -contains 'Cancel') { 'Cancel' } elseif ($btns -contains 'No') { 'No' } else { 'OK' }
+    $danger = $Icon -in 'Warning', 'Error' -and $btns.Count -gt 1
+    $bx = ($btns | ForEach-Object {
+        $isMain = $_ -eq $main
+        $bg = if ($isMain) { if ($danger) { " Background='#FF453A' Foreground='#FFFFFF'" } else { " Background='#0071E3' Foreground='#FFFFFF'" } } else { '' }
+        "<Button x:Name='B_$_' Content='$_' Style='{DynamicResource Btn}' MinWidth='96' Padding='16,8' Margin='8,0,0,0'$bg/>"
+    }) -join ''
+    $dlg = [ZdTheme]::Parse(@"
+<Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        Title='$(Esc $Title)' Width='480' SizeToContent='Height' WindowStyle='None' AllowsTransparency='True' Background='Transparent'
+        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='Segoe UI' Opacity='0'>
+  <Grid Margin='24'>
+    <Border CornerRadius='20' Background='#2C2C2F'>
+      <Border.Effect><DropShadowEffect BlurRadius='40' ShadowDepth='10' Direction='270' Opacity='0.6' Color='Black'/></Border.Effect>
+    </Border>
+    <Border x:Name='Card' CornerRadius='20' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' ClipToBounds='True'>
+      <Grid>
+        <Ellipse Width='300' Height='300' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-120,-150,0,0' IsHitTestVisible='False'>
+          <Ellipse.Fill><RadialGradientBrush><GradientStop Color='$($look[1] -replace '^#', '#40')' Offset='0'/><GradientStop Color='$($look[1] -replace '^#', '#00')' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
+        </Ellipse>
+        <StackPanel Margin='26,24,24,20'>
+          <StackPanel Orientation='Horizontal'>
+            <Border Width='42' Height='42' CornerRadius='12' Background='$($look[1] -replace '^#', '#33')'>
+              <Border.Effect><DropShadowEffect Color='$($look[1])' BlurRadius='18' ShadowDepth='0' Opacity='0.45'/></Border.Effect>
+              <TextBlock Text='&#x$('{0:X}' -f $look[0]);' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='19' Foreground='$($look[1])' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+            </Border>
+            <TextBlock Text='$(Esc $Title)' FontSize='18' FontWeight='SemiBold' Foreground='{DynamicResource Label}' VerticalAlignment='Center' Margin='14,0,0,0' TextWrapping='Wrap' MaxWidth='330'/>
+          </StackPanel>
+          <ScrollViewer Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' MaxHeight='440' Margin='0,16,0,0'>
+            <TextBlock x:Name='Msg' FontSize='13.5' Foreground='{DynamicResource Label2}' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'/>
+          </ScrollViewer>
+          <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,22,0,0'>$bx</StackPanel>
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
+"@)
+    $dlg.Resources.MergedDictionaries.Add($window.Resources)
+    Set-RoundClip $dlg.FindName('Card') 20
+    $dlg.FindName('Msg').Text = $Message
+    $script:DlgResult = $escape
+    foreach ($b in $btns) {
+        $btn = $dlg.FindName("B_$b"); $btn.Tag = $b
+        $btn.Add_Click({ param($s, $e) $script:DlgResult = $s.Tag; [Windows.Window]::GetWindow($s).Close() })
+    }
+    $script:DlgMain = $main; $script:DlgEsc = $escape
+    $dlg.Add_KeyDown({ param($s, $e)
+        if ($e.Key -eq 'Escape') { $script:DlgResult = $script:DlgEsc; $s.Close() }
+        elseif ($e.Key -eq 'Return') { $script:DlgResult = $script:DlgMain; $s.Close() }
+    })
+    $dlg.Add_MouseLeftButtonDown({ param($s, $e) try { $s.DragMove() } catch {} })
+    $dlg.Add_Loaded({ param($s, $e)
+        $s.FindName("B_$script:DlgMain").Focus() | Out-Null
+        if ($script:Anim) {
+            $s.BeginAnimation([Windows.UIElement]::OpacityProperty, (New-Object Windows.Media.Animation.DoubleAnimation 0, 1, ([Windows.Duration][TimeSpan]::FromMilliseconds(160))))
+            $c = $s.FindName('Card'); $tt = New-Object Windows.Media.ScaleTransform 0.96, 0.96; $c.RenderTransformOrigin = '0.5,0.5'; $c.RenderTransform = $tt
+            $a = New-Object Windows.Media.Animation.DoubleAnimation 0.96, 1, ([Windows.Duration][TimeSpan]::FromMilliseconds(220)); $a.EasingFunction = New-Ease
+            $tt.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $a); $tt.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $a)
+        } else { $s.Opacity = 1 }
+    })
+    if ($window -and $window.IsVisible) { $dlg.Owner = $window; $dlg.WindowStartupLocation = 'CenterOwner' } else { $dlg.WindowStartupLocation = 'CenterScreen'; $dlg.Topmost = $true }
+    # dim the app behind the question
+    $dim = $window -and $window.IsVisible -and $ui.Wizard.Visibility -ne 'Visible'
+    if ($dim) { $script:DimPrev = $ui.Wizard.Background; $ui.WizardBody.Visibility = 'Collapsed'; $ui.Wizard.Visibility = 'Visible' }
+    try { [void]$dlg.ShowDialog() } finally { if ($dim) { $ui.Wizard.Visibility = 'Collapsed'; $ui.WizardBody.Visibility = 'Visible' } }
+    $script:DlgResult
+}
+
 # ---------------------------------------------------------------- toast ---
 $script:ToastTimer = New-Object Windows.Threading.DispatcherTimer
 $script:ToastTimer.Interval = [TimeSpan]::FromSeconds(4.5)
@@ -6107,7 +6224,7 @@ function New-BenchmarkPage {
         $b[$n].Add_Click({ param($s, $e) $script:BenchSeconds = $s.Tag; Update-BenchDurationButtons })
     }
     $b.Get.Add_Click({
-        $r = [Windows.MessageBox]::Show("Download PresentMon 2.6.0 from Intel's official GitHub page?`n`n$PresentMonUrl`n`nIt is Intel's free frame-time recorder. ZeroDelay saves it to its own folder and only runs it when you start a benchmark.", 'Download PresentMon', 'YesNo', 'Question')
+        $r = (Show-ZdDialog ("Download PresentMon 2.6.0 from Intel's official GitHub page?`n`n$PresentMonUrl`n`nIt is Intel's free frame-time recorder. ZeroDelay saves it to its own folder and only runs it when you start a benchmark.") ('Download PresentMon') ('YesNo') ('Question'))
         if ($r -ne 'Yes') { return }
         try {
             $window.Cursor = [Windows.Input.Cursors]::Wait
@@ -6549,7 +6666,7 @@ function New-ProfilesPage {
     $pr.Import.Add_Click({
         try {
             $o = ConvertFrom-ShareCode $script:ProfUi.Code.Text
-            $r = [Windows.MessageBox]::Show("Profile '$($o.Name)' switches on $(@($o.On).Count) cards$(if ($o.Preset) { ", sets the '$($o.Preset.Title)' graphics preset" })$(if ($o.FpsCap) { " and an FPS cap of $([int][double]$o.FpsCap)" }).`n`nSave it to your profiles? (Nothing changes until you press Apply.)", 'Import profile', 'YesNo', 'Question')
+            $r = (Show-ZdDialog ("Profile '$($o.Name)' switches on $(@($o.On).Count) cards$(if ($o.Preset) { ", sets the '$($o.Preset.Title)' graphics preset" })$(if ($o.FpsCap) { " and an FPS cap of $([int][double]$o.FpsCap)" }).`n`nSave it to your profiles? (Nothing changes until you press Apply.)") ('Import profile') ('YesNo') ('Question'))
             if ($r -ne 'Yes') { return }
             $o | Add-Member -NotePropertyName Created -NotePropertyValue (Get-Date).ToString('o') -Force
             Save-Profile $o; $script:ProfUi.Code.Text = ''; Show-Toast "Imported '$($o.Name)'." '#30D158'; Update-ProfilesPage
@@ -6937,7 +7054,7 @@ function Install-Update {
     $u = $script:UpdateInfo
     if (-not $u -or $script:UpdateDl) { return }
     if (-not $u.SetupUrl -or -not $u.Sha) { Open-UpdatePage; return }
-    $r = [Windows.MessageBox]::Show("Update ZeroDelay to $($u.Version) now?`n`nZeroDelay downloads the new setup from GitHub, checks it, closes, installs it and opens again. It takes about 10 seconds. Your settings, backups and history are kept.", 'ZeroDelay update', 'YesNo', 'Question')
+    $r = (Show-ZdDialog ("Update ZeroDelay to $($u.Version) now?`n`nZeroDelay downloads the new setup from GitHub, checks it, closes, installs it and opens again. It takes about 10 seconds. Your settings, backups and history are kept.") ('ZeroDelay update') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     $dir = Join-Path $env:TEMP 'ZeroDelay-Update'
     New-Item -ItemType Directory -Force $dir | Out-Null
@@ -6984,6 +7101,12 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.9.1' = @(
+        @{ T = 'New look for questions'; D = 'The grey Windows pop-ups are gone: every question and message is now a dark ZeroDelay dialog that matches the app. Enter picks the main button, Esc closes it, and actions that delete things use a red button.' }
+        @{ T = 'FreeSync asks the NVIDIA driver'; D = 'The FreeSync page now checks every monitor with the NVIDIA driver and shows G-SYNC on, off for that monitor, or not seen by the driver, with what to check in the monitor menu. It also marks your main screen.' }
+        @{ T = 'G-SYNC on the restart banner'; D = 'Switched G-SYNC on in the NVIDIA App but it is not active yet? Press I turned it on: ZeroDelay adds it to the restart banner and checks after the restart that the driver uses it.' }
+        @{ T = 'Clearer restart banner'; D = 'Changes Windows already uses drop off the banner, it says when Windows last restarted, and after the restart ZeroDelay confirms the changes took effect.' }
+    )
     '1.9.0' = @(
         @{ T = 'You choose what Optimize switches on'; D = 'Optimize now lists every recommended tweak that is still off, with what it does and when to skip it. Nothing is ticked: you pick, then confirm.' }
         @{ T = 'Debloat'; D = 'A new Tools > Debloat page finds preinstalled Windows apps, promo apps and PC-maker trials, explains each one, and removes only what you tick.' }
@@ -7966,7 +8089,7 @@ function Get-AppIconSource($app) {
 }
 function Invoke-AppUninstall($app) {
     if ($app.Kind -eq 'store') {
-        $r = [Windows.MessageBox]::Show("Remove $($app.Name)?`n`nIt is removed for your Windows account. You can reinstall it from the Microsoft Store at any time.", 'Uninstall app', 'YesNo', 'Question')
+        $r = (Show-ZdDialog ("Remove $($app.Name)?`n`nIt is removed for your Windows account. You can reinstall it from the Microsoft Store at any time.") ('Uninstall app') ('YesNo') ('Question'))
         if ($r -ne 'Yes') { return }
         Show-Toast "Removing $($app.Name)..." '#A1A1A6'
         $script:RemovingApp = $app.Name
@@ -7980,7 +8103,7 @@ function Invoke-AppUninstall($app) {
         }
         return
     }
-    $r = [Windows.MessageBox]::Show("Uninstall $($app.Name)?`n`nIts own uninstaller opens next. Follow its steps; some ask you to restart.", 'Uninstall app', 'YesNo', 'Question')
+    $r = (Show-ZdDialog ("Uninstall $($app.Name)?`n`nIts own uninstaller opens next. Follow its steps; some ask you to restart.") ('Uninstall app') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     $cmd = $app.Uninstall.Trim()
     if ($cmd -match '(?i)msiexec') {
@@ -8227,7 +8350,7 @@ function Remove-Leftovers {
     $sh = $script:LeftoverSheet
     $chosen = @(for ($i = 0; $i -lt $sh.Items.Count; $i++) { if ($sh.Body.FindName("L_$i").IsChecked) { $sh.Items[$i] } })
     if (-not $chosen) { Hide-Animated $ui.Wizard 200; return }
-    $r = [Windows.MessageBox]::Show("Delete $($chosen.Count) item$(if ($chosen.Count -ne 1) { 's' }) of $($sh.App.Name) for good?`n`nFolders and files cannot be brought back. Registry keys are backed up first.", 'Deep uninstall', 'YesNo', 'Warning')
+    $r = (Show-ZdDialog ("Delete $($chosen.Count) item$(if ($chosen.Count -ne 1) { 's' }) of $($sh.App.Name) for good?`n`nFolders and files cannot be brought back. Registry keys are backed up first.") ('Deep uninstall') ('YesNo') ('Warning'))
     if ($r -ne 'Yes') { return }
     Hide-Animated $ui.Wizard 200
     Show-Toast "Removing $($sh.App.Name)..." '#A1A1A6'
@@ -8256,7 +8379,7 @@ $StoreForceScript = {
 }
 function Invoke-ForceRemove($app) {
     if ($app.Kind -eq 'store') {
-        $r = [Windows.MessageBox]::Show("Force remove $($app.Name)?`n`nIt is removed for every account on this PC, its data folder is deleted, and Windows stops installing it for new accounts. You can still get it again from the Microsoft Store.", 'Force remove', 'YesNo', 'Warning')
+        $r = (Show-ZdDialog ("Force remove $($app.Name)?`n`nIt is removed for every account on this PC, its data folder is deleted, and Windows stops installing it for new accounts. You can still get it again from the Microsoft Store.") ('Force remove') ('YesNo') ('Warning'))
         if ($r -ne 'Yes') { return }
         $script:RemovingApp = $app.Name
         Show-Toast "Removing $($app.Name) for all accounts..." '#A1A1A6'
@@ -8271,7 +8394,7 @@ function Invoke-ForceRemove($app) {
         }
         return
     }
-    $r = [Windows.MessageBox]::Show("Force remove $($app.Name)?`n`nZeroDelay skips its own uninstaller, closes it, and then shows you every file, registry key, shortcut, service and task it found, so you can delete them.`n`nUse this when the normal Uninstall does not work.", 'Force remove', 'YesNo', 'Warning')
+    $r = (Show-ZdDialog ("Force remove $($app.Name)?`n`nZeroDelay skips its own uninstaller, closes it, and then shows you every file, registry key, shortcut, service and task it found, so you can delete them.`n`nUse this when the normal Uninstall does not work.") ('Force remove') ('YesNo') ('Warning'))
     if ($r -ne 'Yes') { return }
     Find-Leftovers $app $true
 }
@@ -8434,7 +8557,7 @@ function Start-Clean {
     $keys = @($cu.Check.Keys | Where-Object { $cu.Check[$_].IsChecked })
     if (-not $keys) { return }
     $extra = if ($keys -contains 'recycle') { "`n`nThis also empties the Recycle Bin." } else { '' }
-    $r = [Windows.MessageBox]::Show("Delete $(Format-Size $script:CleanPlanned) of files now?`n`nDeleted files cannot be brought back. Files that are in use are skipped.$extra", 'Clean up files', 'YesNo', 'Question')
+    $r = (Show-ZdDialog ("Delete $(Format-Size $script:CleanPlanned) of files now?`n`nDeleted files cannot be brought back. Files that are in use are skipped.$extra") ('Clean up files') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     $cu.Go.IsEnabled = $false; $cu.Rescan.IsEnabled = $false
     $cu.Total.Text = 'Cleaning...'; $cu.Status.Text = 'This can take a minute for big caches.'
@@ -8577,7 +8700,7 @@ function Show-MemoryPage($d) {
 function Close-AppGroup([string]$Name) {
     $procs = @(Get-Process -Name $Name -ErrorAction SilentlyContinue)
     if (-not $procs) { return }
-    $r = [Windows.MessageBox]::Show("Close $Name ($($procs.Count) process$(if ($procs.Count -ne 1) { 'es' }))?`n`nZeroDelay asks it to close first and ends it if it does not. Unsaved work in it may be lost.", 'Close app', 'YesNo', 'Question')
+    $r = (Show-ZdDialog ("Close $Name ($($procs.Count) process$(if ($procs.Count -ne 1) { 'es' }))?`n`nZeroDelay asks it to close first and ends it if it does not. Unsaved work in it may be lost.") ('Close app') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     foreach ($p in $procs) { try { if ($p.MainWindowHandle -ne [IntPtr]::Zero) { [void]$p.CloseMainWindow() } } catch {} }
     # anything still running after 3 s (tray apps have no window to close) is ended
@@ -9954,6 +10077,15 @@ function Update-BoosterPage {
 
 # =============================================================== FreeSync / G-SYNC Compatible
 # Monitors with a variable refresh range (read from their EDID), how they are connected, and what that means here.
+# G-SYNC switched on in the NVIDIA App but the driver is not using it yet: remember it until a restart, then confirm.
+$GsyncPendingTitle = 'G-SYNC Compatible (NVIDIA)'
+function Add-GsyncPending {
+    $script:VrrMonitors = $null
+    if (Test-MainVrrOn) { Show-Toast 'G-SYNC Compatible is already working on your main screen. No restart needed.' '#30D158'; return }
+    Add-PendingRestart @{ Title = $GsyncPendingTitle; Badge = 'restart'; Live = { Test-MainVrrOn } }
+    Update-RestartBar
+    Show-Toast 'Added to the restart banner. After you restart, ZeroDelay checks that the driver uses G-SYNC.' '#0A84FF'
+}
 function Get-VrrMonitors {
     if ($null -ne $script:VrrMonitors) { return $script:VrrMonitors }
     $list = @()
@@ -9969,13 +10101,23 @@ function Get-VrrMonitors {
             $cable = switch ($vot) { 5 { 'HDMI' } 10 { 'DisplayPort' } 11 { 'DisplayPort' } 4 { 'DVI' } 0 { 'VGA' } 15 { 'USB-C' } default { 'other' } }
             # a real VRR range: at least 30 Hz wide and above 60 Hz
             if ($max -and $min -and $max -gt 60 -and ($max - $min) -ge 30) {
-                $list += [pscustomobject]@{ Name = $(if ($name) { $name } else { 'Monitor' }); Instance = $inst; Min = $min; Max = $max; Cable = $cable }
+                $gdi = $null; $main = $false
+                foreach ($row in [DisplayMap]::List()) { $f = $row -split '\|'; if ($f[1] -ieq $inst) { $gdi = $f[0]; $main = $f[2] -eq '1' } }
+                $list += [pscustomobject]@{ Name = $(if ($name) { $name } else { 'Monitor' }); Instance = $inst; Min = $min; Max = $max; Cable = $cable; Gdi = $gdi; Main = $main }
             }
         }
     } catch {}
-    $script:VrrMonitors = $list
-    $list
+    $script:VrrMonitors = @($list | Sort-Object { -not $_.Main })
+    $script:VrrMonitors
 }
+# the driver's answer for one monitor: 'on', 'off' (it can, G-SYNC is off for it), 'blocked' (driver sees no VRR), or $null
+function Get-MonitorVrr($m) {
+    if (-not (Test-NvAvailable) -or -not $m.Gdi) { return $null }
+    $f = [NvDrs]::VrrFlagsFor($m.Gdi)
+    if ($f -lt 0) { $null } elseif ($f -band 1) { 'on' } elseif ($f -band 2) { 'off' } else { 'blocked' }
+}
+# G-SYNC on for the main screen right now (used by the restart banner to confirm it after a restart)
+function Test-MainVrrOn { $m = @(Get-VrrMonitors) | Where-Object { $_.Main } | Select-Object -First 1; if ($m) { (Get-MonitorVrr $m) -eq 'on' } else { Test-VrrDisplayOn } }
 function New-SyncPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
@@ -10014,7 +10156,7 @@ function New-SyncPage {
     $g = @{}; foreach ($n in 'Hero', 'StatePill', 'StateDot', 'StateText', 'StateSub', 'Monitors', 'Steps') { $g[$n] = $root.FindName($n) }
     $script:SyncUi = $g
     Set-RoundClip $g.Hero 22
-    $script:PageRefresh['Sync'] = { Update-SyncPage }
+    $script:PageRefresh['Sync'] = { $script:VrrMonitors = $null; Update-SyncPage }
     Update-SyncPage
     New-PageScroll $root
 }
@@ -10023,34 +10165,38 @@ function Update-SyncPage {
     $mons = @(Get-VrrMonitors)
     $nv = Test-NvAvailable
     $amd = [bool](Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -and $_.Name -notmatch 'Graphics$' })
-    $flags = if ($nv) { [NvDrs]::VrrFlags() } else { -1 }
-    $on = $flags -ge 0 -and ($flags -band 1)
+    $mainMon = $mons | Where-Object { $_.Main } | Select-Object -First 1
+    $on = if ($nv) { if ($mainMon) { (Get-MonitorVrr $mainMon) -eq 'on' } else { Test-VrrDisplayOn } } else { $false }
     $curHz = [NativeDisplay]::CurrentHz(); $maxHz = [NativeDisplay]::MaxHz()
     $good = '#30D158'; $warn = '#FF9F0A'; $bad = '#FF453A'
     $g.StatePill.Background = ConvertTo-Brush $(if ($on) { '#2630D158' } else { '#26FF9F0A' })
     $g.StateDot.Fill = ConvertTo-Brush $(if ($on) { $good } else { $warn })
-    $g.StateText.Text = if ($nv) { if ($on) { 'G-SYNC Compatible on' } else { 'Off on your main screen' } } elseif ($amd) { 'Set in AMD Software' } else { 'Check your GPU settings' }
+    $g.StateText.Text = if ($nv) { if ($on) { 'G-SYNC Compatible on' } else { 'Not active on your main screen' } } elseif ($amd) { 'Set in AMD Software' } else { 'Check your GPU settings' }
     $g.StateText.Foreground = ConvertTo-Brush $(if ($on) { $good } else { $warn })
     $g.StateSub.Text = if ($nv) { "On an NVIDIA card FreeSync is called G-SYNC Compatible. It needs DisplayPort (or HDMI 2.1), the monitor's own FreeSync / Adaptive-Sync option on, and the NVIDIA switch on. Your main screen runs at $curHz Hz." }
                        else { "Turn FreeSync on in the monitor's menu and in AMD Software > Gaming > Display. Your main screen runs at $curHz Hz." }
     # one card per monitor
     $g.Monitors.Children.Clear()
     foreach ($m in $mons) {
-        $hdmiNv = $nv -and $m.Cable -eq 'HDMI'
-        $state = if ($hdmiNv) { @($bad, "Not over this HDMI cable. NVIDIA cards run FreeSync over DisplayPort, or HDMI 2.1 on monitors that support HDMI 2.1 VRR. Connect this monitor with a DisplayPort cable.") }
-                 elseif ($m.Cable -eq 'DisplayPort') { if ($nv) { @($good, 'Supported over DisplayPort.') } else { @($good, 'Supported. Turn it on in AMD Software.') } }
-                 else { @($warn, "Connected by $($m.Cable): VRR may not work over this connection.") }
+        $drv = Get-MonitorVrr $m
+        # the NVIDIA driver knows best; without it, fall back to what the cable allows
+        $state = switch ($drv) {
+            'on'      { @($good, 'G-SYNC Compatible is on for this monitor: the NVIDIA driver is using it.', 'G-SYNC on') }
+            'off'     { @($warn, 'This monitor can do it, but G-SYNC is off for it. In the NVIDIA App > System > Displays, pick this monitor and switch G-SYNC on.', 'Off for this monitor') }
+            'blocked' { @($bad, "The NVIDIA driver does not see FreeSync on this monitor right now. Check the monitor menu: Adaptive-Sync / FreeSync on, and motion-blur reduction (MPRT, ELMB, Aim Stabilizer) and any HDR mode off, as they switch FreeSync off. If you just changed it, restart the PC.$(if ($m.Cable -eq 'HDMI') { ' Over HDMI, DisplayPort works more often.' })", 'Not seen by driver') }
+            default   { if ($m.Cable -eq 'DisplayPort') { @($good, $(if ($nv) { 'Supported over DisplayPort.' } else { 'Supported. Turn it on in AMD Software.' }), 'Can use FreeSync') } else { @($warn, "Connected by $($m.Cable): VRR may need DisplayPort on this graphics card.", 'Check the cable') } }
+        }
         $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' CornerRadius='16' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,14' Margin='0,0,0,10'>
   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
     <Border Width='40' Height='40' CornerRadius='11' Background='#22FFFFFF' VerticalAlignment='Top'><TextBlock Text='&#xE7F4;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' Foreground='#E6E6EC' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
     <StackPanel Grid.Column='1' Margin='14,0,14,0'>
-      <TextBlock Text='$(Esc $m.Name)' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+      <StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $m.Name)' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF'/>$(if ($m.Main) { "<Border Background='#260A84FF' CornerRadius='6' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='main screen' FontSize='11' Foreground='#0A84FF'/></Border>" })</StackPanel>
       <TextBlock Text='$(Esc "Variable refresh $($m.Min) to $($m.Max) Hz  ·  connected by $($m.Cable)")' FontSize='12.5' Foreground='#9A9AA5' Margin='0,2,0,0'/>
       <TextBlock Text='$(Esc $state[1])' FontSize='12.5' Foreground='$($state[0])' TextWrapping='Wrap' Margin='0,6,0,0'/>
     </StackPanel>
     <Border Grid.Column='2' Background='$($state[0] -replace '^#', '#26')' CornerRadius='10' Padding='10,3,12,4' VerticalAlignment='Top'>
-      <TextBlock Text='$(if ($state[0] -eq $good) { 'Can use FreeSync' } elseif ($state[0] -eq $bad) { 'Needs DisplayPort' } else { 'Check the cable' })' FontSize='12' FontWeight='SemiBold' Foreground='$($state[0])'/>
+      <TextBlock Text='$(Esc $state[2])' FontSize='12' FontWeight='SemiBold' Foreground='$($state[0])'/>
     </Border>
   </Grid>
 </Border>
@@ -10063,7 +10209,7 @@ function Update-SyncPage {
     $steps = @(
         @{ Done = ($curHz -ge $maxHz -and $maxHz -gt 0); Title = "Run at the highest refresh rate ($maxHz Hz)"; Desc = $(if ($curHz -ge $maxHz) { "Your main screen already runs at $curHz Hz." } else { "Your main screen runs at $curHz Hz but can do $maxHz Hz." }); Btn = $(if ($curHz -lt $maxHz) { 'Set' }); Act = 'hz' }
         @{ Done = $false; Info = $true; Title = 'Turn on FreeSync / Adaptive-Sync in the monitor menu'; Desc = 'Use the buttons on the monitor. Many monitors ship with it off.' }
-        @{ Done = [bool]$on; Info = -not $nv; Title = $(if ($nv) { 'Turn on G-SYNC Compatible in the NVIDIA App' } else { 'Turn on FreeSync in AMD Software' }); Desc = $(if ($nv) { $(if ($on) { 'On for your main screen.' } else { 'NVIDIA App > System > Displays > G-SYNC: on, for full screen and windowed mode. ZeroDelay cannot switch this for you; this button opens the NVIDIA App.' }) } else { 'AMD Software > Gaming > Display > AMD FreeSync.' }); Btn = $(if ($nv -and -not $on -and (Test-Path $NvAppExe)) { 'Open NVIDIA App' }); Act = 'nvapp' }
+        @{ Done = [bool]$on; Info = -not $nv; Title = $(if ($nv) { 'Turn on G-SYNC Compatible in the NVIDIA App' } else { 'Turn on FreeSync in AMD Software' }); Btn2 = $(if ($nv -and -not $on) { 'I turned it on' }); Act2 = 'gsyncpending'; Desc = $(if ($nv) { $(if ($on) { 'On for your main screen.' } else { 'NVIDIA App > System > Displays > G-SYNC: on, for full screen and windowed mode. ZeroDelay cannot switch this for you; this button opens the NVIDIA App.' }) } else { 'AMD Software > Gaming > Display > AMD FreeSync.' }); Btn = $(if ($nv -and -not $on -and (Test-Path $NvAppExe)) { 'Open NVIDIA App' }); Act = 'nvapp' }
         @{ Done = ($vrr -and $vrr.State -eq $true); Title = 'Windows variable refresh rate'; Desc = 'Lets borderless and windowed games use VRR too.'; Switch = [bool]$vrr; Act = 'vrr' }
         @{ Done = $false; Title = 'Keep FPS inside the range'; Desc = $(if ($capOk) { 'The Tear-free preset caps Fortnite a few FPS under your refresh rate and turns on Reflex and driver V-Sync, so frames always land inside the FreeSync range: no tearing and almost no added delay. Fortnite must be closed.' } else { 'Once G-SYNC Compatible is on, the Tear-free preset caps Fortnite just under your refresh rate so frames stay inside the FreeSync range.' }); Btn = $(if ($capOk) { 'Tear-free preset' }); Act = 'tearfree' }
     )
@@ -10072,12 +10218,14 @@ function Update-SyncPage {
         $dot = if ($st.Done) { "<Border Width='22' Height='22' CornerRadius='11' Background='#2630D158'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#30D158' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
                else { "<Border Width='22' Height='22' CornerRadius='11' Background='#1AFFFFFF'><TextBlock Text='$($i + 1)' FontSize='11.5' FontWeight='SemiBold' Foreground='#E6E6EC' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
         $right = if ($st.Switch) { "<ToggleButton x:Name='V_$i' Grid.Column='2' Style='{DynamicResource Switch}' IsChecked='$(if ($st.Done) { 'True' } else { 'False' })' VerticalAlignment='Center'/>" }
-                 elseif ($st.Btn) { "<Button x:Name='B_$i' Grid.Column='2' Content='$(Esc $st.Btn)' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' VerticalAlignment='Center'/>" } else { '' }
+                 elseif ($st.Btn -or $st.Btn2) { "<StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center'>" + $(if ($st.Btn2) { "<Button x:Name='C_$i' Content='$(Esc $st.Btn2)' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,6,0' ToolTip='The driver does not use it yet: ZeroDelay adds it to the restart banner and checks it after the restart.'/>" } else { '' }) + $(if ($st.Btn) { "<Button x:Name='B_$i' Content='$(Esc $st.Btn)' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12'/>" } else { '' }) + "</StackPanel>" } else { '' }
         "<Grid Margin='0,0,0,12'><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>$dot" +
         "<StackPanel Grid.Column='1' Margin='12,0,12,0'><TextBlock Text='$(Esc $st.Title)' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF' TextWrapping='Wrap'/><TextBlock Text='$(Esc $st.Desc)' FontSize='12' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,2,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel>$right</Grid>"
     }
     $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($x -join '')</StackPanel>")
     for ($i = 0; $i -lt $steps.Count; $i++) {
+        $c = $panel.FindName("C_$i")
+        if ($c) { $c.Tag = $steps[$i].Act2; $c.Add_Click({ param($s, $e) Add-GsyncPending; Update-SyncPage }) }
         $b = $panel.FindName("B_$i"); if (-not $b) { $b = $panel.FindName("V_$i") }; if (-not $b) { continue }
         $b.Tag = $steps[$i].Act
         $b.Add_Click({ param($s, $e)
@@ -10219,7 +10367,7 @@ function Invoke-Debloat {
     $pick = @($script:BloatItems | Where-Object { $_.Box.IsChecked })
     if (-not $pick.Count) { return }
     $names = ($pick | ForEach-Object { "  •  $($_.App.Name)" }) -join "`n"
-    $r = [Windows.MessageBox]::Show("Remove these?`n`n$names`n`nStore apps are removed for your account and can be reinstalled from the Microsoft Store. Other programs open their own uninstaller.", 'Debloat', 'YesNo', 'Question')
+    $r = (Show-ZdDialog ("Remove these?`n`n$names`n`nStore apps are removed for your account and can be reinstalled from the Microsoft Store. Other programs open their own uninstaller.") ('Debloat') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     $store = @($pick | Where-Object { $_.App.Kind -eq 'store' })
     foreach ($d in @($pick | Where-Object { $_.App.Kind -ne 'store' })) { Invoke-AppUninstallDirect $d.App }
@@ -10757,7 +10905,7 @@ function Show-OptimizeChooser {
 function Invoke-ApplyTweaks($pick) {
     if (-not @($pick).Count) { return }
     if (-not $script:Backup.Custom.ContainsKey('restorepoint')) {
-        $r = [Windows.MessageBox]::Show("Create a Windows restore point first? It takes a few seconds and lets you roll everything back.", 'Restore point', 'YesNoCancel', 'Question')
+        $r = (Show-ZdDialog ("Create a Windows restore point first? It takes a few seconds and lets you roll everything back.") ('Restore point') ('YesNoCancel') ('Question'))
         if ($r -eq 'Cancel') { return }
         if ($r -eq 'Yes') { $window.Cursor = [Windows.Input.Cursors]::Wait; Show-Toast (New-ZeroDelayRestorePoint) '#A1A1A6'; $window.Cursor = $null }
         else { $script:Backup.Custom['restorepoint'] = 'declined'; Save-Backup }
@@ -10883,14 +11031,14 @@ $ui.RestartNow.Add_Click({
     $restart = $script:Pending.Kind -eq 'restart'
     $msg = if ($restart) { 'Restart your PC now? Save anything you have open first.' } else { 'Sign out now? Save anything you have open first.' }
     if (Test-FortniteRunning) { $msg = "Fortnite is still running and will be closed.`n`n$msg" }
-    $r = [Windows.MessageBox]::Show($msg, $(if ($restart) { 'Restart now' } else { 'Sign out now' }), 'YesNo', 'Question')
+    $r = (Show-ZdDialog ($msg) ($(if ($restart) { 'Restart now' } else { 'Sign out now' })) ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     if ($restart) { shutdown.exe /r /t 5 /c 'ZeroDelay is restarting your PC to apply your changes.' }
     else { shutdown.exe /l }
 })
 
 $ui.RestoreAll.Add_Click({
-    $r = [Windows.MessageBox]::Show('Put every setting this app changed back to how it was?', 'Restore all', 'YesNo', 'Question')
+    $r = (Show-ZdDialog ('Put every setting this app changed back to how it was?') ('Restore all') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
     $window.Cursor = [Windows.Input.Cursors]::Wait
     $failed = @()

@@ -29,7 +29,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   to undo each one.
 - **Debloat**: finds preinstalled Windows apps, promo apps and PC-maker trials, explains each one, and removes only
   what you tick.
-- **FreeSync**: each monitor's variable refresh range and cable, whether it can work on your graphics card (NVIDIA needs
+- **FreeSync**: each monitor's variable refresh range and cable, what the NVIDIA driver reports for each one (on, off for that monitor, or not seen), and what to check (NVIDIA needs
   DisplayPort or HDMI 2.1), and the settings in order: refresh rate, G-SYNC Compatible, Windows VRR, an in-range frame cap.
 - **Ping booster**: works with GearUP, ExitLag, WTFast and NoPing. A trusted booster may change settings: ZeroDelay
   keeps its changes, never switches them back, and lists every change with the old and new value.
@@ -58,6 +58,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Memory (RAM)**: what uses your memory, closing heavy apps, and a one-time standby-list clear. No "RAM cleaner" that
   forces apps to drop their memory: that causes the stutter it claims to fix.
 - **Light and true-black dark mode** (or match Windows) with six accent colours.
+- **Own dialogs**: every question is a dark ZeroDelay dialog instead of a grey Windows pop-up.
 - **One-click updates**: ZeroDelay tells you when a new version is out, downloads it from the GitHub release, checks
   its SHA-256 against the release notes and reinstalls itself.
 - Optional **Start with Windows** (in the tray), and **Report a problem**, which opens a GitHub issue with your PC
