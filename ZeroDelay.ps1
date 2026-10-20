@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.7.0'
+$AppVersion = '1.8.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -66,6 +66,18 @@ public static class ZdTheme {
     public static object Parse(string xaml) { return System.Windows.Markup.XamlReader.Parse(Apply(xaml)); }
     public static System.Windows.Media.Brush Brush(string c) {
         return (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFrom(Apply(c));
+    }
+}
+
+// CPU load from GetSystemTimes (works even when performance counters are switched off)
+public static class CpuLoad {
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+    static long li, lk, lu;
+    public static int Sample() {
+        long i, k, u; if (!GetSystemTimes(out i, out k, out u)) return -1;
+        long di = i - li, dt = (k - lk) + (u - lu); bool first = li == 0; li = i; lk = k; lu = u;
+        if (first || dt <= 0) return -1;
+        return (int)System.Math.Round(100.0 * (dt - di) / dt);
     }
 }
 
@@ -1491,13 +1503,15 @@ function Get-ZeroDelayPlanGuid {
 function Enable-ZDGameMode {
     if (Test-ZDGameMode) { return 'Game Mode is already on.' }
     $prefs = Get-GameModePrefs
-    $state = @{ Started = (Get-Date).ToString('o'); SawFortnite = (Test-FortniteRunning); Done = @() }
+    $state = @{ Started = (Get-Date).ToString('o'); SawFortnite = (Test-FortniteRunning); Done = @(); ClosedCount = 0; FreedMb = 0 }
     $done = @()
+    $memBefore = try { [double](Get-MemInfo).Available } catch { 0 }
     if ($prefs.apps) {
         $msg = Start-GameSession
         $script:SessionTimer.Stop()          # Game Mode decides when apps come back
         $state.Session = $true
-        if ($msg -match 'Closed: (.+?)\. Everything') { $done += "closed $($Matches[1])" }
+        if ($msg -match 'Closed: (.+?)\. Everything') { $done += "closed $($Matches[1])"; $state.ClosedCount = @($Matches[1] -split ', ').Count }
+        if ($state.ClosedCount -and $memBefore) { Start-Sleep -Milliseconds 700; try { $state.FreedMb = [int][Math]::Max(0, ([double](Get-MemInfo).Available - $memBefore) / 1MB) } catch {} }
     }
     if ($prefs.plan) {
         $cur = Get-ActivePowerScheme
@@ -3615,6 +3629,13 @@ $script:Accent = if ($env:ZD_ACCENT) { $env:ZD_ACCENT } elseif ($script:Backup.C
 if (-not $Accents.Contains($script:Accent)) { $script:Accent = 'blue' }
 [ZdTheme]::Map.Clear()
 if ($script:Theme -eq 'light') { foreach ($k in $LightMap.Keys) { [ZdTheme]::Map[$k] = $LightMap[$k] } }
+else {
+    # Dark is true black: black window, near-black panels, very dark greys for controls
+    $DarkMap = @{ '1C1C1E' = '000000'; '262628' = '0A0A0B'; '2C2C2E' = '131314'; '3A3A3C' = '1F1F21'; '48484A' = '2C2C2F'; '38383A' = '1E1E20'
+                  '303033' = '18181A'; '38383B' = '121214'; '3D3D41' = '242427'; '444446' = '28282B'; '4D4D50' = '3A3A3D'; '4A4A4D' = '303033'
+                  '2C2C2F' = '0F0F10'; '3A3A3D' = '1A1A1C'; '48484B' = '2A2A2D'; '5A5A5E' = '3A3A3E'; '6E6E73' = '4A4A4E' }
+    foreach ($k in $DarkMap.Keys) { [ZdTheme]::Map[$k] = $DarkMap[$k] }
+}
 $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { $Accents[$script:Accent].Dark }
 [ZdTheme]::Map['0A84FF'] = $acc[0]; [ZdTheme]::Map['0071E3'] = $acc[1]; [ZdTheme]::Map['273A4F'] = $acc[2]
 
@@ -3628,7 +3649,7 @@ if ($script:Glass) {
         @{ '262628' = '4DFFFFFF'; '2C2C2E' = 'B8FFFFFF'; '1C1C1E' = '66FFFFFF'; '3A3A3C' = '14000000'; '48484A' = '22000000'; '38383A' = '1A000000'
            '303033' = '0A000000'; '38383B' = '12000000'; '3D3D41' = '14000000'; '444446' = '18000000'; '4D4D50' = '33000000'; '4A4A4D' = '26000000' }
     } else {
-        @{ '262628' = '33000000'; '2C2C2E' = '14FFFFFF'; '1C1C1E' = '47000000'; '3A3A3C' = '1AFFFFFF'; '48484A' = '29FFFFFF'; '38383A' = '1AFFFFFF'
+        @{ '262628' = '66000000'; '2C2C2E' = '12FFFFFF'; '1C1C1E' = '73000000'; '3A3A3C' = '1AFFFFFF'; '48484A' = '29FFFFFF'; '38383A' = '17FFFFFF'
            '303033' = '12FFFFFF'; '38383B' = '0DFFFFFF'; '3D3D41' = '24FFFFFF'; '444446' = '26FFFFFF'; '4D4D50' = '40FFFFFF'; '4A4A4D' = '33FFFFFF' }
     }
     foreach ($k in $glassMap.Keys) { [ZdTheme]::Map[$k] = $glassMap[$k] }
@@ -4414,10 +4435,15 @@ $window.Add_SourceInitialized({
             $m = New-Object ZD.DwmFrame+MARGINS; $m.L = -1; $m.R = -1; $m.T = -1; $m.B = -1
             [void][ZD.DwmFrame]::DwmExtendFrameIntoClientArea($h, [ref]$m)
             $v = 3; $hr = [ZD.Dwm]::DwmSetWindowAttribute($h, 38, [ref]$v, 4)                            # DWMSBT_TRANSIENTWINDOW (acrylic)
-            if ($hr -eq 0) { $window.Background = [Windows.Media.Brushes]::Transparent; return }
+            if ($hr -eq 0) {
+                # dark: almost-black tint over the frost so the window reads as black, with only a hint of glass
+                $window.Background = if ($dk) { [ZdTheme]::Brush('#EB000000') } else { [Windows.Media.Brushes]::Transparent }
+                $v = if ($dk) { 0x00000000 } else { 0x00F7F2F2 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 35, [ref]$v, 4)   # black title bar
+                return
+            }
             $window.Background = [ZdTheme]::Brush('#1C1C1E')   # backdrop refused: solid window, glass panels on top
         }
-        $v = if ($dk) { 0x001E1C1C } else { 0x00F7F2F2 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 35, [ref]$v, 4)  # caption = window colour
+        $v = if ($dk) { 0x00000000 } else { 0x00F7F2F2 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 35, [ref]$v, 4)  # caption = window colour
         $v = if ($dk) { 0x003A3838 } else { 0x00E5E0E0 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 34, [ref]$v, 4)  # border = separator
     } catch {}
 })
@@ -4857,6 +4883,7 @@ function New-GameModePanel($t) {
     $panel
 }
 function Update-GameModeUi {
+    if ($script:GmUi) { Update-GameModePage }
     $on = Test-ZDGameMode
     $mint = [ZdTheme]::Brush('#30D158')
     $ui.GmSwitch.IsChecked = $on
@@ -5008,8 +5035,7 @@ $Categories = @(
     @{ Name = 'All';        Icon = [char]0xE80F; Title = 'All optimizations' }
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
        Note = 'Only the tweaks that change input delay, frame time or ping. Green icons mark them in every tab.' }
-    @{ Name = 'GameMode';   Icon = [char]0xE768; Title = 'Game Mode'
-       Note = 'Turn it on before you play, or let it switch on by itself when Fortnite starts. ZeroDelay must stay open for the automatic part.' }
+    @{ Name = 'GameMode';   Icon = [char]0xE768; Title = 'Game Mode'; Page = 'GameMode' }
     @{ Name = 'Potato';     Icon = [char]0xE7F4; Title = 'Potato graphics'
        Note = 'Ugly but fast. Performance mode, low mesh and lower 3D resolution give the biggest gains; Fortnite must be closed to apply.' }
     @{ Name = 'Gtx1080Ti';  Icon = [char]0xE7F4; Title = 'GTX 1080 Ti'; Requires = { Test-Gtx1080Ti }
@@ -6461,6 +6487,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.8.0' = @(
+        @{ T = 'New Game Mode screen'; D = 'Game Mode is now a full dashboard: a big Start Game button that turns Game Mode on and launches Fortnite, a session timer, live ping, apps closed, memory freed, and CPU, GPU and memory numbers.' }
+        @{ T = 'Game Mode tools'; D = 'Every boost step and every app Game Mode closes in one panel, with app icons, a running label, and filters for Boost, Apps and Auto.' }
+        @{ T = 'True black'; D = 'Dark mode is now real black instead of grey, glass included.' }
+    )
     '1.7.0' = @(
         @{ T = 'A cleaner ZeroDelay'; D = 'A new Home page with one Optimize button, a shorter menu with folding Tweaks and Tools groups, and Restore point / Undo everything tucked into the menu next to Optimize.' }
         @{ T = 'Glass'; D = 'Frosted, see-through window and glass panels on Windows 11, with cards that lift under the mouse. Switch it off in Settings > Appearance.' }
@@ -8252,6 +8283,350 @@ function Select-NavPage([string]$Name) {
     $script:NavButtons[$Name].BringIntoView()
 }
 
+# =============================================================== Game Mode page (booster dashboard)
+$GmStepInfo = [ordered]@{
+    apps     = @{ Icon = 0xE71D; Tint = '#5E5CE6'; Desc = 'Closes the apps you pick below and reopens them afterwards.' }
+    plan     = @{ Icon = 0xE945; Tint = '#FF9F0A'; Desc = 'Full CPU speed and no parked cores while you play.' }
+    priority = @{ Icon = 0xE9D9; Tint = '#0A84FF'; Desc = 'Discord, browsers and launchers step back to below-normal priority.' }
+    dnd      = @{ Icon = 0xE708; Tint = '#BF5AF2'; Desc = 'No Windows pop-ups in the middle of a fight.' }
+    updates  = @{ Icon = 0xE896; Tint = '#30B0C7'; Desc = 'Windows Update stops downloading until you are done.' }
+    dns      = @{ Icon = 0xE968; Tint = '#34C759'; Desc = 'Clears stale server addresses before you queue.' }
+    nvreplay = @{ Icon = 0xE714; Tint = '#76B900'; Desc = 'Stops NVIDIA background recording. Leave off if you want clips.' }
+    auto     = @{ Icon = 0xE768; Tint = '#2EE6A6'; Desc = 'Game Mode starts by itself when Fortnite opens.' }
+    autooff  = @{ Icon = 0xE71A; Tint = '#FF6482'; Desc = 'Everything goes back when Fortnite closes.' }
+}
+# icons for the apps Game Mode closes: from the running process, Settings > Apps, or the app's known exe
+function Get-ExeIconSource([string]$Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    if (-not $script:ExeIcons) { $script:ExeIcons = @{} }
+    if ($script:ExeIcons.ContainsKey($Path)) { return $script:ExeIcons[$Path] }
+    $src = $null
+    try {
+        $ico = if ($Path -match '(?i)\.ico$') { New-Object System.Drawing.Icon $Path, 48, 48 } else { [System.Drawing.Icon]::ExtractAssociatedIcon($Path) }
+        $src = [Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon($ico.Handle, [Windows.Int32Rect]::Empty, [Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+        $src.Freeze(); $ico.Dispose()
+    } catch {}
+    $script:ExeIcons[$Path] = $src
+    $src
+}
+function Get-InstalledEntries {
+    Get-Cached 'installedentries' {
+        @(foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
+            foreach ($k in Get-ChildItem $root -ErrorAction SilentlyContinue) { $q = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue; if ($q.DisplayName) { [pscustomobject]@{ Name = "$($q.DisplayName)"; Icon = "$($q.DisplayIcon)" } } }
+        })
+    }
+}
+function Get-SessionAppIcon($app) {
+    $paths = @()
+    if ($script:GmRunningPaths -and $script:GmRunningPaths[$app.Key]) { $paths += $script:GmRunningPaths[$app.Key] }
+    if ($app.Main) { $paths += Get-AppPath $app.Main }
+    if ($app.Detect) { $e = Get-InstalledEntries | Where-Object { $_.Name -match "^($($app.Detect))" -and $_.Icon } | Select-Object -First 1; if ($e) { $paths += (($e.Icon -replace ',\s*-?\d+\s*$', '').Trim('"')) } }
+    foreach ($pth in $paths) { $i = Get-ExeIconSource $pth; if ($i) { return $i } }
+    $null
+}
+function Start-FortniteGame {
+    if (Test-FortniteRunning) { return 'Fortnite is already running.' }
+    try { Start-Process 'com.epicgames.launcher://apps/fn%3A4fe75bbc5a674f4f9b356b5c90567da5%3AFortnite?action=launch&silent=true'; 'Launching Fortnite through the Epic Games Launcher.' }
+    catch { 'Could not start Fortnite: is the Epic Games Launcher installed?' }
+}
+$GmStatScript = {
+    param($pingHost, $apps)
+    $r = @{ Cpu = $null; GpuTemp = $null; GpuUtil = $null; MemPct = $null; Ping = $null; Running = @{} }
+    
+    $smi = "$env:WINDIR\System32\nvidia-smi.exe"
+    if (Test-Path $smi) { try { $x = "$(& $smi --query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits 2>$null | Select-Object -First 1)" -split ',\s*'; if ($x.Count -ge 2) { $r.GpuTemp = [int]$x[0]; $r.GpuUtil = [int]$x[1] } } catch {} }
+    try { $os = Get-CimInstance Win32_OperatingSystem; $r.MemPct = [int](100 - 100 * $os.FreePhysicalMemory / $os.TotalVisibleMemorySize) } catch {}
+    if ($pingHost) { try { $png = New-Object Net.NetworkInformation.Ping; $x = $png.Send($pingHost, 1000); if ($x.Status -eq 'Success') { $r.Ping = [int]$x.RoundtripTime } } catch {} }
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Path } catch { $null } } | Where-Object { $_ })
+    foreach ($a in $apps) { $hit = $procs | Where-Object { $_ -match $a.PathRx } | Select-Object -First 1; if ($hit) { $r.Running[$a.Key] = $hit } }
+    [pscustomobject]$r
+}
+function New-GameModePage {
+    $root = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' HorizontalAlignment='Stretch' Margin='0,0,0,8'>
+  <Border CornerRadius='26' ClipToBounds='True' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Height='640'>
+    <Grid>
+      <!-- soft colour glows instead of game art -->
+      <Ellipse Width='620' Height='620' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-180,-260,0,0' IsHitTestVisible='False'>
+        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#552EE6A6' Offset='0'/><GradientStop Color='#002EE6A6' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
+      </Ellipse>
+      <Ellipse Width='760' Height='760' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-260,-320' IsHitTestVisible='False'>
+        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#555E5CE6' Offset='0'/><GradientStop Color='#005E5CE6' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
+      </Ellipse>
+      <Ellipse Width='420' Height='420' HorizontalAlignment='Center' VerticalAlignment='Center' Margin='0,0,260,0' IsHitTestVisible='False'>
+        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#3324A0FF' Offset='0'/><GradientStop Color='#0024A0FF' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
+      </Ellipse>
+      <Grid Margin='44,40,22,22'>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='370'/></Grid.ColumnDefinitions>
+        <Grid.RowDefinitions><RowDefinition Height='*'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
+        <!-- left: title, status, numbers, start -->
+        <DockPanel Margin='0,0,28,0'>
+          <StackPanel DockPanel.Dock='Top'>
+            <TextBlock Text='FORTNITE' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='74' Foreground='#FFFFFF' Margin='-3,0,0,0'/>
+            <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
+              <Border x:Name='StatePill' CornerRadius='14' Padding='12,5,14,6' Background='#1AFFFFFF' BorderBrush='#26FFFFFF' BorderThickness='1'>
+                <StackPanel Orientation='Horizontal'>
+                  <Ellipse x:Name='StateDot' Width='8' Height='8' Fill='#8E8E93' VerticalAlignment='Center' Margin='0,0,8,0'/>
+                  <TextBlock x:Name='StateText' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+                </StackPanel>
+              </Border>
+              <TextBlock x:Name='StateSub' FontSize='12.5' Foreground='#9A9AA5' VerticalAlignment='Center' Margin='14,0,0,0'/>
+            </StackPanel>
+            <WrapPanel Margin='0,30,0,0'>
+              <StackPanel Margin='0,0,44,16'>
+                <StackPanel Orientation='Horizontal'><TextBlock x:Name='PingVal' Text='-' FontSize='38' FontWeight='Bold' Foreground='#2EE6A6' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms' FontSize='13' Foreground='#2EE6A6' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
+                <TextBlock x:Name='PingLbl' Text='Ping' FontSize='12' Foreground='#9A9AA5'/>
+              </StackPanel>
+              <StackPanel Margin='0,0,44,16'>
+                <TextBlock x:Name='AppsVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/>
+                <TextBlock x:Name='AppsLbl' Text='Apps closed' FontSize='12' Foreground='#9A9AA5'/>
+              </StackPanel>
+              <StackPanel Margin='0,0,44,16'>
+                <StackPanel Orientation='Horizontal'><TextBlock x:Name='MemVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/><TextBlock Text='GB' FontSize='13' Foreground='#9A9AA5' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
+                <TextBlock Text='Memory freed' FontSize='12' Foreground='#9A9AA5'/>
+              </StackPanel>
+              <StackPanel Margin='0,0,0,16'>
+                <TextBlock x:Name='StepsVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF'/>
+                <TextBlock Text='Boost steps on' FontSize='12' Foreground='#9A9AA5'/>
+              </StackPanel>
+            </WrapPanel>
+            <TextBlock x:Name='DoneText' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' MaxWidth='560' HorizontalAlignment='Left' Margin='0,6,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+          </StackPanel>
+          <StackPanel DockPanel.Dock='Bottom' Orientation='Horizontal' VerticalAlignment='Bottom' Margin='0,30,0,0'>
+            <Border CornerRadius='30' Background='#14FFFFFF' BorderBrush='#22FFFFFF' BorderThickness='1' Padding='22,0' Height='60' Margin='0,0,14,0'>
+              <StackPanel Orientation='Horizontal' VerticalAlignment='Center'>
+                <Ellipse x:Name='TimerDot' Width='10' Height='10' Fill='#8E8E93' Margin='0,0,12,0'/>
+                <TextBlock x:Name='Timer' Text='00:00:00' FontSize='22' FontWeight='SemiBold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/>
+              </StackPanel>
+            </Border>
+            <Button x:Name='Start' Height='60' Width='270' Cursor='Hand' Margin='0,0,10,0'>
+              <Button.Template>
+                <ControlTemplate TargetType='Button'>
+                  <Border x:Name='B' CornerRadius='30' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='{TemplateBinding BorderThickness}'>
+                    <Border.Effect><DropShadowEffect x:Name='Glow' Color='#2EE6A6' BlurRadius='34' ShadowDepth='0' Opacity='0.55'/></Border.Effect>
+                    <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
+                  </Border>
+                  <ControlTemplate.Triggers>
+                    <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='B' Property='Opacity' Value='0.92'/></Trigger>
+                    <Trigger Property='IsPressed' Value='True'><Setter TargetName='B' Property='Opacity' Value='0.8'/></Trigger>
+                  </ControlTemplate.Triggers>
+                </ControlTemplate>
+              </Button.Template>
+              <TextBlock x:Name='StartText' Text='Start Game' FontSize='20' FontWeight='SemiBold'/>
+            </Button>
+            <Button x:Name='Power' Width='60' Height='60' Cursor='Hand' ToolTip='Game Mode on or off, without launching Fortnite'>
+              <Button.Template>
+                <ControlTemplate TargetType='Button'>
+                  <Border x:Name='B' CornerRadius='30' Background='{TemplateBinding Background}' BorderBrush='#33FFFFFF' BorderThickness='1'><ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+                  <ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='B' Property='Opacity' Value='0.85'/></Trigger></ControlTemplate.Triggers>
+                </ControlTemplate>
+              </Button.Template>
+              <TextBlock x:Name='PowerIcon' Text='&#xE7E8;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='20'/>
+            </Button>
+          </StackPanel>
+        </DockPanel>
+        <!-- right: the tools panel -->
+        <Border Grid.Column='1' Grid.RowSpan='2' CornerRadius='20' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,18,10,14'>
+          <DockPanel>
+            <StackPanel DockPanel.Dock='Top' Margin='0,0,8,0'>
+              <StackPanel Orientation='Horizontal'>
+                <TextBlock Text='&#xE71D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#2EE6A6' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/>
+                <TextBlock Text='Game Mode tools' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+              </StackPanel>
+              <StackPanel x:Name='Chips' Orientation='Horizontal' Margin='0,14,0,12'/>
+            </StackPanel>
+            <ScrollViewer Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' Padding='0,0,8,0'>
+              <StackPanel x:Name='Tools'/>
+            </ScrollViewer>
+          </DockPanel>
+        </Border>
+        <!-- live numbers -->
+        <Border Grid.Row='1' HorizontalAlignment='Left' CornerRadius='16' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='6,8' Margin='0,18,28,0'>
+          <StackPanel Orientation='Horizontal'>
+            <StackPanel Width='86'><TextBlock x:Name='CpuVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='CPU' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
+            <Border Width='1' Background='#22FFFFFF' Margin='0,4'/>
+            <StackPanel Width='86'><TextBlock x:Name='GpuTVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='GPU temp' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
+            <Border Width='1' Background='#22FFFFFF' Margin='0,4'/>
+            <StackPanel Width='86'><TextBlock x:Name='GpuUVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='GPU load' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
+            <Border Width='1' Background='#22FFFFFF' Margin='0,4'/>
+            <StackPanel Width='86'><TextBlock x:Name='MemPctVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='Memory' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Grid>
+  </Border>
+</Grid>
+"@)
+    $g = @{}; foreach ($n in 'StatePill', 'StateDot', 'StateText', 'StateSub', 'PingVal', 'PingLbl', 'AppsVal', 'AppsLbl', 'MemVal', 'StepsVal', 'DoneText', 'TimerDot', 'Timer', 'Start', 'StartText', 'Power', 'PowerIcon', 'Chips', 'Tools', 'CpuVal', 'GpuTVal', 'GpuUVal', 'MemPctVal') { $g[$n] = $root.FindName($n) }
+    $script:GmUi = $g
+    $script:GmFilter = 'all'
+    foreach ($c in @(@('all', 'All'), @('steps', 'Boost'), @('apps', 'Apps'), @('auto', 'Auto'))) {
+        $b = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Content='$($c[1])' Cursor='Hand' Margin='0,0,6,0' Padding='14,5' FontSize='12.5'><Button.Template><ControlTemplate TargetType='Button'><Border CornerRadius='13' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='1' Padding='{TemplateBinding Padding}'><ContentPresenter/></Border></ControlTemplate></Button.Template></Button>")
+        $b.Tag = $c[0]
+        $b.Add_Click({ param($s, $e) $script:GmFilter = $s.Tag; Update-GameModeTools; Show-Animated $script:GmUi.Tools 8 220 })
+        [void]$g.Chips.Children.Add($b)
+    }
+    $g.Start.Add_Click({
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        if (Test-ZDGameMode) { $msg = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true } }
+        else { $msg = Enable-ZDGameMode; $msg = "$msg $(Start-FortniteGame)" }
+        $window.Cursor = $null
+        Show-Toast $msg '#30D158'; Update-GameModeUi
+    })
+    $g.Power.Add_Click({
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        $msg = if (Test-ZDGameMode) { $m = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true }; $m } else { Enable-ZDGameMode }
+        $window.Cursor = $null
+        Show-Toast $msg '#30D158'; Update-GameModeUi
+    })
+    # live numbers once a second (clock) and every 3 s (CPU, GPU, memory, ping, running apps) while the page is open
+    if (-not $script:GmPageTimer) {
+        $script:GmPageTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:GmPageTimer.Interval = [TimeSpan]::FromSeconds(1)
+        $script:GmTick = 0
+        $script:GmPageTimer.Add_Tick({
+            if ($script:CurrentCat.Name -ne 'GameMode' -or -not $window.IsVisible) { return }
+            Update-GameModeClock
+            $script:GmTick++
+            if ($script:GmTick % 3 -eq 1 -and -not $script:GmStatBusy) {
+                $script:GmStatBusy = $true
+                $region = Get-Setting 'pingregion' $null
+                $hostEntry = $PingHosts | Where-Object { $_.Name -eq $region } | Select-Object -First 1; if (-not $hostEntry) { $hostEntry = $PingHosts[0] }
+                $script:GmPingName = $hostEntry.Name
+                Start-Background $GmStatScript.ToString() @($hostEntry.Host, @($SessionApps | ForEach-Object { @{ Key = $_.Key; PathRx = $_.PathRx } })) {
+                    param($out, $errs)
+                    $script:GmStatBusy = $false
+                    $r = @($out | Where-Object { $_ }) | Select-Object -First 1
+                    if (-not $r -or -not $script:GmUi) { return }
+                    $g = $script:GmUi
+                    $cpu = [CpuLoad]::Sample(); $g.CpuVal.Text = if ($cpu -ge 0) { "$cpu%" } else { '-' }
+                    $g.GpuTVal.Text = if ($null -ne $r.GpuTemp) { "$($r.GpuTemp)°C" } else { '-' }
+                    $g.GpuUVal.Text = if ($null -ne $r.GpuUtil) { "$($r.GpuUtil)%" } else { '-' }
+                    $g.MemPctVal.Text = if ($null -ne $r.MemPct) { "$($r.MemPct)%" } else { '-' }
+                    $g.PingVal.Text = if ($null -ne $r.Ping) { "$($r.Ping)" } else { '-' }
+                    $g.PingLbl.Text = "Ping to $($script:GmPingName)"
+                    $g.GpuTVal.Foreground = ConvertTo-Brush $(if ($r.GpuTemp -ge 83) { '#FF453A' } elseif ($r.GpuTemp -ge 75) { '#FF9F0A' } else { '#FFFFFF' })
+                    $changed = (@($r.Running.Keys) -join ',') -ne (@($script:GmRunningPaths.Keys) -join ',')
+                    $script:GmRunningPaths = $r.Running
+                    if ($changed) { Update-GameModeTools; Update-GameModePage }
+                }
+            }
+        })
+    }
+    [void][CpuLoad]::Sample()   # first reading is the baseline
+    $script:GmPageTimer.Start()
+    $script:PageRefresh['GameMode'] = { Update-GameModePage; Update-GameModeTools }
+    Update-GameModeTools
+    Update-GameModePage
+    New-PageScroll $root
+}
+function Update-GameModeClock {
+    $g = $script:GmUi; if (-not $g) { return }
+    $span = [TimeSpan]::Zero
+    if (Test-ZDGameMode) { try { $st = Get-Content $GameModeFile -Raw | ConvertFrom-Json; $span = (Get-Date) - [datetime]$st.Started } catch {} }
+    $g.Timer.Text = '{0:00}:{1:00}:{2:00}' -f [int][Math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds
+}
+function Update-GameModePage {
+    $g = $script:GmUi; if (-not $g) { return }
+    $on = Test-ZDGameMode
+    $fn = Test-FortniteRunning
+    $prefs = Get-GameModePrefs
+    $st = $null; if ($on) { try { $st = Get-Content $GameModeFile -Raw | ConvertFrom-Json } catch {} }
+    $mint = '#2EE6A6'
+    $g.StateDot.Fill = ConvertTo-Brush $(if ($on) { $mint } elseif ($fn) { '#FF9F0A' } else { '#8E8E93' })
+    $g.StateText.Text = if ($on) { 'Game Mode on' } else { 'Game Mode off' }
+    $g.StateSub.Text = if ($on -and $fn) { 'Fortnite is running' } elseif ($on) { "On since $(([datetime]$st.Started).ToString('HH:mm'))" } elseif ($fn) { 'Fortnite is running without Game Mode' } elseif ($prefs.auto) { 'Turns on by itself when Fortnite starts' } else { 'Press Start Game when you are ready' }
+    $g.TimerDot.Fill = ConvertTo-Brush $(if ($on) { '#FF453A' } else { '#8E8E93' })
+    if ($on -and $script:Anim) {
+        $a = New-Object Windows.Media.Animation.DoubleAnimation 1, 0.25, ([Windows.Duration][TimeSpan]::FromMilliseconds(900)); $a.AutoReverse = $true; $a.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
+        $g.TimerDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
+    } else { $g.TimerDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null) }
+    # Start button: mint gradient to start, dark with a mint edge to stop
+    if ($on) {
+        $g.Start.Background = ConvertTo-Brush '#141416'; $g.Start.BorderBrush = ConvertTo-Brush $mint; $g.Start.BorderThickness = 1.5
+        $g.StartText.Text = 'Stop Game Mode'; $g.StartText.Foreground = ConvertTo-Brush $mint
+    } else {
+        $grad = New-Object Windows.Media.LinearGradientBrush; $grad.StartPoint = '0,0'; $grad.EndPoint = '1,1'
+        $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString('#4BF0BA')), 0))
+        $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString('#1FC48C')), 1))
+        $g.Start.Background = [Windows.Media.Brush]$grad; $g.Start.BorderThickness = 0
+        $g.StartText.Text = if ($fn) { 'Start Game Mode' } else { 'Start Game' }; $g.StartText.Foreground = ConvertTo-Brush '#04241A'
+    }
+    $g.Power.Background = ConvertTo-Brush $(if ($on) { '#262E2EE6' } else { '#14FFFFFF' })
+    $g.PowerIcon.Foreground = ConvertTo-Brush $(if ($on) { $mint } else { '#FFFFFF' })
+    # numbers
+    if ($on) {
+        $g.AppsVal.Text = "$([int]$st.ClosedCount)"; $g.AppsLbl.Text = 'Apps closed'
+        $g.MemVal.Text = ('{0:0.0}' -f ([double]$st.FreedMb / 1024))
+        $g.DoneText.Text = if (@($st.Done).Count -or $st.Session) { 'Everything is put back when you stop Game Mode' + $(if ($prefs.autooff) { ' or close Fortnite.' } else { '.' }) } else { '' }
+    } else {
+        $would = @($SessionApps | Where-Object { $prefs[$_.Key] -and $script:GmRunningPaths -and $script:GmRunningPaths.ContainsKey($_.Key) }).Count
+        $g.AppsVal.Text = "$would"; $g.AppsLbl.Text = 'Apps it will close'
+        $g.MemVal.Text = '0.0'
+        $g.DoneText.Text = 'Start Game turns on Game Mode and launches Fortnite through the Epic Games Launcher. The round button switches Game Mode on or off without launching anything.'
+    }
+    $g.StepsVal.Text = "$(@('apps', 'plan', 'priority', 'dnd', 'updates', 'dns', 'nvreplay' | Where-Object { $prefs[$_] }).Count)/7"
+    Update-GameModeClock
+}
+function Update-GameModeTools {
+    $g = $script:GmUi; if (-not $g) { return }
+    foreach ($b in $g.Chips.Children) {
+        $sel = $b.Tag -eq $script:GmFilter
+        $b.Background = ConvertTo-Brush $(if ($sel) { '#332EE6A6' } else { '#12FFFFFF' })
+        $b.BorderBrush = ConvertTo-Brush $(if ($sel) { '#2EE6A6' } else { '#1FFFFFFF' })
+        $b.Foreground = [ZdTheme]::Brush($(if ($sel) { '#2EE6A6' } else { '#D3D3D9' }))
+    }
+    $prefs = Get-GameModePrefs; $sp = Get-SessionPrefs
+    $rows = New-Object Collections.ArrayList
+    function Head([string]$t) { "<TextBlock Text='$t' FontSize='11' FontWeight='SemiBold' Foreground='#7C7C86' Margin='4,10,0,6'/>" }
+    function Row([string]$name, [string]$id, [string]$desc, [string]$iconXaml, [bool]$running) {
+        "<Border Background='#0DFFFFFF' CornerRadius='12' Padding='10,9' Margin='0,0,0,6'><Grid>" +
+        "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        "$iconXaml<StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='12,0,8,0'>" +
+        "<StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $name)' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF' TextTrimming='CharacterEllipsis'/>" +
+        $(if ($running) { "<Border Background='#262EE6A6' CornerRadius='6' Padding='6,0,6,1' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='running' FontSize='10.5' Foreground='#2EE6A6'/></Border>" } else { '' }) +
+        "</StackPanel>" + $(if ($desc) { "<TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,2,0,0'/>" } else { '' }) +
+        "</StackPanel><ToggleButton x:Name='$id' Grid.Column='2' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/></Grid></Border>"
+    }
+    function Glyph([int]$code, [string]$tint) { "<Border Width='34' Height='34' CornerRadius='9' Background='$($tint -replace '^#', '#33')'><TextBlock Text='&#x$('{0:X}' -f $code);' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' Foreground='$tint' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
+    $f = $script:GmFilter
+    if ($f -in 'all', 'steps') {
+        [void]$rows.Add((Head 'BOOST STEPS'))
+        foreach ($k in 'apps', 'plan', 'priority', 'dnd', 'updates', 'dns', 'nvreplay') { [void]$rows.Add((Row $GameModeSteps[$k].Name "G_$k" $GmStepInfo[$k].Desc (Glyph $GmStepInfo[$k].Icon $GmStepInfo[$k].Tint) $false)) }
+    }
+    $shown = @()
+    if ($f -in 'all', 'apps') {
+        [void]$rows.Add((Head 'APPS IT CLOSES'))
+        $shown = @($SessionApps | Where-Object { Test-SessionAppPresent $_ })
+        $i = 0
+        foreach ($a in $shown) {
+            $nm = "$($a.Name)" -replace '^[^A-Za-z0-9]+', ''; $letter = if ($nm) { $nm.Substring(0, 1).ToUpper() } else { '?' }
+            $tint = $AppTileColors[[Math]::Abs($a.Name.GetHashCode()) % $AppTileColors.Count]
+            $icon = "<Grid Width='34' Height='34'><Border x:Name='GT_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><Image x:Name='GI_$i' Width='30' Height='30' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>"
+            [void]$rows.Add((Row $a.Name "S_$($a.Key)" $(if ($a.Pause) { 'Paused, not closed' } else { '' }) $icon ([bool]($script:GmRunningPaths -and $script:GmRunningPaths.ContainsKey($a.Key)))))
+            $i++
+        }
+    }
+    if ($f -in 'all', 'auto') {
+        [void]$rows.Add((Head 'AUTOMATIC'))
+        foreach ($k in 'auto', 'autooff') { [void]$rows.Add((Row $GameModeSteps[$k].Name "G_$k" $GmStepInfo[$k].Desc (Glyph $GmStepInfo[$k].Icon $GmStepInfo[$k].Tint) $false)) }
+    }
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($rows -join '')</StackPanel>")
+    foreach ($k in $GameModeSteps.Keys) {
+        $sw = $panel.FindName("G_$k"); if (-not $sw) { continue }
+        $sw.IsChecked = [bool]$prefs[$k]; $sw.Tag = $k
+        $sw.Add_Click({ param($s, $e) $p = Get-GameModePrefs; $p[$s.Tag] = [bool]$s.IsChecked; $script:Backup.Custom['gamemodeprefs'] = $p; Save-Backup; Update-GameModePage; Update-GameModeUi })
+    }
+    for ($i = 0; $i -lt $shown.Count; $i++) {
+        $a = $shown[$i]
+        $sw = $panel.FindName("S_$($a.Key)"); $sw.IsChecked = [bool]$sp[$a.Key]; $sw.Tag = $a.Key
+        $sw.Add_Click({ param($s, $e) $p = Get-SessionPrefs; $p[$s.Tag] = [bool]$s.IsChecked; $script:Backup.Custom['sessionprefs'] = $p; Save-Backup; Update-GameModePage })
+        $img = Get-SessionAppIcon $a
+        if ($img) { $panel.FindName("GI_$i").Source = $img; $panel.FindName("GT_$i").Visibility = 'Collapsed' }
+    }
+    $g.Tools.Children.Clear(); [void]$g.Tools.Children.Add($panel)
+}
+
 # --- System tray icon
 function Show-MainWindow {
     $window.Show()
@@ -8911,7 +9286,7 @@ if ($Snapshot) {
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Hardware-accelerated GPU scheduling', 'Consistent timer resolution') }; Update-RestartBar }
     if ($script:Glass) {
         $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
-        foreach ($st in @(@('#FF1B2133', 0), @('#FF2A1F3A', 0.55), @('#FF14262B', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) }
+        foreach ($st in @(@('#FF050506', 0), @('#FF08070B', 0.55), @('#FF040606', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) }
         if ($script:Theme -eq 'light') { $bg.GradientStops.Clear(); foreach ($st in @(@('#FFDDE4F2', 0), @('#FFEADFF0', 0.55), @('#FFDCEDEB', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) } }
         $window.Background = [Windows.Media.Brush]$bg
     }

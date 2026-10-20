@@ -1,4 +1,4 @@
-# ZeroDelay
+﻿# ZeroDelay
 
 A free, open-source Windows app that lowers input delay and stutter in Fortnite. Every change is shown as a card with
 an on/off switch, explained in plain words, backed up before it is applied, and can be undone at any time.
@@ -17,9 +17,10 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 
 - **160+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
-- **Game Mode**: one switch (or automatic when Fortnite starts) that closes or pauses background apps, switches to the
-  ZeroDelay power plan, lowers background priority, silences notifications and pauses update downloads, then puts
-  everything back when the match ends.
+- **Game Mode**: a booster-style dashboard with a Start Game button (turns Game Mode on and launches Fortnite), a
+  session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
+  background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses
+  update downloads (or does all of it automatically when Fortnite starts), then puts everything back when the match ends.
 - **Potato graphics**: presets from competitive to flat-colour potato, a "build your own" slider card with a live
   "% potato" score, and NVIDIA texture-blur levels.
 - **NVIDIA page**: G-SYNC / V-Sync / Reflex / frame-cap check with tear-free and lowest-latency presets, Smooth Motion
@@ -44,7 +45,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   browser/Discord caches and the Recycle Bin, with the size of each shown before anything is deleted.
 - **Memory (RAM)**: what uses your memory, closing heavy apps, and a one-time standby-list clear. No "RAM cleaner" that
   forces apps to drop their memory: that causes the stutter it claims to fix.
-- **Light and dark mode** (or match Windows) with six accent colours.
+- **Light and true-black dark mode** (or match Windows) with six accent colours.
 - **One-click updates**: ZeroDelay tells you when a new version is out, downloads it from the GitHub release, checks
   its SHA-256 against the release notes and reinstalls itself.
 - Optional **Start with Windows** (in the tray), and **Report a problem**, which opens a GitHub issue with your PC
