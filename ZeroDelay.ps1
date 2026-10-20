@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.9.1'
+$AppVersion = '1.9.2'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -793,6 +793,32 @@ function Get-RefreshRate {
 function Test-FortniteRunning { [bool](Get-Process ($FortniteExeName -replace '\.exe$') -ErrorAction SilentlyContinue) }
 
 function Get-UpAdapters { @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }) }
+# driver registry key and PnPCapabilities value of each connected physical adapter
+function Get-NicPowerKeys {
+    $class = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+    $map = @{}
+    foreach ($k in Get-ChildItem $class -ErrorAction SilentlyContinue) {
+        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+        if ($p.NetCfgInstanceId) { $map["$($p.NetCfgInstanceId)".ToUpper()] = @{ Key = $k.PSPath; Value = $p.PnPCapabilities } }
+    }
+    # connected adapters; while one is reconnecting (right after a change) nothing is "Up", so use the ones that are
+    # not disabled and not unplugged
+    $adapters = @(Get-UpAdapters)
+    if (-not $adapters.Count) { $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -notin 'Disabled', 'Disconnected', 'Not Present' }) }
+    @(foreach ($a in $adapters) {
+        $e = $map["$($a.InterfaceGuid)".ToUpper()]
+        if ($e) { [pscustomobject]@{ Name = $a.Name; Key = $e.Key; Value = $e.Value } }
+    })
+}
+# waits (up to 10 s) for adapters that were just restarted to be connected again
+function Wait-NicsUp([string[]]$Names) {
+    $until = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $until) {
+        $down = @(Get-NetAdapter -Name $Names -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Up' })
+        if (-not $down.Count) { return }
+        Start-Sleep -Milliseconds 300
+    }
+}
 
 # ========================================================= tweak engines ===
 
@@ -2024,27 +2050,32 @@ $Tweaks = @(
        Title = 'Turn off network power-saving'
        Desc  = 'Stops Windows from switching your network adapter off to save power, which causes lag spikes.'
        Warn  = 'You are on a laptop and need maximum battery life. Applying briefly reconnects the adapter.'
+       # "Allow the computer to turn off this device" lives in the adapter's PnPCapabilities value (0x18 = never turn
+       # it off, Microsoft KB 2740020). Set-NetAdapterPowerManagement cannot change it, so it is written directly.
        Test  = {
-           $pm = @(Get-UpAdapters | ForEach-Object { Get-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue } |
-                   Where-Object { "$($_.AllowComputerToTurnOffDevice)" -in 'Enabled', 'Disabled' })
-           if (-not $pm.Count) { return $null }
-           -not ($pm | Where-Object { "$($_.AllowComputerToTurnOffDevice)" -ne 'Disabled' })
+           $nics = @(Get-NicPowerKeys)
+           if (-not $nics.Count) { return $null }
+           -not ($nics | Where-Object { ([int]$_.Value -band 0x18) -ne 0x18 })
        }
        On    = {
-           $pm = @(Get-UpAdapters | ForEach-Object { Get-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue } |
-                   Where-Object { "$($_.AllowComputerToTurnOffDevice)" -in 'Enabled', 'Disabled' })
-           if (-not $script:Backup.Custom.ContainsKey('nicpower')) {
-               $script:Backup.Custom['nicpower'] = @($pm | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = "$($_.AllowComputerToTurnOffDevice)" } })
-           }
-           foreach ($p in $pm) { Set-NetAdapterPowerManagement -Name $p.Name -AllowComputerToTurnOffDevice Disabled }
+           $nics = @(Get-NicPowerKeys)
+           if (-not $nics.Count) { throw 'No connected network adapter found.' }
+           $old = @($script:Backup.Custom['nicpower'] | Where-Object { $_.Key })
+           if (-not $old.Count) { $script:Backup.Custom['nicpower'] = @($nics | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Key = $_.Key; Value = $_.Value } }) }
+           foreach ($n in $nics) { Set-ItemProperty -Path $n.Key -Name PnPCapabilities -Value ([int]$n.Value -bor 0x18) -Type DWord -ErrorAction Stop }
+           foreach ($n in $nics) { Restart-NetAdapter -Name $n.Name -Confirm:$false -ErrorAction SilentlyContinue }   # applies it now (a second or two offline)
+           Wait-NicsUp @($nics | ForEach-Object { $_.Name })
        }
        Off   = {
-           if ($script:Backup.Custom.ContainsKey('nicpower')) {
-               foreach ($o in @($script:Backup.Custom['nicpower'])) { Set-NetAdapterPowerManagement -Name $o.Name -AllowComputerToTurnOffDevice $o.Value -ErrorAction SilentlyContinue }
-               $script:Backup.Custom.Remove('nicpower')
-           } else {
-               foreach ($a in Get-UpAdapters) { Set-NetAdapterPowerManagement -Name $a.Name -AllowComputerToTurnOffDevice Enabled -ErrorAction SilentlyContinue }
+           $saved = @($script:Backup.Custom['nicpower'] | Where-Object { $_.Key })
+           $nics = if ($saved.Count) { $saved } else { @(Get-NicPowerKeys | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Key = $_.Key; Value = $null } }) }
+           foreach ($o in $nics) {
+               if ($null -eq $o.Value -or "$($o.Value)" -eq '') { Remove-ItemProperty -Path $o.Key -Name PnPCapabilities -ErrorAction SilentlyContinue }
+               else { Set-ItemProperty -Path $o.Key -Name PnPCapabilities -Value ([int]$o.Value) -Type DWord -ErrorAction SilentlyContinue }
            }
+           foreach ($o in $nics) { Restart-NetAdapter -Name $o.Name -Confirm:$false -ErrorAction SilentlyContinue }
+           Wait-NicsUp @($nics | ForEach-Object { $_.Name })
+           $script:Backup.Custom.Remove('nicpower')
        } }
 
     @{ Id = 'eee'; Cat = 'Network'; Icon = [char]0xE968; Rec = $true
@@ -7101,6 +7132,9 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.9.2' = @(
+        @{ T = 'Network power-saving fixed'; D = 'Turn off network power-saving failed on newer Windows builds. It now sets the adapter''s own power setting (the one in Device Manager > Power Management), reconnects the adapter for a second, and the card shows the right state afterwards.' }
+    )
     '1.9.1' = @(
         @{ T = 'New look for questions'; D = 'The grey Windows pop-ups are gone: every question and message is now a dark ZeroDelay dialog that matches the app. Enter picks the main button, Esc closes it, and actions that delete things use a red button.' }
         @{ T = 'FreeSync asks the NVIDIA driver'; D = 'The FreeSync page now checks every monitor with the NVIDIA driver and shows G-SYNC on, off for that monitor, or not seen by the driver, with what to check in the monitor menu. It also marks your main screen.' }

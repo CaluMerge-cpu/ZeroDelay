@@ -10,8 +10,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Installer for ZeroDelay, a Fortnite latency optimizer for Windows")]
 [assembly: AssemblyCompany("ZeroDelay contributors")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.9.1.0")]
-[assembly: AssemblyFileVersion("1.9.1.0")]
+[assembly: AssemblyVersion("1.9.2.0")]
+[assembly: AssemblyFileVersion("1.9.2.0")]
 
 static class Setup
 {
