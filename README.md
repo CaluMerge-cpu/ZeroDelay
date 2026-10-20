@@ -5,6 +5,12 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 
 ## Features
 
+- **Knows your PC**: on first start (and every few days) ZeroDelay scans the hardware, drivers, Windows and installed
+  apps, and adapts its recommendations: laptops, streamers, Wi-Fi vs Ethernet, X3D and hybrid CPUs, GPU model.
+  **Tools > This PC** shows everything it found and what it changed. Nothing is sent anywhere.
+- **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
+  advice for undervolting and cooling an older card.
+
 - **160+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
 - **Game Mode**: one switch (or automatic when Fortnite starts) that closes or pauses background apps, switches to the

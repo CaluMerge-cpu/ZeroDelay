@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.5.0'
+$AppVersion = '1.6.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -1071,6 +1071,16 @@ function Get-Displays {
         [pscustomobject]@{ Monitor = $f[0]; Gpu = $f[1]; Hz = [int]$f[2]; Primary = ($f[3] -eq 'True'); Discrete = ($f[1] -match $DiscreteGpuRx) }
     })
 }
+# GTX 1080 Ti (Pascal): gets its own tab. ZD_FAKE_GPU lets a dev render simulate the card.
+function Test-Gtx1080Ti {
+    if ($null -eq $script:Is1080Ti) {
+        $script:Is1080Ti = ("$env:ZD_FAKE_GPU" -match '1080 Ti') -or [bool](Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'GTX 1080 Ti' })
+    }
+    $script:Is1080Ti
+}
+# NVIDIA ended Game Ready drivers for GTX 10 cards in late 2025; they get security updates on the R580 branch until Oct 2028.
+$PascalSecurityDriver = '582.78'
+
 # FPS cap that keeps G-SYNC/FreeSync engaged: refresh - refresh^2/3600 (Blur Busters / NVIDIA Reflex guidance).
 function Get-VrrCap {
     $d = Get-Displays
@@ -3048,6 +3058,44 @@ $Tweaks = @(
        On    = { Set-AdvDisplay 'wifi5ghz' 'RoamingPreferredBandType' 'Prefer 5' }
        Off   = { Reset-AdvProp 'wifi5ghz' 'RoamingPreferredBandType' 0 } }
 
+    # ======================================================= GTX 1080 Ti tab (1.6)
+    @{ Id = 'gtx-preset'; Cat = 'Gtx1080Ti'; Icon = [char]0xE7F4; Action = 'Apply'; Gtx = $true; Extra = 'preset'; Requires = { Test-Gtx1080Ti }
+       Title = 'GTX 1080 Ti competitive settings'
+       Desc  = 'Everything low except textures: 11 GB of video memory handles High textures at no FPS cost. Medium view distance, no grass, no shadows, no Lumen. Use it with Performance rendering mode.'
+       Warn  = 'Fortnite must be closed.'
+       Preset = (New-PresetValues 100 1 2 0 0 0 $false 0)
+       Run   = { Invoke-Preset $t } }
+
+    @{ Id = 'gtx-driver'; Cat = 'Gtx1080Ti'; Icon = [char]0xE896; Action = 'Driver page'; Gtx = $true; Requires = { Test-Gtx1080Ti }
+       Title = 'Stay on the 580 driver branch'
+       Desc  = 'NVIDIA stopped making game drivers for GTX 10 cards in late 2025. Your card now gets security updates only, on the 580 branch (582.78 is the newest, October 2026). Drivers 590 and newer do not support it and will not install.'
+       Warn  = 'Ignore the NVIDIA App if it offers a 59x or newer driver. Get updates from NVIDIA''s driver search by picking "GeForce GTX 1080 Ti".'
+       Run   = { Start-Process 'https://www.nvidia.com/en-us/drivers/'; 'NVIDIA driver search opened. Pick GeForce 10 Series > GTX 1080 Ti.' } }
+
+    @{ Id = 'gtx-undervolt'; Cat = 'Gtx1080Ti'; Icon = [char]0xE945; Action = 'Show how'; Gtx = $true; Requires = { Test-Gtx1080Ti }
+       Title = 'Undervolt for steadier clocks (advice)'
+       Desc  = 'A 1080 Ti lowers its clock as it heats up. Owners commonly lock it at about 1900-1950 MHz at 0.90-0.95 V in MSI Afterburner: cooler, quieter and steadier than stock. ZeroDelay never changes voltages itself.'
+       Warn  = 'Every chip is different: test stability in a few matches and step the voltage up if it crashes.'
+       Run   = {
+           [void][Windows.MessageBox]::Show("Undervolting a GTX 1080 Ti with MSI Afterburner:`n`n1. Open Afterburner and press Ctrl+F to open the voltage/frequency curve.`n2. Lower the whole curve by about 150 to 200 MHz (Shift+drag), then raise the point at 0.950 V to about 1900 MHz and press L to lock it there. Click Apply.`n3. Play a few matches. If the game crashes, raise the voltage one step (0.962 or 0.975 V), or lower the clock by 13 MHz.`n4. Click the save icon and enable 'Apply at startup' once it is stable.`n`nTypical owner results: about 1900-1950 MHz at 0.90-0.95 V, often 70-75 C instead of 80+ C, with clocks that no longer drop mid-match. These are user reports, not lab data.", 'Undervolting a GTX 1080 Ti', 'OK', 'Information')
+           'Undervolt guide shown.' } }
+
+    @{ Id = 'gtx-cooling'; Cat = 'Gtx1080Ti'; Icon = [char]0xE9CA; Action = 'Show how'; Gtx = $true; Requires = { Test-Gtx1080Ti }
+       Title = 'Cool down an 8-year-old card (advice)'
+       Desc  = 'The thermal paste on a 2017 card is often dried out. Owners report 3-4 C better temperatures from a fresh repaste, and 15 C or more when the old paste was bad. Match reports show when your GPU slowed down from heat.'
+       Warn  = 'Opening the card can void any warranty left. Thermal pads must match the original thickness.'
+       Run   = {
+           [void][Windows.MessageBox]::Show("Signs the card needs attention: it reaches 83 C or more in matches, the fans run near full speed, or Match reports say the GPU slowed down because it got too hot.`n`nIn order of effort:`n1. Blow the dust out of the cooler and case fans (compressed air, hold the fans still).`n2. Set a stronger fan curve in MSI Afterburner (for example 60% at 65 C, 80% at 75 C).`n3. Undervolt (see the card next to this one).`n4. Repaste: replace the thermal paste on the GPU die, and the memory and VRM pads if they are crumbling. Use pads of the same thickness as the originals.`n`nPascal cards drop their clock about 13 MHz at a time as they warm up, and harder above about 83 C, which makes FPS less steady.", 'Cooling a GTX 1080 Ti', 'OK', 'Information')
+           'Cooling guide shown.' } }
+
+    @{ Id = 'gtx-limits'; Cat = 'Gtx1080Ti'; Icon = [char]0xE946; Action = 'See list'; Gtx = $true; Requires = { Test-Gtx1080Ti }
+       Title = 'What this card cannot do'
+       Desc  = 'No DLSS, frame generation, Smooth Motion or RTX HDR (they need RTX hardware), no hardware ray tracing, no DSC for very high refresh at 4K, no HDMI VRR. ZeroDelay hides the cards for these on this PC.'
+       Warn  = ''
+       Run   = {
+           [void][Windows.MessageBox]::Show("Not available on a GTX 1080 Ti:`n`n- DLSS and DLSS Frame Generation: need RTX Tensor cores. Use Fortnite's 3D resolution slider instead.`n- NVIDIA Smooth Motion, RTX HDR, RTX Video, Broadcast: RTX only.`n- Hardware ray tracing and Lumen: need an RTX card; keep them off.`n- Resizable BAR: RTX 30 and newer only.`n- DSC (Display Stream Compression): the card cannot drive 4K above 120 Hz or 1440p above 240 Hz at full colour. Pick the highest refresh it offers at full RGB.`n- HDMI VRR: the card has HDMI 2.0b; use G-SYNC or G-SYNC Compatible over DisplayPort.`n- AV1 recording: the card records H.264 and HEVC (ShadowPlay works), not AV1.`n- New Game Ready drivers: only security updates on the 580 branch until October 2028.`n`nReported since spring 2026 (not confirmed by Microsoft or NVIDIA): some Windows 11 users with GTX 10 cards see glitches with Windows HDR on. If that happens, turn Windows HDR off.", 'GTX 1080 Ti limits', 'OK', 'Information')
+           'List shown.' } }
+
     # ======================================================= vendor software (1.5): shown only when installed
     (New-VendorTweak 'v-armoury' 'ASUS Armoury Crate services' 'Stops the Armoury Crate service stack (device detection, update bridge, system analysis, link apps). Fan curves, performance modes and keyboard lighting live in the firmware, so they keep their last setting.' 'Armoury Crate will not open or apply new profiles; Aura Sync and update checks stop. ROG laptops: the Armoury key and per-app profile switching stop. Armoury updates turn these back on.' @(
         @{ N = 'ArmouryCrateService'; D = 2 }, @{ N = 'ArmouryCrateControlInterface'; D = 2 }, @{ N = 'ROG Live Service'; D = 2 }, @{ N = 'AsusAppService'; D = 2 }, @{ N = 'ASUSOptimization'; D = 2 }, @{ N = 'ASUSSoftwareManager'; D = 2 },
@@ -3350,6 +3398,10 @@ foreach ($t in $Tweaks) { if ($LatencyIds -contains $t.Id) { $t.Lat = $true } }
 $PotatoIds = @('shadercache', 'nvlod-soft', 'nvlod-smudge', 'nvlod-flat', 'perfmode', 'meshquality', 'res3d', 'texturelow', 'compgfx', 'shadinglow', 'landscapelow', 'viewnear',
                'grass', 'antialias', 'motionblur', 'nanite', 'fnhdr', 'dynres')
 foreach ($t in $Tweaks) { if ($PotatoIds -contains $t.Id) { $t.Potato = $true } }
+
+# Cards shown on the GTX 1080 Ti tab (alongside the ones made for it)
+$Gtx1080Ids = @('perfmode', 'meshquality', 'nanite', 'reflex', 'vsync', 'fullscreen', 'fpscap', 'vrrcap', 'motionblur', 'grass', 'nvpower', 'hags', 'gpu-msi', 'shadercache')
+foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
 
 # ==================================================================== UI ===
 
@@ -4237,7 +4289,7 @@ function New-Card($t) {
     } else {
         "<ToggleButton x:Name='Toggle' Style='{DynamicResource Switch}'/>"
     })
-    $recTag = if ($t.Rec) { "<StackPanel Orientation='Horizontal' Margin='0,12,14,0' VerticalAlignment='Center' Background='Transparent' ToolTip='Included when you press Apply recommended'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#30D158' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended' FontSize='12' FontWeight='Medium' Foreground='#A1A1A6' VerticalAlignment='Center'/></StackPanel>" } else { '' }
+    $recTag = if ($t.Rec) { "<StackPanel x:Name='RecTag' Orientation='Horizontal' Margin='0,12,14,0' VerticalAlignment='Center' Background='Transparent' ToolTip='Included when you press Apply recommended'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#30D158' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended' FontSize='12' FontWeight='Medium' Foreground='#A1A1A6' VerticalAlignment='Center'/></StackPanel>" } else { '' }
     $cardXaml = @"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Style='{DynamicResource Card}' Width='342' Height='220' VerticalAlignment='Top' Margin='0,0,16,16' Padding='20'>
@@ -4583,7 +4635,7 @@ function Update-Card($t) {
     $state = Invoke-TweakTest $t
     $t.State = $state
     # a card for hardware or software this PC does not have is hidden rather than shown greyed out
-    $t.Hidden = [bool]($t.Requires -and $null -eq $state -and -not (& $t.Requires))
+    $t.Hidden = [bool]($t.ForceHidden -or ($t.Requires -and $null -eq $state -and -not (& $t.Requires)))
     if ($t.Hidden) { $t.Card.Visibility = 'Collapsed' }
     if ($null -eq $state) {
         $t.Toggle.IsEnabled = $false
@@ -4703,6 +4755,8 @@ $Categories = @(
        Note = 'Turn it on before you play, or let it switch on by itself when Fortnite starts. ZeroDelay must stay open for the automatic part.' }
     @{ Name = 'Potato';     Icon = [char]0xE7F4; Title = 'Potato graphics'
        Note = 'Ugly but fast. Performance mode, low mesh and lower 3D resolution give the biggest gains; Fortnite must be closed to apply.' }
+    @{ Name = 'Gtx1080Ti';  Icon = [char]0xE7F4; Title = 'GTX 1080 Ti'; Requires = { Test-Gtx1080Ti }
+       Note = 'Everything that matters for a GTX 1080 Ti in one place. This 2017 card has no DLSS, frame generation or RTX features, and is now on a security-only driver branch, so some general advice does not apply to it.' }
     @{ Name = 'Fortnite';   Icon = [char]0xE7FC; Title = 'Fortnite' }
     @{ Name = 'System';     Icon = [char]0xE7F8; Title = 'System' }
     @{ Name = 'Power';      Icon = [char]0xE945; Title = 'Power & CPU' }
@@ -4717,7 +4771,9 @@ $Categories = @(
     @{ Name = 'Visuals';    Icon = [char]0xE790; Title = 'Desktop visuals' }
     @{ Name = 'Startup';    Icon = [char]0xE768; Title = 'Startup apps' }
     @{ Name = 'Repair';     Icon = [char]0xE90F; Title = 'Repair old tweaks' }
-    @{ Name = 'Nvidia';     Icon = [char]0xE7F4; Title = 'NVIDIA'; Page = 'Nvidia'; Section = 'TOOLS'
+    @{ Name = 'ThisPC';     Icon = [char]0xE7F8; Title = 'This PC'; Page = 'ThisPC'; Section = 'TOOLS'
+       Note = 'Everything ZeroDelay found on this PC: hardware, Windows, drivers and installed apps, and how it adapted its tweaks to them.' }
+    @{ Name = 'Nvidia';     Icon = [char]0xE7F4; Title = 'NVIDIA'; Page = 'Nvidia'
        Note = 'G-SYNC, V-Sync and frame cap setup, NVIDIA App features that cost FPS, and your driver.' }
     @{ Name = 'Health';     Icon = [char]0xE95E; Title = 'Health check'; Page = 'Health'
        Note = 'One scan for the problems that cost you the most. Fix them one by one or all at once.' }
@@ -5006,7 +5062,12 @@ function Get-HealthIssues {
     if ($sys -and $sys.FreeSpace / $sys.Size -lt 0.1) { Add-Issue 2 ('System drive is {0:N0}% full' -f (100 - 100 * $sys.FreeSpace / $sys.Size)) 'Low free space slows Windows and game updates.' $null { & ($Tweaks | Where-Object { $_.Id -eq 'cleantemp' }).Run } 'Clean temp' }
     $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $DiscreteGpuRx } | Select-Object -First 1
     $drv = Get-NvDriverInfo
-    if ($drv -and $drv.Latest -and $drv.Installed -and [version]$drv.Latest -gt [version]$drv.Installed) {
+    if (Test-Gtx1080Ti) {
+        if ($drv -and $drv.Installed -and [version]$drv.Installed -lt [version]$PascalSecurityDriver) {
+            Add-Issue 1 "Security driver $PascalSecurityDriver is available for your GTX 1080 Ti (you have $($drv.Installed))" 'Your card is on NVIDIA''s 580 security branch. Drivers 590 and newer do not support it, so ignore those. Get this one from NVIDIA''s driver search (GeForce 10 Series > GTX 1080 Ti).' $null `
+                { Start-Process 'https://www.nvidia.com/en-us/drivers/'; 'NVIDIA driver search opened.' } 'Driver page'
+        }
+    } elseif ($drv -and $drv.Latest -and $drv.Installed -and [version]$drv.Latest -gt [version]$drv.Installed) {
         Add-Issue 1 "NVIDIA driver $($drv.Latest) is available (you have $($drv.Installed))" 'Updates often fix Fortnite stutter. Install it from the NVIDIA App. It is not a latency fix by itself.' $null $null
     } elseif ($gpu -and $gpu.DriverDate -and ((Get-Date) - $gpu.DriverDate).TotalDays -gt 180) { Add-Issue 1 ('Graphics driver is {0:N0} months old' -f (((Get-Date) - $gpu.DriverDate).TotalDays / 30)) 'New drivers often fix Fortnite stutter. Update through the NVIDIA app or AMD Adrenalin.' $null $null }
     if (Test-NvAvailable) {
@@ -5779,6 +5840,7 @@ function Show-Wizard {
       <TextBlock Text='$(Esc "Monitor  $($hw.Hz) Hz")' FontFamily='Consolas' FontSize='12' Foreground='#D1D1D6'/>
     </StackPanel>
   </Border>
+  <TextBlock x:Name='PcLine' Text='Scanning your PC: hardware, drivers, Windows and installed apps...' FontSize='12' Foreground='#98989D' Margin='0,-8,0,18' TextWrapping='Wrap'/>
   <TextBlock Text='1. What kind of PC is this?' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
   <StackPanel Orientation='Horizontal' Margin='0,0,0,16'>
     <RadioButton x:Name='Desk' GroupName='pc' Content='Desktop' Foreground='#D1D1D6' FontSize='13' Margin='0,0,24,0'/>
@@ -5802,12 +5864,13 @@ function Show-Wizard {
   </Grid>
 </StackPanel>
 "@)
-    $wz = @{}; foreach ($n in 'Desk', 'Lap', 'LookComp', 'LookFlat', 'LookKeep', 'StreamNo', 'StreamYes', 'Progress', 'Skip', 'Go') { $wz[$n] = $body.FindName($n) }
+    $wz = @{}; foreach ($n in 'Desk', 'Lap', 'LookComp', 'LookFlat', 'LookKeep', 'StreamNo', 'StreamYes', 'Progress', 'Skip', 'Go', 'PcLine') { $wz[$n] = $body.FindName($n) }
     $script:Wiz = $wz
     if ($hw.Laptop) { $wz.Lap.IsChecked = $true } else { $wz.Desk.IsChecked = $true }
     if (-not $hw.Nvidia) { $wz.LookFlat.IsEnabled = $false }
     $wz.Skip.Add_Click({ $script:Backup.Custom['wizarddone'] = $true; Save-Backup; $ui.Wizard.Visibility = 'Collapsed' })
     $wz.Go.Add_Click({ Invoke-Wizard })
+    if ($script:SysProfile) { Update-WizardProfileLine }
     $ui.WizardBody.Content = $body
     $ui.Wizard.Visibility = 'Visible'
     if ($script:Anim) {
@@ -6131,6 +6194,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.6.0' = @(
+        @{ T = 'ZeroDelay now knows your PC'; D = 'On first start (and every few days) it scans the hardware, drivers, Windows and every installed app, then adapts which tweaks it recommends. See Tools > This PC.' }
+        @{ T = 'Recommendations that fit'; D = 'Laptops keep battery-draining power tweaks out of Apply recommended, streamers keep their frames, and cards for hardware or apps you do not have stay hidden.' }
+        @{ T = 'GTX 1080 Ti tab'; D = 'On PCs with a GTX 1080 Ti: the right renderer and settings for that card, the driver branch it needs, and advice for keeping an older card cool.' }
+    )
     '1.5.0' = @(
         @{ T = 'Vendor software tab'; D = 'Services from ASUS, MSI, Corsair, Razer, Logitech, Dell, HP, Lenovo, Intel, AMD and Adobe that are known stutter sources. Only what is installed on your PC is shown, and each card says what stops working.' }
         @{ T = '12 new Health checks'; D = 'RAM below its rated speed or in single channel, the graphics card on fewer PCIe lanes, Fortnite on a hard drive, no page file, CPU held back by heat, a mouse on a USB hub, Windows Update restarts, Defender scan timing and more.' }
@@ -7363,6 +7431,313 @@ function Invoke-StandbyPurge {
     Update-MemoryPage
 }
 
+# =============================================================== System profile (This PC)
+# One background scan of the hardware, Windows and installed apps. Saved to system-profile.json and used to decide which
+# tweaks fit this PC. Runs on first start (right after install) and again every few days or after an update.
+$ProfileFile = Join-Path $DataDir 'system-profile.json'
+$ProfileScan = {
+    param($appVersion)
+    function Try-Get([scriptblock]$sb) { try { & $sb } catch { $null } }
+    $P = [ordered]@{ Version = 1; AppVersion = $appVersion; ScannedAt = (Get-Date).ToString('o') }
+    # --- Windows and the machine
+    $os = Try-Get { Get-CimInstance Win32_OperatingSystem }
+    $cv = Try-Get { Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' }
+    $P.Windows = [ordered]@{ Name = "$($os.Caption)".Trim(); Version = "$($cv.DisplayVersion)"; Build = "$($os.BuildNumber).$($cv.UBR)"
+                             Installed = $(if ($os.InstallDate) { $os.InstallDate.ToString('yyyy-MM-dd') }) }
+    $cs = Try-Get { Get-CimInstance Win32_ComputerSystem }
+    $bb = Try-Get { Get-CimInstance Win32_BaseBoard }
+    $bios = Try-Get { Get-CimInstance Win32_BIOS }
+    $enc = Try-Get { Get-CimInstance Win32_SystemEnclosure }
+    $bat = @(Try-Get { Get-CimInstance Win32_Battery })
+    $laptop = ($bat.Count -gt 0) -or (@($enc.ChassisTypes) | Where-Object { $_ -in 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32 }).Count -gt 0
+    $P.Computer = [ordered]@{ Maker = "$($cs.Manufacturer)".Trim(); Model = "$($cs.Model)".Trim(); Board = "$($bb.Manufacturer) $($bb.Product)".Trim()
+                              Bios = "$($bios.SMBIOSBIOSVersion)".Trim(); BiosDate = $(if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString('yyyy-MM-dd') }); Laptop = [bool]$laptop }
+    # --- CPU
+    $cpu = Try-Get { Get-CimInstance Win32_Processor | Select-Object -First 1 }
+    $cn = "$($cpu.Name)".Trim() -replace '\s+', ' '
+    $P.Cpu = [ordered]@{ Name = $cn; Vendor = $(switch ($cpu.Manufacturer) { 'AuthenticAMD' { 'AMD' } 'GenuineIntel' { 'Intel' } default { "$($cpu.Manufacturer)" } })
+                         Cores = [int]$cpu.NumberOfCores; Threads = [int]$cpu.NumberOfLogicalProcessors; MaxMHz = [int]$cpu.MaxClockSpeed
+                         Hybrid = [bool]($cn -match 'i[3579]-1[2-4]\d{3}|Core\(TM\) Ultra|Core Ultra|i[3579]-2\d{2}[A-Z]'); X3D = [bool]($cn -match 'X3D'); DualDieX3D = [bool]($cn -match '79[05]0X3D|99[05]0X3D') }
+    # --- graphics (nvidia-smi gives exact memory and driver for NVIDIA cards; Windows caps memory at 4 GB in this list)
+    $nv = @{}
+    $smi = "$env:WINDIR\System32\nvidia-smi.exe"
+    if (Test-Path $smi) { Try-Get { & $smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits 2>$null | ForEach-Object { $x = $_ -split ',\s*'; if ($x.Count -ge 3) { $nv[$x[0].Trim()] = @{ Mb = [int]$x[1]; Drv = $x[2].Trim() } } } } }
+    if ($env:ZD_FAKE_GPU) { $nv[$env:ZD_FAKE_GPU] = @{ Mb = 11264; Drv = '580.97' } }
+    $gl = @(Try-Get { Get-CimInstance Win32_VideoController })
+    if ($env:ZD_FAKE_GPU) { $gl = @([pscustomobject]@{ Name = $env:ZD_FAKE_GPU; PNPDeviceID = 'PCI\VEN_10DE&DEV_1B06'; AdapterRAM = 0; DriverVersion = '32.0.15.8097'; DriverDate = (Get-Date '2025-10-01') }) + @($gl | Where-Object { $_.PNPDeviceID -notmatch 'VEN_10DE' }) }
+    $P.Gpus = @(foreach ($g in $gl) {
+        $id = "$($g.PNPDeviceID)"; $name = "$($g.Name)".Trim()
+        $vendor = if ($id -match 'VEN_10DE') { 'NVIDIA' } elseif ($id -match 'VEN_1002') { 'AMD' } elseif ($id -match 'VEN_8086') { 'Intel' } else { 'Other' }
+        if ($vendor -eq 'Other') { continue }
+        $arch = switch -Regex ($name) {
+            'RTX 50\d\d' { 'Blackwell'; break }  'RTX 40\d\d' { 'Ada Lovelace'; break }  'RTX 30\d\d' { 'Ampere'; break }  'RTX 20\d\d|GTX 16\d\d|TITAN RTX' { 'Turing'; break }
+            'GTX 10\d\d|TITAN Xp|TITAN X \(Pascal\)|GT 10\d\d' { 'Pascal'; break }  'GTX 9\d\d|GTX 750' { 'Maxwell'; break }
+            'RX 9\d\d\d' { 'RDNA 4'; break }  'RX 7\d\d\d' { 'RDNA 3'; break }  'RX 6\d\d\d' { 'RDNA 2'; break }  'RX 5\d\d\d' { 'RDNA'; break }  'RX (4|5)\d\d\b|Vega' { 'GCN'; break }
+            'Arc\(TM\) (A|B)\d|Arc (A|B)\d' { 'Intel Arc'; break }  default { '' } }
+        $integrated = ($vendor -eq 'Intel' -and $arch -ne 'Intel Arc') -or ($vendor -eq 'AMD' -and $name -match 'Radeon\(TM\) Graphics|Radeon Graphics$|Vega \d+ Graphics|Radeon\(TM\) \d+M')
+        [ordered]@{ Name = $name; Vendor = $vendor; Arch = $arch; Integrated = [bool]$integrated
+                    VramMb = $(if ($nv[$name]) { $nv[$name].Mb } elseif ($g.AdapterRAM -gt 0) { [int]($g.AdapterRAM / 1MB) } else { $null })
+                    Driver = $(if ($nv[$name]) { $nv[$name].Drv } else { "$($g.DriverVersion)" }); DriverDate = $(if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') }) }
+    })
+    # --- memory
+    $m = @(Try-Get { Get-CimInstance Win32_PhysicalMemory } | Where-Object { $_.Capacity -gt 0 })
+    $P.Memory = [ordered]@{ TotalGb = [int](($m | Measure-Object Capacity -Sum).Sum / 1GB); Sticks = $m.Count
+                            SpeedMts = [int](($m | Measure-Object ConfiguredClockSpeed -Minimum).Minimum); RatedMts = [int](($m | Measure-Object Speed -Maximum).Maximum)
+                            Type = $(switch ([int]($m | Select-Object -First 1).SMBIOSMemoryType) { 26 { 'DDR4' } 34 { 'DDR5' } 24 { 'DDR3' } 30 { 'LPDDR4' } 35 { 'LPDDR5' } default { '' } }) }
+    # --- drives, and where Windows and Fortnite live
+    $disks = @(Try-Get { Get-PhysicalDisk })
+    $P.Drives = @(foreach ($d in $disks) { [ordered]@{ Name = "$($d.FriendlyName)".Trim(); Type = "$($d.MediaType)"; Bus = "$($d.BusType)"; SizeGb = [int]($d.Size / 1GB); Number = "$($d.DeviceId)" } })
+    function Get-DriveOf([string]$path) { try { $n = (Get-Partition -DriveLetter ((Split-Path -Qualifier $path).TrimEnd(':')) -ErrorAction Stop).DiskNumber; ($P.Drives | Where-Object { $_.Number -eq "$n" } | Select-Object -First 1).Name } catch { $null } }
+    $fn = $null
+    try { $dat = "$env:ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat"; if (Test-Path $dat) { $fn = ((Get-Content $dat -Raw | ConvertFrom-Json).InstallationList | Where-Object { $_.AppName -eq 'Fortnite' } | Select-Object -First 1).InstallLocation } } catch {}
+    $P.Fortnite = [ordered]@{ Path = $fn; Drive = $(if ($fn) { Get-DriveOf $fn }) }
+    $P.SystemDrive = Get-DriveOf $env:SystemDrive
+    # --- monitors (name, refresh rate, cable)
+    $ids = @(Try-Get { Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID })
+    $conn = @(Try-Get { Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams })
+    $P.Displays = @(foreach ($x in @(Try-Get { [NativeDisplay]::ListDisplays() })) {
+        if ($x -match 'Virtual|Parsec|Remote Display|Meta ') { continue }
+        $f = $x -split '\|'
+        $cable = ''
+        $mid = $ids | Where-Object { $n = -join (@($_.UserFriendlyName) | Where-Object { $_ } | ForEach-Object { [char]$_ }); $n -and $f[0] -like "*$($n.Trim())*" } | Select-Object -First 1
+        if ($mid) { $c = $conn | Where-Object { $_.InstanceName -eq $mid.InstanceName } | Select-Object -First 1
+            $cable = switch ([int]$c.VideoOutputTechnology) { 5 { 'HDMI' } 10 { 'DisplayPort' } 11 { 'Built-in' } 6 { 'Built-in' } 4 { 'DVI' } 18 { 'USB-C' } default { '' } } }
+        [ordered]@{ Name = $f[0]; Gpu = $f[1]; Hz = [int]$f[2]; Primary = ($f[3] -eq 'True'); Cable = $cable }
+    })
+    $P.Monitors = @(foreach ($mi in $ids) {
+        $n = (-join (@($mi.UserFriendlyName) | Where-Object { $_ } | ForEach-Object { [char]$_ })).Trim()
+        $c = $conn | Where-Object { $_.InstanceName -eq $mi.InstanceName } | Select-Object -First 1
+        [ordered]@{ Name = $(if ($n) { $n } else { 'Monitor' }); Cable = $(switch ([int]$c.VideoOutputTechnology) { 5 { 'HDMI' } 10 { 'DisplayPort' } 11 { 'Built-in' } 6 { 'Built-in' } 4 { 'DVI' } 18 { 'USB-C' } default { '' } }) }
+    })
+    # --- network
+    $P.Network = @(foreach ($a in @(Try-Get { Get-NetAdapter -Physical -ErrorAction Stop | Where-Object Status -eq 'Up' })) {
+        [ordered]@{ Name = "$($a.InterfaceDescription)"; Kind = $(if ("$($a.PhysicalMediaType)" -match '802\.11|Wireless' -or $a.InterfaceDescription -match 'Wi-?Fi|Wireless|802\.11') { 'Wi-Fi' } else { 'Ethernet' }); Speed = "$($a.LinkSpeed)" } })
+    # --- audio and input devices
+    $P.Audio = @(Try-Get { [AudioFx]::List() | ForEach-Object { $_.Name } })
+    $P.Input = @(foreach ($h in @(Try-Get { Get-PnpDevice -PresentOnly -Class Mouse, Keyboard -ErrorAction Stop | Where-Object { $_.InstanceId -like 'HID\VID_*' } })) {
+        $name = $null; $id = $h.InstanceId
+        for ($hop = 0; $hop -lt 3 -and -not $name; $hop++) {
+            $parent = Try-Get { (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent -ErrorAction Stop).Data }
+            if (-not $parent) { break }
+            $desc = Try-Get { (Get-PnpDeviceProperty -InstanceId $parent -KeyName DEVPKEY_Device_BusReportedDeviceDesc -ErrorAction Stop).Data }
+            if ($desc -and $desc -notmatch '^(USB Input Device|USB Composite Device|HID-compliant)') { $name = "$desc".Trim() }
+            $id = $parent
+        }
+        if ($name) { [ordered]@{ Kind = "$($h.Class)"; Name = $name } }
+    }) | Group-Object { $_.Name } | ForEach-Object { $g = $_.Group; $mouse = $g | Where-Object { $_.Kind -eq 'Mouse' } | Select-Object -First 1; if ($mouse) { $mouse } else { $g[0] } }
+    # --- security and power
+    $dg = Try-Get { Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard }
+    $P.Security = [ordered]@{ Vbs = ([int]$dg.VirtualizationBasedSecurityStatus -eq 2); MemoryIntegrity = (@($dg.SecurityServicesRunning) -contains 2); Hypervisor = [bool]$cs.HypervisorPresent
+                              Antivirus = @(Try-Get { Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop } | ForEach-Object { $_.displayName } | Select-Object -Unique) }
+    $plan = (Try-Get { powercfg /getactivescheme }) -replace '^.*\((.*)\)\s*$', '$1'
+    $P.Power = [ordered]@{ Plan = "$plan".Trim(); OnBattery = (@($bat | Where-Object { $_.BatteryStatus -eq 1 }).Count -gt 0) }
+    # --- installed apps
+    $seen = @{}
+    $progs = foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
+        foreach ($k in @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+            $q = Try-Get { Get-ItemProperty $k.PSPath }
+            if (-not $q.DisplayName -or $q.SystemComponent -eq 1 -or $q.ParentKeyName -or "$($q.ReleaseType)" -match 'Update|Hotfix') { continue }
+            $n = "$($q.DisplayName)".Trim() -replace '[\x00-\x1F]', ''
+            if ($seen.ContainsKey($n)) { continue }; $seen[$n] = 1
+            $n
+        }
+    }
+    $progs = @($progs | Sort-Object)
+    $store = @(Try-Get { Get-AppxPackage -PackageTypeFilter Main -ErrorAction Stop } | Where-Object { -not $_.IsFramework -and "$($_.SignatureKind)" -ne 'System' })
+    $P.Apps = [ordered]@{ Programs = $progs; StoreCount = $store.Count; Store = @($store | ForEach-Object { $_.Name } | Sort-Object) }
+    # --- what the installed software means for tuning
+    $groups = [ordered]@{
+        'Game launchers'          = 'Epic Games Launcher|^Steam$|Battle\.net|^EA app|Ubisoft Connect|GOG GALAXY|Riot (Client|Vanguard)|^Xbox'
+        'Overlays and recording'  = 'Discord|^Medal|Overwolf|OBS Studio|Streamlabs|NVIDIA App|GeForce Experience|AMD Software|Outplayed|ShareX|Insights Capture'
+        'RGB and device software' = 'Armoury Crate|AURA|iCUE|Synapse|G HUB|Logitech Gaming Software|SteelSeries GG|NZXT CAM|SignalRGB|OpenRGB|MSI Center|Mystic Light|RGB Fusion|Gigabyte Control Center|L-Connect|Wootility|NGENUITY|Glorious Core|Stream ?Deck|Stream ?Dock|Elgato'
+        'Monitoring and tuning'   = 'HWiNFO|HWMonitor|AIDA64|Core Temp|MSI Afterburner|RivaTuner|CPU-Z|GPU-Z|Ryzen Master|Extreme Tuning|Precision X1|ThrottleStop|LatencyMon'
+        'Other optimizers'        = 'ExitLag|^EXM|GearUP|Razer Cortex|WTFast|NoPing|^Hone|Process Lasso|CCleaner|Advanced SystemCare|Game Booster'
+        'PC maker software'       = 'MyASUS|Dell SupportAssist|Dell Optimizer|Alienware Command|HP Support Assistant|OMEN Gaming Hub|Lenovo Vantage|Legion|Acer Care|PredatorSense|Driver & Support Assistant|Killer'
+        'Cloud and sync'          = 'OneDrive|Dropbox|Google Drive|iCloud|^MEGA|pCloud'
+        'Streaming and voice'     = 'OBS Studio|Streamlabs|XSplit|Spotify|TeamSpeak|Mumble|VoiceMeeter|Wave Link'
+        'Antivirus'               = 'Norton|McAfee|Avast|^AVG|Bitdefender|Kaspersky|ESET|Malwarebytes|Avira|Sophos|Webroot|Trend Micro'
+    }
+    $P.Software = [ordered]@{}
+    foreach ($k in $groups.Keys) { $hit = @($progs | Where-Object { $_ -match $groups[$k] }); if ($hit.Count) { $P.Software[$k] = $hit } }
+    $P
+}
+function Get-SavedProfile { if (Test-Path $ProfileFile) { try { Get-Content $ProfileFile -Raw | ConvertFrom-Json } catch { $null } } else { $null } }
+function Get-MainGpu($p) { $g = @($p.Gpus | Where-Object { -not $_.Integrated }); if ($g) { $g[0] } else { @($p.Gpus)[0] } }
+function Start-ProfileScan([switch]$Quiet) {
+    if ($script:ProfileScanning) { return }
+    $script:ProfileScanning = $true; $script:ProfileQuiet = [bool]$Quiet
+    if ($script:PcUi) { $script:PcUi.Status.Text = 'Scanning this PC: hardware, drivers, Windows and installed apps...'; $script:PcUi.Rescan.IsEnabled = $false }
+    Start-Background $ProfileScan.ToString() @($AppVersion) {
+        param($out, $errs)
+        $script:ProfileScanning = $false
+        $p = @($out | Where-Object { $_ }) | Select-Object -First 1
+        if (-not $p) { if ($script:PcUi) { $script:PcUi.Status.Text = 'The scan did not finish. Try again.'; $script:PcUi.Rescan.IsEnabled = $true }; return }
+        $p | ConvertTo-Json -Depth 6 | Set-Content $ProfileFile -Encoding UTF8
+        $script:SysProfile = Get-SavedProfile
+        Set-ProfileTailoring
+        if ($script:PcUi) { Update-ThisPCPage }
+        Update-WizardProfileLine
+        if (-not $script:ProfileQuiet) { Show-Toast 'Scan finished. ZeroDelay adapted its recommendations to this PC.' '#30D158' }
+    }
+}
+# Adjusts which cards "Apply recommended" and the setup wizard switch on, from what the scan found. Never adds risky
+# tweaks: it only takes cards out of the recommended set, and records why.
+function Set-ProfileTailoring {
+    $p = $script:SysProfile; if (-not $p) { return }
+    $notes = New-Object Collections.ArrayList
+    foreach ($t in $Tweaks) { if ($null -eq $t.RecBase) { $t.RecBase = [bool]$t.Rec }; $t.Rec = $t.RecBase; $t.TailorWhy = $null }
+    function Drop([string[]]$Ids, [string]$Why) {
+        $n = 0
+        foreach ($id in $Ids) { $t = $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1; if ($t -and $t.Rec) { $t.Rec = $false; $t.TailorWhy = $Why; $n++ } }
+        $n
+    }
+    if ($p.Computer.Laptop) {
+        $n = Drop @('coreparking', 'minstate', 'epp', 'boostmode', 'throttle', 'zdplan', 'nvme-idle', 'sata-lpm', 'hybrid-pcore', 'usbsuspend', 'usb3lpm', 'pcie') 'Laptop: keeps parts at full power and drains the battery. Switch it on yourself when you play plugged in.'
+        [void]$notes.Add("Laptop detected: $n power tweaks are no longer part of Apply recommended (they drain the battery). You can still switch them on when you play plugged in.")
+    }
+    $stream = @($p.Software.'Streaming and voice') + @($p.Software.'Overlays and recording') | Where-Object { $_ -match 'OBS|Streamlabs|XSplit' } | Select-Object -First 1
+    if ($stream) {
+        [void](Drop @('cpuprio', 'lowprio') "You have $stream`: raising Fortnite's priority can make your stream drop frames.")
+        [void]$notes.Add("$stream found: Fortnite priority tweaks are not recommended, so your stream keeps its frames.")
+    }
+    $av = @($p.Security.Antivirus | Where-Object { $_ -notmatch 'Defender' })
+    if ($av.Count) { [void]$notes.Add("Antivirus: $($av -join ', '). Cards that change Microsoft Defender have no effect while it is in charge.") }
+    if ($p.Cpu.DualDieX3D) { [void]$notes.Add("$($p.Cpu.Name): core unparking is hidden. The AMD driver parks the second die on purpose so Fortnite stays on the V-Cache cores.") }
+    elseif ($p.Cpu.Hybrid) { [void]$notes.Add("$($p.Cpu.Name) has performance and efficiency cores: the hybrid-CPU power card is shown for you.") }
+    $net = @($p.Network | ForEach-Object { $_.Kind } | Select-Object -Unique)
+    if ($net -contains 'Wi-Fi' -and $net -notcontains 'Ethernet') { [void]$notes.Add('You play on Wi-Fi: the Wi-Fi cards apply to you. A cable is the biggest single ping and jitter improvement if you can run one.') }
+    elseif ($net -contains 'Ethernet') { [void]$notes.Add('You are on Ethernet: Wi-Fi cards are hidden.') }
+    $gpu = Get-MainGpu $p
+    if ($gpu -and $gpu.Vendor -ne 'NVIDIA') { [void]$notes.Add("$($gpu.Name): NVIDIA-only cards (Reflex driver settings, texture blur, G-SYNC page) are hidden.") }
+    if (Test-Gtx1080Ti) {
+        Set-GpuTailoring
+        $pm = $Tweaks | Where-Object { $_.Id -eq 'perfmode' } | Select-Object -First 1
+        if ($pm) { $pm.Rec = $true; $pm.TailorWhy = 'GTX 1080 Ti: Performance mode is the right renderer for this card.' }
+        [void]$notes.Add('GTX 1080 Ti: a tab of its own was added (left menu). Performance rendering mode is now part of Apply recommended; cards for features the card does not have (frame generation, Smooth Motion, low textures for small graphics memory) are hidden; driver alerts only point to the 580 security branch.')
+    }
+    $opt = @($p.Software.'Other optimizers')
+    if ($opt.Count) { [void]$notes.Add("Other optimizers installed: $($opt -join ', '). They can change the same settings; drift alerts will tell you when they do.") }
+    $script:TailorNotes = @($notes)
+    foreach ($t in $Tweaks) {
+        if (-not $t.Card) { continue }
+        $tag = $t.Card.FindName('RecTag')
+        if ($tag) { $tag.Visibility = if ($t.Rec) { 'Visible' } else { 'Collapsed' } }
+    }
+}
+# Cards for features a GTX 1080 Ti does not have are hidden (also before the first scan finishes).
+function Set-GpuTailoring {
+    if (-not (Test-Gtx1080Ti)) { return }
+    foreach ($id in 'smoothmotion', 'framegen', 'texturelow') {
+        $t = $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+        if ($t) { $t.ForceHidden = $true; $t.Rec = $false; if ($t.Card) { $t.Card.Visibility = 'Collapsed' } }
+    }
+}
+function Update-WizardProfileLine {
+    $p = $script:SysProfile
+    if (-not $script:Wiz -or -not $script:Wiz.PcLine -or -not $p) { return }
+    $bits = @("$(@($p.Apps.Programs).Count) programs and $($p.Apps.StoreCount) Store apps")
+    foreach ($k in 'Overlays and recording', 'RGB and device software', 'Other optimizers') { $v = @($p.Software.$k); if ($v.Count) { $bits += ($v | Select-Object -First 2) -join ', ' } }
+    $script:Wiz.PcLine.Text = "Scanned: $($bits -join '; '). ZeroDelay picks tweaks that fit this PC (details in Tools > This PC)."
+    $stream = @($p.Software.'Streaming and voice') + @($p.Software.'Overlays and recording') | Where-Object { $_ -match 'OBS|Streamlabs|XSplit' }
+    if ($stream -and $script:Wiz.StreamYes) { $script:Wiz.StreamYes.IsChecked = $true }
+    if ($p.Computer.Laptop -and $script:Wiz.Lap) { $script:Wiz.Lap.IsChecked = $true }
+}
+
+function New-ThisPCPage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,18' Margin='0,0,0,14'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock x:Name='Head' FontSize='20' FontWeight='Bold' TextWrapping='Wrap'/>
+        <TextBlock x:Name='Status' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,0,0' TextWrapping='Wrap'/>
+      </StackPanel>
+      <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+        <Button x:Name='Copy' Content='Copy summary' Style='{DynamicResource Btn}' Margin='0,0,8,0' ToolTip='Copies a text summary of this PC, handy when asking for help'/>
+        <Button x:Name='Rescan' Content='Scan again' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF'/>
+      </StackPanel>
+    </Grid>
+  </Border>
+  <ContentControl x:Name='Body'/>
+</StackPanel>
+"@)
+    $u = @{}; foreach ($n in 'Head', 'Status', 'Copy', 'Rescan', 'Body') { $u[$n] = $root.FindName($n) }
+    $script:PcUi = $u
+    $u.Rescan.Add_Click({ Start-ProfileScan })
+    $u.Copy.Add_Click({ [Windows.Clipboard]::SetText((Get-ProfileText)); Show-Toast 'Summary copied.' '#30D158' })
+    Update-ThisPCPage
+    New-PageScroll $root
+}
+function Get-ProfileText {
+    $p = $script:SysProfile; if (-not $p) { return 'Not scanned yet.' }
+    $g = @($p.Gpus | ForEach-Object { "$($_.Name)$(if ($_.VramMb) { " $([Math]::Round($_.VramMb / 1024)) GB" }) (driver $($_.Driver))" }) -join '; '
+    @("ZeroDelay $AppVersion - PC summary, scanned $(([datetime]$p.ScannedAt).ToString('yyyy-MM-dd HH:mm'))",
+      "Windows: $($p.Windows.Name) $($p.Windows.Version) (build $($p.Windows.Build))",
+      "PC: $($p.Computer.Maker) $($p.Computer.Model)$(if ($p.Computer.Laptop) { ' (laptop)' }); board $($p.Computer.Board), BIOS $($p.Computer.Bios) ($($p.Computer.BiosDate))",
+      "CPU: $($p.Cpu.Name), $($p.Cpu.Cores) cores / $($p.Cpu.Threads) threads",
+      "GPU: $g",
+      "RAM: $($p.Memory.TotalGb) GB $($p.Memory.Type), $($p.Memory.Sticks) sticks at $($p.Memory.SpeedMts) MT/s (rated $($p.Memory.RatedMts))",
+      "Drives: $(@($p.Drives | ForEach-Object { "$($_.Name) ($($_.Type) $($_.Bus), $($_.SizeGb) GB)" }) -join '; ')",
+      "Fortnite: $(if ($p.Fortnite.Path) { "$($p.Fortnite.Path) on $($p.Fortnite.Drive)" } else { 'not found' })",
+      "Monitors: $(@($p.Monitors | ForEach-Object { "$($_.Name)$(if ($_.Cable) { " ($($_.Cable))" })" }) -join '; '); refresh rates $(@($p.Displays | ForEach-Object { "$($_.Hz) Hz" }) -join ', ')",
+      "Network: $(@($p.Network | ForEach-Object { "$($_.Kind) $($_.Name) $($_.Speed)" }) -join '; ')",
+      "Security: Memory Integrity $(if ($p.Security.MemoryIntegrity) { 'on' } else { 'off' }), hypervisor $(if ($p.Security.Hypervisor) { 'running' } else { 'off' }), antivirus $(@($p.Security.Antivirus) -join ', ')",
+      "Power plan: $($p.Power.Plan)",
+      "Apps: $(@($p.Apps.Programs).Count) programs, $($p.Apps.StoreCount) Store apps") -join "`r`n"
+}
+function Update-ThisPCPage {
+    $u = $script:PcUi; $p = $script:SysProfile
+    $u.Rescan.IsEnabled = -not $script:ProfileScanning
+    if (-not $p) {
+        $u.Head.Text = 'This PC has not been scanned yet'
+        $u.Status.Text = if ($script:ProfileScanning) { 'Scanning this PC: hardware, drivers, Windows and installed apps...' } else { 'Press Scan again to read the hardware, Windows and installed apps.' }
+        $u.Body.Content = $null; return
+    }
+    $u.Head.Text = if ($p.Computer.Model -and $p.Computer.Model -notmatch 'System Product Name|To be filled|Default string') { "$($p.Computer.Maker) $($p.Computer.Model)" } else { "$($p.Cpu.Name) + $((Get-MainGpu $p).Name)" }
+    $u.Status.Text = "Scanned $(([datetime]$p.ScannedAt).ToString('d MMM, HH:mm'))  ·  $(@($p.Apps.Programs).Count) programs, $($p.Apps.StoreCount) Store apps  ·  ZeroDelay re-scans every few days and after updates."
+    function Row([string]$k, [string]$v) { if (-not "$v".Trim()) { return '' }; "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='110'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions><TextBlock Text='$(Esc $k)' FontSize='12' Foreground='#98989D'/><TextBlock Grid.Column='1' Text='$(Esc $v)' FontSize='12.5' Foreground='#D1D1D6' TextWrapping='Wrap'/></Grid>" }
+    function Box([string]$title, [string]$rows) { if (-not $rows) { return '' }; "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='20,16' Margin='0,0,12,12' Width='520' VerticalAlignment='Top'><StackPanel><TextBlock Text='$(Esc $title)' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,10'/>$rows</StackPanel></Border>" }
+    $gpuRows = (@($p.Gpus) | ForEach-Object { Row $(if ($_.Integrated) { 'Integrated' } else { 'Graphics' }) "$($_.Name)$(if ($_.VramMb) { ", $([Math]::Round($_.VramMb / 1024)) GB" })$(if ($_.Arch) { " ($($_.Arch))" }), driver $($_.Driver)" }) -join ''
+    $boxes = @(
+        (Box 'Computer' ((Row 'Type' $(if ($p.Computer.Laptop) { 'Laptop' } else { 'Desktop' })) + (Row 'Made by' $(if ("$($p.Computer.Model)" -match 'System Product Name|To be filled|Default string|^System$') { '' } else { "$($p.Computer.Maker) $($p.Computer.Model)" })) + (Row 'Motherboard' $p.Computer.Board) + (Row 'BIOS' "$($p.Computer.Bios)$(if ($p.Computer.BiosDate) { ", $($p.Computer.BiosDate)" })") + (Row 'Windows' "$($p.Windows.Name) $($p.Windows.Version), build $($p.Windows.Build)")))
+        (Box 'Processor and graphics' ((Row 'CPU' "$($p.Cpu.Name)") + (Row 'Cores' "$($p.Cpu.Cores) cores, $($p.Cpu.Threads) threads$(if ($p.Cpu.Hybrid) { ', performance + efficiency cores' })$(if ($p.Cpu.X3D) { ', 3D V-Cache' })") + $gpuRows))
+        (Box 'Memory and drives' ((Row 'RAM' "$($p.Memory.TotalGb) GB $($p.Memory.Type), $($p.Memory.Sticks) stick$(if ($p.Memory.Sticks -ne 1) { 's' }) at $($p.Memory.SpeedMts) MT/s$(if ($p.Memory.RatedMts -gt $p.Memory.SpeedMts) { " (rated $($p.Memory.RatedMts))" })") +
+            ((@($p.Drives) | ForEach-Object { Row 'Drive' "$($_.Name): $($_.Type) $($_.Bus), $($_.SizeGb) GB" }) -join '') + (Row 'Windows on' $p.SystemDrive) + (Row 'Fortnite on' $(if ($p.Fortnite.Path) { "$($p.Fortnite.Drive) ($($p.Fortnite.Path))" } else { 'not found' }))))
+        (Box 'Monitors, network and devices' (((@($p.Monitors) | ForEach-Object { Row 'Monitor' "$($_.Name)$(if ($_.Cable) { ", $($_.Cable)" })" }) -join '') +
+            (Row 'Refresh rates' ((@($p.Displays) | Sort-Object { -not $_.Primary } | ForEach-Object { "$($_.Hz) Hz$(if ($_.Primary) { ' (main)' })" }) -join ', ')) +
+            ((@($p.Network) | ForEach-Object { Row $_.Kind "$($_.Name), $($_.Speed)" }) -join '') + ((@($p.Input) | ForEach-Object { Row $_.Kind $_.Name }) -join '') + (Row 'Audio' "$(@($p.Audio).Count) playback devices")))
+        (Box 'Windows security and power' ((Row 'Memory Integrity' $(if ($p.Security.MemoryIntegrity) { 'On' } else { 'Off' })) + (Row 'Hypervisor' $(if ($p.Security.Hypervisor) { 'Running' } else { 'Off' })) + (Row 'Antivirus' (@($p.Security.Antivirus) -join ', ')) + (Row 'Power plan' $p.Power.Plan)))
+        (Box 'Software that matters for gaming' ((@($p.Software.PSObject.Properties) | ForEach-Object { Row $_.Name ((@($_.Value) | Select-Object -First 6) -join ', ' + $(if (@($_.Value).Count -gt 6) { ", +$(@($_.Value).Count - 6) more" })) }) -join ''))
+    ) -join ''
+    $notesX = (@($script:TailorNotes) | ForEach-Object { "<TextBlock Text='$(Esc "•  $_")' FontSize='12.5' Foreground='#D1D1D6' TextWrapping='Wrap' Margin='0,0,0,6' LineHeight='18' LineStackingStrategy='BlockLineHeight'/>" }) -join ''
+    if (-not $notesX) { $notesX = "<TextBlock Text='Nothing on this PC needs special handling: the standard recommendations fit.' FontSize='12.5' Foreground='#D1D1D6'/>" }
+    $progList = Esc ((@($p.Apps.Programs)) -join "`n")
+    $panel = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,12,12'>
+    <StackPanel>
+      <TextBlock Text='How ZeroDelay adapted to this PC' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,10'/>
+      $notesX
+    </StackPanel>
+  </Border>
+  <WrapPanel>$boxes</WrapPanel>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,12,12'>
+    <StackPanel>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <TextBlock Text='$(@($p.Apps.Programs).Count) installed programs' FontSize='14' FontWeight='SemiBold' VerticalAlignment='Center'/>
+        <Button x:Name='ShowApps' Grid.Column='1' Content='Show all' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12'/>
+      </Grid>
+      <TextBlock x:Name='AppList' Text='$progList' FontSize='12' Foreground='#A1A1A6' Margin='0,10,0,0' Visibility='Collapsed' LineHeight='18' LineStackingStrategy='BlockLineHeight'/>
+    </StackPanel>
+  </Border>
+</StackPanel>
+"@)
+    $panel.FindName('ShowApps').Add_Click({ param($s, $e) $l = $s.Parent.Parent.Children[1]; $vis = $l.Visibility -ne 'Visible'; $l.Visibility = if ($vis) { 'Visible' } else { 'Collapsed' }; $s.Content = if ($vis) { 'Hide' } else { 'Show all' } })
+    $u.Body.Content = $panel
+}
+
 # --- System tray icon
 function Show-MainWindow {
     $window.Show()
@@ -7696,6 +8071,7 @@ function Update-Filter {
         $show = if ($q) { -not $t.Header -and ($t.Title -like "*$q*" -or $t.Desc -like "*$q*") }
                 elseif ($script:CurrentCat.Name -eq 'Latency') { [bool]$t.Lat }
                 elseif ($script:CurrentCat.Name -eq 'Potato') { [bool]$t.Potato }
+                elseif ($script:CurrentCat.Name -eq 'Gtx1080Ti') { [bool]$t.Gtx }
                 else { $script:CurrentCat.Name -eq 'All' -or $t.Cat -eq $script:CurrentCat.Name }
         $t.Card.Visibility = if ($show -and -not $t.Hidden) { 'Visible' } else { 'Collapsed' }
     }
@@ -7703,6 +8079,7 @@ function Update-Filter {
 $ui.Search.Add_TextChanged({ Update-Filter })
 $script:NavButtons = @{}
 foreach ($c in $Categories) {
+    if ($c.Requires -and -not (& $c.Requires)) { continue }   # e.g. the GTX 1080 Ti tab on other PCs
     if ($c.Section) {
         $lbl = New-Object Windows.Controls.TextBlock
         $lbl.Text = (Get-Culture).TextInfo.ToTitleCase($c.Section.ToLower()); $lbl.FontSize = 11; $lbl.FontWeight = 'SemiBold'; $lbl.Foreground = ConvertTo-Brush '#98989D'; $lbl.Margin = '10,16,0,6'
@@ -7949,6 +8326,10 @@ $script:NavButtons[$startName].IsChecked = $true
 $window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringIntoView() })
 Update-GameModeUi
 Update-All
+$script:SysProfile = if ($Snapshot -and $env:ZD_SCANPC) { $null } else { Get-SavedProfile }
+if ($script:SysProfile) { Set-ProfileTailoring } else { Set-GpuTailoring }
+$profileAge = if ($script:SysProfile) { try { ((Get-Date) - [datetime]$script:SysProfile.ScannedAt).TotalDays } catch { 999 } } else { 999 }
+if ((-not $Snapshot -and ($profileAge -gt 3 -or "$($script:SysProfile.AppVersion)" -ne $AppVersion)) -or ($Snapshot -and $env:ZD_SCANPC)) { Start-ProfileScan -Quiet }
 if ((-not $Snapshot -and -not $script:Backup.Custom['wizarddone']) -or ($Snapshot -and $env:ZD_WIZARD)) { Show-Wizard }
 elseif ($Snapshot -and $env:ZD_WHATSNEW) { Show-WhatsNew }
 elseif (-not $Snapshot -and "$($script:Backup.Custom['lastversion'])" -ne $AppVersion) { Show-WhatsNew }
