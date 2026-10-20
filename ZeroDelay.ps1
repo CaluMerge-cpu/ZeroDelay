@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.6.0'
+$AppVersion = '1.7.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -48,14 +48,19 @@ using System.Collections.Generic;
 using System.Text.RegularExpressions;
 public static class ZdTheme {
     public static readonly Dictionary<string, string> Map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    // exact text swaps done before colours (used by the glass look to point card fills/edges at gradient resources)
+    public static readonly List<KeyValuePair<string, string>> Literal = new List<KeyValuePair<string, string>>();
     static readonly Regex Hex = new Regex("#([0-9A-Fa-f]{8}|[0-9A-Fa-f]{6})(?![0-9A-Fa-f])");
     public static string Apply(string s) {
-        if (s == null || Map.Count == 0) return s;
+        if (s == null) return s;
+        foreach (var kv in Literal) s = s.Replace(kv.Key, kv.Value);
+        if (Map.Count == 0) return s;
         return Hex.Replace(s, m => {
             string h = m.Groups[1].Value, a = "";
             if (h.Length == 8) { a = h.Substring(0, 2); h = h.Substring(2); }
             string t;
-            return Map.TryGetValue(h, out t) ? "#" + a + t : m.Value;
+            if (!Map.TryGetValue(h, out t)) return m.Value;
+            return t.Length == 8 ? "#" + t : "#" + a + t;   // a mapped colour with its own alpha wins
         });
     }
     public static object Parse(string xaml) { return System.Windows.Markup.XamlReader.Parse(Apply(xaml)); }
@@ -282,6 +287,13 @@ public static class AudioFx {
         }
         return -1;
     }
+}
+
+// Creator tab: keeps Windows from sleeping while a render runs (released as soon as it ends).
+public static class KeepAwake {
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    public static void Hold() { SetThreadExecutionState(0x80000000u | 0x00000001u); }   // ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    public static void Release() { SetThreadExecutionState(0x80000000u); }
 }
 
 // Memory page: clears the standby list once. Needs SeProfileSingleProcessPrivilege (admins have it, disabled by default).
@@ -973,6 +985,58 @@ function Set-SteamAutoUpdateWindow([bool]$On, $Start, $End) {
     [IO.File]::WriteAllLines($f, $out)
 }
 
+# --- Creator apps (Adobe, OBS). Their settings files are edited one value at a time, as text, only while the app is closed.
+function Get-AppPath([string]$Exe) {
+    foreach ($h in 'HKLM:', 'HKCU:') { $v = (Get-ItemProperty "$h\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$Exe" -ErrorAction SilentlyContinue).'(default)'; if ($v) { $v = "$v".Trim('"'); if (Test-Path -LiteralPath $v) { return $v } } }
+    $null
+}
+function Get-CreatorExes {
+    Get-Cached 'creatorexes' {
+        $list = @()
+        foreach ($e in 'Adobe Premiere Pro.exe', 'AfterFX.exe', 'Photoshop.exe', 'Adobe Media Encoder.exe') { $p = Get-AppPath $e; if ($p) { $list += $p } }
+        $ae = $list | Where-Object { $_ -like '*AfterFX.exe' } | Select-Object -First 1
+        if ($ae) { $r = Join-Path (Split-Path $ae) 'aerender.exe'; if (Test-Path -LiteralPath $r) { $list += $r } }
+        $list += @(Get-Item "$env:ProgramFiles\Adobe\Adobe Photoshop *\Photoshop.exe", "$env:ProgramFiles\Adobe\Adobe Media Encoder *\Adobe Media Encoder.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        @($list | Select-Object -Unique)
+    }
+}
+$ObsIni = "$env:APPDATA\obs-studio\global.ini"
+function Get-PrPrefsFile { Get-ChildItem "$env:USERPROFILE\Documents\Adobe\Premiere Pro\*\Profile-*\Adobe Premiere Pro Prefs" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+function Get-AePrefsFile { Get-ChildItem "$env:APPDATA\Adobe\After Effects\*\Adobe After Effects * Prefs.txt" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'indep' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+function Get-MemBalancerFile { Get-ChildItem "$env:APPDATA\Adobe\dynamiclinkmanager\*\memorybalancer*.xml" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+function Test-CreatorPc { @(Get-CreatorExes).Count -gt 0 -or (Test-Path $ObsIni) -or [bool](Get-PrPrefsFile) -or [bool](Get-AePrefsFile) }
+function Assert-AppsClosed([string[]]$Names, [string]$App) { if (Get-Process -Name $Names -ErrorAction SilentlyContinue) { throw "Close $App first: it rewrites its settings when it closes." } }
+$AdobeVideoProcs = @('Adobe Premiere Pro', 'AfterFX', 'aerender', 'Adobe Media Encoder', 'dynamiclinkmanager', 'Audition')
+function Read-KeepText([string]$Path) { $b = [IO.File]::ReadAllBytes($Path); @{ Text = [IO.File]::ReadAllText($Path); Bom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) } }
+function Write-KeepText([string]$Path, $Doc) { [IO.File]::WriteAllText($Path, $Doc.Text, (New-Object Text.UTF8Encoding ([bool]$Doc.Bom))) }
+function Get-XmlTag([string]$Text, [string]$Tag) { if ($Text -match "<$([regex]::Escape($Tag))>([^<]*)</") { $Matches[1] } else { $null } }
+function Set-XmlTag([string]$Text, [string]$Tag, [string]$Value) { [regex]::Replace($Text, "(<$([regex]::Escape($Tag))>)[^<]*(</)", { param($m) $m.Groups[1].Value + $Value + $m.Groups[2].Value }) }
+# After Effects prefs: tab-indented "key" = value lines inside ["Section"] blocks
+function Get-AeValue([string]$Text, [string]$Section, [string]$Key) {
+    $i = $Text.IndexOf("[`"$Section`"]"); if ($i -lt 0) { return $null }
+    $m = [regex]::Match($Text.Substring($i), "(?m)^\s*`"$([regex]::Escape($Key))`"\s*=\s*(.+?)\s*$"); if ($m.Success) { $m.Groups[1].Value } else { $null }
+}
+function Set-AeValue([string]$Text, [string]$Section, [string]$Key, [string]$Value) {
+    $i = $Text.IndexOf("[`"$Section`"]"); if ($i -lt 0) { throw 'This After Effects setting was not found. Open and close After Effects once, then try again.' }
+    $rx = New-Object Text.RegularExpressions.Regex "(?m)^(\s*`"$([regex]::Escape($Key))`"\s*=\s*)(.+?)(\s*)$"
+    $m = $rx.Match($Text, $i); if (-not $m.Success) { throw 'This After Effects setting was not found.' }
+    $Text.Substring(0, $m.Groups[2].Index) + $Value + $Text.Substring($m.Groups[2].Index + $m.Groups[2].Length)
+}
+# Adobe's own RAM reserve default for this PC's memory, from the table in memorybalancer.xml
+function Get-AdobeReserve {
+    $f = Get-MemBalancerFile; if (-not $f) { return $null }
+    try {
+        [xml]$x = Get-Content $f -Raw
+        $pairs = @($x.'prop.map'.'prop.list'.'prop.pair')
+        $arr = { param($k) @(($pairs | Where-Object { $_.key -eq $k }).array.int | ForEach-Object { [uint64]"$($_.'#text')" }) }
+        $tops = & $arr 'rangeTop'; $defs = & $arr 'defaultReserved'
+        $cur = [uint64]"$((($pairs | Where-Object { $_.key -eq 'memorytouseforotherapplications' }).int).'#text')"
+        $ram = [uint64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+        $idx = $defs.Count - 1; for ($i = 0; $i -lt $tops.Count; $i++) { if ($tops[$i] -ge $ram) { $idx = $i; break } }
+        @{ File = $f; Current = $cur; Default = $defs[[Math]::Min($idx, $defs.Count - 1)] }
+    } catch { $null }
+}
+
 # --- Builds a card that disables a Windows service (Start = 4) and restores its default start type.
 function New-SvcTweak([string]$Id, [string]$Svc, [int]$Default, [string]$Title, [string]$Desc, [string]$Warn, [bool]$Rec, [string]$Badge) {
     @{ Id = $Id; Cat = 'Services'; Icon = [char]0xE912; Rec = $Rec; Badge = $Badge; Svc = $Svc
@@ -1357,7 +1421,9 @@ function Get-WallpaperExe {
 function Start-GameSession {
     $prefs = Get-SessionPrefs
     $closed = @(); $names = @()
+    $adobeOpen = [bool](Get-Process -Name 'Adobe Premiere Pro', 'AfterFX', 'aerender', 'Photoshop', 'Adobe Media Encoder' -ErrorAction SilentlyContinue)
     foreach ($app in $SessionApps | Where-Object { $prefs[$_.Key] }) {
+        if ($app.Key -eq 'adobe' -and $adobeOpen) { continue }   # closing Creative Cloud under Premiere/AE breaks fonts and licensing
         if ($app.Pause) {
             $we = Get-WallpaperExe
             if ($we) { Start-Process $we -ArgumentList '-control', 'pause' -WindowStyle Hidden; $closed += @{ Key = $app.Key; Pause = $we }; $names += 'Wallpaper Engine (paused)' }
@@ -3058,6 +3124,119 @@ $Tweaks = @(
        On    = { Set-AdvDisplay 'wifi5ghz' 'RoamingPreferredBandType' 'Prefer 5' }
        Off   = { Reset-AdvProp 'wifi5ghz' 'RoamingPreferredBandType' 0 } }
 
+    # ======================================================= Creator tab (1.7)
+    @{ Id = 'cr-autosave'; Cat = 'Creator'; Icon = [char]0xE74E; Rec = $true; Requires = { [bool](Get-PrPrefsFile) }
+       Title = 'Premiere: auto-save every 15 minutes'
+       Desc  = 'Premiere freezes for a moment every time it auto-saves, which shows up as hitches in playback on big projects. This moves a short interval back to Adobe''s 15-minute default.'
+       Warn  = 'You want very frequent backups: save by hand with Ctrl+S instead. Close Premiere first.'
+       Test  = { $f = Get-PrPrefsFile; if (-not $f) { return $null }; $v = Get-XmlTag ([IO.File]::ReadAllText($f)) 'BE.Prefs.AutoSave.Interval'; if ($null -eq $v) { return $null }; [int]$v -ge 15 }
+       On    = { Assert-AppsClosed 'Adobe Premiere Pro' 'Premiere Pro'; $f = Get-PrPrefsFile; $d = Read-KeepText $f
+               if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = (Get-XmlTag $d.Text 'BE.Prefs.AutoSave.Interval') } }
+               $d.Text = Set-XmlTag $d.Text 'BE.Prefs.AutoSave.Interval' '15'; Write-KeepText $f $d }
+       Off   = { Assert-AppsClosed 'Adobe Premiere Pro' 'Premiere Pro'; $f = Get-PrPrefsFile; $d = Read-KeepText $f
+               $d.Text = Set-XmlTag $d.Text 'BE.Prefs.AutoSave.Interval' "$($script:Backup.Custom[$t.Id].Value)"; Write-KeepText $f $d; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'cr-hwdecode'; Cat = 'Creator'; Icon = [char]0xE7F4; Rec = $true; Requires = { [bool](Get-PrPrefsFile) }
+       Title = 'Premiere: hardware decoding and encoding'
+       Desc  = 'Decodes H.264/HEVC footage and exports H.264/HEVC on the graphics card: much smoother timeline playback and faster exports. On by default; this keeps it on.'
+       Warn  = 'Close Premiere first.'
+       Keys  = @('Project.Prefs.Enableh264Acceleration', 'Project.Prefs.EnablehHWAcceleratedEncode', 'Project.Prefs.EnableNvidiaDecode', 'Project.Prefs.EnableIntelDecode', 'Project.Prefs.EnablehAMDDecode')
+       Test  = { $f = Get-PrPrefsFile; if (-not $f) { return $null }; $x = [IO.File]::ReadAllText($f); $vals = @($t.Keys | ForEach-Object { Get-XmlTag $x $_ } | Where-Object { $null -ne $_ }); if (-not $vals) { return $null }; -not ($vals | Where-Object { $_ -ne 'true' }) }
+       On    = { Assert-AppsClosed 'Adobe Premiere Pro' 'Premiere Pro'; $f = Get-PrPrefsFile; $d = Read-KeepText $f
+               if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $b = @{}; foreach ($k in $t.Keys) { $b[$k] = Get-XmlTag $d.Text $k }; $script:Backup.Custom[$t.Id] = $b }
+               foreach ($k in $t.Keys) { if ($null -ne (Get-XmlTag $d.Text $k)) { $d.Text = Set-XmlTag $d.Text $k 'true' } }; Write-KeepText $f $d }
+       Off   = { Assert-AppsClosed 'Adobe Premiere Pro' 'Premiere Pro'; $f = Get-PrPrefsFile; $d = Read-KeepText $f; $b = $script:Backup.Custom[$t.Id]
+               foreach ($k in $t.Keys) { $v = if ($b -is [hashtable]) { $b[$k] } else { $b.$k }; if ($v) { $d.Text = Set-XmlTag $d.Text $k "$v" } }; Write-KeepText $f $d; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'cr-ramreserve'; Cat = 'Creator'; Icon = [char]0xE964; Rec = $false; Requires = { [bool](Get-MemBalancerFile) }
+       Title = 'Adobe RAM reserve: Adobe''s default'
+       Desc  = 'Premiere, After Effects and Media Encoder share one "RAM reserved for other applications" setting. This sets it back to Adobe''s own default for how much RAM this PC has, so the video apps get the rest.'
+       Warn  = 'You run a game, OBS or a heavy browser next to Premiere and want them to keep more RAM. Close the Adobe video apps first.'
+       Test  = { $r = Get-AdobeReserve; if (-not $r) { return $null }; $r.Current -eq $r.Default }
+       On    = { Assert-AppsClosed $AdobeVideoProcs 'Premiere Pro, After Effects and Media Encoder'; $r = Get-AdobeReserve; if (-not $r) { throw 'Adobe memory settings not found.' }
+               if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = "$($r.Current)" } }
+               $d = Read-KeepText $r.File
+               $d.Text = [regex]::Replace($d.Text, "(<key>memorytouseforotherapplications</key>\s*<int[^>]*>)\d+(</int>)", { param($m) $m.Groups[1].Value + "$($r.Default)" + $m.Groups[2].Value })
+               Write-KeepText $r.File $d }
+       Off   = { Assert-AppsClosed $AdobeVideoProcs 'Premiere Pro, After Effects and Media Encoder'; $f = Get-MemBalancerFile; $v = "$($script:Backup.Custom[$t.Id].Value)"
+               if ($v -match '^\d+$') { $d = Read-KeepText $f; $d.Text = [regex]::Replace($d.Text, "(<key>memorytouseforotherapplications</key>\s*<int[^>]*>)\d+(</int>)", { param($m) $m.Groups[1].Value + $v + $m.Groups[2].Value }); Write-KeepText $f $d }
+               $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'cr-mfr'; Cat = 'Creator'; Icon = [char]0xE9D9; Rec = $true; Requires = { [bool](Get-AePrefsFile) }
+       Title = 'After Effects: Multi-Frame Rendering'
+       Desc  = 'Renders several frames at once on all CPU cores: 1.2 to 4 times faster previews and exports. On by default since 2022; this turns it back on if it was switched off.'
+       Warn  = 'Close After Effects first.'
+       Test  = { $f = Get-AePrefsFile; if (-not $f) { return $null }; $v = Get-AeValue ([IO.File]::ReadAllText($f)) 'Concurrent Frame Rendering' 'Enable Concurrent Frame Renders'; if ($null -eq $v) { return $null }; $v -eq '01' }
+       On    = { Assert-AppsClosed 'AfterFX', 'aerender' 'After Effects'; $f = Get-AePrefsFile; $d = Read-KeepText $f
+               if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = (Get-AeValue $d.Text 'Concurrent Frame Rendering' 'Enable Concurrent Frame Renders') } }
+               $d.Text = Set-AeValue $d.Text 'Concurrent Frame Rendering' 'Enable Concurrent Frame Renders' '01'; Write-KeepText $f $d }
+       Off   = { Assert-AppsClosed 'AfterFX', 'aerender' 'After Effects'; $f = Get-AePrefsFile; $d = Read-KeepText $f; $v = "$($script:Backup.Custom[$t.Id].Value)"
+               if ($v) { $d.Text = Set-AeValue $d.Text 'Concurrent Frame Rendering' 'Enable Concurrent Frame Renders' $v; Write-KeepText $f $d }; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'cr-gpupref'; Cat = 'Creator'; Icon = [char]0xE7F8; Rec = $true
+       Title = 'Adobe apps on the dedicated graphics card'
+       Desc  = 'This PC has two graphics chips. Windows can start Premiere, After Effects, Photoshop or Media Encoder on the weaker built-in one. This pins them to the dedicated card, like Settings > Display > Graphics > High performance.'
+       Warn  = 'Restart the Adobe apps afterwards.'
+       Requires = { @(Get-CreatorExes | Where-Object { $_ -notmatch 'obs' }).Count -gt 0 -and @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Virtual|Parsec|Remote|Basic' }).Count -ge 2 }
+       Test  = { $ex = @(Get-CreatorExes); if (-not $ex) { return $null }; -not ($ex | Where-Object { "$(Get-RegValue $GpuPrefKey $_)" -notmatch 'GpuPreference=2;' }) }
+       On    = { foreach ($e in Get-CreatorExes) { Set-RegTracked 'cr-gpupref' $GpuPrefKey $e 'GpuPreference=2;' 'String' } }
+       Off   = { if (-not (Restore-RegTweak 'cr-gpupref')) { foreach ($e in Get-CreatorExes) { Remove-RegValue $GpuPrefKey $e } } } }
+
+    @{ Id = 'cr-obsprio'; Cat = 'Creator'; Icon = [char]0xE714; Rec = $true; Requires = { Test-Path $ObsIni }
+       Title = 'OBS: Above Normal priority'
+       Desc  = 'OBS needs a bit more CPU priority than normal apps so recordings and streams do not drop frames, but "High" makes the game itself stutter. Above Normal is the balanced setting.'
+       Warn  = 'Close OBS first.'
+       Test  = { if (-not (Test-Path $ObsIni)) { return $null }; $l = Get-Content $ObsIni | Where-Object { $_ -match '^ProcessPriority=' } | Select-Object -First 1; "$l" -eq 'ProcessPriority=AboveNormal' }
+       On    = { Assert-AppsClosed 'obs64' 'OBS'
+               $lines = [IO.File]::ReadAllLines($ObsIni)
+               $cur = $lines | Where-Object { $_ -match '^ProcessPriority=' } | Select-Object -First 1
+               if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = $(if ($cur) { $cur.Substring(16) } else { '' }) } }
+               if ($cur) { $lines = $lines | ForEach-Object { if ($_ -match '^ProcessPriority=') { 'ProcessPriority=AboveNormal' } else { $_ } } }
+               else { $out = New-Object Collections.Generic.List[string]; foreach ($x in $lines) { $out.Add($x); if ($x -eq '[General]') { $out.Add('ProcessPriority=AboveNormal') } }; $lines = $out.ToArray() }
+               $d = Read-KeepText $ObsIni; [IO.File]::WriteAllLines($ObsIni, $lines, (New-Object Text.UTF8Encoding ([bool]$d.Bom))) }
+       Off   = { Assert-AppsClosed 'obs64' 'OBS'; $v = "$($script:Backup.Custom[$t.Id].Value)"
+               $d = Read-KeepText $ObsIni
+               $lines = [IO.File]::ReadAllLines($ObsIni) | Where-Object { $v -or $_ -notmatch '^ProcessPriority=' } | ForEach-Object { if ($v -and $_ -match '^ProcessPriority=') { "ProcessPriority=$v" } else { $_ } }
+               [IO.File]::WriteAllLines($ObsIni, @($lines), (New-Object Text.UTF8Encoding ([bool]$d.Bom))); $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'cr-keepawake'; Cat = 'Creator'; Icon = [char]0xE708; Rec = $true; Requires = { Test-CreatorPc }
+       Title = 'Stay awake while rendering'
+       Desc  = 'While Media Encoder, an After Effects render or a Premiere export is busy, ZeroDelay asks Windows not to sleep, so a long render does not stop halfway. It lets go as soon as the render ends. ZeroDelay must be running (the tray is enough).'
+       Warn  = ''
+       Test  = { [bool](Get-Setting 'keepawake' $false) }
+       On    = { $script:Backup.Custom['keepawake'] = $true; Save-Backup; Start-RenderWatch }
+       Off   = { $script:Backup.Custom['keepawake'] = $false; Save-Backup; [KeepAwake]::Release(); $script:RenderAwake = $false } }
+
+    @{ Id = 'cr-adv-premiere'; Cat = 'Creator'; Icon = [char]0xE946; Action = 'Show how'; Requires = { Test-CreatorPc }
+       Title = 'Smooth 4K timelines in Premiere (advice)'
+       Desc  = 'The GPU renderer, preview at 1/2 resolution and proxies make heavy footage play smoothly without changing export quality. These live inside Premiere, so here is where to find them.'
+       Warn  = ''
+       Run   = { [void][Windows.MessageBox]::Show("1. GPU renderer: File > Project Settings > General > Renderer: 'Mercury Playback Engine GPU Acceleration (CUDA)' on NVIDIA, '(OpenCL)' on AMD. Never 'Software only'.`n`n2. Playback resolution: Program Monitor > the drop-down at the bottom right > 1/2 (or 1/4 for 6K/8K). Export quality is not affected.`n`n3. Proxies for heavy camera files: Project panel > select clips > right-click > Proxy > Create Proxies, then turn on 'Toggle Proxies' in the Program Monitor.`n`n4. Camera footage in 10-bit 4:2:2 (many Sony, Canon, Panasonic cameras): RTX 50 graphics cards and Intel 11th-gen-or-newer integrated graphics decode it in hardware; RTX 40 and older, and AMD, decode it on the CPU, so use proxies there.", 'Premiere Pro playback', 'OK', 'Information'); 'Shown.' } }
+
+    @{ Id = 'cr-adv-cache'; Cat = 'Creator'; Icon = [char]0xE74D; Action = 'Show how'; Requires = { Test-Path "$env:APPDATA\Adobe\Common" }
+       Title = 'Keep the Adobe media cache in check (advice)'
+       Desc  = 'Adobe never deletes its media cache by default, so it grows forever. Let Premiere clean files older than 90 days, and move the cache to a fast second SSD if you have one. Clean up files can empty it now.'
+       Warn  = ''
+       Run   = { [void][Windows.MessageBox]::Show("In Premiere Pro: Edit > Preferences > Media Cache.`n`n- Media Cache Management: choose 'Automatically delete cache files older than 90 days' (or 'when cache exceeds' a size). Restart Premiere.`n- Media Cache Files > Browse: pick a folder on a fast SSD that is not the Windows drive, if you have one.`n`nAfter Effects: Edit > Preferences > Media & Disk Cache: Disk Cache on, on a fast SSD, 100 GB or more.`n`nTo empty the caches now, use Tools > Clean up files with the Adobe apps closed: they rebuild what they need on the next open.", 'Adobe media cache', 'OK', 'Information'); 'Shown.' } }
+
+    @{ Id = 'cr-adv-photoshop'; Cat = 'Creator'; Icon = [char]0xE91B; Action = 'Show how'; Requires = { @(Get-CreatorExes | Where-Object { $_ -like '*Photoshop.exe' }).Count -gt 0 }
+       Title = 'Photoshop performance settings (advice)'
+       Desc  = 'Photoshop keeps its performance settings in a binary file that is not safe to edit from outside, so here are the values to set yourself.'
+       Warn  = ''
+       Run   = { [void][Windows.MessageBox]::Show("Edit > Preferences > Performance:`n- Let Photoshop use: 70-80% of RAM.`n- History states: 20-50 (fewer uses less RAM).`n- Cache levels: 4 (5-8 for very large images, 1-2 for small images with many layers).`n- Use Graphics Processor: on; Advanced Settings: Normal.`n`nEdit > Preferences > Scratch Disks: tick a fast SSD that is not the Windows drive first.", 'Photoshop performance', 'OK', 'Information'); 'Shown.' } }
+
+    @{ Id = 'cr-adv-driver'; Cat = 'Creator'; Icon = [char]0xE896; Action = 'Show how'; Requires = { Test-CreatorPc -and (Test-NvAvailable) }
+       Title = 'Studio or Game Ready driver? (advice)'
+       Desc  = 'Both come from the same code. Studio drivers are released less often and get extra testing in creative apps; no measured speed difference exists. If you mostly game, keep Game Ready.'
+       Warn  = ''
+       Run   = { [void][Windows.MessageBox]::Show("Game Ready: day-one fixes for new games. Best if you mostly play.`n`nStudio: the same driver code, released less often after extra testing in Premiere, After Effects, DaVinci Resolve and others. Switch to it if an Adobe app crashes or shows GPU errors, or before a big deadline.`n`nSwitch in the NVIDIA App: Drivers > the menu next to the driver > Studio Driver. Choose a clean install. Fortnite and ZeroDelay settings are not affected.", 'NVIDIA driver type', 'OK', 'Information'); 'Shown.' } }
+
+    @{ Id = 'cr-adv-obs'; Cat = 'Creator'; Icon = [char]0xE714; Action = 'Show how'; Requires = { Test-Path $ObsIni }
+       Title = 'Record and stream without lag in OBS (advice)'
+       Desc  = 'Use the graphics card''s encoder (NVENC), Game Capture instead of Display Capture, and cap your game FPS so the GPU has room for OBS.'
+       Warn  = ''
+       Run   = { [void][Windows.MessageBox]::Show("Settings > Output > Video Encoder: 'NVIDIA NVENC' (H.264, HEVC or AV1). x264 uses the CPU and competes with the game.`n`nIf OBS says 'Encoding overloaded' or 'Rendering lag':`n- use preset P4 or faster and turn off multipass / Psycho Visual Tuning,`n- cap your game FPS a little below what you reach, so the GPU has room for OBS,`n- use Game Capture for games, not Display Capture,`n- in Game Capture properties, untick 'Multi-adapter Compatibility' on desktops with one graphics card,`n- run OBS as administrator (right-click > Properties > Compatibility): it can then reserve GPU time for itself.", 'OBS performance', 'OK', 'Information'); 'Shown.' } }
+
     # ======================================================= GTX 1080 Ti tab (1.6)
     @{ Id = 'gtx-preset'; Cat = 'Gtx1080Ti'; Icon = [char]0xE7F4; Action = 'Apply'; Gtx = $true; Extra = 'preset'; Requires = { Test-Gtx1080Ti }
        Title = 'GTX 1080 Ti competitive settings'
@@ -3422,7 +3601,7 @@ $LightMap = @{
     '1C1C1E' = 'F2F2F7'; '262628' = 'EBEBF0'; '2C2C2E' = 'FFFFFF'; '3A3A3C' = 'E8E8ED'; '48484A' = 'D2D2D7'; '38383A' = 'E0E0E5'
     'F5F5F7' = '1D1D1F'; 'A1A1A6' = '6E6E73'; '98989D' = '86868B'; '8E8E93' = '86868B'; 'D1D1D6' = '3A3A3C'; 'E5E5EA' = '2C2C2E'
     '5A5A5E' = 'B0B0B5'; '6E6E73' = 'A1A1A6'; '4D4D50' = 'C4C4C9'; '636366' = 'C7C7CC'; '4A4A4D' = 'C7C7CC'; '444446' = 'DADADF'
-    '3D3D41' = 'DCDCE1'; '38383B' = 'D8D8DD'; '303033' = 'EDEDF2'
+    '3D3D41' = 'DCDCE1'; '38383B' = 'D8D8DD'; '303033' = 'EDEDF2'; '2C2C2F' = 'FFFFFF'; '3A3A3D' = 'FFFFFF'; '48484B' = 'D2D2D7'
     '30D158' = '1FA34A'; 'FF9F0A' = 'D97706'; 'FF453A' = 'DC2626'; 'FFD60A' = 'B58900'
     '2D4635' = 'D7F2DF'; '22382A' = 'E6F6EA'; '2F5A3D' = 'B9E3C6'; '4E3E28' = 'FCEBD2'
 }
@@ -3438,6 +3617,27 @@ if (-not $Accents.Contains($script:Accent)) { $script:Accent = 'blue' }
 if ($script:Theme -eq 'light') { foreach ($k in $LightMap.Keys) { [ZdTheme]::Map[$k] = $LightMap[$k] } }
 $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { $Accents[$script:Accent].Dark }
 [ZdTheme]::Map['0A84FF'] = $acc[0]; [ZdTheme]::Map['0071E3'] = $acc[1]; [ZdTheme]::Map['273A4F'] = $acc[2]
+
+# --- Glass: the window shows Windows 11's frosted (acrylic) backdrop and every panel becomes translucent glass with a light
+#     top edge. Windows 10 and older Windows 11 builds keep the solid look.
+$glassPref = if ($env:ZD_GLASS) { $env:ZD_GLASS -ne '0' } elseif ($script:Backup.Custom.ContainsKey('glass')) { [bool]$script:Backup.Custom['glass'] } else { $true }
+$script:GlassSetting = [bool]$glassPref
+$script:Glass = $script:GlassSetting -and [Environment]::OSVersion.Version.Build -ge 22621 -and -not [Windows.SystemParameters]::HighContrast
+if ($script:Glass) {
+    $glassMap = if ($script:Theme -eq 'light') {
+        @{ '262628' = '4DFFFFFF'; '2C2C2E' = 'B8FFFFFF'; '1C1C1E' = '66FFFFFF'; '3A3A3C' = '14000000'; '48484A' = '22000000'; '38383A' = '1A000000'
+           '303033' = '0A000000'; '38383B' = '12000000'; '3D3D41' = '14000000'; '444446' = '18000000'; '4D4D50' = '33000000'; '4A4A4D' = '26000000' }
+    } else {
+        @{ '262628' = '33000000'; '2C2C2E' = '14FFFFFF'; '1C1C1E' = '47000000'; '3A3A3C' = '1AFFFFFF'; '48484A' = '29FFFFFF'; '38383A' = '1AFFFFFF'
+           '303033' = '12FFFFFF'; '38383B' = '0DFFFFFF'; '3D3D41' = '24FFFFFF'; '444446' = '26FFFFFF'; '4D4D50' = '40FFFFFF'; '4A4A4D' = '33FFFFFF' }
+    }
+    foreach ($k in $glassMap.Keys) { [ZdTheme]::Map[$k] = $glassMap[$k] }
+    # cards built from text get the gradient glass fill and the light top edge
+    foreach ($q in "'", '"') {
+        [ZdTheme]::Literal.Add((New-Object 'Collections.Generic.KeyValuePair[string,string]' "Background=$($q)#2C2C2E$q", "Background=$($q){DynamicResource GlassFill}$q"))
+        [ZdTheme]::Literal.Add((New-Object 'Collections.Generic.KeyValuePair[string,string]' "BorderBrush=$($q)#38383A$q", "BorderBrush=$($q){DynamicResource GlassEdge}$q"))
+    }
+}
 
 [xml]$xaml = [ZdTheme]::Apply(@'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -3462,6 +3662,10 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
     <SolidColorBrush x:Key="GreenTint" Color="#2D4635"/>
     <SolidColorBrush x:Key="Orange" Color="#FF9F0A"/>
     <SolidColorBrush x:Key="Red" Color="#FF453A"/>
+    <!-- Glass panels: a soft top-to-bottom fill and a lit top edge. Replaced with real gradients when glass is on. -->
+    <LinearGradientBrush x:Key="GlassFill" StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#2C2C2F" Offset="0"/><GradientStop Color="#2C2C2F" Offset="1"/></LinearGradientBrush>
+    <LinearGradientBrush x:Key="GlassEdge" StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#3A3A3D" Offset="0"/><GradientStop Color="#3A3A3D" Offset="1"/></LinearGradientBrush>
+    <LinearGradientBrush x:Key="GlassEdgeHover" StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#48484B" Offset="0"/><GradientStop Color="#48484B" Offset="1"/></LinearGradientBrush>
 
     <!-- iOS/macOS switch: drawn at 40x24 inside a Viewbox, so Width='34' Height='18' callers scale cleanly. -->
     <Style x:Key="Switch" TargetType="ToggleButton">
@@ -3525,11 +3729,14 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
 
     <!-- Grouped box: graphite on graphite, hairline edge. Not clickable, so no hover change (macOS grouped boxes do not highlight). Never put an Effect on it. -->
     <Style x:Key="Card" TargetType="Border">
-      <Setter Property="Background" Value="{StaticResource BgCard}"/>
-      <Setter Property="BorderBrush" Value="{StaticResource Separator}"/>
+      <Setter Property="Background" Value="{DynamicResource GlassFill}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource GlassEdge}"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="CornerRadius" Value="12"/>
+      <Setter Property="CornerRadius" Value="14"/>
       <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True"><Setter Property="BorderBrush" Value="{DynamicResource GlassEdgeHover}"/></Trigger>
+      </Style.Triggers>
     </Style>
 
     <!-- Source-list row: soft rounded neutral selection, white label when selected. -->
@@ -3769,9 +3976,9 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
     <!-- Rounded tooltip. Shadow is a sibling layer so text keeps ClearType. Popups do not inherit the window font, so it is set here.
          String content uses the wrapping DataTemplate; UIElement content (the rich Warn tooltip) bypasses it. -->
     <Style TargetType="ToolTip">
-      <Setter Property="Background" Value="#3A3A3C"/>
+      <Setter Property="Background" Value="#3A3A3D"/>
       <Setter Property="Foreground" Value="#F5F5F7"/>
-      <Setter Property="BorderBrush" Value="#4A4A4D"/>
+      <Setter Property="BorderBrush" Value="#48484B"/>
       <Setter Property="FontFamily" Value="Inter, Segoe UI Variable Text, Segoe UI"/>
       <Setter Property="FontWeight" Value="Normal"/>
       <Setter Property="Padding" Value="10,6"/>
@@ -3878,10 +4085,10 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
                      IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
                 <Grid Margin="0,0,10,12" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
                       TextElement.FontFamily="Inter, Segoe UI Variable Text, Segoe UI">
-                  <Border CornerRadius="8" Background="#2C2C2E">
+                  <Border CornerRadius="8" Background="#2C2C2F">
                     <Border.Effect><DropShadowEffect BlurRadius="18" ShadowDepth="5" Direction="270" Opacity="0.45" Color="Black"/></Border.Effect>
                   </Border>
-                  <Border CornerRadius="8" Background="#2C2C2E" BorderBrush="#48484A" BorderThickness="1" Padding="4">
+                  <Border CornerRadius="8" Background="#2C2C2F" BorderBrush="#48484B" BorderThickness="1" Padding="4">
                     <ScrollViewer MaxHeight="{TemplateBinding MaxDropDownHeight}" VerticalScrollBarVisibility="Auto">
                       <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
                     </ScrollViewer>
@@ -4029,10 +4236,29 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
             <TextBlock Text="&#xE721;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="13" Foreground="#98989D" Margin="12,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
             <TextBlock x:Name="SearchHint" Text="Search" FontSize="13" Foreground="#98989D" Margin="35,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
           </Grid>
-          <Button x:Name="RestorePoint" Content="Restore point" Style="{StaticResource Btn}" Margin="0,0,8,0"
-                  ToolTip="Create a Windows restore point you can roll back to if anything goes wrong."/>
-          <Button x:Name="RestoreAll" Content="Restore all" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-          <Button x:Name="ApplyRec" Content="Apply recommended" Style="{StaticResource Btn}" Background="#0071E3" Foreground="#FFFFFF"/>
+          <Button x:Name="MoreBtn" Content="&#xE712;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="14" Style="{StaticResource Btn}" Margin="0,0,8,0" Padding="12,8"
+                  ToolTip="Restore point and undo everything"/>
+          <Popup x:Name="MorePop" PlacementTarget="{Binding ElementName=MoreBtn}" Placement="Bottom" HorizontalOffset="-150" VerticalOffset="6" StaysOpen="False" AllowsTransparency="True" PopupAnimation="Fade">
+            <Grid Margin="0,0,10,12" TextElement.FontFamily="Inter, Segoe UI Variable Text, Segoe UI">
+              <Border CornerRadius="12" Background="#2C2C2F">
+                <Border.Effect><DropShadowEffect BlurRadius="20" ShadowDepth="6" Direction="270" Opacity="0.45" Color="Black"/></Border.Effect>
+              </Border>
+              <Border CornerRadius="12" Background="#2C2C2F" BorderBrush="#48484B" BorderThickness="1" Padding="6">
+                <StackPanel MinWidth="230">
+                  <Button x:Name="RestorePoint" Style="{StaticResource Btn}" Background="Transparent" HorizontalContentAlignment="Left" Padding="12,9" Margin="0,0,0,2"
+                          ToolTip="A Windows restore point you can roll back to if anything goes wrong.">
+                    <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE777;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Margin="0,1,10,0"/><TextBlock Text="Create restore point"/></StackPanel>
+                  </Button>
+                  <Button x:Name="RestoreAll" Style="{StaticResource Btn}" Background="Transparent" HorizontalContentAlignment="Left" Padding="12,9">
+                    <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE7A7;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Margin="0,1,10,0"/><TextBlock Text="Undo everything (restore all)"/></StackPanel>
+                  </Button>
+                </StackPanel>
+              </Border>
+            </Grid>
+          </Popup>
+          <Button x:Name="ApplyRec" Style="{StaticResource Btn}" Background="#0071E3" Foreground="#FFFFFF" Padding="16,8" ToolTip="Switch on every recommended tweak that fits this PC. Everything can be undone.">
+            <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE945;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Margin="0,1,8,0"/><TextBlock Text="Optimize"/></StackPanel>
+          </Button>
         </StackPanel>
       </Grid>
       <StackPanel Grid.Row="1">
@@ -4092,10 +4318,10 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
       <ContentControl x:Name="PageHost" Grid.Row="2" Visibility="Collapsed"/>
 
       <Grid x:Name="Toast" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,28" Visibility="Collapsed">
-        <Border CornerRadius="14" Background="#3A3A3C">
+        <Border CornerRadius="14" Background="#3A3A3D">
           <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.45" Color="Black"/></Border.Effect>
         </Border>
-        <Border CornerRadius="14" Background="#3A3A3C" BorderBrush="#48484A" BorderThickness="1" Padding="14,10,18,10">
+        <Border CornerRadius="14" Background="#3A3A3D" BorderBrush="#48484B" BorderThickness="1" Padding="14,10,18,10">
           <StackPanel Orientation="Horizontal">
             <TextBlock x:Name="ToastIcon" Text="&#xE73E;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="15" Foreground="#30D158" VerticalAlignment="Center" Margin="0,0,10,0" Visibility="Collapsed"/>
             <TextBlock x:Name="ToastText" FontSize="13" FontWeight="Medium" Foreground="#F5F5F7" TextWrapping="Wrap" MaxWidth="560" VerticalAlignment="Center" LineHeight="18" LineStackingStrategy="BlockLineHeight"/>
@@ -4105,10 +4331,10 @@ $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { 
     </Grid>
     <Grid x:Name="Wizard" Grid.ColumnSpan="2" Background="#99000000" Visibility="Collapsed">
       <Grid Width="600" Margin="24" VerticalAlignment="Center" HorizontalAlignment="Center">
-        <Border CornerRadius="16" Background="#2C2C2E">
+        <Border CornerRadius="16" Background="#2C2C2F">
           <Border.Effect><DropShadowEffect BlurRadius="48" ShadowDepth="16" Direction="270" Opacity="0.55" Color="Black"/></Border.Effect>
         </Border>
-        <Border Background="#2C2C2E" BorderBrush="#48484A" BorderThickness="1" CornerRadius="16" Padding="32,28,20,28">
+        <Border Background="#2C2C2F" BorderBrush="#48484B" BorderThickness="1" CornerRadius="16" Padding="32,28,20,28">
           <ScrollViewer Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="0,0,12,0">
             <ContentControl x:Name="WizardBody"/>
           </ScrollViewer>
@@ -4160,11 +4386,37 @@ function Save-LogoIco([string]$Path) {
 }
 $window.Icon = New-LogoBitmap 64
 try { Add-Type -Namespace ZD -Name Dwm -MemberDefinition '[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int s);' } catch {}
+try { Add-Type -Namespace ZD -Name DwmFrame -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct MARGINS { public int L, R, T, B; } [DllImport("dwmapi.dll")] public static extern int DwmExtendFrameIntoClientArea(IntPtr h, ref MARGINS m);' } catch {}
+# real gradients for the glass resources
+function Set-GlassBrushes {
+    if (-not $script:Glass) { return }
+    function Grad([string]$top, [string]$bottom) {
+        $g = New-Object Windows.Media.LinearGradientBrush; $g.StartPoint = '0,0'; $g.EndPoint = '0,1'
+        $g.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($top)), 0))
+        $g.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($bottom)), 1))
+        $g
+    }
+    if ($script:Theme -eq 'light') {
+        $window.Resources['GlassFill'] = [Windows.Media.Brush](Grad '#E6FFFFFF' '#B3FFFFFF'); $window.Resources['GlassEdge'] = [Windows.Media.Brush](Grad '#FFFFFFFF' '#1F000000'); $window.Resources['GlassEdgeHover'] = [Windows.Media.Brush](Grad '#FFFFFFFF' '#33000000')
+    } else {
+        $window.Resources['GlassFill'] = [Windows.Media.Brush](Grad '#21FFFFFF' '#0AFFFFFF'); $window.Resources['GlassEdge'] = [Windows.Media.Brush](Grad '#47FFFFFF' '#0FFFFFFF'); $window.Resources['GlassEdgeHover'] = [Windows.Media.Brush](Grad '#7AFFFFFF' '#24FFFFFF')
+    }
+}
+Set-GlassBrushes
 $window.Add_SourceInitialized({
     try {
         $h = (New-Object Windows.Interop.WindowInteropHelper $window).Handle
         $dk = $script:Theme -ne 'light'
         $v = [int]$dk; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$v, 4)                         # dark title bar
+        if ($script:Glass -and -not $Snapshot) {
+            # frosted acrylic backdrop behind the whole window, title bar included (dev renders keep their stand-in)
+            $hs = [Windows.Interop.HwndSource]::FromHwnd($h); $hs.CompositionTarget.BackgroundColor = [Windows.Media.Colors]::Transparent
+            $m = New-Object ZD.DwmFrame+MARGINS; $m.L = -1; $m.R = -1; $m.T = -1; $m.B = -1
+            [void][ZD.DwmFrame]::DwmExtendFrameIntoClientArea($h, [ref]$m)
+            $v = 3; $hr = [ZD.Dwm]::DwmSetWindowAttribute($h, 38, [ref]$v, 4)                            # DWMSBT_TRANSIENTWINDOW (acrylic)
+            if ($hr -eq 0) { $window.Background = [Windows.Media.Brushes]::Transparent; return }
+            $window.Background = [ZdTheme]::Brush('#1C1C1E')   # backdrop refused: solid window, glass panels on top
+        }
         $v = if ($dk) { 0x001E1C1C } else { 0x00F7F2F2 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 35, [ref]$v, 4)  # caption = window colour
         $v = if ($dk) { 0x003A3838 } else { 0x00E5E0E0 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 34, [ref]$v, 4)  # border = separator
     } catch {}
@@ -4175,7 +4427,7 @@ if (Test-Path $LogoIco) {
     try { $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$LogoIco, 'None', 'OnLoad') } catch {}
 }
 $ui = @{}
-foreach ($n in 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
+foreach ($n in 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
             'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon',
             'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet') { $ui[$n] = $window.FindName($n) }
@@ -4325,6 +4577,9 @@ function New-Card($t) {
 </Border>
 "@
     $card = [ZdTheme]::Parse($cardXaml)
+    $card.RenderTransform = New-Object Windows.Media.TranslateTransform
+    $card.Add_MouseEnter({ param($s, $e) if ($script:Anim -and $s.RenderTransform -is [Windows.Media.TranslateTransform]) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
+    $card.Add_MouseLeave({ param($s, $e) if ($script:Anim -and $s.RenderTransform -is [Windows.Media.TranslateTransform]) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
     $card.Tag = $t
     $t.Card = $card
     $t.Toggle = $card.FindName('Toggle')
@@ -4660,6 +4915,7 @@ function Update-Summary {
     $ui.RestoreAll.IsEnabled = ($script:Backup.Registry.Count -gt 0 -or $script:Backup.Custom.Count -gt 0)
     Update-RestartBar
     if ($script:CurrentCat) { Update-Filter }
+    if ($script:HomeUi) { Update-HomePage }
 }
 
 function Update-RestartBar {
@@ -4748,6 +5004,7 @@ function Start-PingTest($btn) {
 
 # ---------------------------------------------------------- navigation ----
 $Categories = @(
+    @{ Name = 'Home';       Icon = [char]0xE80F; Title = 'Home'; Page = 'Home' }
     @{ Name = 'All';        Icon = [char]0xE80F; Title = 'All optimizations' }
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
        Note = 'Only the tweaks that change input delay, frame time or ping. Green icons mark them in every tab.' }
@@ -4757,6 +5014,8 @@ $Categories = @(
        Note = 'Ugly but fast. Performance mode, low mesh and lower 3D resolution give the biggest gains; Fortnite must be closed to apply.' }
     @{ Name = 'Gtx1080Ti';  Icon = [char]0xE7F4; Title = 'GTX 1080 Ti'; Requires = { Test-Gtx1080Ti }
        Note = 'Everything that matters for a GTX 1080 Ti in one place. This 2017 card has no DLSS, frame generation or RTX features, and is now on a security-only driver branch, so some general advice does not apply to it.' }
+    @{ Name = 'Creator';    Icon = [char]0xE714; Title = 'Creator'; Requires = { Test-CreatorPc }
+       Note = 'For Premiere Pro, After Effects, Photoshop, Media Encoder and OBS. Close the app before you flip a switch: Adobe apps and OBS rewrite their settings when they close.' }
     @{ Name = 'Fortnite';   Icon = [char]0xE7FC; Title = 'Fortnite' }
     @{ Name = 'System';     Icon = [char]0xE7F8; Title = 'System' }
     @{ Name = 'Power';      Icon = [char]0xE945; Title = 'Power & CPU' }
@@ -5936,7 +6195,7 @@ function New-SettingsPage {
       <TextBlock Text='Appearance' FontSize='14' FontWeight='SemiBold'/>
       <Grid Margin='0,14,0,0'>
         <Grid.ColumnDefinitions><ColumnDefinition Width='120'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-        <Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+        <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
         <TextBlock Text='Theme' Foreground='#A1A1A6' FontSize='12.5' VerticalAlignment='Center'/>
         <StackPanel Grid.Column='1' Orientation='Horizontal'>
           <Button x:Name='T_dark' Content='Dark' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='72'/>
@@ -5945,6 +6204,11 @@ function New-SettingsPage {
         </StackPanel>
         <TextBlock Grid.Row='1' Text='Accent colour' Foreground='#A1A1A6' FontSize='12.5' VerticalAlignment='Center' Margin='0,14,0,0'/>
         <StackPanel x:Name='Swatches' Grid.Row='1' Grid.Column='1' Orientation='Horizontal' Margin='0,14,0,0'/>
+        <TextBlock Grid.Row='2' Text='Glass' Foreground='#A1A1A6' FontSize='12.5' VerticalAlignment='Center' Margin='0,14,0,0'/>
+        <StackPanel Grid.Row='2' Grid.Column='1' Orientation='Horizontal' Margin='0,14,0,0'>
+          <ToggleButton x:Name='S_glass' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
+          <TextBlock Text='Frosted, see-through window and panels (Windows 11)' Foreground='#98989D' FontSize='12' VerticalAlignment='Center' Margin='10,0,0,0'/>
+        </StackPanel>
       </Grid>
       <Border x:Name='ThemeNote' Background='#1C1C1E' CornerRadius='8' Padding='14,10' Margin='0,16,0,0' Visibility='Collapsed'>
         <Grid>
@@ -5985,7 +6249,7 @@ function New-SettingsPage {
   </Border>
 </StackPanel>
 "@)
-    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'S_autoupdate', 'S_startup', 'S_matchreport', 'UpdReport', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply',
+    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'S_autoupdate', 'S_startup', 'S_matchreport', 'UpdReport', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply', 'S_glass',
                               'VerTitle', 'UpdStatus', 'UpdCheck', 'UpdGet', 'UpdRepo') { $st[$n] = $root.FindName($n) }
     $script:SetUi = $st
     $st.S_closetotray.IsChecked = [bool](Get-Setting 'closetotray' $true)
@@ -6028,6 +6292,9 @@ function New-SettingsPage {
         [void]$st.Swatches.Children.Add($ring)
     }
     $st.ThemeApply.Add_Click({ Restart-ZeroDelay })
+    $st.S_glass.IsChecked = [bool](Get-Setting 'glass' $true)
+    if ([Environment]::OSVersion.Version.Build -lt 22621) { $st.S_glass.IsEnabled = $false; $st.S_glass.ToolTip = 'Needs Windows 11 22H2 or newer' }
+    $st.S_glass.Add_Click({ param($s, $e) $script:Backup.Custom['glass'] = [bool]$s.IsChecked; Save-Backup; Update-AppearanceUi })
     Update-AppearanceUi
     # version and updates
     $st.VerTitle.Text = "ZeroDelay $AppVersion"
@@ -6051,7 +6318,7 @@ function Update-AppearanceUi {
     foreach ($ring in $st.Swatches.Children) {
         $ring.BorderBrush = if ($ring.Tag -eq $acc) { [ZdTheme]::Brush('#F5F5F7') } else { [Windows.Media.Brushes]::Transparent }
     }
-    $changed = ($mode -ne $script:ThemeMode) -or ($acc -ne $script:Accent)
+    $changed = ($mode -ne $script:ThemeMode) -or ($acc -ne $script:Accent) -or ([bool](Get-Setting 'glass' $true) -ne $script:GlassSetting)
     $st.ThemeNote.Visibility = if ($changed) { 'Visible' } else { 'Collapsed' }
 }
 # Closes this window and starts a fresh copy on the Settings page (used to switch theme).
@@ -6194,6 +6461,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.7.0' = @(
+        @{ T = 'A cleaner ZeroDelay'; D = 'A new Home page with one Optimize button, a shorter menu with folding Tweaks and Tools groups, and Restore point / Undo everything tucked into the menu next to Optimize.' }
+        @{ T = 'Glass'; D = 'Frosted, see-through window and glass panels on Windows 11, with cards that lift under the mouse. Switch it off in Settings > Appearance.' }
+        @{ T = 'Creator tab'; D = 'For Premiere Pro, After Effects, Photoshop, Media Encoder and OBS: auto-save hitches, Adobe RAM reserve, Multi-Frame Rendering, Adobe apps on the right graphics card, OBS priority and staying awake during renders.' }
+        @{ T = 'App icons in Uninstall apps'; D = 'Programs and Store apps now show their own icons, so you find them at a glance.' }
+        @{ T = 'Adobe caches in Clean up'; D = 'Adobe media cache and the After Effects disk cache can be emptied, only while the apps are closed.' }
+    )
     '1.6.0' = @(
         @{ T = 'ZeroDelay now knows your PC'; D = 'On first start (and every few days) it scans the hardware, drivers, Windows and every installed app, then adapts which tweaks it recommends. See Tools > This PC.' }
         @{ T = 'Recommendations that fit'; D = 'Laptops keep battery-draining power tweaks out of Apply recommended, streamers keep their frames, and cards for hardware or apps you do not have stay hidden.' }
@@ -6709,6 +6983,14 @@ $AppScanScript = {
     param($opt)
     $list = New-Object Collections.ArrayList
     $seen = @{}
+    # Start-menu shortcuts by name -> the exe they open (used for icons when an app registers none)
+    $lnkIndex = @{}
+    $sh = New-Object -ComObject WScript.Shell
+    foreach ($r in "$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs") {
+        foreach ($l in Get-ChildItem -LiteralPath $r -Recurse -Filter *.lnk -ErrorAction SilentlyContinue) {
+            try { $tgt = $sh.CreateShortcut($l.FullName).TargetPath; if ($tgt -and $tgt -like '*.exe' -and $tgt -notmatch '(?i)unins|\\Windows\\') { $k = $l.BaseName.ToLower(); if (-not $lnkIndex.ContainsKey($k)) { $lnkIndex[$k] = $tgt } } } catch {}
+        }
+    }
     foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
         foreach ($k in Get-ChildItem $root -ErrorAction SilentlyContinue) {
             $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
@@ -6719,19 +7001,58 @@ $AppScanScript = {
             $seen[$id] = $true
             $date = $null
             if ("$($p.InstallDate)" -match '^(\d{4})(\d{2})(\d{2})$') { try { $date = Get-Date -Year $Matches[1] -Month $Matches[2] -Day $Matches[3] } catch {} }
+            # the app's own icon (the one Settings > Apps shows), as PNG bytes. Fallbacks: the uninstaller, the app's
+            # Start-menu shortcut, then an exe in its install folder whose name matches the app.
+            $png = $null
+            $nameKey = ("$($p.DisplayName)" -replace '\s*\(.*?\)|\s+v?\d+(\.\d+)+.*$', '').Trim().ToLower()
+            $first = ($nameKey -split '\s+')[0]
+            $lnkTarget = $null
+            if ($nameKey) {
+                $hit = $lnkIndex.Keys | Where-Object { $_ -eq $nameKey } | Select-Object -First 1
+                if (-not $hit -and $first.Length -ge 4) { $hit = $lnkIndex.Keys | Where-Object { $_ -like "$nameKey*" -or $_ -like "$first*" } | Select-Object -First 1 }
+                if ($hit) { $lnkTarget = $lnkIndex[$hit] }
+            }
+            $dirExe = $null
+            if ($p.InstallLocation -and $first.Length -ge 3 -and (Test-Path -LiteralPath "$($p.InstallLocation)".Trim('"'))) {
+                $dirExe = Get-ChildItem -LiteralPath "$($p.InstallLocation)".Trim('"') -Filter *.exe -File -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -like "*$first*" -and $_.Name -notmatch '(?i)unins|setup|update|crash|helper' } | Select-Object -First 1 -ExpandProperty FullName
+            }
+            foreach ($src in "$($p.DisplayIcon)", "$($p.UninstallString)", "$lnkTarget", "$dirExe") {
+                if ($png -or -not $src -or $src -match '(?i)msiexec|rundll32') { continue }
+                $path = if ($src.Trim().StartsWith('"')) { $src.Trim().Split('"')[1] } else { ($src -split '(?i)(?<=\.(exe|ico|dll))')[0] }
+                $path = ($path -replace ',\s*-?\d+\s*$', '').Trim().Trim('"')
+                if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+                try {
+                    $icon = if ($path -match '(?i)\.ico$') { New-Object System.Drawing.Icon $path, 48, 48 } else { [System.Drawing.Icon]::ExtractAssociatedIcon($path) }
+                    $bmp = $icon.ToBitmap(); $ms = New-Object IO.MemoryStream
+                    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); $png = $ms.ToArray()
+                    $bmp.Dispose(); $icon.Dispose(); $ms.Dispose()
+                } catch {}
+            }
             [void]$list.Add([pscustomobject]@{ Kind = 'desktop'; Name = "$($p.DisplayName)".Trim(); Publisher = "$($p.Publisher)".Trim(); Version = "$($p.DisplayVersion)"
                 SizeMb = $(if ($p.EstimatedSize) { [Math]::Round($p.EstimatedSize / 1024.0) } else { $null }); Date = $date; Uninstall = "$($p.UninstallString)"; Id = $k.PSChildName; Bloat = $false
-                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:') })
+                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:'); IconPng = $png })
         }
     }
     foreach ($a in @(Get-AppxPackage -PackageTypeFilter Main -ErrorAction SilentlyContinue)) {
         if ($a.IsFramework -or $a.NonRemovable -or "$($a.SignatureKind)" -eq 'System' -or $opt.Protected -contains $a.Name) { continue }
-        $dn = $null; $pub = $null
+        $dn = $null; $pub = $null; $png = $null
         try { [xml]$m = Get-Content (Join-Path $a.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop; $dn = "$($m.Package.Properties.DisplayName)"; $pub = "$($m.Package.Properties.PublisherDisplayName)" } catch {}
+        # Store logo: the manifest names a base file; the package ships size variants (scale-100, targetsize-48, ...)
+        try {
+            $lg = "$($m.Package.Properties.Logo)"
+            if ($lg) {
+                $full = Join-Path $a.InstallLocation $lg
+                $pick = if (Test-Path -LiteralPath $full) { $full } else {
+                    Get-ChildItem -LiteralPath (Split-Path $full) -Filter "$([IO.Path]::GetFileNameWithoutExtension($full)).*$([IO.Path]::GetExtension($full))" -ErrorAction SilentlyContinue |
+                        Sort-Object { if ($_.Name -match 'scale-100|targetsize-48') { 0 } elseif ($_.Name -match 'scale-1[25]0|targetsize-(32|64)') { 1 } elseif ($_.Name -match 'scale-200') { 2 } else { 3 } } |
+                        Select-Object -First 1 -ExpandProperty FullName }
+                if ($pick -and (Get-Item -LiteralPath $pick).Length -lt 200KB) { $png = [IO.File]::ReadAllBytes($pick) }
+            }
+        } catch {}
         if (-not $dn -or $dn -like 'ms-resource:*') { $dn = (($a.Name -replace '^[^.]+\.', '') -creplace '([a-z])([A-Z])', '$1 $2') }
         if (-not $pub -or $pub -like 'ms-resource:*') { $pub = ($a.Publisher -replace '^CN=([^,]+).*', '$1') }
         [void]$list.Add([pscustomobject]@{ Kind = 'store'; Name = $dn; Publisher = $pub; Version = "$($a.Version)"; SizeMb = $null; Date = $null
-            Full = $a.PackageFullName; Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name) })
+            Full = $a.PackageFullName; Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name); IconPng = $png })
     }
     $list
 }
@@ -6811,11 +7132,18 @@ function Update-AppsList {
         $a = $items[$i]
         $sub = @($a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
         $tag = if ($a.Bloat) { "<Border Background='#4E3E28' CornerRadius='5' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='#FF9F0A'/></Border>" } else { '' }
-        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='10' Padding='16,10' Margin='0,0,0,6'><Grid>" +
-        "<Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
-        "<StackPanel VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>$tag</StackPanel>" +
+        # icon slot: a letter tile in the app's own colour, covered by the real icon when there is one
+        $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
+        $letter = if ($nm) { Esc $nm.Substring(0, 1).ToUpper() } else { '?' }
+        $tint = $AppTileColors[[Math]::Abs(("$($a.Name)".GetHashCode())) % $AppTileColors.Count]
+        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='10' Padding='12,10,16,10' Margin='0,0,0,6'><Grid>" +
+        "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        "<Grid Width='36' Height='36' Margin='0,0,14,0' VerticalAlignment='Center'>" +
+        "<Border x:Name='T_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='16' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
+        "<Image x:Name='I_$i' Width='32' Height='32' HorizontalAlignment='Center' VerticalAlignment='Center' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>" +
+        "<StackPanel Grid.Column='1' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>$tag</StackPanel>" +
         "<TextBlock Text='$(Esc ($sub -join '  ·  '))' FontSize='12' Foreground='#98989D' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/></StackPanel>" +
-        "<StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center' Margin='12,0,0,0'>" +
+        "<StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center' Margin='12,0,0,0'>" +
         "<Button x:Name='U_$i' Content='Uninstall' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,6,0'/>" +
         "<Button x:Name='F_$i' Content='Force remove' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Foreground='#FF453A' ToolTip='$(Esc $(if ($a.Kind -eq 'store') { 'Removes it for every account on this PC and stops Windows from installing it again for new accounts.' } else { 'Skips the app''s own uninstaller: closes it, then deletes its files, settings, shortcuts, services and tasks. For apps whose normal uninstall fails.' }))'/>" +
         "</StackPanel></Grid></Border>"
@@ -6823,12 +7151,26 @@ function Update-AppsList {
     if (-not $items.Count) { $rows = @("<TextBlock Text='Nothing matches.' Foreground='#98989D' FontSize='13' Margin='4,4,0,0'/>") }
     $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($rows -join '')</StackPanel>")
     for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
+        $img = Get-AppIconSource $items[$i]
+        if ($img) { $panel.FindName("I_$i").Source = $img; $panel.FindName("T_$i").Visibility = 'Collapsed' }
         $b = $panel.FindName("U_$i"); $b.Tag = $items[$i]
         $b.Add_Click({ param($s, $e) Invoke-AppUninstall $s.Tag })
         $b = $panel.FindName("F_$i"); $b.Tag = $items[$i]
         $b.Add_Click({ param($s, $e) Invoke-ForceRemove $s.Tag })
     }
     $au.List.Content = $panel
+}
+# App icons: made once from the PNG bytes the scan collected, then reused when the list is filtered or sorted.
+$AppTileColors = @('#5E5CE6', '#0A84FF', '#30B0C7', '#34C759', '#FF9F0A', '#FF6482', '#BF5AF2', '#AC8E68', '#8E8E93')
+function Get-AppIconSource($app) {
+    if ($app.IconSrc) { return $app.IconSrc }
+    if (-not $app.IconPng) { return $null }
+    try {
+        $bi = New-Object Windows.Media.Imaging.BitmapImage
+        $bi.BeginInit(); $bi.StreamSource = New-Object IO.MemoryStream (, [byte[]]$app.IconPng); $bi.CacheOption = 'OnLoad'; $bi.DecodePixelWidth = 64; $bi.EndInit(); $bi.Freeze()
+        $app | Add-Member -NotePropertyName IconSrc -NotePropertyValue $bi -Force
+        $bi
+    } catch { $null }
 }
 function Invoke-AppUninstall($app) {
     if ($app.Kind -eq 'store') {
@@ -7172,6 +7514,28 @@ $CleanTargets = @(
     @{ Key = 'recycle'; Title = 'Recycle Bin'; Default = $false; Recycle = $true
        Desc = 'Permanently deletes everything in the Recycle Bin. Look inside first if you are not sure.' }
 )
+# Adobe caches: added only on PCs with Adobe video apps; skipped while any of them is open
+if (Test-Path "$env:APPDATA\Adobe\Common") {
+    $mc = @("$env:APPDATA\Adobe\Common\Media Cache Files", "$env:APPDATA\Adobe\Common\Media Cache", "$env:APPDATA\Adobe\Common\Peak Files")
+    foreach ($k in @(Get-Item 'HKCU:\Software\Adobe\Common *\Media Cache' -ErrorAction SilentlyContinue)) {
+        $fp = "$((Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).FolderPath)".TrimEnd('\')
+        if ($fp -and $fp -notlike "$env:APPDATA\Adobe\Common*") { $mc += "$fp\Media Cache Files", "$fp\Media Cache", "$fp\Peak Files" }
+    }
+    $CleanTargets += @{ Key = 'adobecache'; Title = 'Adobe media cache'; Default = $false; Age = 0; Block = $AdobeVideoProcs
+        Desc = 'Audio conform and preview files for Premiere, After Effects and Media Encoder. They are rebuilt when you open a project (the first playback is slower). Skipped while an Adobe video app is open.'
+        Dirs = @($mc | Select-Object -Unique) }
+}
+$aeFile = Get-AePrefsFile
+if ($aeFile) {
+    $folder = "$(Get-AeValue ([IO.File]::ReadAllText($aeFile)) 'Disk Cache Controls' 'Folder 7')".Trim().Trim('"') -replace '\\\\', '\'
+    # only a folder that is clearly a cache, never a drive root or a personal folder
+    if ($folder -and $folder -match '(?i)cache' -and $folder.Length -gt 6 -and (Test-Path -LiteralPath $folder)) {
+        $CleanTargets += @{ Key = 'aecache'; Title = 'After Effects disk cache'; Default = $false; Age = 0; Block = @('AfterFX', 'aerender')
+            Desc = "Rendered preview frames in $folder. After Effects re-renders them when needed. Skipped while After Effects is open."
+            Dirs = @($folder) }
+    }
+}
+
 # Scans (Clean = false) or deletes (Clean = true) the chosen targets; returns one result per target.
 $CleanWorker = {
     param($job)
@@ -7179,6 +7543,7 @@ $CleanWorker = {
     foreach ($t in $job.Targets) {
         if ($job.Keys -notcontains $t.Key) { continue }
         $bytes = [long]0; $files = 0; $skipped = 0
+        if ($job.Clean -and $t.Block -and (Get-Process -Name $t.Block -ErrorAction SilentlyContinue)) { [pscustomobject]@{ Key = $t.Key; Bytes = 0; Files = 0; Skipped = 1 }; continue }
         if ($t.Recycle) {
             try { $sh = New-Object -ComObject Shell.Application; foreach ($it in @($sh.Namespace(10).Items())) { $bytes += [long]$it.ExtendedProperty('Size'); $files++ } } catch {}
             if ($job.Clean -and $files) { try { Clear-RecycleBin -Force -ErrorAction Stop } catch { $skipped = $files; $bytes = 0; $files = 0 } }
@@ -7615,9 +7980,11 @@ function Set-ProfileTailoring {
         if ($pm) { $pm.Rec = $true; $pm.TailorWhy = 'GTX 1080 Ti: Performance mode is the right renderer for this card.' }
         [void]$notes.Add('GTX 1080 Ti: a tab of its own was added (left menu). Performance rendering mode is now part of Apply recommended; cards for features the card does not have (frame generation, Smooth Motion, low textures for small graphics memory) are hidden; driver alerts only point to the 580 security branch.')
     }
+    if (Test-CreatorPc) { [void]$notes.Add('Creator apps found (Adobe, OBS): a Creator tab was added, and Game Mode leaves Creative Cloud running while an Adobe app is open, so fonts and licences keep working.') }
     $opt = @($p.Software.'Other optimizers')
     if ($opt.Count) { [void]$notes.Add("Other optimizers installed: $($opt -join ', '). They can change the same settings; drift alerts will tell you when they do.") }
     $script:TailorNotes = @($notes)
+    if ($script:HomeUi) { Update-HomePage }
     foreach ($t in $Tweaks) {
         if (-not $t.Card) { continue }
         $tag = $t.Card.FindName('RecTag')
@@ -7631,6 +7998,28 @@ function Set-GpuTailoring {
         $t = $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1
         if ($t) { $t.ForceHidden = $true; $t.Rec = $false; if ($t.Card) { $t.Card.Visibility = 'Collapsed' } }
     }
+}
+# --- Keep awake while a render runs: checks every 20 s how busy the render processes are.
+function Start-RenderWatch {
+    if (-not $script:RenderTimer) {
+        $script:RenderTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:RenderTimer.Interval = [TimeSpan]::FromSeconds(20)
+        $script:RenderCpu = @{}
+        $script:RenderTimer.Add_Tick({
+            if (-not (Get-Setting 'keepawake' $false)) { $script:RenderTimer.Stop(); [KeepAwake]::Release(); $script:RenderAwake = $false; return }
+            $now = @{}; $busy = $false
+            foreach ($p in Get-Process -Name 'Adobe Media Encoder', 'aerender', 'AfterFX', 'Adobe Premiere Pro' -ErrorAction SilentlyContinue) {
+                $c = $null; try { $c = $p.TotalProcessorTime.TotalSeconds } catch {}
+                if ($null -eq $c) { continue }
+                $now[$p.Id] = $c
+                if ($script:RenderCpu.ContainsKey($p.Id) -and (($c - $script:RenderCpu[$p.Id]) / 20 / [Environment]::ProcessorCount) -gt 0.2) { $busy = $true }
+            }
+            $script:RenderCpu = $now
+            if ($busy -and -not $script:RenderAwake) { [KeepAwake]::Hold(); $script:RenderAwake = $true }
+            elseif (-not $busy -and $script:RenderAwake) { [KeepAwake]::Release(); $script:RenderAwake = $false }
+        })
+    }
+    $script:RenderTimer.Start()
 }
 function Update-WizardProfileLine {
     $p = $script:SysProfile
@@ -7736,6 +8125,131 @@ function Update-ThisPCPage {
 "@)
     $panel.FindName('ShowApps').Add_Click({ param($s, $e) $l = $s.Parent.Parent.Children[1]; $vis = $l.Visibility -ne 'Visible'; $l.Visibility = if ($vis) { 'Visible' } else { 'Collapsed' }; $s.Content = if ($vis) { 'Hide' } else { 'Show all' } })
     $u.Body.Content = $panel
+}
+
+# =============================================================== Home: one place, one button
+function New-HomePage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='34,30' Margin='0,0,0,16'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <Grid Width='132' Height='132' VerticalAlignment='Center'>
+        <Ellipse Stroke='#3A3A3C' StrokeThickness='11'/>
+        <Ellipse x:Name='Ring' Stroke='#30D158' StrokeThickness='11' StrokeDashCap='Round' RenderTransformOrigin='0.5,0.5'>
+          <Ellipse.RenderTransform><RotateTransform Angle='-90'/></Ellipse.RenderTransform>
+        </Ellipse>
+        <StackPanel VerticalAlignment='Center' HorizontalAlignment='Center'>
+          <TextBlock x:Name='Pct' Text='0' FontSize='38' FontWeight='Bold' HorizontalAlignment='Center' Typography.NumeralAlignment='Tabular'/>
+          <TextBlock Text='optimized' FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center' Margin='0,-4,0,0'/>
+        </StackPanel>
+      </Grid>
+      <StackPanel Grid.Column='1' Margin='30,0,24,0' VerticalAlignment='Center'>
+        <TextBlock x:Name='Headline' FontSize='26' FontWeight='Bold' TextWrapping='Wrap'/>
+        <TextBlock x:Name='Sub' FontSize='13.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'/>
+      </StackPanel>
+      <Button x:Name='Go' Grid.Column='2' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='26,13' FontSize='15' VerticalAlignment='Center'>
+        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,10,0'/><TextBlock x:Name='GoText' Text='Optimize'/></StackPanel>
+      </Button>
+    </Grid>
+  </Border>
+  <UniformGrid Columns='3'>
+    <Border Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12'>
+      <StackPanel>
+        <Grid><TextBlock Text='Game Mode' FontSize='15' FontWeight='SemiBold'/><ToggleButton x:Name='Gm' Style='{DynamicResource Switch}' HorizontalAlignment='Right'/></Grid>
+        <TextBlock x:Name='GmText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
+      </StackPanel>
+    </Border>
+    <Border x:Name='HealthTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+      <StackPanel>
+        <Grid><TextBlock Text='Health check' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
+        <TextBlock x:Name='HealthText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
+      </StackPanel>
+    </Border>
+    <Border x:Name='MatchTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+      <StackPanel>
+        <Grid><TextBlock Text='Last match' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
+        <TextBlock x:Name='MatchText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
+      </StackPanel>
+    </Border>
+    <Border x:Name='PcTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+      <StackPanel>
+        <Grid><TextBlock Text='This PC' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
+        <TextBlock x:Name='PcText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
+      </StackPanel>
+    </Border>
+    <Border x:Name='CleanTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+      <StackPanel>
+        <Grid><TextBlock Text='Clean up' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
+        <TextBlock Text='Temp files, update leftovers and caches. You see the size first.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
+      </StackPanel>
+    </Border>
+    <Border x:Name='TweaksTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+      <StackPanel>
+        <Grid><TextBlock Text='All tweaks' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
+        <TextBlock x:Name='TweaksText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
+      </StackPanel>
+    </Border>
+  </UniformGrid>
+</StackPanel>
+"@)
+    $h = @{}; foreach ($n in 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Gm', 'GmText', 'HealthTile', 'HealthText', 'MatchTile', 'MatchText', 'PcTile', 'PcText', 'CleanTile', 'TweaksTile', 'TweaksText') { $h[$n] = $root.FindName($n) }
+    $script:HomeUi = $h
+    $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
+    $h.Gm.Add_Click({ param($s, $e)
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        $msg = if ($s.IsChecked) { Enable-ZDGameMode } else { $m = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true }; $m }
+        $window.Cursor = $null
+        Show-Toast $msg '#30D158'; Update-GameModeUi; Update-HomePage })
+    foreach ($pair in @(@('HealthTile', 'Health'), @('MatchTile', 'Matches'), @('PcTile', 'ThisPC'), @('CleanTile', 'Clean'), @('TweaksTile', 'All'))) {
+        $h[$pair[0]].Tag = $pair[1]
+        $h[$pair[0]].Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag })
+        $h[$pair[0]].RenderTransform = New-Object Windows.Media.TranslateTransform
+        $h[$pair[0]].Add_MouseEnter({ param($s, $e) if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
+        $h[$pair[0]].Add_MouseLeave({ param($s, $e) if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
+    }
+    $script:PageRefresh['Home'] = { Update-HomePage }
+    Update-HomePage
+    New-PageScroll $root
+}
+function Update-HomePage {
+    $h = $script:HomeUi; if (-not $h) { return }
+    $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State })
+    $on = @($rec | Where-Object { $_.State }).Count
+    $left = $rec.Count - $on
+    $pct = if ($rec.Count) { [int][Math]::Round(100 * $on / $rec.Count) } else { 100 }
+    Start-CountUp $h.Pct $pct '' 900
+    # ring: dash length in stroke-thickness units around the circle (diameter 132 - stroke 11)
+    $circ = [Math]::PI * (132 - 11) / 11
+    $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(($circ * $pct / 100), 1000))
+    $h.Ring.Stroke = ConvertTo-Brush $(if ($pct -ge 90) { '#30D158' } elseif ($pct -ge 60) { '#FFD60A' } else { '#FF9F0A' })
+    if ($left -gt 0) {
+        $h.Headline.Text = "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off"
+        $h.Sub.Text = 'One click switches on everything that fits this PC. A restore point comes first, and every change can be undone from the menu next to Optimize.'
+        $h.Go.IsEnabled = $true; $h.GoText.Text = 'Optimize'
+    } else {
+        $h.Headline.Text = 'Your PC is fully optimized'
+        $h.Sub.Text = 'Everything recommended for this PC is on. ZeroDelay keeps watching and tells you if another program changes something back.'
+        $h.Go.IsEnabled = $false; $h.GoText.Text = 'All set'
+    }
+    $gm = Test-ZDGameMode
+    $h.Gm.IsChecked = $gm
+    $h.GmText.Text = if ($gm) { 'On. Background apps are closed and the PC is in match mode.' } elseif ((Get-GameModePrefs).auto) { 'Turns on by itself when Fortnite starts.' } else { 'Closes background apps and switches to match mode while you play.' }
+    $issues = @($script:HealthIssues)
+    $h.HealthText.Text = if ($null -eq $script:HealthIssues) { 'Scan for the problems that cost the most FPS and delay.' } elseif ($issues.Count) { "$($issues.Count) thing$(if ($issues.Count -ne 1) { 's' }) to look at." } else { 'Everything looks good.' }
+    $mr = @(Get-MatchReports) | Select-Object -First 1
+    $h.MatchText.Text = if ($mr) { "$(([datetime]$mr.Start).ToString('ddd HH:mm')): $(if (@($mr.Issues).Count) { "$(@($mr.Issues).Count) thing$(if (@($mr.Issues).Count -ne 1) { 's' }) got in the way" } else { 'smooth' })$(if ($mr.Fps) { ", $($mr.Fps.Avg) FPS" })." } else { 'Play a match with ZeroDelay open to get your first report.' }
+    $p = $script:SysProfile
+    $h.PcText.Text = if ($p) { "$((Get-MainGpu $p).Name), $($p.Memory.TotalGb) GB RAM. $(@($script:TailorNotes).Count) adjustments for this PC." } else { 'Scanning your hardware and apps...' }
+    $all = @($Tweaks | Where-Object { $_.Toggle -and $null -ne $_.State })
+    $h.TweaksText.Text = "$(@($all | Where-Object { $_.State }).Count) of $($all.Count) switched on, in $(@($Categories | Where-Object { -not $_.Page }).Count) groups."
+}
+# Switches the left menu (and the page) to a category, opening its group if it is folded.
+function Select-NavPage([string]$Name) {
+    if (-not $script:NavButtons.ContainsKey($Name)) { return }
+    Set-NavGroupOpen (Get-NavGroupOf $Name) $true
+    $script:NavButtons[$Name].IsChecked = $true
+    $script:NavButtons[$Name].BringIntoView()
 }
 
 # --- System tray icon
@@ -8078,13 +8592,53 @@ function Update-Filter {
 }
 $ui.Search.Add_TextChanged({ Update-Filter })
 $script:NavButtons = @{}
-foreach ($c in $Categories) {
+$NavTop = @('Home', 'GameMode', 'Health')
+$NavTools = @('ThisPC', 'Nvidia', 'Benchmark', 'Matches', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Apps', 'Clean', 'Memory')
+$NavEnd = @('Settings')
+function Get-NavGroupOf([string]$Name) { if ($NavTop -contains $Name -or $NavEnd -contains $Name) { '' } elseif ($NavTools -contains $Name) { 'Tools' } else { 'Tweaks' } }
+$script:NavGroups = @{}
+function Set-NavGroupOpen([string]$Group, [bool]$Open) {
+    $g = $script:NavGroups[$Group]; if (-not $g) { return }
+    $was = $g.Panel.Visibility -eq 'Visible'
+    $g.Panel.Visibility = if ($Open) { 'Visible' } else { 'Collapsed' }
+    if ($script:Anim) { Start-Anim $g.Chevron ([Windows.Media.RotateTransform]::AngleProperty) $null $(if ($Open) { 90 } else { 0 }) 200 } else { $g.Chevron.Angle = $(if ($Open) { 90 } else { 0 }) }
+    if ($Open -and -not $was) { Show-Animated $g.Panel -6 220 }
+    $script:Backup.Custom["nav_$Group"] = $Open
+}
+function New-NavGroup([string]$Group, [string]$Title) {
+    $hd = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Background='Transparent' Cursor='Hand' Padding='10,14,10,6' Margin='0,4,0,0'>
+  <Grid>
+    <TextBlock Text='$Title' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+    <TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='9' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center' RenderTransformOrigin='0.5,0.5'>
+      <TextBlock.RenderTransform><RotateTransform Angle='0'/></TextBlock.RenderTransform>
+    </TextBlock>
+  </Grid>
+</Border>
+"@)
+    $panel = New-Object Windows.Controls.StackPanel
+    $script:NavGroups[$Group] = @{ Header = $hd; Panel = $panel; Chevron = $hd.Child.Children[1].RenderTransform }
+    $hd.Tag = $Group
+    $hd.Add_MouseLeftButtonUp({ param($s, $e) $g = $script:NavGroups[$s.Tag]; Set-NavGroupOpen $s.Tag ($g.Panel.Visibility -ne 'Visible') })
+    [void]$ui.Nav.Children.Add($hd); [void]$ui.Nav.Children.Add($panel)
+    $open = [bool]$script:Backup.Custom["nav_$Group"]
+    $panel.Visibility = if ($open) { 'Visible' } else { 'Collapsed' }
+    if ($open) { $script:NavGroups[$Group].Chevron.Angle = 90 }
+}
+$navOrder = @($Categories | Where-Object { $NavTop -contains $_.Name } | Sort-Object { $NavTop.IndexOf($_.Name) }) +
+            @($Categories | Where-Object { (Get-NavGroupOf $_.Name) -eq 'Tweaks' }) +
+            @($Categories | Where-Object { $NavTools -contains $_.Name } | Sort-Object { $NavTools.IndexOf($_.Name) }) +
+            @($Categories | Where-Object { $NavEnd -contains $_.Name })
+$navTarget = $ui.Nav
+foreach ($c in $navOrder) {
     if ($c.Requires -and -not (& $c.Requires)) { continue }   # e.g. the GTX 1080 Ti tab on other PCs
-    if ($c.Section) {
-        $lbl = New-Object Windows.Controls.TextBlock
-        $lbl.Text = (Get-Culture).TextInfo.ToTitleCase($c.Section.ToLower()); $lbl.FontSize = 11; $lbl.FontWeight = 'SemiBold'; $lbl.Foreground = ConvertTo-Brush '#98989D'; $lbl.Margin = '10,16,0,6'
-        [void]$ui.Nav.Children.Add($lbl)
+    $grp = Get-NavGroupOf $c.Name
+    if ($grp -and -not $script:NavGroups.ContainsKey($grp)) { New-NavGroup $grp $(if ($grp -eq 'Tools') { 'Tools' } else { 'Tweaks' }) }
+    if (-not $grp -and $NavEnd -contains $c.Name -and -not $script:NavEndSep) {
+        $script:NavEndSep = New-Object Windows.Controls.Border; $script:NavEndSep.Height = 1; $script:NavEndSep.Margin = '10,10,10,8'; $script:NavEndSep.Background = ConvertTo-Brush '#38383A'
+        [void]$ui.Nav.Children.Add($script:NavEndSep)
     }
+    $navTarget = if ($grp) { $script:NavGroups[$grp].Panel } else { $ui.Nav }
     $rb = [ZdTheme]::Parse(@"
 <RadioButton xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' GroupName='nav' Style='{DynamicResource NavButton}'>
   <StackPanel Orientation='Horizontal'>
@@ -8115,7 +8669,7 @@ foreach ($c in $Categories) {
         if ($s.Tag.Page -and $script:PageRefresh[$s.Tag.Page]) { & $script:PageRefresh[$s.Tag.Page] }
     })
     $script:NavButtons[$c.Name] = $rb
-    [void]$ui.Nav.Children.Add($rb)
+    [void]$navTarget.Children.Add($rb)
 }
 
 # --------------------------------------------------------------- header ---
@@ -8136,6 +8690,9 @@ $ui.RestorePoint.Add_Click({
     Show-Toast $msg $(if ($msg -like 'Restore point created*') { '#30D158' } else { '#FF9F0A' })
 })
 
+$ui.MoreBtn.Add_Click({ $ui.MorePop.IsOpen = -not $ui.MorePop.IsOpen })
+$ui.RestorePoint.Add_PreviewMouseLeftButtonUp({ $ui.MorePop.IsOpen = $false })
+$ui.RestoreAll.Add_PreviewMouseLeftButtonUp({ $ui.MorePop.IsOpen = $false })
 $ui.ApplyRec.Add_Click({
     if (-not $script:Backup.Custom.ContainsKey('restorepoint')) {
         $r = [Windows.MessageBox]::Show("Create a Windows restore point first? It takes a few seconds and lets you roll everything back.", 'Restore point', 'YesNoCancel', 'Question')
@@ -8154,6 +8711,7 @@ $ui.ApplyRec.Add_Click({
     if ($failed) { $msg += " Skipped: $($failed -join ', ')." }
     if ($Tweaks | Where-Object { $_.Badge -eq 'restart' -and $_.State }) { $msg += ' Restart your PC to finish.' }
     Show-Toast $msg $(if ($failed) { '#FF9F0A' } else { '#30D158' })
+    if ($script:HomeUi) { Update-HomePage }
 })
 
 $script:SessionTimer = New-Object Windows.Threading.DispatcherTimer
@@ -8321,13 +8879,15 @@ $ui.Cards.Add_SizeChanged({
     $cardW = [Math]::Floor($w / $cols) - 16
     foreach ($c in $ui.Cards.Children) { $c.Width = if ($c.Tag.Header) { [Math]::Max(100, $w - 16) } else { $cardW } }
 })
-$startName = if ($Page -and $script:NavButtons.ContainsKey($Page)) { $Page } else { 'All' }
+$startName = if ($Page -and $script:NavButtons.ContainsKey($Page)) { $Page } else { 'Home' }
+Set-NavGroupOpen (Get-NavGroupOf $startName) $true
 $script:NavButtons[$startName].IsChecked = $true
 $window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringIntoView() })
 Update-GameModeUi
 Update-All
 $script:SysProfile = if ($Snapshot -and $env:ZD_SCANPC) { $null } else { Get-SavedProfile }
 if ($script:SysProfile) { Set-ProfileTailoring } else { Set-GpuTailoring }
+if (-not $Snapshot -and (Get-Setting 'keepawake' $false)) { Start-RenderWatch }
 $profileAge = if ($script:SysProfile) { try { ((Get-Date) - [datetime]$script:SysProfile.ScannedAt).TotalDays } catch { 999 } } else { 999 }
 if ((-not $Snapshot -and ($profileAge -gt 3 -or "$($script:SysProfile.AppVersion)" -ne $AppVersion)) -or ($Snapshot -and $env:ZD_SCANPC)) { Start-ProfileScan -Quiet }
 if ((-not $Snapshot -and -not $script:Backup.Custom['wizarddone']) -or ($Snapshot -and $env:ZD_WIZARD)) { Show-Wizard }
@@ -8349,6 +8909,12 @@ if ($Snapshot) {
     if ($env:ZD_DRIFT) { Invoke-DriftCheck; if (-not $script:DriftItems) { $ui.DriftTitle.Text = '2 settings were changed back — ExitLag is running'; $ui.DriftText.Text = 'Turn off USB 3 link power-saving  ·  USB hubs never suspend'; $ui.DriftBar.Visibility = 'Visible' } }
     if ($env:ZD_FAKE_UPDATE) { Start-UpdateCheck }
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Hardware-accelerated GPU scheduling', 'Consistent timer resolution') }; Update-RestartBar }
+    if ($script:Glass) {
+        $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
+        foreach ($st in @(@('#FF1B2133', 0), @('#FF2A1F3A', 0.55), @('#FF14262B', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) }
+        if ($script:Theme -eq 'light') { $bg.GradientStops.Clear(); foreach ($st in @(@('#FFDDE4F2', 0), @('#FFEADFF0', 0.55), @('#FFDCEDEB', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) } }
+        $window.Background = [Windows.Media.Brush]$bg
+    }
     $window.Add_ContentRendered({
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
         $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($(if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }))

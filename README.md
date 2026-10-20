@@ -8,6 +8,10 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Knows your PC**: on first start (and every few days) ZeroDelay scans the hardware, drivers, Windows and installed
   apps, and adapts its recommendations: laptops, streamers, Wi-Fi vs Ethernet, X3D and hybrid CPUs, GPU model.
   **Tools > This PC** shows everything it found and what it changed. Nothing is sent anywhere.
+- **Clean, simple design**: a Home page with one Optimize button, folding menu groups, and frosted glass on Windows 11.
+- **Creator tab** for Premiere Pro, After Effects, Photoshop, Media Encoder and OBS: auto-save hitches, Adobe RAM
+  reserve, Multi-Frame Rendering, Adobe apps on the dedicated GPU, OBS priority, staying awake during renders, and
+  Adobe cache cleanup. Each setting is changed one value at a time, only while the app is closed.
 - **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
   advice for undervolting and cooling an older card.
 
