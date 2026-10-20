@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.3.0'
+$AppVersion = '1.4.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -746,12 +746,82 @@ function Disable-TaskTweak($t) {
     $script:Backup.Custom.Remove($t.Id)
 }
 
+# --- Several power settings in one card: Powers = @( @{ Sub; Set; V; D } ). Each value is saved before it changes.
+function Test-PowerSet($t) {
+    foreach ($p in $t.Powers) { $v = Get-PowerIndex $p.Sub $p.Set; if ($null -eq $v) { return $null }; if ($v -ne $p.V) { return $false } }
+    $true
+}
+function Enable-PowerSet($t) {
+    if (-not $script:Backup.Custom.ContainsKey($t.Id)) {
+        $script:Backup.Custom[$t.Id] = @{ Scheme = (Get-ActivePowerScheme).Guid; Values = @($t.Powers | ForEach-Object { Get-PowerIndex $_.Sub $_.Set }) }
+    }
+    foreach ($p in $t.Powers) {
+        powercfg /setacvalueindex scheme_current $p.Sub $p.Set $p.V
+        if ($LASTEXITCODE -ne 0) { throw 'Windows refused the power setting.' }
+    }
+    powercfg /setactive scheme_current
+}
+function Disable-PowerSet($t) {
+    $saved = $script:Backup.Custom[$t.Id]
+    for ($i = 0; $i -lt $t.Powers.Count; $i++) {
+        $p = $t.Powers[$i]
+        $v = if ($saved -and $null -ne @($saved.Values)[$i]) { @($saved.Values)[$i] } else { $p.D }
+        $scheme = if ($saved) { $saved.Scheme } else { 'scheme_current' }
+        powercfg /setacvalueindex $scheme $p.Sub $p.Set $v 2>$null
+    }
+    powercfg /setactive scheme_current
+    $script:Backup.Custom.Remove($t.Id)
+}
+
+# --- Graphics card interrupts (MSI). Only offered when the driver has not turned MSI on itself.
+function Get-GpuMsiKeys {
+    @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'PCI\*' } |
+        ForEach-Object { "HKLM:\SYSTEM\CurrentControlSet\Enum\$($_.InstanceId)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" })
+}
+function Test-GpuMsi { $k = Get-GpuMsiKeys; if (-not $k) { return $null }; -not ($k | Where-Object { (Get-RegValue $_ 'MSISupported') -ne 1 }) }
+
+# --- Hypervisor launch (bcdedit). The value is often absent, which means "Auto".
+function Get-HypervisorLaunch {
+    $line = (bcdedit /enum '{current}' 2>$null) | Where-Object { $_ -match '^\s*hypervisorlaunchtype\s' } | Select-Object -First 1
+    if ($line) { ($line -split '\s+', 2)[1].Trim() } else { $null }
+}
+
+# --- Epic Games Launcher: the "Additional Command Line Arguments" switch for Fortnite (only read/written while the launcher is closed)
+function Get-EpicLauncherIni {
+    foreach ($d in 'Windows', 'WindowsEditor') { $f = "$env:LOCALAPPDATA\EpicGamesLauncher\Saved\Config\$d\GameUserSettings.ini"; if ((Test-Path $f) -and (Select-String -Path $f -Pattern 'Fortnite_AdditionalCommands=' -Quiet)) { return $f } }
+    $null
+}
+function Get-FnLaunchArgs {
+    $f = Get-EpicLauncherIni; if (-not $f) { return $null }
+    $lines = Get-Content $f
+    [pscustomobject]@{
+        File = $f
+        Enabled = ($lines | Where-Object { $_ -match 'Fortnite_AdditionalCommandsEnabled=' } | Select-Object -First 1) -replace '^.*?=', ''
+        Args = ($lines | Where-Object { $_ -match 'Fortnite_AdditionalCommands=' } | Select-Object -First 1) -replace '^.*?=', ''
+    }
+}
+function Set-FnLaunchArgsEnabled([string]$Value) {
+    if (Get-Process EpicGamesLauncher -ErrorAction SilentlyContinue) { throw 'Close the Epic Games Launcher first (it rewrites this setting when it closes).' }
+    $f = Get-EpicLauncherIni; if (-not $f) { throw 'Epic launcher settings not found.' }
+    $lines = Get-Content $f
+    $i = 0; $done = $false
+    $out = foreach ($ln in $lines) {
+        if ($ln -match '^(fn:[0-9a-f]+:Fortnite_AdditionalCommandsEnabled)=') { $done = $true; "$($Matches[1])=$Value" } else { $ln }
+    }
+    if (-not $done) {
+        # add the switch right after the arguments line, with the same prefix
+        $out = foreach ($ln in $lines) { $ln; if ($ln -match '^(fn:[0-9a-f]+:Fortnite_AdditionalCommands)=') { "$($Matches[1])Enabled=$Value" } }
+    }
+    Set-Content -Path $f -Value $out -Encoding UTF8
+}
+
 # --- Builds a card that disables a Windows service (Start = 4) and restores its default start type.
 function New-SvcTweak([string]$Id, [string]$Svc, [int]$Default, [string]$Title, [string]$Desc, [string]$Warn, [bool]$Rec, [string]$Badge) {
     @{ Id = $Id; Cat = 'Services'; Icon = [char]0xE912; Rec = $Rec; Badge = $Badge; Svc = $Svc
        Title = $Title; Desc = $Desc; Warn = $Warn
        Reg   = @( @{ P = "HKLM:\SYSTEM\CurrentControlSet\Services\$Svc"; N = 'Start'; V = 4; D = $Default; M = $Default } )
-       After = { Sync-Service $t.Svc } }
+       After = { Sync-Service $t.Svc }
+       Requires = { [bool](Get-Service -Name $t.Svc -ErrorAction SilentlyContinue) -or (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($t.Svc)") } }
 }
 
 # --- Startup apps: one card per Run-key entry / Startup-folder shortcut, toggled like Task Manager does.
@@ -2611,6 +2681,135 @@ $Tweaks = @(
            }
            'Freed {0:N0} MB of temporary files.' -f ($bytes / 1MB)
        } }
+
+    # ======================================================= researched additions (1.4)
+    @{ Id = 'hybrid-pcore'; Cat = 'Power'; Icon = [char]0xE964; Rec = $true; Lat = $true
+       Title = 'Hybrid CPUs: full speed on performance cores'
+       Desc  = 'Intel 12th gen and newer have separate power settings for their fast cores. This gives them the same max-performance, minimum-speed and never-park settings the other power cards give the rest.'
+       Warn  = 'Laptops on battery run hotter. Only shown on CPUs with two kinds of core.'
+       Requires = { (Get-CpuName) -match 'i[3579]-1[2-4]\d{3}|Core\(TM\) Ultra|Core Ultra|i[3579]-2\d{2}[A-Z]' }
+       Powers = @( @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '36687f9e-e3a5-4dbf-b1dc-15eb381c6864'; V = 0; D = 33 }
+                   @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '893dee8e-2bef-41e0-89c6-b55d0929964d'; V = 100; D = 5 }
+                   @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '0cc5b647-c1df-4637-891a-dec35c318584'; V = 100; D = 0 } )
+       Test  = { Test-PowerSet $t }; On = { Enable-PowerSet $t }; Off = { Disable-PowerSet $t } }
+
+    @{ Id = 'nvme-idle'; Cat = 'Power'; Icon = [char]0xEDA2; Rec = $true; Lat = $true
+       Title = 'Keep NVMe SSDs out of deep sleep'
+       Desc  = 'Windows lets NVMe drives doze after 0.2 s idle, and waking them can take milliseconds: a small hitch when the game loads data. Uses the High Performance plan values while plugged in.'
+       Warn  = 'Laptops: the SSD uses a little more power when plugged in.'
+       Powers = @( @{ Sub = '0012ee47-9041-4b5d-9b77-535fba8b1442'; Set = 'fc95af4d-40e7-4b6d-835a-56d131dbc80e'; V = 0; D = 15 }
+                   @{ Sub = '0012ee47-9041-4b5d-9b77-535fba8b1442'; Set = 'dbc9e238-6de9-49e3-92cd-8c2b4946b472'; V = 0; D = 100 } )
+       Test  = { Test-PowerSet $t }; On = { Enable-PowerSet $t }; Off = { Disable-PowerSet $t } }
+
+    @{ Id = 'sata-lpm'; Cat = 'Power'; Icon = [char]0xEDA2; Rec = $true; Lat = $true
+       Title = 'Turn off SATA link power-saving'
+       Desc  = 'Keeps the link to SATA SSDs and hard drives awake instead of letting it sleep between reads, which can cost up to 10 ms on wake.'
+       Warn  = 'Laptops: slightly more power use. Does nothing if all your drives are NVMe.'
+       Power = @{ Sub = '0012ee47-9041-4b5d-9b77-535fba8b1442'; Set = '0b2d69d7-a2a1-449c-9680-f91c70521c60'; V = 0; D = 1 } }
+
+    @{ Id = 'gpu-msi'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Lat = $true; Badge = 'restart'
+       Title = 'Graphics card: message-signalled interrupts'
+       Desc  = 'Lets the graphics card signal the CPU without sharing an interrupt line, which lowers driver latency spikes. Only shown when your driver has not already done this itself (most new ones have).'
+       Warn  = 'If a device stops working after the restart, turn this off again. A driver reinstall can reset it.'
+       Requires = { @(Get-GpuMsiKeys).Count -gt 0 -and ((Test-GpuMsi) -eq $false -or $script:Backup.Custom.ContainsKey('gpu-msi')) }
+       Test  = { Test-GpuMsi }
+       On    = {
+           $keys = Get-GpuMsiKeys
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @($keys | ForEach-Object { @{ Key = $_; Value = (Get-RegValue $_ 'MSISupported') } }) }
+           foreach ($k in $keys) { if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }; Set-RegValue $k 'MSISupported' 1 'DWord' } }
+       Off   = {
+           foreach ($b in @($script:Backup.Custom[$t.Id])) { if ($null -eq $b.Value) { Remove-RegValue $b.Key 'MSISupported' } else { Set-RegValue $b.Key 'MSISupported' ([int]$b.Value) 'DWord' } }
+           $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'hypervisor'; Cat = 'System'; Icon = [char]0xE83D; Rec = $false; Lat = $true; Badge = 'restart'
+       Title = "Don't start the Windows hypervisor"
+       Desc  = 'With Hyper-V, WSL2, Sandbox or Memory Integrity installed, Windows itself runs on a hypervisor, which adds overhead to interrupts and memory access. Microsoft''s gaming guide suggests turning it off.'
+       Warn  = 'You use WSL2, Docker, Hyper-V, Windows Sandbox or an Android emulator, or your work PC needs Credential Guard. Lowers kernel security protections. If BitLocker is on, keep your recovery key at hand.'
+       Requires = { (Get-CimInstance Win32_ComputerSystem -Property HypervisorPresent).HypervisorPresent -or (Get-HypervisorLaunch) -eq 'Off' }
+       Test  = { (Get-HypervisorLaunch) -eq 'Off' }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = (Get-HypervisorLaunch) } }
+           bcdedit /set '{current}' hypervisorlaunchtype off | Out-Null
+           if ($LASTEXITCODE -ne 0) { throw 'Windows refused the boot setting.' } }
+       Off   = {
+           $v = $script:Backup.Custom[$t.Id].Value
+           if ($v) { bcdedit /set '{current}' hypervisorlaunchtype $v | Out-Null } else { bcdedit /deletevalue '{current}' hypervisorlaunchtype | Out-Null }
+           $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'mpo-off'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Badge = 'restart'
+       Title = 'Turn off multiplane overlay (MPO)'
+       Desc  = 'NVIDIA''s official fix for flicker, black flashes and stutter on multi-monitor or mixed-refresh setups, often with a browser or Discord on a second screen. True fullscreen is not affected.'
+       Warn  = 'Only use it if you see flicker or stutter with several monitors: it can add delay in borderless mode. Don''t combine with "Keep low-FPS games on overlay planes".'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'; N = 'OverlayTestMode'; V = 5; D = $null; M = 0 } ) }
+
+    @{ Id = 'overlay-minfps'; Cat = 'Graphics'; Icon = [char]0xE740; Rec = $false; Lat = $true; Badge = 'restart'
+       Title = 'Keep low-FPS games on overlay planes'
+       Desc  = 'A Microsoft-documented setting: a borderless game that briefly drops FPS keeps its low-latency direct path to the screen instead of being switched back to slower desktop composition.'
+       Warn  = 'Only helps borderless/windowed play on Windows 11. Microsoft may remove it in a future version. Don''t combine with "Turn off multiplane overlay".'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'; N = 'OverlayMinFPS'; V = 0; D = $null; M = 15 } ) }
+
+    (New-SvcTweak 'nahimic' 'NahimicService' 2 'Turn off Nahimic audio effects' 'Nahimic (bundled with MSI, Alienware, Legion and some ASUS/Gigabyte boards) is widely reported to cause CPU spikes and game stutter.' 'You lose Nahimic sound and mic effects. Some driver updates turn it back on.' $true 'restart')
+
+    @{ Id = 'fn-launchargs'; Cat = 'Fortnite'; Icon = [char]0xE756; Rec = $true
+       Title = 'Switch off fake launch arguments'
+       Desc  = 'Turns off the Epic launcher''s "Additional Command Line Arguments" box for Fortnite. Tweak-pack arguments like -useallavailablecores, -nosplash or -lanplay do nothing or cause problems. Your text is kept.'
+       Warn  = 'You pass a real argument on purpose (for example for troubleshooting). Close the Epic Games Launcher first.'
+       Requires = { [bool](Get-EpicLauncherIni) }
+       Test  = { $a = Get-FnLaunchArgs; if (-not $a) { return $null }; $a.Enabled -ne 'True' -or -not $a.Args.Trim() }
+       On    = { $a = Get-FnLaunchArgs; if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = $a.Enabled } }; Set-FnLaunchArgsEnabled 'False' }
+       Off   = { $v = $script:Backup.Custom[$t.Id].Value; Set-FnLaunchArgsEnabled $(if ($v) { $v } else { 'True' }); $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'alttab-windows'; Cat = 'Visuals'; Icon = [char]0xE737; Rec = $true
+       Title = 'Alt+Tab shows windows only'
+       Desc  = 'Stops Windows 11 adding Edge tabs to Alt+Tab, so jumping out of and back into Fortnite takes fewer presses.'
+       Warn  = 'You like switching between Edge tabs with Alt+Tab.'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'MultiTaskingAltTabFilter'; V = 3; D = $null; M = 1 } ) }
+
+    @{ Id = 'diaglogs'; Cat = 'Background'; Icon = [char]0xE9D9; Rec = $true
+       Title = 'Stop diagnostic log and dump uploads'
+       Desc  = 'Microsoft''s policies to stop Windows collecting extra diagnostic logs and crash dumps and downloading its OneSettings configuration in the background. Removes occasional disk and network bursts.'
+       Warn  = ''
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; N = 'LimitDiagnosticLogCollection'; V = 1; D = $null; M = 0 }
+                  @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; N = 'LimitDumpCollection'; V = 1; D = $null; M = 0 }
+                  @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; N = 'DisableOneSettingsDownloads'; V = 1; D = $null; M = 0 } ) }
+
+    @{ Id = 'task-diag-extra'; Cat = 'Services'; Icon = [char]0xE823; Rec = $true
+       Title = 'Turn off extra diagnostic tasks'
+       Desc  = 'Scheduled tasks that collect device inventory, app backup data, power and sustainability statistics, plus the WinSAT benchmark. They wake the CPU and disk in the background.'
+       Warn  = ''
+       Tasks = @('\Microsoft\Windows\Device Information\Device', '\Microsoft\Windows\Device Information\Device User', '\Microsoft\Windows\Application Experience\MareBackup',
+                 '\Microsoft\Windows\Application Experience\StartupAppTask', '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem',
+                 '\Microsoft\Windows\Sustainability\SustainabilityTelemetry', '\Microsoft\Windows\Sustainability\PowerGridForecastTask', '\Microsoft\Windows\Maintenance\WinSAT') }
+
+    @{ Id = 'docap'; Cat = 'Network'; Icon = [char]0xE896; Rec = $false; Lat = $true
+       Title = 'Cap background update downloads'
+       Desc  = 'Limits Windows Update and Store background downloads to 10% of your bandwidth, so a big update can''t fill your connection and spike your ping mid-match.'
+       Warn  = 'You want updates to download as fast as possible.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'; N = 'DOPercentageMaxBackgroundBandwidth'; V = 10; D = $null; M = 0 } ) }
+
+    @{ Id = 'store-autoupdate'; Cat = 'Background'; Icon = [char]0xE719; Rec = $false
+       Title = 'Stop automatic Store app updates'
+       Desc  = 'The Microsoft Store stops downloading app updates in the background. You can still update apps by hand. Windows Update is not affected.'
+       Warn  = 'You want Store apps (Xbox, Phone Link, Notepad...) to keep updating themselves.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'; N = 'AutoDownload'; V = 2; D = $null; M = 4 } ) }
+
+    @{ Id = 'onedrive-off'; Cat = 'Background'; Icon = [char]0xE753; Rec = $false; Badge = 'signout'
+       Title = 'Turn off OneDrive sync'
+       Desc  = 'Microsoft''s policy to stop OneDrive syncing entirely, so it never scans or uploads files in the background. Goes further than the upload-speed cap.'
+       Warn  = 'You use OneDrive or back up your Desktop and Documents with it. Nothing syncs until you turn this off.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'; N = 'DisableFileSyncNGSC'; V = 1; D = $null; M = 0 } ) }
+
+    (New-SvcTweak 'dps' 'DPS' 2 'Turn off Diagnostic Policy Service' 'Stops problem detection and the hourly resource-usage logging that writes to disk in the background.' 'You use Windows troubleshooters, or the per-app network and battery usage pages in Settings.' $false 'restart')
+    (New-SvcTweak 'ndu' 'Ndu' 2 'Turn off network data-usage monitor' 'Turns off the driver that counts every network packet per app. Removes a small per-packet cost; it has a history of memory leaks with some network drivers.' 'You use the Data usage page in Settings or data limits on a metered connection.' $false 'restart')
+    (New-SvcTweak 'inventorysvc' 'InventorySvc' 2 'Turn off compatibility inventory service' 'Windows 11 24H2 runs app inventory and compatibility scans for about 5 minutes every 30 to 60 minutes. This stops them.' 'Windows may offer you the next big feature update later. Monthly security updates are not affected.' $false 'restart')
+
+    @{ Id = 'wifi5ghz'; Cat = 'Network'; Icon = [char]0xE701; Rec = $false; Lat = $true
+       Title = 'Wi-Fi: prefer the 5 GHz band'
+       Desc  = 'Tells Intel Wi-Fi to prefer 5 GHz, which usually has less interference and lower jitter than 2.4 GHz.'
+       Warn  = 'You connect on 6 GHz (Wi-Fi 6E/7): this would pull you down to 5 GHz. Or your 5 GHz signal is weak where you play. Applying briefly reconnects Wi-Fi.'
+       Test  = { Test-AdvDisplay 'RoamingPreferredBandType' 'Prefer 5' }
+       On    = { Set-AdvDisplay 'wifi5ghz' 'RoamingPreferredBandType' 'Prefer 5' }
+       Off   = { Reset-AdvProp 'wifi5ghz' 'RoamingPreferredBandType' 0 } }
 
     # ======================================================= Desktop visuals
     @{ Id = 'menudelay'; Cat = 'Visuals'; Icon = [char]0xE700; Rec = $false
@@ -5447,6 +5646,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.4.0' = @(
+        @{ T = '18 new researched tweaks'; D = 'Found by checking Microsoft, NVIDIA and Epic documentation and measured guides. About 120 placebo or harmful tweaks were rejected on purpose.' }
+        @{ T = 'Power and drives'; D = 'Full speed for Intel performance cores, and NVMe/SATA drives that never doze mid-match.' }
+        @{ T = 'Graphics'; D = 'GPU interrupt mode (when your driver has not done it), the hypervisor switch, and two fixes for borderless and multi-monitor stutter.' }
+        @{ T = 'Background'; D = 'Fewer diagnostic uploads and tasks, capped update downloads, optional Store, OneDrive and inventory switches, and Nahimic off.' }
+        @{ T = 'Fortnite'; D = 'Switches off fake launch arguments in the Epic launcher, such as -useallavailablecores.' }
+    )
     '1.3.0' = @(
         @{ T = 'Uninstall apps'; D = 'Tools > Uninstall apps lists your programs and Store apps. Force remove also deletes the files, registry keys, shortcuts, services and tasks an app leaves behind.' }
         @{ T = 'Clean up files'; D = 'Temp files, old Windows Update downloads, crash dumps and caches. You see the size of each group before anything is deleted.' }

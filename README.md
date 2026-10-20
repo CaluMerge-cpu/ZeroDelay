@@ -5,7 +5,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 
 ## Features
 
-- **150+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
+- **160+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
 - **Game Mode**: one switch (or automatic when Fortnite starts) that closes or pauses background apps, switches to the
   ZeroDelay power plan, lowers background priority, silences notifications and pauses update downloads, then puts
