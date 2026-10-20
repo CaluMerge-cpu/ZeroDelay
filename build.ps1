@@ -13,6 +13,8 @@ try {
     $ico = Join-Path $root 'assets\ZeroDelay.ico'
     if (-not (Test-Path $ico)) { throw 'assets\ZeroDelay.ico is missing (run ZeroDelay once; it writes ZeroDelay.ico next to the script).' }
     Copy-Item $ico $stage
+    # WebView2 SDK for the Tournaments tab (see assets\webview2\README.md)
+    foreach ($w in 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.Wpf.dll', 'WebView2Loader.dll') { Copy-Item (Join-Path $root "assets\webview2\$w") $stage }
 
     # ZeroDelay.exe: the launcher Windows shows (name and icon) when it asks for administrator rights
     & $csc /nologo /target:winexe /optimize+ "/out:$(Join-Path $stage 'ZeroDelay.exe')" "/win32icon:$(Join-Path $stage 'ZeroDelay.ico')" `
@@ -22,7 +24,7 @@ try {
     $dist = Join-Path $root 'dist'; New-Item -ItemType Directory -Force $dist | Out-Null
     Copy-Item (Join-Path $stage 'ZeroDelay.exe') $dist -Force
     $out = Join-Path $dist 'ZeroDelay-Setup.exe'
-    $res = foreach ($n in 'ZeroDelay.ps1', 'ZeroDelay.exe', 'ZeroDelay.ico', 'install.ps1', 'uninstall.ps1', 'LICENSE.txt') { "/resource:$(Join-Path $stage $n),$n" }
+    $res = foreach ($n in 'ZeroDelay.ps1', 'ZeroDelay.exe', 'ZeroDelay.ico', 'install.ps1', 'uninstall.ps1', 'LICENSE.txt', 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.Wpf.dll', 'WebView2Loader.dll') { "/resource:$(Join-Path $stage $n),$n" }
     & $csc /nologo /target:winexe /optimize+ "/out:$out" "/win32icon:$(Join-Path $stage 'ZeroDelay.ico')" /r:System.Windows.Forms.dll @res (Join-Path $stage 'Setup.cs')
     if ($LASTEXITCODE -ne 0) { throw "Compiler failed ($LASTEXITCODE)." }
     $hash = (Get-FileHash $out -Algorithm SHA256).Hash

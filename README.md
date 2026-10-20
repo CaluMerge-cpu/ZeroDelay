@@ -1,4 +1,4 @@
-﻿# ZeroDelay
+# ZeroDelay
 
 A free, open-source Windows app that lowers input delay and stutter in Fortnite. Every change is shown as a card with
 an on/off switch, explained in plain words, backed up before it is applied, and can be undone at any time.
@@ -8,7 +8,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Knows your PC**: on first start (and every few days) ZeroDelay scans the hardware, drivers, Windows and installed
   apps, and adapts its recommendations: laptops, streamers, Wi-Fi vs Ethernet, X3D and hybrid CPUs, GPU model.
   **Tools > This PC** shows everything it found and what it changed. Nothing is sent anywhere.
-- **Clean, simple design**: a Home page with one Optimize button, folding menu groups, and frosted glass on Windows 11.
+- **Clean, simple design**: a Home page with an Optimize button that lists what is still off so you choose what to switch on, folding menu groups, and frosted glass on Windows 11.
 - **Creator tab** for Premiere Pro, After Effects, Photoshop, Media Encoder and OBS: auto-save hitches, Adobe RAM
   reserve, Multi-Frame Rendering, Adobe apps on the dedicated GPU, OBS priority, staying awake during renders, and
   Adobe cache cleanup. Each setting is changed one value at a time, only while the app is closed.
@@ -21,6 +21,18 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses
   update downloads (or does all of it automatically when Fortnite starts), then puts everything back when the match ends.
+- **Tournaments**: Epic's official competitive schedule inside ZeroDelay, opened on the region you play (read from
+  your Fortnite settings), with every cup's art, times in your PC's time zone, and each event's scoring, rules and
+  prizes. Next to it: a ready check (ping to the region, Game Mode, Fortnite settings, two-factor sign-in) and
+  competitive tips. Shown with Microsoft Edge WebView2, which comes with Windows 11.
+- **Active tweaks**: everything switched on right now, grouped like the menu, with when ZeroDelay turned it on and a switch
+  to undo each one.
+- **Debloat**: finds preinstalled Windows apps, promo apps and PC-maker trials, explains each one, and removes only
+  what you tick.
+- **FreeSync**: each monitor's variable refresh range and cable, whether it can work on your graphics card (NVIDIA needs
+  DisplayPort or HDMI 2.1), and the settings in order: refresh rate, G-SYNC Compatible, Windows VRR, an in-range frame cap.
+- **Ping booster**: works with GearUP, ExitLag, WTFast and NoPing. A trusted booster may change settings: ZeroDelay
+  keeps its changes, never switches them back, and lists every change with the old and new value.
 - **Potato graphics**: presets from competitive to flat-colour potato, a "build your own" slider card with a live
   "% potato" score, and NVIDIA texture-blur levels.
 - **NVIDIA page**: G-SYNC / V-Sync / Reflex / frame-cap check with tear-free and lowest-latency presets, Smooth Motion
@@ -36,7 +48,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Profiles** with share codes, **History** with per-change undo, **drift alerts** when another program changes your
   settings back, Windows restore point before applying.
 - **Match reports**: after each Fortnite session, the stutters (with what was busy at that moment), background apps
-  that used your CPU, GPU heat or hardware slowdowns, and low memory. Stutter timing uses PresentMon.
+  that used your CPU, GPU heat or hardware slowdowns, and low memory, plus a How to fix it list with one button per fix. Stutter timing uses PresentMon.
 - **Mouse test**: measures your mouse's real polling rate (125 to 8000 Hz) and whether it is steady.
 - **Uninstall apps**: programs and Microsoft Store apps, with common Windows bloat labelled. **Force remove** skips a
   broken uninstaller and deletes the app's own folders, registry keys (backed up first), shortcuts, services and tasks;

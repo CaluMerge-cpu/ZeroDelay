@@ -22,7 +22,7 @@ try {
         }
     }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    foreach ($f in 'ZeroDelay.ps1', 'ZeroDelay.exe', 'ZeroDelay.ico', 'uninstall.ps1', 'LICENSE.txt') {
+    foreach ($f in 'ZeroDelay.ps1', 'ZeroDelay.exe', 'ZeroDelay.ico', 'uninstall.ps1', 'LICENSE.txt', 'Microsoft.Web.WebView2.Core.dll', 'Microsoft.Web.WebView2.Wpf.dll', 'WebView2Loader.dll') {
         if (Test-Path (Join-Path $src $f)) { Copy-Item (Join-Path $src $f) (Join-Path $InstallDir $f) -Force }
     }
     # files from early versions that ran the app as FortniteOptimizer.ps1
