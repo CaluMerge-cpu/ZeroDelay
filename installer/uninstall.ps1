@@ -10,6 +10,12 @@ if ($r -ne 'Yes') { exit }
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*$dir\ZeroDelay.ps1*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
+# "Start with Windows" task (it runs with admin rights, so removing it may ask for permission)
+if (Get-ScheduledTask -TaskName 'ZeroDelay' -TaskPath '\' -ErrorAction SilentlyContinue) {
+    try { Unregister-ScheduledTask -TaskName 'ZeroDelay' -TaskPath '\' -Confirm:$false -ErrorAction Stop }
+    catch { try { Start-Process schtasks.exe -ArgumentList '/Delete /TN ZeroDelay /F' -Verb RunAs -WindowStyle Hidden -Wait } catch {} }
+}
+
 foreach ($l in (Join-Path ([Environment]::GetFolderPath('Desktop')) 'ZeroDelay.lnk'), (Join-Path ([Environment]::GetFolderPath('Programs')) 'ZeroDelay.lnk')) {
     Remove-Item $l -Force -ErrorAction SilentlyContinue
 }

@@ -10,23 +10,28 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Installer for ZeroDelay, a Fortnite latency optimizer for Windows")]
 [assembly: AssemblyCompany("ZeroDelay contributors")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 static class Setup
 {
     static readonly string[] Files = { "ZeroDelay.ps1", "ZeroDelay.ico", "install.ps1", "uninstall.ps1", "LICENSE.txt" };
 
     [STAThread]
-    static int Main()
+    static int Main(string[] args)
     {
         Application.EnableVisualStyles();
-        var answer = MessageBox.Show(
-            "Install ZeroDelay, the Fortnite latency optimizer?\n\n" +
-            "It is installed for your Windows account only and adds Desktop and Start menu shortcuts. " +
-            "ZeroDelay is free software under the MIT License and comes with no warranty.",
-            "ZeroDelay Setup", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (answer != DialogResult.Yes) return 1;
+        // "/update" is passed by ZeroDelay's own Update now button: the user already confirmed there.
+        bool update = Array.Exists(args, a => a.Equals("/update", StringComparison.OrdinalIgnoreCase));
+        if (!update)
+        {
+            var answer = MessageBox.Show(
+                "Install ZeroDelay, the Fortnite latency optimizer?\n\n" +
+                "It is installed for your Windows account only and adds Desktop and Start menu shortcuts. " +
+                "ZeroDelay is free software under the MIT License and comes with no warranty.",
+                "ZeroDelay Setup", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes) return 1;
+        }
 
         string dir = Path.Combine(Path.GetTempPath(), "ZeroDelaySetup_" + Guid.NewGuid().ToString("N"));
         try
@@ -44,7 +49,7 @@ static class Setup
             var psi = new ProcessStartInfo
             {
                 FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe"),
-                Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + Path.Combine(dir, "install.ps1") + "\"",
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + Path.Combine(dir, "install.ps1") + "\"" + (update ? " -Update" : ""),
                 WorkingDirectory = dir,
                 UseShellExecute = false,
                 CreateNoWindow = true

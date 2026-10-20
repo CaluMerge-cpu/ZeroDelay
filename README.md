@@ -20,8 +20,14 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   **Ping monitor** for Fortnite regions, **Sensitivity** calculator (eDPI, cm/360).
 - **Profiles** with share codes, **History** with per-change undo, **drift alerts** when another program changes your
   settings back, Windows restore point before applying.
-- **Light and dark mode** (or match Windows) with six accent colours, and an **update check** that tells you when a
-  new version is on GitHub.
+- **Match reports**: after each Fortnite session, the stutters (with what was busy at that moment), background apps
+  that used your CPU, GPU heat or hardware slowdowns, and low memory. Stutter timing uses PresentMon.
+- **Mouse test**: measures your mouse's real polling rate (125 to 8000 Hz) and whether it is steady.
+- **Light and dark mode** (or match Windows) with six accent colours.
+- **One-click updates**: ZeroDelay tells you when a new version is out, downloads it from the GitHub release, checks
+  its SHA-256 against the release notes and reinstalls itself.
+- Optional **Start with Windows** (in the tray), and **Report a problem**, which opens a GitHub issue with your PC
+  details filled in.
 
 ## How to install
 
@@ -37,8 +43,8 @@ Not comfortable running an unsigned file? Every line of code is in this reposito
 release page, or build the setup yourself (see below).
 
 ZeroDelay installs for your Windows account only (`%LOCALAPPDATA%\Programs\ZeroDelay`) and adds Desktop and Start menu
-shortcuts. **Updating:** ZeroDelay tells you when a new version is out; exit it from the tray icon and run the new
-setup. Your settings and backups are kept. **Uninstalling:** press **Restore all** in ZeroDelay first if you want your
+shortcuts. **Updating:** ZeroDelay tells you when a new version is out; press **Update now**. (From 1.0 or 1.1, update once
+by hand: exit ZeroDelay from the tray and run the new setup.) Your settings and backups are kept. **Uninstalling:** press **Restore all** in ZeroDelay first if you want your
 original settings back, then remove it from Settings > Apps > ZeroDelay.
 
 ## Run from source
@@ -63,9 +69,11 @@ This compiles `dist\ZeroDelay-Setup.exe` with the C# compiler that ships with Wi
   is changed; switching a card off or pressing **Restore all** puts it back.
 - No placebo tweaks: TCP/Nagle tweaks (Fortnite uses UDP), RAM cleaners, disabling Windows Update or security
   protections are deliberately not included.
+- **Start with Windows** is off unless you switch it on. It creates a scheduled task named ZeroDelay, which switching it
+  off (or uninstalling) removes.
 - Game files are only edited when Fortnite is closed. ZeroDelay never touches Fortnite's program files or anti-cheat.
-- ZeroDelay only connects to the internet for the update check (it reads the latest release number from GitHub and
-  never downloads or installs anything by itself; switch it off in Settings), the optional PresentMon download (from
+- ZeroDelay only connects to the internet for the update check (it reads the latest release from GitHub; the new
+  setup is downloaded only when you press **Update now**; switch the check off in Settings), the optional PresentMon download (from
   Intel's GitHub) and the optional ping test to Epic's servers.
 
 ## License

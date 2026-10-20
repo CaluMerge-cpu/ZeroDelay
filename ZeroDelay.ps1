@@ -28,7 +28,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.1.0'
+$AppVersion = '1.2.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -54,6 +54,142 @@ public static class ZdTheme {
     public static object Parse(string xaml) { return System.Windows.Markup.XamlReader.Parse(Apply(xaml)); }
     public static System.Windows.Media.Brush Brush(string c) {
         return (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFrom(Apply(c));
+    }
+}
+
+// Mouse polling-rate test: timestamps every raw mouse report (WM_INPUT) sent to the ZeroDelay window.
+public static class MouseRate {
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct RAWINPUTDEVICE { public ushort UsagePage; public ushort Usage; public uint Flags; public IntPtr Target; }
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
+    static readonly long[] Stamps = new long[400000];
+    static int count;
+    static System.Windows.Interop.HwndSource source;
+    static readonly System.Windows.Interop.HwndSourceHook HookRef = Hook;
+    public static bool Running { get; private set; }
+    public static int Count { get { return count; } }
+    static double TicksPerMs { get { return System.Diagnostics.Stopwatch.Frequency / 1000.0; } }
+    static bool Register(uint flags, IntPtr target) {
+        var d = new RAWINPUTDEVICE[] { new RAWINPUTDEVICE { UsagePage = 1, Usage = 2, Flags = flags, Target = target } };
+        return RegisterRawInputDevices(d, 1, (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+    }
+    public static bool Start(IntPtr hwnd) {
+        if (Running) return true;
+        source = System.Windows.Interop.HwndSource.FromHwnd(hwnd);
+        if (source == null || !Register(0, hwnd)) return false;
+        count = 0;
+        source.AddHook(HookRef);
+        Running = true;
+        return true;
+    }
+    public static void Stop() {
+        if (!Running) return;
+        Running = false;
+        source.RemoveHook(HookRef);
+        Register(0x1 /* RIDEV_REMOVE */, IntPtr.Zero);
+    }
+    static IntPtr Hook(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled) {
+        if (msg == 0x00FF && count < Stamps.Length) Stamps[count++] = System.Diagnostics.Stopwatch.GetTimestamp();
+        return IntPtr.Zero;
+    }
+    // reports per second over the last `ms` milliseconds
+    public static double RecentRate(int ms) {
+        int n = count;
+        long from = System.Diagnostics.Stopwatch.GetTimestamp() - (long)(ms * TicksPerMs);
+        int k = 0;
+        for (int i = n - 1; i >= 0 && Stamps[i] >= from; i--) k++;
+        return k * 1000.0 / ms;
+    }
+    // number of reports in each `binMs` slice, from the first report to the last
+    public static int[] Bins(int binMs) {
+        int n = count;
+        if (n < 2) return new int[0];
+        long w = (long)(binMs * TicksPerMs), t0 = Stamps[0];
+        var b = new int[(int)((Stamps[n - 1] - t0) / w) + 1];
+        for (int i = 0; i < n; i++) b[(int)((Stamps[i] - t0) / w)]++;
+        return b;
+    }
+}
+
+// After-match report: frame times from a PresentMon CSV.
+public class MatchFrames {
+    public int Frames; public double AvgFps; public double Low1Fps; public double TotalMs;
+    public int StutterCount; public double[] StutterAtMs; public double[] StutterMs;
+}
+public static class FrameStats {
+    public static System.Threading.Tasks.Task<MatchFrames> AnalyzeAsync(string path) {
+        return System.Threading.Tasks.Task.Run(() => Analyze(path));
+    }
+    public static MatchFrames Analyze(string path) {
+        var ft = new List<double>();
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+        using (var r = new System.IO.StreamReader(fs)) {
+            string header = r.ReadLine();
+            if (header == null) return null;
+            var cols = header.Split(',');
+            int col = Array.IndexOf(cols, "MsBetweenPresents");
+            if (col < 0) col = Array.IndexOf(cols, "FrameTime");
+            if (col < 0) return null;
+            string line;
+            while ((line = r.ReadLine()) != null) {
+                var f = line.Split(',');
+                double v;
+                if (f.Length > col && double.TryParse(f[col], System.Globalization.NumberStyles.Float, inv, out v) && v > 0) ft.Add(v);
+            }
+        }
+        int n = ft.Count;
+        if (n < 300) return null;
+        var m = new MatchFrames { Frames = n };
+        // median frame time of each 240-frame block; blocks under 20 FPS are menus or loading screens
+        const int B = 240;
+        var meds = new double[(n + B - 1) / B];
+        for (int b = 0; b < n; b += B) {
+            var blk = ft.GetRange(b, Math.Min(n, b + B) - b);
+            blk.Sort();
+            meds[b / B] = blk[blk.Count / 2];
+        }
+        // gameplay frames only: no menus, and no frames over 1 s (alt-tab, pauses)
+        var play = new List<double>();
+        double total = 0, playSum = 0;
+        for (int i = 0; i < n; i++) {
+            total += ft[i];
+            if (meds[i / B] < 50 && ft[i] < 1000) { play.Add(ft[i]); playSum += ft[i]; }
+        }
+        if (play.Count < 300) return null;
+        m.TotalMs = total;
+        m.AvgFps = play.Count > 0 ? 1000.0 * play.Count / playSum : 0;
+        play.Sort();
+        int k = Math.Max(1, (int)Math.Ceiling(play.Count * 0.01));
+        double slow = 0;
+        for (int i = play.Count - k; i < play.Count; i++) slow += play[i];
+        m.Low1Fps = 1000.0 / (slow / k);
+        // a stutter is one frame far slower than the frames around it (the median of its block);
+        // hitches less than 1 s apart count as one; menu and loading blocks are skipped
+        var at = new List<double>(); var ms = new List<double>();
+        double cum = 0, lastAt = -1e9;
+        bool lastKept = false;
+        for (int b = 0; b < n; b += B) {
+            int e = Math.Min(n, b + B);
+            double med = meds[b / B];
+            double thr = Math.Max(med * 2.5, med + 12);
+            for (int i = b; i < e; i++) {
+                double v = ft[i];
+                if (med < 50 && v > thr && v < 1000) {
+                    if (cum - lastAt > 1000) {
+                        m.StutterCount++;
+                        lastKept = at.Count < 30;
+                        if (lastKept) { at.Add(cum); ms.Add(v); }
+                    } else if (lastKept && v > ms[ms.Count - 1]) ms[ms.Count - 1] = v;
+                    lastAt = cum;
+                }
+                cum += v;
+            }
+        }
+        m.StutterAtMs = at.ToArray();
+        m.StutterMs = ms.ToArray();
+        return m;
     }
 }
 '@
@@ -3951,10 +4087,14 @@ $Categories = @(
        Note = 'One scan for the problems that cost you the most. Fix them one by one or all at once.' }
     @{ Name = 'Benchmark';  Icon = [char]0xE9D9; Title = 'Benchmark'; Page = 'Benchmark'
        Note = 'Measure real FPS, 1% lows and latency in Fortnite, then compare before and after a change.' }
+    @{ Name = 'Matches';    Icon = [char]0xE7FC; Title = 'Match reports'; Page = 'Matches'
+       Note = 'After each Fortnite session: stutters and what was busy at that moment, GPU heat, background apps and memory.' }
     @{ Name = 'Ping';       Icon = [char]0xE839; Title = 'Ping monitor'; Page = 'Ping'
        Note = 'Live ping, jitter and packet loss to a Fortnite region. Spikes are logged with what was busy at the time.' }
     @{ Name = 'Sens';       Icon = [char]0xE962; Title = 'Sensitivity'; Page = 'Sens'
        Note = 'eDPI and cm/360 for Fortnite, and keeping the same aim when you change DPI.' }
+    @{ Name = 'Mouse';      Icon = [char]0xEC4A; Title = 'Mouse test'; Page = 'Mouse'
+       Note = 'Measures how often your mouse really reports to the PC (its polling rate) and whether that rate is steady.' }
     @{ Name = 'Profiles';   Icon = [char]0xE8F1; Title = 'Profiles'; Page = 'Profiles'
        Note = 'Save your whole setup, switch between setups, and share one with a code.' }
     @{ Name = 'History';    Icon = [char]0xE81C; Title = 'History'; Page = 'History'
@@ -4934,7 +5074,9 @@ function Get-Setting([string]$Key, $Default) { if ($script:Backup.Custom.Contain
 function New-SettingsPage {
     $rows = @(
         @{ Key = 'closetotray'; Title = 'Closing the window keeps ZeroDelay in the tray'; Desc = 'The X button hides ZeroDelay next to the clock instead of quitting. Right-click the tray icon to exit.' }
+        @{ Key = 'startup';    Title = 'Start ZeroDelay when you sign in to Windows'; Desc = 'Opens quietly in the tray (no window), so Game Mode and match reports work without opening the app. Uses a Windows scheduled task named ZeroDelay; switching this off removes it.' }
         @{ Key = 'autofix';    Title = 'Automatically re-apply settings other programs change'; Desc = 'Instead of showing the orange bar, ZeroDelay quietly puts your settings back and tells you.' }
+        @{ Key = 'matchreport'; Title = 'Match reports'; Desc = 'Watches quietly while Fortnite runs and shows what got in the way when you close it (Tools > Match reports). Uses about 1% of one CPU core.' }
         @{ Key = 'autoupdate'; Title = 'Check for new versions'; Desc = 'Asks GitHub when ZeroDelay starts and every 6 hours whether a newer version is out. Nothing is downloaded or installed unless you choose to.' }
     )
     $xr = ($rows | ForEach-Object {
@@ -4981,6 +5123,7 @@ function New-SettingsPage {
         <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
           <Button x:Name='UpdCheck' Content='Check for updates' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
           <Button x:Name='UpdGet' Content='Download' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='0,0,8,0' Visibility='Collapsed'/>
+          <Button x:Name='UpdReport' Content='Report a problem' Style='{DynamicResource Btn}' Margin='0,0,8,0' ToolTip='Opens a new GitHub issue with your PC details filled in. Needs a free GitHub account.'/>
           <Button x:Name='UpdRepo' Content='GitHub page' Style='{DynamicResource Btn}'/>
         </StackPanel>
       </Grid>
@@ -4998,7 +5141,7 @@ function New-SettingsPage {
   </Border>
 </StackPanel>
 "@)
-    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'S_autoupdate', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply',
+    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'S_autoupdate', 'S_startup', 'S_matchreport', 'UpdReport', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply',
                               'VerTitle', 'UpdStatus', 'UpdCheck', 'UpdGet', 'UpdRepo') { $st[$n] = $root.FindName($n) }
     $script:SetUi = $st
     $st.S_closetotray.IsChecked = [bool](Get-Setting 'closetotray' $true)
@@ -5008,6 +5151,17 @@ function New-SettingsPage {
     $st.Wizard.Add_Click({ Show-Wizard })
     $st.Folder.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$DataDir`"" })
     $st.About.Text = "ZeroDelay $AppVersion  ·  app: $PSCommandPath  ·  data and backups: $DataDir"
+    $st.S_matchreport.IsChecked = [bool](Get-Setting 'matchreport' $true)
+    $st.S_matchreport.Add_Click({ param($s, $e) $script:Backup.Custom['matchreport'] = [bool]$s.IsChecked; Save-Backup })
+    $st.S_startup.IsChecked = [bool](Get-StartupTask)
+    if ($NoElevate) { $st.S_startup.IsEnabled = $false }
+    $st.S_startup.Add_Click({ param($s, $e)
+        try {
+            Set-StartWithWindows ([bool]$s.IsChecked)
+            Show-Toast $(if ($s.IsChecked) { 'ZeroDelay will start in the tray when you sign in.' } else { 'ZeroDelay no longer starts with Windows.' }) '#30D158'
+        } catch { $s.IsChecked = [bool](Get-StartupTask); Show-Toast "Could not change this: $($_.Exception.Message)" '#FF9F0A' }
+    })
+    $st.UpdReport.Add_Click({ Open-ProblemReport })
     $st.S_autoupdate.IsChecked = [bool](Get-Setting 'autoupdate' $true)
     $st.S_autoupdate.Add_Click({ param($s, $e)
         $script:Backup.Custom['autoupdate'] = [bool]$s.IsChecked; Save-Backup
@@ -5034,7 +5188,7 @@ function New-SettingsPage {
     # version and updates
     $st.VerTitle.Text = "ZeroDelay $AppVersion"
     $st.UpdCheck.Add_Click({ Start-UpdateCheck -Manual })
-    $st.UpdGet.Add_Click({ Open-UpdatePage })
+    $st.UpdGet.Add_Click({ Install-Update })
     $st.UpdRepo.Add_Click({ Start-Process "https://github.com/$UpdateRepo" })
     Update-UpdateUi
     New-PageScroll $root
@@ -5094,7 +5248,7 @@ function Start-UpdateCheck([switch]$Manual) {
                 Set-UpdateResult $null $(if ($msg -match '404') { 'No release has been published yet.' } else { 'Could not reach GitHub. Check your internet connection and try again.' })
                 return
             }
-            try { $j = $task.Result | ConvertFrom-Json; Set-UpdateResult @{ Tag = "$($j.tag_name)"; Url = "$($j.html_url)" } }
+            try { $j = $task.Result | ConvertFrom-Json; Set-UpdateResult @{ Tag = "$($j.tag_name)"; Url = "$($j.html_url)"; Body = "$($j.body)"; Assets = @($j.assets) } }
             catch { Set-UpdateResult $null 'GitHub sent an answer ZeroDelay could not read.' }
         })
     }
@@ -5109,7 +5263,12 @@ function Set-UpdateResult($r, [string]$err) {
     }
     $script:UpdateError = $null
     $latest = Get-TagVersion $r.Tag
-    $script:UpdateInfo = if ($latest -and $latest -gt [version]$AppVersion) { @{ Version = "$latest"; Url = $r.Url } } else { $null }
+    $script:UpdateInfo = $null
+    if ($latest -and $latest -gt [version]$AppVersion) {
+        $asset = @($r.Assets) | Where-Object { $_.name -like '*Setup*.exe' } | Select-Object -First 1
+        $sha = if ("$($r.Body)" -match '\b([A-Fa-f0-9]{64})\b') { $Matches[1].ToUpper() } else { $null }
+        $script:UpdateInfo = @{ Version = "$latest"; Url = $r.Url; SetupUrl = "$($asset.browser_download_url)"; Size = [long]$asset.size; Sha = $sha }
+    }
     if ($script:UpdateManual -and -not $script:UpdateInfo) { Show-Toast "You have the latest version ($AppVersion)." '#30D158' }
     Update-UpdateUi
 }
@@ -5117,13 +5276,18 @@ function Update-UpdateUi {
     $u = $script:UpdateInfo
     if ($u -and -not $script:UpdateSnoozed) {
         $ui.UpdateTitle.Text = "ZeroDelay $($u.Version) is available"
-        $ui.UpdateText.Text = "You have $AppVersion. Download the new setup, exit ZeroDelay from the tray, then run it. Your settings and backups are kept."
+        $ui.UpdateText.Text = if ($script:UpdateDl) { $script:UpdateDl.Status }
+                              elseif ($u.SetupUrl -and $u.Sha) { "You have $AppVersion. ZeroDelay closes, updates and opens again in about 10 seconds. Your settings are kept." }
+                              else { "You have $AppVersion. Download the new setup, exit ZeroDelay from the tray, then run it. Your settings are kept." }
+        $ui.UpdateGet.Content = if ($u.SetupUrl -and $u.Sha) { 'Update now' } else { 'Download' }
+        $ui.UpdateGet.IsEnabled = -not $script:UpdateDl; $ui.UpdateLater.IsEnabled = -not $script:UpdateDl
         if ($ui.UpdateBar.Visibility -ne 'Visible') { $ui.UpdateBar.Visibility = 'Visible'; Show-Animated $ui.UpdateBar -8 260 }
     } else { $ui.UpdateBar.Visibility = 'Collapsed' }
     $st = $script:SetUi; if (-not $st) { return }
     $st.UpdGet.Visibility = if ($u) { 'Visible' } else { 'Collapsed' }
-    if ($u) { $st.UpdGet.Content = "Download $($u.Version)" }
-    $st.UpdStatus.Text = if ($u) { "Version $($u.Version) is out. Download the setup and run it; your settings and backups are kept." }
+    if ($u) { $st.UpdGet.Content = if ($u.SetupUrl -and $u.Sha) { "Update to $($u.Version)" } else { "Download $($u.Version)" }; $st.UpdGet.IsEnabled = -not $script:UpdateDl }
+    $st.UpdStatus.Text = if ($script:UpdateDl) { $script:UpdateDl.Status }
+                         elseif ($u) { "Version $($u.Version) is out. Your settings, backups and history are kept when you update." }
                          elseif ($script:UpdateError) { $script:UpdateError }
                          elseif ($script:UpdateChecked) { "You have the latest version. Checked at $($script:UpdateChecked.ToString('HH:mm'))." }
                          else { 'Not checked yet.' }
@@ -5131,6 +5295,506 @@ function Update-UpdateUi {
 function Open-UpdatePage {
     $url = if ($script:UpdateInfo) { $script:UpdateInfo.Url } else { "https://github.com/$UpdateRepo/releases/latest" }
     Start-Process $url
+}
+
+# --- One-click update: download the new setup from the GitHub release, check its SHA-256 against the
+#     release notes, then let the setup replace this copy and reopen ZeroDelay.
+function Install-Update {
+    $u = $script:UpdateInfo
+    if (-not $u -or $script:UpdateDl) { return }
+    if (-not $u.SetupUrl -or -not $u.Sha) { Open-UpdatePage; return }
+    $r = [Windows.MessageBox]::Show("Update ZeroDelay to $($u.Version) now?`n`nZeroDelay downloads the new setup from GitHub, checks it, closes, installs it and opens again. It takes about 10 seconds. Your settings, backups and history are kept.", 'ZeroDelay update', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    $dir = Join-Path $env:TEMP 'ZeroDelay-Update'
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $file = Join-Path $dir "ZeroDelay-Setup-$($u.Version).exe"
+    Remove-Item $file -Force -ErrorAction SilentlyContinue
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object Net.WebClient
+        $wc.Headers['User-Agent'] = "ZeroDelay/$AppVersion"
+        $task = $wc.DownloadFileTaskAsync([uri]$u.SetupUrl, $file)
+    } catch { Show-Toast "Could not start the download: $($_.Exception.Message)" '#FF9F0A'; return }
+    $script:UpdateDl = @{ Task = $task; File = $file; Info = $u; Status = "Downloading ZeroDelay $($u.Version)..." }
+    $script:UpdateSnoozed = $false
+    Update-UpdateUi
+    $script:UpdateDlTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:UpdateDlTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $script:UpdateDlTimer.Add_Tick({ Watch-UpdateDownload })
+    $script:UpdateDlTimer.Start()
+}
+function Watch-UpdateDownload {
+    $d = $script:UpdateDl
+    if (-not $d.Task.IsCompleted) {
+        $len = try { (Get-Item $d.File -ErrorAction Stop).Length } catch { 0 }
+        if ($d.Info.Size -gt 0) { $d.Status = "Downloading ZeroDelay $($d.Info.Version)... $([int](100 * $len / $d.Info.Size))%"; Update-UpdateUi }
+        return
+    }
+    $script:UpdateDlTimer.Stop()
+    $script:UpdateDl = $null
+    $fail = $null
+    if ($d.Task.IsFaulted -or $d.Task.IsCanceled) { $fail = 'The download failed. Check your internet connection and try again.' }
+    elseif ((Get-FileHash $d.File -Algorithm SHA256).Hash -ne $d.Info.Sha) { $fail = 'The downloaded file did not match the release checksum, so it was deleted and nothing was installed.' }
+    if ($fail) {
+        Remove-Item $d.File -Force -ErrorAction SilentlyContinue
+        Update-UpdateUi
+        Show-Toast $fail '#FF453A'
+        return
+    }
+    Add-History "Updated ZeroDelay $AppVersion to $($d.Info.Version)" 'update' $null
+    Save-Backup
+    try { Start-Process -FilePath $d.File -ArgumentList '/update' } catch { Show-Toast "Could not start the setup: $($_.Exception.Message)" '#FF453A'; Update-UpdateUi; return }
+    $script:ReallyExit = $true
+    $window.Close()
+}
+
+# --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
+$WhatsNew = @{
+    '1.2.0' = @(
+        @{ T = 'One-click updates'; D = 'When a new version is out, press Update now. ZeroDelay downloads it from GitHub, checks it and reinstalls itself in about 10 seconds.' }
+        @{ T = 'Match reports'; D = 'After each Fortnite session ZeroDelay shows its stutters with what was busy at that moment, GPU heat, background apps and memory. Tools > Match reports.' }
+        @{ T = 'Mouse test'; D = 'Tools > Mouse test measures your real polling rate and whether it is steady.' }
+        @{ T = 'Start with Windows'; D = 'Settings: ZeroDelay can open quietly in the tray when you sign in, so Game Mode is always ready. It stays off unless you switch it on.' }
+        @{ T = 'Report a problem'; D = 'Settings > Report a problem opens a GitHub issue with your PC details already filled in.' }
+    )
+}
+function Show-WhatsNew {
+    $items = $WhatsNew[$AppVersion]
+    if (-not $items) { return }
+    $rows = ($items | ForEach-Object {
+        "<StackPanel Margin='0,0,0,14'><TextBlock Text='$(Esc $_.T)' FontSize='14' FontWeight='SemiBold'/>" +
+        "<TextBlock Text='$(Esc $_.D)' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,3,0,0' LineHeight='18' LineStackingStrategy='BlockLineHeight'/></StackPanel>"
+    }) -join ''
+    $body = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <TextBlock Text='$(Esc "What's new in ZeroDelay $AppVersion")' FontSize='22' FontWeight='Bold'/>
+  <TextBlock Text='ZeroDelay was updated. Your settings, backups and history are all still here.' Foreground='#A1A1A6' FontSize='13' Margin='0,6,0,22' TextWrapping='Wrap'/>
+  $rows
+  <Button x:Name='Ok' Content='Got it' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Right' Margin='0,8,0,0' MinWidth='90'/>
+</StackPanel>
+"@)
+    $body.FindName('Ok').Add_Click({ Hide-Animated $ui.Wizard 200 })
+    $ui.WizardBody.Content = $body
+    $ui.Wizard.Visibility = 'Visible'
+    if ($script:Anim) {
+        Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220
+        Show-Animated $ui.WizardBody 24 380 60
+    }
+}
+
+# --- Report a problem: a new GitHub issue with the PC details filled in (the user reviews it before sending).
+function Open-ProblemReport {
+    $window.Cursor = [Windows.Input.Cursors]::Wait
+    try {
+        $hw = Get-HardwareSummary
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $drv = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $hw.Gpu } | Select-Object -First 1).DriverVersion
+        $info = @(
+            "ZeroDelay $AppVersion", "$($os.Caption) (build $($os.BuildNumber))", "CPU: $($hw.Cpu)", "GPU: $($hw.Gpu) (driver $drv)",
+            "RAM: $($hw.RamGb) GB at $($hw.RamMts) MT/s", "Monitor: $($hw.Hz) Hz", "Fortnite found: $(if ($script:FortniteExe) { 'yes' } else { 'no' })",
+            "Game Mode: $(if (Test-ZDGameMode) { 'on' } else { 'off' })", "Tweaks on: $(@(Get-Applied).Count)", "Theme: $script:Theme / $script:Accent"
+        )
+    } finally { $window.Cursor = $null }
+    $body = "### What happened?`n`n`n### What did you expect to happen?`n`n`n### How can it be made to happen again?`n1. `n`n---`n" +
+            "<details><summary>PC details (added by ZeroDelay)</summary>`n`n" + (($info | ForEach-Object { "- $_" }) -join "`n") + "`n</details>"
+    Start-Process "https://github.com/$UpdateRepo/issues/new?body=$([uri]::EscapeDataString($body))"
+    Show-Toast 'GitHub is open. Describe what went wrong, then press Create. You need a free GitHub account.' '#0A84FF'
+}
+
+# --- Start with Windows: a logon task (admin rights, so no permission prompt at every sign-in), started in the tray.
+$StartupTaskName = 'ZeroDelay'
+function Get-StartupTask { Get-ScheduledTask -TaskName $StartupTaskName -TaskPath '\' -ErrorAction SilentlyContinue }
+function Set-StartWithWindows([bool]$On) {
+    if (-not $On) { Unregister-ScheduledTask -TaskName $StartupTaskName -TaskPath '\' -Confirm:$false -ErrorAction SilentlyContinue; return }
+    $user = "$env:USERDOMAIN\$env:USERNAME"
+    $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $action = New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Tray"
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $trigger.Delay = 'PT15S'   # let Windows finish signing in first
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $StartupTaskName -TaskPath '\' -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+        -Description 'Starts ZeroDelay in the tray when you sign in. Turn it off in ZeroDelay > Settings.' -Force -ErrorAction Stop | Out-Null
+}
+# After an update or a move the task may point at an old copy; point it at this one.
+function Repair-StartupTask {
+    if ($Snapshot -or $NoElevate) { return }
+    try { $t = Get-StartupTask; if ($t -and "$($t.Actions[0].Arguments)" -notlike "*$PSCommandPath*") { Set-StartWithWindows $true } } catch {}
+}
+
+# --- Mouse test (Tools > Mouse test)
+function Measure-MouseBins([int[]]$Bins, [int]$BinMs) {
+    $b = @($Bins)
+    if ($b.Count -lt 10) { return $null }
+    $sorted = @($b | Sort-Object)
+    $p95 = $sorted[[int][Math]::Floor(0.95 * ($sorted.Count - 1))]
+    # only slices where the mouse was clearly moving (a mouse only reports when it moves)
+    $moving = @($b | Where-Object { $_ -gt 0 -and $_ -ge 0.5 * $p95 })
+    if ($moving.Count -lt 8) { return $null }
+    $ms = @($moving | Sort-Object)
+    $med = $ms[[int][Math]::Floor($ms.Count / 2)]
+    $hz = $med * 1000.0 / $BinMs
+    $snap = 125, 250, 500, 1000, 2000, 4000, 8000 | Where-Object { [Math]::Abs($_ - $hz) / $_ -le 0.12 } | Select-Object -First 1
+    $steady = @($moving | Where-Object { [Math]::Abs($_ - $med) / [Math]::Max(1, $med) -le 0.15 }).Count / $moving.Count
+    [pscustomobject]@{ Hz = [int][Math]::Round($hz); Snap = $snap; Steady = [int][Math]::Round(100 * $steady); Seconds = [Math]::Round($moving.Count * $BinMs / 1000.0, 1) }
+}
+function Get-MouseVerdict($r) {
+    if (-not $r) { return @('No steady movement was measured. Click Start and move the mouse in fast circles for the whole 5 seconds.', '#FF9F0A') }
+    $rate = if ($r.Snap) { $r.Snap } else { $r.Hz }
+    if ($r.Steady -lt 75) { return @("Your rate jumps around (only $($r.Steady)% of the test was steady). Plug the mouse or its receiver straight into a USB port on the back of the PC (not a hub or the front panel), and close mouse-software overlays.", '#FF9F0A') }
+    if (-not $r.Snap) { return @("About $($r.Hz) Hz, which is not a standard rate. Usually the CPU or USB port cannot keep up: try 1000 Hz in your mouse software, or another USB port.", '#FF9F0A') }
+    if ($rate -le 250) { return @("$rate Hz is slow for gaming: up to $([Math]::Round(1000 / $rate)) ms between mouse updates. Almost every gaming mouse can do 1000 Hz; set it in your mouse software (Logitech G HUB, Razer Synapse, SteelSeries GG, ...) or with the button under the mouse.", '#FF453A') }
+    if ($rate -eq 500) { return @('500 Hz works, but 1000 Hz halves the gap between mouse updates (2 ms to 1 ms). Set 1000 Hz in your mouse software if it offers it.', '#FF9F0A') }
+    if ($rate -eq 1000) { return @('1000 Hz and steady: the competitive standard. Nothing to change.', '#30D158') }
+    @("$rate Hz and steady: very smooth. If Fortnite ever stutters while you flick, try 1000 Hz, because high rates need more CPU time.", '#30D158')
+}
+function New-MousePage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
+    <StackPanel>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel>
+          <TextBlock Text='Polling rate' Foreground='#A1A1A6' FontSize='12'/>
+          <StackPanel Orientation='Horizontal'>
+            <TextBlock x:Name='Hz' Text='-' FontSize='44' FontWeight='Bold'/>
+            <TextBlock Text='Hz' FontSize='18' Foreground='#A1A1A6' VerticalAlignment='Bottom' Margin='8,0,0,10'/>
+          </StackPanel>
+          <TextBlock x:Name='Sub' Text='Click Start, then move your mouse in fast circles for 5 seconds.' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap'/>
+        </StackPanel>
+        <Button x:Name='Start' Grid.Column='1' Content='Start test' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' VerticalAlignment='Top'/>
+      </Grid>
+      <Border Background='#1C1C1E' CornerRadius='10' Height='150' Margin='0,18,0,0'>
+        <Grid>
+          <TextBlock x:Name='PadText' Text='Move your mouse anywhere while the test runs' Foreground='#98989D' FontSize='13' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+          <Border Height='4' CornerRadius='2' Background='#3A3A3C' VerticalAlignment='Bottom' Margin='16,0,16,14'>
+            <Border x:Name='Prog' Height='4' CornerRadius='2' Background='#0A84FF' HorizontalAlignment='Left' Width='0'/>
+          </Border>
+        </Grid>
+      </Border>
+      <TextBlock x:Name='Verdict' FontSize='13' FontWeight='SemiBold' Margin='0,14,0,0' TextWrapping='Wrap' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+      <TextBlock x:Name='Detail' FontSize='12' Foreground='#98989D' Margin='0,4,0,0' TextWrapping='Wrap'/>
+    </StackPanel>
+  </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20'>
+    <StackPanel>
+      <TextBlock Text='Good to know' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
+      <TextBlock Foreground='#A1A1A6' FontSize='12.5' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'
+        Text='&#x2022;  1000 Hz is the competitive standard: a new mouse position every 1 ms. 500 Hz waits up to 2 ms, 125 Hz up to 8 ms.&#x0a;&#x2022;  2000 to 8000 Hz feels even smoother but costs CPU time; if Fortnite stutters when you flick, go back to 1000 Hz.&#x0a;&#x2022;  Change the rate in your mouse software (Logitech G HUB, Razer Synapse, SteelSeries GG, ...) or with the button under the mouse.&#x0a;&#x2022;  Plug the mouse or its wireless receiver straight into the PC, not into a hub, keyboard or front-panel port.'/>
+    </StackPanel>
+  </Border>
+</StackPanel>
+"@)
+    $m = @{}; foreach ($n in 'Hz', 'Sub', 'Start', 'PadText', 'Prog', 'Verdict', 'Detail') { $m[$n] = $root.FindName($n) }
+    $script:MouseUi = $m
+    $m.Start.Add_Click({ Start-MouseTest })
+    $last = Get-Setting 'mousetest' $null
+    if ($last) {
+        $m.Hz.Text = "$(if ($last.Snap) { $last.Snap } else { $last.Hz })"
+        $m.Sub.Text = "Last test $(([datetime]$last.Time).ToString('d MMM HH:mm')), $($last.Steady)% steady. Run it again any time."
+    }
+    New-PageScroll $root
+}
+function Start-MouseTest {
+    $m = $script:MouseUi
+    $h = (New-Object Windows.Interop.WindowInteropHelper $window).Handle
+    if (-not [MouseRate]::Start($h)) { Show-Toast 'Windows did not let ZeroDelay read the mouse.' '#FF9F0A'; return }
+    $script:MouseWait = Get-Date; $script:MouseT0 = $null
+    $m.Start.IsEnabled = $false; $m.Hz.Text = '0'; $m.Verdict.Text = ''; $m.Detail.Text = ''; $m.Prog.Width = 0
+    $m.Sub.Text = 'Now move your mouse in fast circles and keep going...'
+    $m.PadText.Text = 'Keep moving...'
+    if (-not $script:MouseTimer) {
+        $script:MouseTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:MouseTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+        $script:MouseTimer.Add_Tick({
+            $m = $script:MouseUi
+            if (-not $script:MouseT0) {
+                if ([MouseRate]::Count -gt 20) { $script:MouseT0 = Get-Date }
+                elseif (((Get-Date) - $script:MouseWait).TotalSeconds -gt 15) { Stop-MouseTest; return }
+                return
+            }
+            $m.Hz.Text = "$([int][MouseRate]::RecentRate(250))"
+            $el = ((Get-Date) - $script:MouseT0).TotalSeconds
+            $w = $m.Prog.Parent.ActualWidth
+            $m.Prog.Width = [Math]::Max(0, [Math]::Min($w, $w * $el / 5))
+            if ($el -ge 5) { Stop-MouseTest }
+        })
+    }
+    $script:MouseTimer.Start()
+}
+function Stop-MouseTest {
+    $script:MouseTimer.Stop()
+    $bins = [MouseRate]::Bins(50)
+    [MouseRate]::Stop()
+    $m = $script:MouseUi
+    $m.Start.IsEnabled = $true; $m.Start.Content = 'Test again'; $m.PadText.Text = 'Move your mouse anywhere while the test runs'
+    $r = Measure-MouseBins $bins 50
+    $v = Get-MouseVerdict $r
+    $m.Verdict.Text = $v[0]; $m.Verdict.Foreground = ConvertTo-Brush $v[1]
+    if ($r) {
+        $m.Hz.Text = "$(if ($r.Snap) { $r.Snap } else { $r.Hz })"
+        $m.Sub.Text = 'Done.'
+        $m.Detail.Text = "Measured $($r.Hz) Hz over $($r.Seconds) s of movement, $($r.Steady)% of it steady."
+        $script:Backup.Custom['mousetest'] = @{ Hz = $r.Hz; Snap = $r.Snap; Steady = $r.Steady; Time = (Get-Date).ToString('o') }; Save-Backup
+    } else { $m.Hz.Text = '-'; $m.Sub.Text = 'Click Start, then move your mouse in fast circles for 5 seconds.' }
+}
+
+# --- Match reports: while Fortnite runs, a background sampler notes CPU hogs, GPU heat/slowdowns and free memory
+#     every 5 s, and PresentMon (if downloaded on the Benchmark page) records frame times. When Fortnite closes,
+#     the two are lined up so each stutter shows what was busy at that moment.
+$MatchDir = Join-Path $DataDir 'matches'
+$MatchSampler = {
+    param($sync, $smi, $smiField, $cores, $exclude, $selfPid)
+    $prev = @{}; $prevT = Get-Date
+    while (-not $sync.Stop) {
+        $now = Get-Date
+        $dt = ($now - $prevT).TotalSeconds; $prevT = $now
+        $cur = @{}; $top = @()
+        foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+            $c = $null; try { $c = $p.TotalProcessorTime.TotalSeconds } catch {}
+            if ($null -eq $c) { continue }
+            $cur[$p.Id] = $c
+            if ($prev.ContainsKey($p.Id) -and $dt -gt 1 -and $p.Id -ne $selfPid -and $exclude -notcontains $p.ProcessName) {
+                $pct = ($c - $prev[$p.Id]) / $dt / $cores * 100
+                if ($pct -ge 3) { $top += [pscustomobject]@{ Name = $p.ProcessName; Pct = [Math]::Round($pct, 1) } }
+            }
+        }
+        $prev = $cur
+        $gpu = $null
+        if ($smi) {
+            try {
+                $o = & $smi "--query-gpu=temperature.gpu,utilization.gpu,$smiField" --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+                $f = "$o" -split ',\s*'
+                if ($f.Count -ge 3) {
+                    $bits = [Convert]::ToInt64(($f[2].Trim() -replace '^0x', ''), 16)
+                    # 0x20/0x40 = thermal slowdown, 0x08/0x80 = hardware slowdown / power brake. The everyday
+                    # power-limit flag (0x04) is normal under load and deliberately ignored.
+                    $gpu = [pscustomobject]@{ Temp = [int]$f[0]; Util = [int]$f[1]; Thermal = [bool]($bits -band 0x60); HwSlow = [bool]($bits -band 0x88) }
+                }
+            } catch {}
+        }
+        $free = $null; try { $free = [int]((Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory).FreePhysicalMemory / 1024) } catch {}
+        [void]$sync.Samples.Add([pscustomobject]@{ T = $now; Top = @($top | Sort-Object Pct -Descending | Select-Object -First 3); Gpu = $gpu; FreeMb = $free })
+        for ($i = 0; $i -lt 20 -and -not $sync.Stop; $i++) { Start-Sleep -Milliseconds 250 }
+    }
+}
+function Start-MatchRecorder {
+    $rec = @{ Start = Get-Date; Csv = $null; Pm = $null }
+    if ((Test-Path $PresentMonExe) -and -not ($script:BenchProc -and -not $script:BenchProc.HasExited)) {
+        $rec.Csv = Join-Path $ToolsDir "match-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+        $pmArgs = @('--process_name', $FortniteExeName, '--output_file', "`"$($rec.Csv)`"", '--terminate_on_proc_exit',
+                    '--no_console_stats', '--stop_existing_session', '--session_name', 'ZeroDelayMatch')
+        try { $rec.Pm = Start-Process $PresentMonExe -ArgumentList $pmArgs -WindowStyle Hidden -PassThru } catch { $rec.Csv = $null }
+    }
+    $smi = "$env:WINDIR\System32\nvidia-smi.exe"
+    if (Test-Path $smi) {
+        if (-not $script:SmiField) {
+            $o = & $smi --query-gpu=clocks_event_reasons.active --format=csv,noheader 2>$null | Out-String
+            $script:SmiField = if ($o -match '0x[0-9A-Fa-f]+') { 'clocks_event_reasons.active' } else { 'clocks_throttle_reasons.active' }
+        }
+    } else { $smi = $null }
+    $sync = [hashtable]::Synchronized(@{ Stop = $false; Samples = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)) })
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($MatchSampler.ToString()).AddArgument($sync).AddArgument($smi).AddArgument($script:SmiField).AddArgument([Environment]::ProcessorCount).AddArgument(@('Idle', ($FortniteExeName -replace '\.exe$'))).AddArgument($PID)
+    $rec.PS = $ps; $rec.Sync = $sync; $rec.Handle = $ps.BeginInvoke()
+    $script:MatchRec = $rec
+    if ($script:MatchUi) { Update-MatchesPage }
+}
+function Stop-MatchRecorder {
+    $rec = $script:MatchRec
+    $script:MatchRec = $null
+    $rec.Sync.Stop = $true
+    $rec.End = Get-Date
+    $script:MatchAnalysis = @{ Rec = $rec; Phase = 'pm'; Deadline = (Get-Date).AddSeconds(15); Task = $null }
+}
+# Runs on the match timer until the report is built, so nothing here blocks the window.
+function Complete-MatchReport {
+    $a = $script:MatchAnalysis
+    if ($a.Phase -eq 'pm') {
+        if ($a.Rec.Pm -and -not $a.Rec.Pm.HasExited) {
+            if ((Get-Date) -lt $a.Deadline) { return }
+            try { $a.Rec.Pm.Kill() } catch {}
+        }
+        $a.Task = if ($a.Rec.Csv -and (Test-Path $a.Rec.Csv)) { [FrameStats]::AnalyzeAsync($a.Rec.Csv) } else { $null }
+        $a.Phase = 'analyze'
+    }
+    if ($a.Task -and -not $a.Task.IsCompleted) { return }
+    $script:MatchAnalysis = $null
+    $frames = if ($a.Task -and -not $a.Task.IsFaulted) { $a.Task.Result } else { $null }
+    try { if ($a.Rec.Handle.IsCompleted) { [void]$a.Rec.PS.EndInvoke($a.Rec.Handle) }; $a.Rec.PS.Dispose() } catch {}
+    if ($a.Rec.Csv) { Remove-Item $a.Rec.Csv -Force -ErrorAction SilentlyContinue }
+    if ($script:MatchUi) { Update-MatchesPage }
+    if (($a.Rec.End - $a.Rec.Start).TotalMinutes -lt 2) { return }   # too short to say anything useful
+    $r = New-MatchReport $a.Rec.Start $a.Rec.End $frames @($a.Rec.Sync.Samples)
+    Save-MatchReport $r
+    if ($script:MatchUi) { Update-MatchesPage }
+    $n = @($r.Issues).Count
+    $sum = if ($n) { "$n thing$(if ($n -ne 1) { 's' }) got in the way." } else { 'Smooth session: nothing got in the way.' }
+    Show-Toast "Match report ready. $sum" $(if ($n) { '#FF9F0A' } else { '#30D158' })
+    if (-not $window.IsVisible -and $script:Tray) {
+        $script:BalloonPage = 'Matches'
+        $script:Tray.ShowBalloonTip(6000, 'ZeroDelay match report', "$sum Click to see it.", 'None')
+    }
+}
+function New-MatchReport($Start, $End, $Frames, $Samples) {
+    $samples = @($Samples | Where-Object { $_ })
+    $n = [Math]::Max(1, $samples.Count)
+    $issues = @()
+    # background apps
+    $hog = @{}
+    foreach ($s in $samples) { foreach ($p in @($s.Top)) {
+        if (-not $hog.ContainsKey($p.Name)) { $hog[$p.Name] = @{ Sum = 0.0; Max = 0.0 } }
+        $hog[$p.Name].Sum += $p.Pct; if ($p.Pct -gt $hog[$p.Name].Max) { $hog[$p.Name].Max = $p.Pct }
+    } }
+    $hogs = @($hog.Keys | ForEach-Object { [pscustomobject]@{ Name = $_; Avg = [Math]::Round($hog[$_].Sum / $n, 1); Max = $hog[$_].Max } } |
+              Where-Object { $_.Avg -ge 3 -or $_.Max -ge 25 } | Sort-Object Avg -Descending | Select-Object -First 4)
+    foreach ($h in $hogs | Where-Object { $_.Avg -ge 6 }) { $issues += "$($h.Name) used $($h.Avg)% of your CPU on average (up to $($h.Max)%). Close it before playing, or add it to the apps Game Mode closes." }
+    # graphics card
+    $g = @($samples | Where-Object { $_.Gpu })
+    $maxT = if ($g) { ($g | ForEach-Object { $_.Gpu.Temp } | Measure-Object -Maximum).Maximum } else { $null }
+    $hot = if ($g) { [int][Math]::Round(100 * @($g | Where-Object { $_.Gpu.Thermal }).Count / $g.Count) } else { 0 }
+    $slow = if ($g) { [int][Math]::Round(100 * @($g | Where-Object { $_.Gpu.HwSlow }).Count / $g.Count) } else { 0 }
+    if ($hot -ge 5) { $issues += "Your graphics card slowed itself down because it got too hot (up to $maxT °C) for $hot% of the session. Clean out the dust or set a stronger fan curve." }
+    if ($slow -ge 5) { $issues += "Your graphics card hit a hardware slowdown (power or heat protection) for $slow% of the session. Check its power cables and that the power supply is strong enough." }
+    # memory
+    $minFree = ($samples | Where-Object { $null -ne $_.FreeMb } | ForEach-Object { $_.FreeMb } | Measure-Object -Minimum).Minimum
+    if ($minFree -and $minFree -lt 1024) { $issues += "Your PC ran low on memory (only $minFree MB free at one point). Windows then swaps to the disk, which causes stutters. Close browsers and other big apps before playing." }
+    # frames
+    $stutters = @(); $fps = $null
+    if ($Frames -and $Frames.Frames -gt 0) {
+        $fps = [pscustomobject]@{ Avg = [Math]::Round($Frames.AvgFps); Low1 = [Math]::Round($Frames.Low1Fps); Frames = $Frames.Frames }
+        for ($i = 0; $i -lt $Frames.StutterAtMs.Length; $i++) {
+            # PresentMon stops with Fortnite, so frame times are counted back from the end of the session
+            $at = $End.AddMilliseconds(-($Frames.TotalMs - $Frames.StutterAtMs[$i]))
+            $near = $samples | Sort-Object { [Math]::Abs(($_.T - $at).TotalSeconds) } | Select-Object -First 1
+            $busy = @()
+            if ($near -and [Math]::Abs(($near.T - $at).TotalSeconds) -le 6) {
+                $busy = @($near.Top | ForEach-Object { "$($_.Name) $($_.Pct)%" })
+                if ($near.Gpu -and $near.Gpu.Thermal) { $busy += 'GPU too hot' }
+                if ($null -ne $near.FreeMb -and $near.FreeMb -lt 1024) { $busy += 'low memory' }
+            }
+            $stutters += [pscustomobject]@{ At = $at.ToString('o'); Ms = [int][Math]::Round($Frames.StutterMs[$i]); Busy = ($busy -join ', ') }
+        }
+        $sc = $Frames.StutterCount
+        if ($sc) { $issues = @("$sc stutter$(if ($sc -ne 1) { 's' }): a frame that took much longer than the ones around it. The times are below, with what was busy at that moment.") + $issues }
+        if ($Frames.Low1Fps -lt 0.5 * $Frames.AvgFps) { $issues += "Your 1% lows ($($fps.Low1) FPS) are less than half your average ($($fps.Avg) FPS), so the game felt less smooth than the FPS counter says." }
+    }
+    [pscustomobject]@{
+        Version = 1; Start = $Start.ToString('o'); End = $End.ToString('o'); Minutes = [int][Math]::Round(($End - $Start).TotalMinutes)
+        Fps = $fps; StutterCount = $(if ($Frames) { $Frames.StutterCount } else { $null }); Stutters = $stutters
+        GpuMaxTemp = $maxT; GpuHotPct = $hot; GpuSlowPct = $slow; Hogs = $hogs; MinFreeMb = $minFree; Issues = @($issues)
+    }
+}
+function Save-MatchReport($r) {
+    New-Item -ItemType Directory -Force $MatchDir | Out-Null
+    $r | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $MatchDir "$(([datetime]$r.Start).ToString('yyyyMMdd-HHmmss')).json") -Encoding UTF8
+    Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+function Get-MatchReports {
+    if ($Snapshot -and $env:ZD_FAKE_MATCH) { return @(New-FakeMatchReport) }
+    if (-not (Test-Path $MatchDir)) { return @() }
+    @(Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | ForEach-Object {
+        $f = $_.FullName
+        try { Get-Content $f -Raw | ConvertFrom-Json | Add-Member -NotePropertyName File -NotePropertyValue $f -PassThru } catch {}
+    })
+}
+# dev: a report built from a synthetic session, to see the page without playing
+function New-FakeMatchReport {
+    $csv = Join-Path $env:TEMP 'zd-fake-match.csv'
+    $rnd = New-Object Random 7
+    $lines = New-Object Collections.Generic.List[string]; $lines.Add('Application,ProcessID,FrameTime')
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    for ($i = 0; $i -lt 60000; $i++) { $ft = 4.2 + $rnd.NextDouble() * 0.6; if ($i -in 12000, 30500, 30520, 47000) { $ft = 38.0 + $i % 20 }; $lines.Add("Fortnite,1,$($ft.ToString($inv))") }
+    [IO.File]::WriteAllLines($csv, $lines)
+    $frames = [FrameStats]::Analyze($csv)
+    Remove-Item $csv -ErrorAction SilentlyContinue
+    $end = Get-Date; $start = $end.AddMinutes(-21)
+    $samples = for ($t = 0; $t -lt 252; $t++) {
+        [pscustomobject]@{ T = $start.AddSeconds($t * 5); Top = @([pscustomobject]@{ Name = 'Discord'; Pct = 9.5 }, [pscustomobject]@{ Name = 'chrome'; Pct = 4.1 })
+                           Gpu = [pscustomobject]@{ Temp = 70 + ($t % 15); Util = 97; Thermal = ($t % 10 -eq 0); HwSlow = $false }; FreeMb = 5200 }
+    }
+    New-MatchReport $start $end $frames $samples | Add-Member -NotePropertyName File -NotePropertyValue '' -PassThru
+}
+function New-MatchesPage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,18' Margin='0,0,0,16'>
+    <StackPanel>
+      <TextBlock x:Name='State' FontSize='14' FontWeight='SemiBold'/>
+      <TextBlock x:Name='How' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,0,0' TextWrapping='Wrap' LineHeight='18' LineStackingStrategy='BlockLineHeight'/>
+    </StackPanel>
+  </Border>
+  <StackPanel x:Name='List'/>
+</StackPanel>
+"@)
+    $script:MatchUi = @{ State = $root.FindName('State'); How = $root.FindName('How'); List = $root.FindName('List') }
+    Update-MatchesPage
+    New-PageScroll $root
+}
+function Update-MatchesPage {
+    $mu = $script:MatchUi
+    $on = [bool](Get-Setting 'matchreport' $true)
+    $pm = Test-Path $PresentMonExe
+    $mu.State.Text = if (-not $on) { 'Match reports are off (Settings).' }
+                     elseif ($script:MatchRec) { "Recording since $($script:MatchRec.Start.ToString('HH:mm')). The report appears when you close Fortnite." }
+                     elseif ($script:MatchAnalysis) { 'Building the report...' }
+                     else { 'Ready. Play with ZeroDelay open (the tray is enough) and close Fortnite when you are done.' }
+    $mu.How.Text = 'ZeroDelay checks every 5 seconds which apps use your CPU, how hot your graphics card is and how much memory is free. ' +
+                   $(if ($pm) { 'PresentMon records every frame, so each stutter is shown with what was busy at that moment.' }
+                     else { 'To also find stutters, download PresentMon once on the Benchmark page.' })
+    $mu.List.Children.Clear()
+    $reports = Get-MatchReports
+    if (-not $reports) {
+        $tb = New-Object Windows.Controls.TextBlock
+        $tb.Text = 'No reports yet. Your first one appears after your next Fortnite session (at least 2 minutes).'
+        $tb.Foreground = ConvertTo-Brush '#98989D'; $tb.FontSize = 13; $tb.Margin = '4,4,0,0'
+        [void]$mu.List.Children.Add($tb); return
+    }
+    foreach ($r in $reports) {
+        $start = [datetime]$r.Start
+        $head = "$($start.ToString('ddd d MMM, HH:mm'))  ·  $($r.Minutes) min"
+        $fpsTxt = if ($r.Fps) { "$($r.Fps.Avg) FPS average  ·  $($r.Fps.Low1) FPS 1% low" } else { 'No frame data (PresentMon not downloaded)' }
+        $issues = @($r.Issues)
+        $verdict = if ($issues.Count) { "$($issues.Count) thing$(if ($issues.Count -ne 1) { 's' }) got in the way" } else { 'Smooth session: nothing got in the way' }
+        $vColor = if ($issues.Count) { '#FF9F0A' } else { '#30D158' }
+        $issueX = ($issues | ForEach-Object { "<TextBlock Text='$(Esc "•  $_")' FontSize='12.5' Foreground='#D1D1D6' TextWrapping='Wrap' Margin='0,6,0,0' LineHeight='18' LineStackingStrategy='BlockLineHeight'/>" }) -join ''
+        $st = @($r.Stutters)
+        $stX = ''
+        if ($st.Count) {
+            $stX = "<TextBlock Text='Stutters' FontSize='12' FontWeight='SemiBold' Foreground='#A1A1A6' Margin='0,14,0,2'/>" +
+                (($st | Select-Object -First 10 | ForEach-Object {
+                    "<Grid Margin='0,3,0,0'><Grid.ColumnDefinitions><ColumnDefinition Width='60'/><ColumnDefinition Width='70'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+                    "<TextBlock Text='$(([datetime]$_.At).ToString('HH:mm:ss'))' FontSize='12' Foreground='#D1D1D6'/>" +
+                    "<TextBlock Grid.Column='1' Text='$($_.Ms) ms' FontSize='12' Foreground='#FF453A' FontWeight='SemiBold'/>" +
+                    "<TextBlock Grid.Column='2' Text='$(Esc $(if ($_.Busy) { "busy: $($_.Busy)" } else { 'nothing else was busy' }))' FontSize='12' Foreground='#98989D' TextTrimming='CharacterEllipsis'/></Grid>"
+                }) -join '')
+            $more = [int]$r.StutterCount - [Math]::Min(10, $st.Count)
+            if ($more -gt 0) { $stX += "<TextBlock Text='and $more more' FontSize='12' Foreground='#98989D' Margin='0,4,0,0'/>" }
+        }
+        $gpuX = if ($r.GpuMaxTemp) { "  ·  GPU up to $($r.GpuMaxTemp) °C" } else { '' }
+        $card = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+  <StackPanel>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text='$(Esc $head)' FontSize='14' FontWeight='SemiBold'/>
+        <TextBlock Text='$(Esc "$fpsTxt$gpuX")' FontSize='12' Foreground='#A1A1A6' Margin='0,3,0,0'/>
+      </StackPanel>
+      <Button x:Name='Del' Grid.Column='1' Content='Delete' Style='{DynamicResource Btn}' Foreground='#FF453A' Padding='12,5' FontSize='12' VerticalAlignment='Top'/>
+    </Grid>
+    <TextBlock Text='$(Esc $verdict)' FontSize='13' FontWeight='SemiBold' Foreground='$vColor' Margin='0,12,0,0'/>
+    $issueX
+    $stX
+  </StackPanel>
+</Border>
+"@)
+        $del = $card.FindName('Del')
+        if ($r.File) { $del.Tag = $r.File; $del.Add_Click({ param($s, $e) Remove-Item $s.Tag -Force -ErrorAction SilentlyContinue; Update-MatchesPage }) } else { $del.IsEnabled = $false }
+        [void]$mu.List.Children.Add($card)
+    }
 }
 
 # --- System tray icon
@@ -5156,6 +5820,7 @@ function New-TrayIcon {
     $script:TrayGm = $gm
     $ni.ContextMenuStrip = $menu
     $ni.Add_MouseClick({ param($s, $e) if ($e.Button -eq 'Left') { Show-MainWindow } })
+    $ni.Add_BalloonTipClicked({ Show-MainWindow; if ($script:BalloonPage) { $script:NavButtons[$script:BalloonPage].IsChecked = $true; $script:BalloonPage = $null } })
     $ni.Visible = $true
     $ni
 }
@@ -5622,15 +6287,27 @@ $window.Add_Activated({
 if (-not $Snapshot) { $script:DriftTimer.Start() }
 
 $ui.UpdateLater.Add_Click({ $script:UpdateSnoozed = $true; Hide-Animated $ui.UpdateBar 200 })
-$ui.UpdateGet.Add_Click({ Open-UpdatePage })
+$ui.UpdateGet.Add_Click({ Install-Update })
 # first check shortly after start (so it never slows the window opening), then every 6 hours
 $script:UpdateTimer = New-Object Windows.Threading.DispatcherTimer
 $script:UpdateTimer.Interval = [TimeSpan]::FromSeconds(6)
 $script:UpdateTimer.Add_Tick({
+    if (-not $script:StartupChecked) { $script:StartupChecked = $true; Repair-StartupTask }
     $script:UpdateTimer.Interval = [TimeSpan]::FromHours(6)
     if (Get-Setting 'autoupdate' $true) { Start-UpdateCheck }
 })
 if (-not $Snapshot) { $script:UpdateTimer.Start() }
+
+# match recorder: starts when Fortnite starts, builds the report when it closes
+$script:MatchTimer = New-Object Windows.Threading.DispatcherTimer
+$script:MatchTimer.Interval = [TimeSpan]::FromSeconds(4)
+$script:MatchTimer.Add_Tick({
+    if ($script:MatchAnalysis) { Complete-MatchReport }
+    $running = Test-FortniteRunning
+    if ($running -and -not $script:MatchRec -and -not $script:MatchAnalysis -and (Get-Setting 'matchreport' $true)) { Start-MatchRecorder }
+    elseif (-not $running -and $script:MatchRec) { Stop-MatchRecorder }
+})
+if (-not $Snapshot) { $script:MatchTimer.Start() }
 
 $ui.RestartLater.Add_Click({
     # Hide until the next change that needs a restart; the pending list is kept until the PC restarts.
@@ -5707,6 +6384,9 @@ $window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringI
 Update-GameModeUi
 Update-All
 if ((-not $Snapshot -and -not $script:Backup.Custom['wizarddone']) -or ($Snapshot -and $env:ZD_WIZARD)) { Show-Wizard }
+elseif ($Snapshot -and $env:ZD_WHATSNEW) { Show-WhatsNew }
+elseif (-not $Snapshot -and "$($script:Backup.Custom['lastversion'])" -ne $AppVersion) { Show-WhatsNew }
+if (-not $Snapshot -and "$($script:Backup.Custom['lastversion'])" -ne $AppVersion) { $script:Backup.Custom['lastversion'] = $AppVersion; Save-Backup }
 if ($Snapshot) {
     if ($env:ZD_PROFILE) {
         $sw = [Diagnostics.Stopwatch]::StartNew(); Update-All; [Console]::WriteLine("UPDATE-ALL {0} ms" -f $sw.ElapsedMilliseconds)
