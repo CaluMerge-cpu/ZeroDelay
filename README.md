@@ -43,12 +43,16 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   restarts mid-match, Defender scan timing, leftovers from other optimizers.
 - **Vendor software**: services from ASUS, MSI, Corsair, Razer, Logitech, Dell, HP, Lenovo, Intel, AMD and Adobe that
   are documented stutter sources. Only what is installed is shown, and each card says what stops working.
-- **Benchmark** with Intel PresentMon (average FPS, 1% and 0.1% lows, latency, before/after comparison),
+- **Trends**: your matches over time (FPS, 1% lows, stutters, input latency, ping) with markers where tweaks changed or
+  Fortnite and the graphics driver updated, and the last matches compared with the ones before.
+- **Heads-up after updates**: when Fortnite or the graphics driver updates, ZeroDelay warns that the first match or two
+  stutter while shaders rebuild.
+- **Benchmark** with Intel PresentMon (average FPS, 1% and 0.1% lows, latency, before/after comparison) and a guided **A/B test with a replay** that says whether a change is a real gain or run-to-run noise,
   **Ping monitor** for Fortnite regions, **Sensitivity** calculator (eDPI, cm/360).
 - **Profiles** with share codes, **History** with per-change undo, **drift alerts** when another program changes your
   settings back, Windows restore point before applying.
 - **Match reports**: after each Fortnite session, the stutters (with what was busy at that moment), background apps
-  that used your CPU, GPU heat or hardware slowdowns, and low memory, plus a How to fix it list with one button per fix. Stutter timing uses PresentMon.
+  that used your CPU, GPU heat or hardware slowdowns, low memory, input latency and the connection (ping, jitter, packet loss), plus a How to fix it list with one button per fix. Stutter timing uses PresentMon.
 - **Mouse test**: measures your mouse's real polling rate (125 to 8000 Hz) and whether it is steady.
 - **Uninstall apps**: programs and Microsoft Store apps, with common Windows bloat labelled. **Force remove** skips a
   broken uninstaller and deletes the app's own folders, registry keys (backed up first), shortcuts, services and tasks;

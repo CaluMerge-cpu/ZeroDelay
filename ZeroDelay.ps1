@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.9.2'
+$AppVersion = '1.10.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -267,13 +267,14 @@ public static class MouseRate {
 public class MatchFrames {
     public int Frames; public double AvgFps; public double Low1Fps; public double TotalMs;
     public int StutterCount; public double[] StutterAtMs; public double[] StutterMs;
+    public double LatAvg; public string LatKind;   // input-to-display latency (PC latency with Reflex), 0 when not recorded
 }
 public static class FrameStats {
     public static System.Threading.Tasks.Task<MatchFrames> AnalyzeAsync(string path) {
         return System.Threading.Tasks.Task.Run(() => Analyze(path));
     }
     public static MatchFrames Analyze(string path) {
-        var ft = new List<double>();
+        var ft = new List<double>(); var lat = new List<double>(); string latKind = null;
         var inv = System.Globalization.CultureInfo.InvariantCulture;
         using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
         using (var r = new System.IO.StreamReader(fs)) {
@@ -283,12 +284,21 @@ public static class FrameStats {
             int col = Array.IndexOf(cols, "MsBetweenPresents");
             if (col < 0) col = Array.IndexOf(cols, "FrameTime");
             if (col < 0) return null;
+            // latency columns differ between PresentMon versions; PC latency (needs Reflex) is the most complete
+            string[] latNames = { "MsPCLatency", "PCLatency", "MsAllInputToPhotonLatency", "AllInputToPhotonLatency", "MsClickToPhotonLatency", "ClickToPhotonLatency", "DisplayLatency", "MsDisplayLatency" };
+            int latCol = -1; string latName = null;
+            foreach (var nm in latNames) { int ix = Array.IndexOf(cols, nm); if (ix >= 0) { latCol = ix; latName = nm; break; } }
             string line;
             while ((line = r.ReadLine()) != null) {
                 var f = line.Split(',');
                 double v;
-                if (f.Length > col && double.TryParse(f[col], System.Globalization.NumberStyles.Float, inv, out v) && v > 0) ft.Add(v);
+                if (f.Length > col && double.TryParse(f[col], System.Globalization.NumberStyles.Float, inv, out v) && v > 0) {
+                    ft.Add(v);
+                    double l;
+                    lat.Add(latCol >= 0 && f.Length > latCol && double.TryParse(f[latCol], System.Globalization.NumberStyles.Float, inv, out l) && l > 0 && l < 500 ? l : double.NaN);
+                }
             }
+            if (latName != null) latKind = latName.Contains("PC") ? "PC latency" : (latName.Contains("Photon") ? "input latency" : "display latency");
         }
         int n = ft.Count;
         if (n < 300) return null;
@@ -303,11 +313,15 @@ public static class FrameStats {
         }
         // gameplay frames only: no menus, and no frames over 1 s (alt-tab, pauses)
         var play = new List<double>();
-        double total = 0, playSum = 0;
+        double total = 0, playSum = 0, latSum = 0; int latN = 0;
         for (int i = 0; i < n; i++) {
             total += ft[i];
-            if (meds[i / B] < 50 && ft[i] < 1000) { play.Add(ft[i]); playSum += ft[i]; }
+            if (meds[i / B] < 50 && ft[i] < 1000) {
+                play.Add(ft[i]); playSum += ft[i];
+                if (i < lat.Count && !double.IsNaN(lat[i])) { latSum += lat[i]; latN++; }
+            }
         }
+        if (latN > 100) { m.LatAvg = latSum / latN; m.LatKind = latKind; }
         if (play.Count < 300) return null;
         m.TotalMs = total;
         m.AvgFps = play.Count > 0 ? 1000.0 * play.Count / playSum : 0;
@@ -4612,8 +4626,8 @@ if ($script:Glass) {
       </Border>
       </StackPanel>
 
-      <ScrollViewer x:Name="Scroller" Grid.Row="2" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="32,0,16,32">
-        <WrapPanel x:Name="Cards"/>
+      <ScrollViewer x:Name="Scroller" Grid.Row="2" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="18,0,2,18">
+        <WrapPanel x:Name="Cards" Margin="14,14,14,14"/>
       </ScrollViewer>
       <ContentControl x:Name="PageHost" Grid.Row="2" Visibility="Collapsed"/>
 
@@ -5596,6 +5610,8 @@ $Categories = @(
        Note = 'One scan for the problems that cost you the most. Fix them one by one or all at once.' }
     @{ Name = 'Benchmark';  Icon = [char]0xE9D9; Title = 'Benchmark'; Page = 'Benchmark'
        Note = 'Measure real FPS, 1% lows and latency in Fortnite, then compare before and after a change.' }
+    @{ Name = 'Trends';     Icon = [char]0xE9D2; Title = 'Trends'; Page = 'Trends'
+       Note = 'Your matches over time: did the changes help? Lines mark when tweaks changed and when Fortnite or the graphics driver updated.' }
     @{ Name = 'Matches';    Icon = [char]0xE7FC; Title = 'Match reports'; Page = 'Matches'
        Note = 'After each Fortnite session: stutters and what was busy at that moment, GPU heat, background apps and memory.' }
     @{ Name = 'Debloat';    Icon = [char]0xE74D; Title = 'Debloat'; Page = 'Debloat'
@@ -6240,14 +6256,39 @@ function New-BenchmarkPage {
       <TextBlock x:Name='Status' FontSize='13' FontWeight='SemiBold' Foreground='#30D158' Margin='0,12,0,0'/>
     </StackPanel>
   </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
+    <StackPanel>
+      <TextBlock Text='A/B test with a replay' FontSize='16' FontWeight='SemiBold'/>
+      <TextBlock FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,0,0' TextWrapping='Wrap' MaxWidth='760' HorizontalAlignment='Left'
+                 Text='A Fortnite replay plays the same every time, so it is the fairest way to test one change. ZeroDelay records the same part of a replay with the setting as it is now (A) and changed (B), a few times each, and tells you whether the difference is real or just run-to-run noise.'/>
+      <StackPanel Orientation='Horizontal' Margin='0,14,0,0'>
+        <TextBlock Text='Test' Foreground='#A1A1A6' FontSize='12' VerticalAlignment='Center' Margin='0,0,10,0'/>
+        <ComboBox x:Name='ABWhat' Width='360' FontSize='13'/>
+        <TextBlock Text='Runs per side' Foreground='#A1A1A6' FontSize='12' VerticalAlignment='Center' Margin='22,0,10,0'/>
+        <Button x:Name='ABR1' Content='1' Style='{DynamicResource Btn}' Padding='12,6' FontSize='12' Margin='0,0,6,0'/>
+        <Button x:Name='ABR2' Content='2' Style='{DynamicResource Btn}' Padding='12,6' FontSize='12' Margin='0,0,6,0'/>
+        <Button x:Name='ABR3' Content='3' Style='{DynamicResource Btn}' Padding='12,6' FontSize='12' Margin='0,0,22,0'/>
+        <Button x:Name='ABStart' Content='Start A/B test' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF'/>
+        <Button x:Name='ABCancel' Content='Stop test' Style='{DynamicResource Btn}' Margin='8,0,0,0' Visibility='Collapsed'/>
+      </StackPanel>
+      <Border x:Name='ABStepBox' Background='#1F0A84FF' BorderBrush='#550A84FF' BorderThickness='1' CornerRadius='10' Padding='16,12' Margin='0,14,0,0' Visibility='Collapsed'>
+        <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+          <StackPanel><TextBlock x:Name='ABStepTitle' FontSize='14' FontWeight='SemiBold' TextWrapping='Wrap'/><TextBlock x:Name='ABStepText' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,0' LineHeight='18' LineStackingStrategy='BlockLineHeight'/></StackPanel>
+          <Button x:Name='ABRecord' Grid.Column='1' Content='Record in 5 s' Style='{DynamicResource Btn}' VerticalAlignment='Center' Margin='14,0,0,0' ToolTip='Or press Ctrl+F9 inside Fortnite'/>
+        </Grid>
+      </Border>
+      <StackPanel x:Name='ABResult' Margin='0,12,0,0'/>
+    </StackPanel>
+  </Border>
   <Border x:Name='CompareBox' Background='#22382A' BorderBrush='#2F5A3D' BorderThickness='1' CornerRadius='10' Padding='22,14' Margin='0,0,0,16' Visibility='Collapsed'>
     <TextBlock x:Name='Compare' FontSize='13.5' TextWrapping='Wrap'/>
   </Border>
   <StackPanel x:Name='Runs'/>
 </StackPanel>
 "@)
-    $b = @{}; foreach ($n in 'Hint', 'Get', 'Label', 'D30', 'D60', 'D120', 'Start', 'Status', 'CompareBox', 'Compare', 'Runs') { $b[$n] = $root.FindName($n) }
+    $b = @{}; foreach ($n in 'Hint', 'Get', 'Label', 'D30', 'D60', 'D120', 'Start', 'Status', 'CompareBox', 'Compare', 'Runs', 'ABWhat', 'ABR1', 'ABR2', 'ABR3', 'ABStart', 'ABCancel', 'ABStepBox', 'ABStepTitle', 'ABStepText', 'ABRecord', 'ABResult') { $b[$n] = $root.FindName($n) }
     $script:Bench = $b
+    Initialize-ABCard
     $script:BenchSeconds = 60
     $b.Label.Text = "Run $(@(Get-BenchRuns).Count + 1)"
     foreach ($n in 'D30', 'D60', 'D120') {
@@ -6274,6 +6315,191 @@ function New-BenchmarkPage {
     Update-BenchDurationButtons
     Update-BenchmarkPage
     New-PageScroll $root
+}
+# ---------------------------------------------------------------- A/B test with a replay
+# tweaks that work while Fortnite runs (no game-file, driver-profile or restart changes)
+function Get-ABTweaks {
+    @($Tweaks | Where-Object { $_.Toggle -and -not $_.Hidden -and $null -ne $_.State -and -not $_.Ini -and -not $_.Nv -and -not $_.Preset -and $_.Badge -notin 'restart', 'signout' -and $_.Id -notlike 'startup:*' -and $_.Id -notlike 'device:*' } |
+      Sort-Object @{ e = { -not $_.Lat } }, Title)
+}
+function Initialize-ABCard {
+    $b = $script:Bench
+    $script:ABReps = 2
+    $b.ABWhat.Items.Clear()
+    $i0 = New-Object Windows.Controls.ComboBoxItem; $i0.Content = 'Something I change myself (a Fortnite setting, Game Mode...)'; $i0.Tag = $null; [void]$b.ABWhat.Items.Add($i0)
+    foreach ($t in Get-ABTweaks) { $it = New-Object Windows.Controls.ComboBoxItem; $it.Content = "$($t.Title)   (now $(if ($t.State) { 'on' } else { 'off' }))"; $it.Tag = $t.Id; [void]$b.ABWhat.Items.Add($it) }
+    $b.ABWhat.SelectedIndex = 0
+    foreach ($n in 'ABR1', 'ABR2', 'ABR3') { $b[$n].Tag = [int]$n.Substring(3); $b[$n].Add_Click({ param($s, $e) $script:ABReps = $s.Tag; Update-ABRepButtons }) }
+    Update-ABRepButtons
+    $b.ABStart.Add_Click({ Start-ABTest })
+    $b.ABCancel.Add_Click({ Stop-ABTest 'The A/B test was stopped.' })
+    $b.ABRecord.Add_Click({ Start-ABCountdown })
+}
+function Update-ABRepButtons {
+    foreach ($n in 'ABR1', 'ABR2', 'ABR3') { $on = $script:Bench[$n].Tag -eq $script:ABReps; $script:Bench[$n].Background = ConvertTo-Brush $(if ($on) { '#636366' } else { '#3A3A3C' }); $script:Bench[$n].Foreground = ConvertTo-Brush $(if ($on) { '#FFFFFF' } else { '#A1A1A6' }) }
+}
+# Ctrl+F9 anywhere (also inside Fortnite) starts the next recording while a test is running
+function Register-ABHotKey {
+    if (-not ('ZdHotKey' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Windows.Forms;
+public class ZdHotKey : NativeWindow, IDisposable {
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+    public event EventHandler Pressed;
+    public bool Ok;
+    public ZdHotKey(uint mod, uint vk) { CreateHandle(new CreateParams()); Ok = RegisterHotKey(Handle, 1, mod | 0x4000, vk); }
+    protected override void WndProc(ref Message m) { if (m.Msg == 0x0312 && Pressed != null) Pressed(this, EventArgs.Empty); base.WndProc(ref m); }
+    public void Dispose() { UnregisterHotKey(Handle, 1); DestroyHandle(); }
+}
+'@
+    }
+    if ($script:ABHotKey) { return $true }
+    $script:ABHotKey = New-Object ZdHotKey 2, 0x78    # Ctrl + F9
+    $script:ABHotKey.Add_Pressed({ if ($script:AB -and -not $script:AB.Recording) { Start-ABRecording } })
+    $script:ABHotKey.Ok
+}
+function Unregister-ABHotKey { if ($script:ABHotKey) { try { $script:ABHotKey.Dispose() } catch {}; $script:ABHotKey = $null } }
+function Start-ABTest {
+    $b = $script:Bench
+    if (-not (Test-Path $PresentMonExe)) { Show-Toast 'Download PresentMon first (button above).' '#FF9F0A'; return }
+    $sel = $b.ABWhat.SelectedItem
+    $t = if ($sel -and $sel.Tag) { Find-Tweak $sel.Tag } else { $null }
+    $seq = @(); for ($i = 0; $i -lt $script:ABReps; $i++) { $seq += 'A', 'B' }
+    $name = if ($t) { $t.Title } else { 'your change' }
+    $script:AB = @{ Tweak = $t; Name = $name; Seq = $seq; Step = 0; Runs = @{ A = @(); B = @() }; Recording = $false
+                    AState = $(if ($t) { [bool]$t.State } else { $null }); Seconds = $script:BenchSeconds }
+    $hk = Register-ABHotKey
+    $b.ABStart.Visibility = 'Collapsed'; $b.ABCancel.Visibility = 'Visible'; $b.ABWhat.IsEnabled = $false
+    $b.ABResult.Children.Clear()
+    if (-not $hk) { Show-Toast 'Ctrl+F9 is taken by another app: use the Record button instead.' '#FF9F0A' }
+    Show-ABStep
+}
+function Get-ABSideText([string]$Side) {
+    $a = $script:AB
+    if ($a.Tweak) { $on = if ($Side -eq 'A') { $a.AState } else { -not $a.AState }; "$($a.Name) $(if ($on) { 'on' } else { 'off' })" }
+    elseif ($Side -eq 'A') { 'as it is now' } else { 'with your change' }
+}
+function Show-ABStep {
+    $a = $script:AB; $b = $script:Bench
+    if ($a.Step -ge $a.Seq.Count) { Complete-ABTest; return }
+    $side = $a.Seq[$a.Step]
+    $b.ABStepBox.Visibility = 'Visible'
+    $b.ABStepTitle.Text = "Run $($a.Step + 1) of $($a.Seq.Count): $side ($(Get-ABSideText $side))"
+    $first = $a.Step -eq 0
+    $b.ABStepText.Text = $(if ($first) { 'In Fortnite open Career > Replays and pick one replay. ' } else { '' }) +
+        "Jump to the same moment every time (for example 1:00), press play, then press Ctrl+F9 (or Record here). ZeroDelay records $($a.Seconds) s and plays a sound when it starts and ends." +
+        $(if (-not $a.Tweak -and $side -eq 'B' -and $a.Step -eq 1) { ' Before this run: make your change now.' } elseif (-not $a.Tweak -and $a.Step -gt 1) { " Before this run: set it back to $(if ($side -eq 'A') { 'how it was (A)' } else { 'your change (B)' })." } else { '' })
+    $b.ABRecord.IsEnabled = $true; $b.ABRecord.Content = 'Record in 5 s'
+}
+function Start-ABCountdown {
+    $script:ABCount = 5
+    $script:Bench.ABRecord.IsEnabled = $false
+    if (-not $script:ABCountTimer) {
+        $script:ABCountTimer = New-Object Windows.Threading.DispatcherTimer; $script:ABCountTimer.Interval = [TimeSpan]::FromSeconds(1)
+        $script:ABCountTimer.Add_Tick({ $script:ABCount--; if ($script:ABCount -le 0) { $script:ABCountTimer.Stop(); Start-ABRecording } else { $script:Bench.ABRecord.Content = "Recording in $script:ABCount s" } })
+    }
+    $script:Bench.ABRecord.Content = 'Recording in 5 s'
+    $script:ABCountTimer.Start()
+}
+function Start-ABRecording {
+    $a = $script:AB; if (-not $a -or $a.Recording) { return }
+    if (-not (Test-FortniteRunning)) { Show-Toast 'Fortnite is not running: start the replay first.' '#FF9F0A'; Show-ABStep; return }
+    $a.Csv = Join-Path $ToolsDir "ab-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    $pmArgs = @('--process_name', $FortniteExeName, '--output_file', "`"$($a.Csv)`"", '--timed', "$($a.Seconds)", '--terminate_after_timed', '--no_console_stats', '--stop_existing_session', '--session_name', 'ZeroDelayAB')
+    try { $a.Proc = Start-Process $PresentMonExe -ArgumentList $pmArgs -WindowStyle Hidden -PassThru } catch { Show-Toast "Could not start PresentMon: $($_.Exception.Message)" '#FF9F0A'; return }
+    $a.Recording = $true; $a.End = (Get-Date).AddSeconds($a.Seconds + 2)
+    [System.Media.SystemSounds]::Asterisk.Play()
+    if (-not $script:ABTimer) {
+        $script:ABTimer = New-Object Windows.Threading.DispatcherTimer; $script:ABTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $script:ABTimer.Add_Tick({ Watch-ABRecording })
+    }
+    $script:ABTimer.Start()
+}
+function Watch-ABRecording {
+    $a = $script:AB; $b = $script:Bench
+    if (-not $a) { $script:ABTimer.Stop(); return }
+    if (-not $a.Proc.HasExited) {
+        $b.ABRecord.Content = "Recording... $([Math]::Max(0, [int]($a.End - (Get-Date)).TotalSeconds)) s"; $b.ABRecord.IsEnabled = $false
+        if ((Get-Date) -gt $a.End.AddSeconds(20)) { try { $a.Proc.Kill() } catch {} }
+        return
+    }
+    $script:ABTimer.Stop(); $a.Recording = $false
+    [System.Media.SystemSounds]::Exclamation.Play()
+    $side = $a.Seq[$a.Step]
+    try {
+        $m = Measure-BenchCsv $a.Csv
+        $a.Runs[$side] += $m
+        $label = "A/B $side$([int](@($a.Runs[$side]).Count)): $(Get-ABSideText $side)"
+        $run = [pscustomobject]@{ Label = $label; Time = (Get-Date).ToString('o'); Seconds = $a.Seconds; Setup = (Get-SetupSummary); AvgFps = $m.AvgFps; Low1 = $m.Low1; Low01 = $m.Low01; FtSd = $m.FtSd; Latency = $m.Latency; LatencyKind = $m.LatencyKind; Frames = $m.Frames }
+        Save-BenchRuns (@(Get-BenchRuns) + $run)
+    } catch { Show-Toast "That run failed: $($_.Exception.Message). Record it again." '#FF9F0A'; Remove-Item $a.Csv -ErrorAction SilentlyContinue; Show-ABStep; return }
+    Remove-Item $a.Csv -ErrorAction SilentlyContinue
+    $a.Step++
+    # switch the tweak for the next run when the side changes
+    if ($a.Tweak -and $a.Step -lt $a.Seq.Count -and $a.Seq[$a.Step] -ne $side) {
+        $want = if ($a.Seq[$a.Step] -eq 'A') { $a.AState } else { -not $a.AState }
+        try { if ($want) { Invoke-TweakOn $a.Tweak } else { Invoke-TweakOff $a.Tweak }; Clear-ReadCache; Update-Card $a.Tweak; Show-Toast "$($a.Name) is now $(if ($want) { 'on' } else { 'off' }) for the next run." '#0A84FF' }
+        catch { Show-Toast "Could not switch $($a.Name): $($_.Exception.Message)" '#FF9F0A' }
+    }
+    Update-BenchmarkPage
+    Show-ABStep
+}
+function Stop-ABTest([string]$Msg) {
+    if ($script:ABTimer) { $script:ABTimer.Stop() }; if ($script:ABCountTimer) { $script:ABCountTimer.Stop() }
+    if ($script:AB -and $script:AB.Proc -and -not $script:AB.Proc.HasExited) { try { $script:AB.Proc.Kill() } catch {} }
+    Unregister-ABHotKey
+    $b = $script:Bench
+    $b.ABStepBox.Visibility = 'Collapsed'; $b.ABStart.Visibility = 'Visible'; $b.ABCancel.Visibility = 'Collapsed'; $b.ABWhat.IsEnabled = $true
+    if ($Msg) { Show-Toast $Msg '#A1A1A6' }
+    $script:AB = $null
+}
+# A real difference has to be bigger than how much the same side varies from run to run.
+function Get-ABVerdict($A, $B, [string]$Prop, [bool]$LowerBetter) {
+    $va = @($A | ForEach-Object { $_.$Prop } | Where-Object { $null -ne $_ }); $vb = @($B | ForEach-Object { $_.$Prop } | Where-Object { $null -ne $_ })
+    if (-not $va.Count -or -not $vb.Count) { return $null }
+    $ma = ($va | Measure-Object -Average).Average; $mb = ($vb | Measure-Object -Average).Average
+    $diff = if ($ma) { ($mb - $ma) / $ma * 100 } else { 0 }
+    $spread = { param($v, $m) if ($v.Count -lt 2 -or -not $m) { $null } else { (($v | Measure-Object -Maximum).Maximum - ($v | Measure-Object -Minimum).Minimum) / $m * 100 } }
+    $na = & $spread $va $ma; $nb = & $spread $vb $mb
+    $noise = @($na, $nb | Where-Object { $null -ne $_ }); $noise = if ($noise.Count) { ($noise | Measure-Object -Maximum).Maximum } else { $null }
+    $better = if ($LowerBetter) { $diff -lt 0 } else { $diff -gt 0 }
+    $verdict = if ($null -eq $noise) { 'one run per side: run 2 or 3 per side to know if this is real' }
+               elseif ([Math]::Abs($diff) -le [Math]::Max($noise, 2)) { "within the run-to-run noise ($('{0:0.#}' -f $noise)%): no real difference" }
+               elseif ($better) { "better, and bigger than the noise ($('{0:0.#}' -f $noise)%): a real gain" } else { "worse, and bigger than the noise ($('{0:0.#}' -f $noise)%)" }
+    [pscustomobject]@{ A = $ma; B = $mb; Diff = $diff; Noise = $noise; Better = $better; Real = ($null -ne $noise -and [Math]::Abs($diff) -gt [Math]::Max($noise, 2)); Text = $verdict }
+}
+function Complete-ABTest {
+    $a = $script:AB; $b = $script:Bench
+    Unregister-ABHotKey
+    $b.ABStepBox.Visibility = 'Collapsed'; $b.ABStart.Visibility = 'Visible'; $b.ABCancel.Visibility = 'Collapsed'; $b.ABWhat.IsEnabled = $true
+    $rows = @(@('Average FPS', 'AvgFps', $false, 'FPS'), @('1% low FPS', 'Low1', $false, 'FPS'), @('Frame-time spread', 'FtSd', $true, 'ms'), @('Latency', 'Latency', $true, 'ms'))
+    $x = foreach ($r in $rows) {
+        $v = Get-ABVerdict $a.Runs.A $a.Runs.B $r[1] $r[2]; if (-not $v) { continue }
+        $c = if (-not $v.Real) { '#A1A1A6' } elseif ($v.Better) { '#30D158' } else { '#FF453A' }
+        "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='150'/><ColumnDefinition Width='200'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+        "<TextBlock Text='$($r[0])' FontSize='13' FontWeight='SemiBold'/>" +
+        "<TextBlock Grid.Column='1' Text='$(Esc ("A {0:0.#}  →  B {1:0.#} {2}  ({3}{4:0.#}%)" -f $v.A, $v.B, $r[3], $(if ($v.Diff -ge 0) { '+' } else { '' }), $v.Diff))' FontSize='12.5'/>" +
+        "<TextBlock Grid.Column='2' Text='$(Esc $v.Text)' FontSize='12.5' Foreground='$c' TextWrapping='Wrap'/></Grid>"
+    }
+    $main = Get-ABVerdict $a.Runs.A $a.Runs.B 'Low1' $false
+    $head = if (-not $main) { 'Not enough data.' } elseif (-not $main.Real) { "B ($(Get-ABSideText 'B')) made no difference you could feel." } elseif ($main.Better) { "B ($(Get-ABSideText 'B')) is smoother: keep it." } else { "B ($(Get-ABSideText 'B')) is worse: go back to A." }
+    $keep = if ($a.Tweak) { "<StackPanel Orientation='Horizontal' Margin='0,10,0,0'><Button x:Name='KeepA' Content='$(Esc "Keep A ($(Get-ABSideText 'A'))")' Style='{DynamicResource Btn}' Margin='0,0,8,0'/><Button x:Name='KeepB' Content='$(Esc "Keep B ($(Get-ABSideText 'B'))")' Style='{DynamicResource Btn}'/></StackPanel>" } else { '' }
+    $panel = [ZdTheme]::Parse("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Background='#1430D158' BorderBrush='#4430D158' BorderThickness='1' CornerRadius='10' Padding='16,12'><StackPanel>" +
+        "<TextBlock Text='$(Esc "Result: $head")' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,10' TextWrapping='Wrap'/>$($x -join '')$keep</StackPanel></Border>")
+    if ($a.Tweak) {
+        $script:ABDone = $a
+        foreach ($k in 'KeepA', 'KeepB') {
+            $btn = $panel.FindName($k); $btn.Tag = $k
+            $btn.Add_Click({ param($s, $e)
+                $d = $script:ABDone; $want = if ($s.Tag -eq 'KeepA') { $d.AState } else { -not $d.AState }
+                try { if ([bool]$d.Tweak.State -ne $want) { if ($want) { Invoke-TweakOn $d.Tweak } else { Invoke-TweakOff $d.Tweak } }; Clear-ReadCache; Update-Card $d.Tweak; Update-Summary; Show-Toast "$($d.Name) is $(if ($want) { 'on' } else { 'off' })." '#30D158' } catch { Show-Toast $_.Exception.Message '#FF9F0A' }
+            })
+        }
+    }
+    $b.ABResult.Children.Clear(); [void]$b.ABResult.Children.Add($panel)
+    Add-History "A/B test: $($a.Name) - $head" 'benchmark' $null
+    $script:AB = $null
 }
 function Update-BenchDurationButtons {
     foreach ($n in 'D30', 'D60', 'D120') {
@@ -7132,6 +7358,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.10.0' = @(
+        @{ T = 'A/B test with a replay'; D = 'On the Benchmark page: pick a tweak, play the same Fortnite replay a few times while ZeroDelay records (Ctrl+F9 inside the game), and it tells you if the change is a real gain or just noise.' }
+        @{ T = 'Trends'; D = 'A new Tools > Trends page shows your matches over time (FPS, 1% lows, stutters, input latency and ping), with dashed lines where tweaks changed or Fortnite and the driver updated, and the last matches compared with the ones before.' }
+        @{ T = 'Latency and connection in match reports'; D = 'Reports now show your input latency (with PresentMon) and your connection during the match: ping, jitter and lost packets, with fixes when the connection was the problem.' }
+        @{ T = 'Heads-up after updates'; D = 'When Fortnite or your graphics driver updates, ZeroDelay tells you the first match or two may stutter while shaders rebuild, so you play a warm-up before a cup.' }
+        @{ T = 'Glow fixes'; D = 'Glows and hover halos were cut off with a straight edge in places (the Home score ring, buttons, cards at the edge of a page). Every page was checked: none are cut off any more.' }
+    )
     '1.9.2' = @(
         @{ T = 'Network power-saving fixed'; D = 'Turn off network power-saving failed on newer Windows builds. It now sets the adapter''s own power setting (the one in Device Manager > Power Management), reconnects the adapter for a second, and the card shows the right state afterwards.' }
     )
@@ -7388,7 +7621,7 @@ function Stop-MouseTest {
 #     the two are lined up so each stutter shows what was busy at that moment.
 $MatchDir = Join-Path $DataDir 'matches'
 $MatchSampler = {
-    param($sync, $smi, $smiField, $cores, $exclude, $selfPid, $gmFile)
+    param($sync, $smi, $smiField, $cores, $exclude, $selfPid, $gmFile, $pingHost, $boostRx)
     $prev = @{}; $prevT = Get-Date
     while (-not $sync.Stop) {
         $now = Get-Date
@@ -7418,11 +7651,64 @@ $MatchSampler = {
             } catch {}
         }
         $free = $null; try { $free = [int]((Get-CimInstance Win32_OperatingSystem -Property FreePhysicalMemory).FreePhysicalMemory / 1024) } catch {}
-        [void]$sync.Samples.Add([pscustomobject]@{ T = $now; Top = @($top | Sort-Object Pct -Descending | Select-Object -First 3); Gpu = $gpu; FreeMb = $free; GM = [bool]($gmFile -and (Test-Path $gmFile)) })
+        # three pings to Epic's servers for the region: round trip, and how many got no answer
+        $pings = @(); $lost = 0
+        if ($pingHost) { $png = New-Object Net.NetworkInformation.Ping; for ($q = 0; $q -lt 3; $q++) { try { $x = $png.Send($pingHost, 800); if ($x.Status -eq 'Success') { $pings += [int]$x.RoundtripTime } else { $lost++ } } catch { $lost++ }; Start-Sleep -Milliseconds 120 } }
+        $boost = [bool]($boostRx -and (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $boostRx } | Select-Object -First 1))
+        [void]$sync.Samples.Add([pscustomobject]@{ T = $now; Top = @($top | Sort-Object Pct -Descending | Select-Object -First 3); Gpu = $gpu; FreeMb = $free; GM = [bool]($gmFile -and (Test-Path $gmFile)); Pings = $pings; Lost = $lost; Boost = $boost })
         for ($i = 0; $i -lt 20 -and -not $sync.Stop; $i++) { Start-Sleep -Milliseconds 250 }
     }
 }
+# Fortnite and graphics-driver versions: after either changes, the first matches stutter while shaders rebuild.
+function Get-UpdateVersions {
+    $fn = $null
+    foreach ($m in Get-ChildItem "$env:ProgramData\Epic\EpicGamesLauncher\Data\Manifests" -Filter *.item -ErrorAction SilentlyContinue) {
+        try { $j = Get-Content $m.FullName -Raw | ConvertFrom-Json; if ($j.AppName -eq 'Fortnite' -or $j.DisplayName -eq 'Fortnite') { $fn = "$($j.AppVersionString)"; break } } catch {}
+    }
+    if ($fn -match 'Release-(\d+\.\d+)') { $fn = $Matches[1] }
+    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_(10DE|1002|8086)' -and $_.Name -match $DiscreteGpuRx } | Select-Object -First 1
+    if (-not $gpu) { $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    $drv = "$($gpu.DriverVersion)"
+    if ($gpu.PNPDeviceID -match 'VEN_10DE' -and $drv) { $dg = $drv -replace '\D', ''; $last = $dg.Substring([Math]::Max(0, $dg.Length - 5)); $drv = '{0}.{1}' -f $last.Substring(0, 3), $last.Substring(3) }
+    @{ Fortnite = $fn; Driver = $drv; Gpu = "$($gpu.Name)" }
+}
+function Invoke-UpdateCheck {
+    if ($script:UpdateBusy -or $Snapshot) { return }
+    $script:UpdateBusy = $true
+    Invoke-Worker 'Get-UpdateVersions' @() {
+        param($out, $errs)
+        $script:UpdateBusy = $false
+        $v = Get-WorkerResult $out; if ($v -isnot [hashtable]) { return }
+        $old = $script:Backup.Custom['versions']
+        $changes = @()
+        if ($old) {
+            if ($v.Fortnite -and $old.Fortnite -and "$($v.Fortnite)" -ne "$($old.Fortnite)") { $changes += @{ What = 'Fortnite'; From = "$($old.Fortnite)"; To = "$($v.Fortnite)"; Text = "Fortnite updated to $($v.Fortnite)" } }
+            if ($v.Driver -and $old.Driver -and "$($v.Driver)" -ne "$($old.Driver)") { $changes += @{ What = 'Driver'; From = "$($old.Driver)"; To = "$($v.Driver)"; Text = "graphics driver $($v.Driver)" } }
+        }
+        $script:Backup.Custom['versions'] = @{ Fortnite = $v.Fortnite; Driver = $v.Driver }
+        if ($changes.Count) {
+            $log = @($script:Backup.Custom['versionlog'] | Where-Object { $_ })
+            foreach ($c in $changes) { $log = @([pscustomobject]@{ Time = (Get-Date).ToString('o'); What = $c.What; From = $c.From; To = $c.To }) + $log }
+            $script:Backup.Custom['versionlog'] = @($log | Select-Object -First 100)
+            $why = ($changes | ForEach-Object { $_.Text }) -join ' and '
+            $script:Backup.Custom['shaderwarm'] = @{ Since = (Get-Date).ToString('o'); Why = $why; Left = 2 }
+            Show-Toast "$((Get-Culture).TextInfo.ToTitleCase($why.Substring(0, 1)) + $why.Substring(1)). Your first match or two may stutter while shaders rebuild: play a warm-up before a cup." '#0A84FF'
+            if ($script:HomeUi) { Update-HomePage }
+            if ($script:EventsUi) { Update-EventsReady }
+        }
+        Save-Backup
+    }
+}
+# Epic's ping server for the region you play (Tournaments region, else Fortnite's own setting, else the Ping monitor's)
+function Get-MatchPingHost {
+    $name = try { $EventRegions[(Get-EventsRegion)] } catch { $null }
+    if (-not $name) { $name = Get-Setting 'pingregion' 'Europe' }
+    $h = $PingHosts | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    $script:MatchPingRegion = $name
+    if ($h) { $h.Host } else { $null }
+}
 function Start-MatchRecorder {
+    Invoke-UpdateCheck
     $rec = @{ Start = Get-Date; Csv = $null; Pm = $null }
     if ((Test-Path $PresentMonExe) -and -not ($script:BenchProc -and -not $script:BenchProc.HasExited)) {
         $rec.Csv = Join-Path $ToolsDir "match-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
@@ -7439,7 +7725,7 @@ function Start-MatchRecorder {
     } else { $smi = $null }
     $sync = [hashtable]::Synchronized(@{ Stop = $false; Samples = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)) })
     $ps = [powershell]::Create()
-    [void]$ps.AddScript($MatchSampler.ToString()).AddArgument($sync).AddArgument($smi).AddArgument($script:SmiField).AddArgument([Environment]::ProcessorCount).AddArgument(@('Idle', ($FortniteExeName -replace '\.exe$'))).AddArgument($PID).AddArgument($GameModeFile)
+    [void]$ps.AddScript($MatchSampler.ToString()).AddArgument($sync).AddArgument($smi).AddArgument($script:SmiField).AddArgument([Environment]::ProcessorCount).AddArgument(@('Idle', ($FortniteExeName -replace '\.exe$'))).AddArgument($PID).AddArgument($GameModeFile).AddArgument((Get-MatchPingHost)).AddArgument('^(gearup_booster|ExitLag|WTFast|NoPing)')
     $rec.PS = $ps; $rec.Sync = $sync; $rec.Handle = $ps.BeginInvoke()
     $script:MatchRec = $rec
     if ($script:MatchUi) { Update-MatchesPage }
@@ -7471,6 +7757,8 @@ function Complete-MatchReport {
     if (($a.Rec.End - $a.Rec.Start).TotalMinutes -lt 2) { return }   # too short to say anything useful
     $r = New-MatchReport $a.Rec.Start $a.Rec.End $frames @($a.Rec.Sync.Samples)
     Save-MatchReport $r
+    $w = $script:Backup.Custom['shaderwarm']
+    if ($w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; if ($script:HomeUi) { Update-HomePage } }
     if ($script:MatchUi) { Update-MatchesPage }
     $n = @($r.Issues).Count
     $sum = if ($n) { "$n thing$(if ($n -ne 1) { 's' }) got in the way." } else { 'Smooth session: nothing got in the way.' }
@@ -7504,6 +7792,24 @@ function New-MatchReport($Start, $End, $Frames, $Samples) {
     # memory
     $minFree = ($samples | Where-Object { $null -ne $_.FreeMb } | ForEach-Object { $_.FreeMb } | Measure-Object -Minimum).Minimum
     if ($minFree -and $minFree -lt 1024) { $issues += "Your PC ran low on memory (only $minFree MB free at one point). Windows then swaps to the disk, which causes stutters. Close browsers and other big apps before playing." }
+    # network: round trip, jitter (how much it jumps from one ping to the next) and lost packets
+    $all = @($samples | ForEach-Object { @($_.Pings) } | Where-Object { $null -ne $_ })
+    $sent = (@($samples | ForEach-Object { @($_.Pings).Count + [int]$_.Lost }) | Measure-Object -Sum).Sum
+    $lostN = (@($samples | ForEach-Object { [int]$_.Lost }) | Measure-Object -Sum).Sum
+    $pingAvg = $null; $jitter = $null; $lossPct = $null
+    if ($all.Count -ge 10) {
+        $pingAvg = [Math]::Round(($all | Measure-Object -Average).Average)
+        $d = for ($i = 1; $i -lt $all.Count; $i++) { [Math]::Abs($all[$i] - $all[$i - 1]) }
+        $jitter = [Math]::Round((@($d) | Measure-Object -Average).Average, 1)
+        $lossPct = if ($sent) { [Math]::Round(100.0 * $lostN / $sent, 1) } else { 0 }
+    }
+    $boosted = @($samples | Where-Object { $_.Boost }).Count -gt $n / 2
+    if ($null -ne $lossPct -and $lossPct -ge 1) { $issues += "$lossPct% of pings to Epic's servers got no answer during the match. Lost packets feel like rubber-banding and shots that do not count." }
+    if ($null -ne $jitter -and $jitter -ge 8) { $issues += "Your ping jumped around a lot (jitter $jitter ms on average around $pingAvg ms). Steady ping matters more than low ping." }
+    # first matches after a Fortnite or driver update compile shaders, which stutters
+    $warm = $script:Backup.Custom['shaderwarm']
+    $afterUpdate = $null
+    if ($warm -and $warm.Since) { try { if ([datetime]$warm.Since -le $Start -and $Start -le ([datetime]$warm.Since).AddDays(3)) { $afterUpdate = "$($warm.Why)" } } catch {} }
     # frames
     $stutters = @(); $fps = $null
     if ($Frames -and $Frames.Frames -gt 0) {
@@ -7529,6 +7835,8 @@ function New-MatchReport($Start, $End, $Frames, $Samples) {
         Fps = $fps; StutterCount = $(if ($Frames) { $Frames.StutterCount } else { $null }); Stutters = $stutters
         GpuMaxTemp = $maxT; GpuHotPct = $hot; GpuSlowPct = $slow; Hogs = $hogs; MinFreeMb = $minFree; Issues = @($issues)
         GameModePct = $(if (@($samples | Where-Object { $null -ne $_.GM }).Count) { [int][Math]::Round(100 * @($samples | Where-Object { $_.GM }).Count / $n) } else { $null })
+        Latency = $(if ($Frames -and $Frames.LatAvg -gt 0) { [Math]::Round($Frames.LatAvg, 1) } else { $null }); LatencyKind = $(if ($Frames) { $Frames.LatKind } else { $null })
+        PingAvg = $pingAvg; Jitter = $jitter; LossPct = $lossPct; PingRegion = $script:MatchPingRegion; Boosted = $boosted; AfterUpdate = $afterUpdate
     }
 }
 # --- What to do about a report: each problem becomes one fix with a button (switch on cards, let Game Mode close an
@@ -7575,12 +7883,24 @@ function Get-MatchFixes($r) {
     $st = @($r.Stutters)
     if ($st.Count) {
         $quiet = @($st | Where-Object { -not $_.Busy }).Count
-        if ($quiet -ge [Math]::Max(1, $st.Count / 2)) {
+        if ($r.AfterUpdate) {
+            Add-Fix @{ Icon = 0xE895; Tint = '#0A84FF'; Title = 'Stutters right after an update'
+                       Desc = "This was one of the first matches after $($r.AfterUpdate). Fortnite builds its shaders again then, which stutters. Play another match before changing settings."
+                       Kind = 'none'; Done = $false }
+        } elseif ($quiet -ge [Math]::Max(1, $st.Count / 2)) {
             $t = Get-OffTweaks @('shaderexcl', 'nvshadercache', 'mpo-off', 'timer', 'coreparking', 'minstate', 'zdplan', 'usbsuspend', 'dvr')
             Add-Fix @{ Icon = 0xE945; Tint = '#FF9F0A'; Title = "$quiet stutter$(if ($quiet -ne 1) { 's' }) with nothing else busy"
                        Desc = $(if ($t.Count) { "Usually shader compiling, power saving or Windows timers. These $($t.Count) settings target exactly that: $(@($t | ForEach-Object { $_.Title }) -join ', ')." } else { 'Everything that targets this is already on. Short stutters in the first minutes are shaders compiling and fade after a few matches.' })
                        Kind = 'tweaks'; Ids = @($t | ForEach-Object { $_.Id }); Button = "Switch on $($t.Count)"; Done = -not $t.Count }
         }
+    }
+    # 2b. network
+    if (($null -ne $r.LossPct -and $r.LossPct -ge 1) -or ($null -ne $r.Jitter -and $r.Jitter -ge 8)) {
+        $t = Get-OffTweaks @('nicpower', 'eee', 'greeneth', 'advancedeee', 'flowcontrol', 'intmod', 'wifipower', 'roaming', 'netthrottle', 'deliveryopt')
+        $wifi = [bool](Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and ($_.PhysicalMediaType -match '802\.11' -or $_.InterfaceDescription -match 'Wi-?Fi|Wireless') })
+        Add-Fix @{ Icon = 0xE839; Tint = '#30B0C7'; Title = $(if ($r.LossPct -ge 1) { "$($r.LossPct)% packet loss" } else { "Unsteady ping (jitter $($r.Jitter) ms)" })
+                   Desc = "$(if ($wifi) { 'You are on Wi-Fi: a cable fixes most loss and jitter. ' })$(if ($t.Count) { "These network settings help: $(@($t | ForEach-Object { $_.Title }) -join ', ')." } else { 'Network settings are already tuned. Check other downloads and streams in the house, and use the Ping monitor to catch the spikes.' })"
+                   Kind = $(if ($t.Count) { 'tweaks' } else { 'page' }); Ids = @($t | ForEach-Object { $_.Id }); Page = 'Ping'; Button = $(if ($t.Count) { "Switch on $($t.Count)" } else { 'Open Ping monitor' }); Done = $false }
     }
     # 3. uneven frame rate
     if ($r.Fps -and $r.Fps.Low1 -lt 0.5 * $r.Fps.Avg) {
@@ -7650,7 +7970,7 @@ function Invoke-MatchFix($fx) {
 function Save-MatchReport($r) {
     New-Item -ItemType Directory -Force $MatchDir | Out-Null
     $r | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $MatchDir "$(([datetime]$r.Start).ToString('yyyyMMdd-HHmmss')).json") -Encoding UTF8
-    Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -Skip 60 | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 function Get-MatchReports {
     if ($Snapshot -and $env:ZD_FAKE_MATCH) { return @(New-FakeMatchReport) }
@@ -7675,6 +7995,8 @@ function New-FakeMatchReport {
         [pscustomobject]@{ T = $start.AddSeconds($t * 5); Top = @([pscustomobject]@{ Name = 'Discord'; Pct = 9.5 }, [pscustomobject]@{ Name = 'chrome'; Pct = 4.1 })
                            Gpu = [pscustomobject]@{ Temp = 70 + ($t % 15); Util = 97; Thermal = ($t % 10 -eq 0); HwSlow = $false }; FreeMb = 5200 }
     }
+    foreach ($sm in $samples) { $sm | Add-Member -NotePropertyName Pings -NotePropertyValue @((30 + $rnd.Next(0, 6)), (31 + $rnd.Next(0, 9)), (29 + $rnd.Next(0, 5))) -Force; $sm | Add-Member -NotePropertyName Lost -NotePropertyValue $(if ($rnd.Next(0, 40) -eq 0) { 1 } else { 0 }) -Force; $sm | Add-Member -NotePropertyName Boost -NotePropertyValue $true -Force }
+    $script:MatchPingRegion = 'Europe'
     New-MatchReport $start $end $frames $samples | Add-Member -NotePropertyName File -NotePropertyValue '' -PassThru
 }
 function New-MatchesPage {
@@ -7734,6 +8056,9 @@ function Update-MatchesPage {
             if ($more -gt 0) { $stX += "<TextBlock Text='and $more more' FontSize='12' Foreground='#98989D' Margin='0,4,0,0'/>" }
         }
         $gpuX = if ($r.GpuMaxTemp) { "  ·  GPU up to $($r.GpuMaxTemp) °C" } else { '' }
+        if ($r.Latency) { $gpuX = "  ·  $($r.Latency) ms $($r.LatencyKind)" + $gpuX }
+        $netX = if ($null -ne $r.PingAvg) { "Connection to Epic's $($r.PingRegion) servers: $($r.PingAvg) ms ping, $($r.Jitter) ms jitter, $($r.LossPct)% lost$(if ($r.Boosted) { '   (a ping booster was running: it routes the game''s own traffic, so this shows your normal connection)' })" } else { '' }
+        $warmX = if ($r.AfterUpdate) { "<TextBlock Text='$(Esc "First match after an update ($($r.AfterUpdate)): some stutter while shaders compile is normal.")' FontSize='12' Foreground='#0A84FF' Margin='0,6,0,0' TextWrapping='Wrap'/>" } else { '' }
         $fixes = @(Get-MatchFixes $r)
         $fixX = ''
         if ($fixes.Count) {
@@ -7762,6 +8087,8 @@ function Update-MatchesPage {
       <StackPanel>
         <TextBlock Text='$(Esc $head)' FontSize='14' FontWeight='SemiBold'/>
         <TextBlock Text='$(Esc "$fpsTxt$gpuX")' FontSize='12' Foreground='#A1A1A6' Margin='0,3,0,0'/>
+        $(if ($netX) { "<TextBlock Text='$(Esc $netX)' FontSize='12' Foreground='#A1A1A6' Margin='0,2,0,0' TextWrapping='Wrap'/>" })
+        $warmX
       </StackPanel>
       <Button x:Name='Del' Grid.Column='1' Content='Delete' Style='{DynamicResource Btn}' Foreground='#FF453A' Padding='12,5' FontSize='12' VerticalAlignment='Top'/>
     </Grid>
@@ -7914,6 +8241,7 @@ function Complete-StateRefresh {
         } else { Update-All }    # worker failed: do it here
         if ($script:EventsUi) { Update-EventsReady }
         Test-AfterBoot; Update-RestartBar
+        Invoke-UpdateCheck
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
 }
 function Format-Size([double]$Bytes) {
@@ -9094,10 +9422,10 @@ function Update-ThisPCPage {
 function New-HomePage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
-  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='34,30' Margin='0,0,0,16'>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='10,6' Margin='0,0,0,16'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-      <Grid Width='132' Height='132' VerticalAlignment='Center'>
+      <Grid Width='132' Height='132' VerticalAlignment='Center' Margin='24'>
         <Ellipse Stroke='#3A3A3C' StrokeThickness='11'/>
         <Ellipse x:Name='Ring' Stroke='#30D158' StrokeThickness='11' StrokeDashCap='Round' RenderTransformOrigin='0.5,0.5'>
           <Ellipse.RenderTransform><RotateTransform Angle='-90'/></Ellipse.RenderTransform>
@@ -9107,47 +9435,54 @@ function New-HomePage {
           <TextBlock Text='optimized' FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center' Margin='0,-4,0,0'/>
         </StackPanel>
       </Grid>
-      <StackPanel Grid.Column='1' Margin='30,0,24,0' VerticalAlignment='Center'>
+      <StackPanel Grid.Column='1' Margin='6,0,24,0' VerticalAlignment='Center'>
         <TextBlock x:Name='Headline' FontSize='26' FontWeight='Bold' TextWrapping='Wrap'/>
         <TextBlock x:Name='Sub' FontSize='13.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'/>
       </StackPanel>
-      <Button x:Name='Go' Grid.Column='2' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='26,13' FontSize='15' VerticalAlignment='Center'>
+      <Button x:Name='Go' Grid.Column='2' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='26,13' FontSize='15' VerticalAlignment='Center' Margin='0,0,24,0'>
         <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,10,0'/><TextBlock x:Name='GoText' Text='Optimize'/></StackPanel>
       </Button>
     </Grid>
   </Border>
-  <UniformGrid Columns='3'>
-    <Border Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12'>
+  <Border x:Name='Warm' CornerRadius='16' Background='#1F0A84FF' BorderBrush='#550A84FF' BorderThickness='1' Padding='18,14' Margin='0,0,12,16' Visibility='Collapsed'>
+    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <TextBlock Text='&#xE895;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='18' Foreground='#0A84FF' VerticalAlignment='Center' Margin='0,0,14,0'/>
+      <StackPanel Grid.Column='1'><TextBlock x:Name='WarmTitle' FontSize='14' FontWeight='SemiBold'/><TextBlock x:Name='WarmText' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/></StackPanel>
+      <Button x:Name='WarmOk' Grid.Column='2' Content='Got it' Style='{DynamicResource Btn}' VerticalAlignment='Center' Margin='12,0,0,0'/>
+    </Grid>
+  </Border>
+  <UniformGrid Columns='3' Margin='-14,-14,-2,-14'>
+    <Border Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2'>
       <StackPanel>
         <Grid><TextBlock Text='Game Mode' FontSize='15' FontWeight='SemiBold'/><ToggleButton x:Name='Gm' Style='{DynamicResource Switch}' HorizontalAlignment='Right'/></Grid>
         <TextBlock x:Name='GmText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
       </StackPanel>
     </Border>
-    <Border x:Name='HealthTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+    <Border x:Name='HealthTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
       <StackPanel>
         <Grid><TextBlock Text='Health check' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
         <TextBlock x:Name='HealthText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
       </StackPanel>
     </Border>
-    <Border x:Name='MatchTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+    <Border x:Name='MatchTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
       <StackPanel>
         <Grid><TextBlock Text='Last match' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
         <TextBlock x:Name='MatchText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
       </StackPanel>
     </Border>
-    <Border x:Name='PcTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+    <Border x:Name='PcTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
       <StackPanel>
         <Grid><TextBlock Text='This PC' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
         <TextBlock x:Name='PcText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
       </StackPanel>
     </Border>
-    <Border x:Name='CleanTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+    <Border x:Name='CleanTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
       <StackPanel>
         <Grid><TextBlock Text='Clean up' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
         <TextBlock Text='Temp files, update leftovers and caches. You see the size first.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
       </StackPanel>
     </Border>
-    <Border x:Name='TweaksTile' Style='{DynamicResource Card}' Padding='22,20' Margin='0,0,12,12' Cursor='Hand'>
+    <Border x:Name='TweaksTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
       <StackPanel>
         <Grid><TextBlock Text='All tweaks' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
         <TextBlock x:Name='TweaksText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
@@ -9156,7 +9491,8 @@ function New-HomePage {
   </UniformGrid>
 </StackPanel>
 "@)
-    $h = @{}; foreach ($n in 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Gm', 'GmText', 'HealthTile', 'HealthText', 'MatchTile', 'MatchText', 'PcTile', 'PcText', 'CleanTile', 'TweaksTile', 'TweaksText') { $h[$n] = $root.FindName($n) }
+    $h = @{}; foreach ($n in 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Gm', 'GmText', 'HealthTile', 'HealthText', 'MatchTile', 'MatchText', 'PcTile', 'PcText', 'CleanTile', 'TweaksTile', 'TweaksText', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk') { $h[$n] = $root.FindName($n) }
+    $h.WarmOk.Add_Click({ $script:Backup.Custom.Remove('shaderwarm'); Save-Backup; Hide-Animated $script:HomeUi.Warm 200 })
     $script:HomeUi = $h
     $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
     $h.Gm.Add_Click({ param($s, $e)
@@ -9177,6 +9513,12 @@ function New-HomePage {
 }
 function Update-HomePage {
     $h = $script:HomeUi; if (-not $h) { return }
+    $w = $script:Backup.Custom['shaderwarm']
+    if ($w -and [int]$w.Left -gt 0) {
+        $h.WarmTitle.Text = "$((Get-Culture).TextInfo.ToTitleCase("$($w.Why)".Substring(0, 1)) + "$($w.Why)".Substring(1)): expect a little stutter at first"
+        $h.WarmText.Text = "Fortnite rebuilds its shaders after a game or driver update, so your next $([int]$w.Left) match$(if ([int]$w.Left -ne 1) { 'es' }) may hitch. Play a warm-up match before a cup or a benchmark; it settles by itself."
+        $h.Warm.Visibility = 'Visible'
+    } else { $h.Warm.Visibility = 'Collapsed' }
     $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State })
     $on = @($rec | Where-Object { $_.State }).Count
     $left = $rec.Count - $on
@@ -9837,6 +10179,8 @@ function Update-EventsReady {
     $rows = New-Object Collections.ArrayList
     $region = Get-EventsRegion; $rName = $EventRegions[$region]
     [void]$rows.Add(@{ Key = 'ping'; State = 'wait'; Title = "Ping to $rName"; Desc = 'Measuring...' })
+    $w = $script:Backup.Custom['shaderwarm']
+    if ($w -and [int]$w.Left -gt 0) { [void]$rows.Add(@{ State = 'warn'; Title = 'Play a warm-up match first'; Desc = "After $($w.Why) the first match or two stutter while shaders rebuild. Get them out of the way before the cup." }) }
     $gp = Get-GameModePrefs
     [void]$rows.Add(@{ State = $(if ($gp.auto) { 'ok' } else { 'warn' }); Title = 'Game Mode starts with Fortnite'
                        Desc = $(if ($gp.auto) { 'Background apps are dealt with as soon as you launch.' } else { 'Turn it on so every cup starts with background apps closed.' })
@@ -10427,6 +10771,208 @@ function Invoke-AppUninstallDirect($app) {
     catch { Show-Toast "Could not start the uninstaller for $($app.Name)." '#FF9F0A' }
 }
 
+# =============================================================== Trends
+# Match reports over time, one small chart per measure (never two scales on one chart), with markers where settings
+# changed or Fortnite / the graphics driver updated, so you can see what a change did.
+function Get-TrendReports {
+    if ($Snapshot -and $env:ZD_FAKE_MATCH) {
+        $rnd = New-Object Random 3; $t0 = (Get-Date).AddDays(-9)
+        return @(for ($i = 0; $i -lt 14; $i++) {
+            $boost = if ($i -ge 7) { 24 } else { 0 }
+            [pscustomobject]@{ Start = $t0.AddHours($i * 15 + $rnd.Next(0, 5)).ToString('o'); Minutes = 18 + $rnd.Next(0, 9)
+                Fps = [pscustomobject]@{ Avg = 205 + $boost + $rnd.Next(-8, 9); Low1 = 128 + 2 * $boost + $rnd.Next(-10, 11) }
+                StutterCount = [Math]::Max(0, $(if ($i -ge 7) { 2 } else { 7 }) + $rnd.Next(-2, 3)); Latency = [Math]::Round(19.5 - $(if ($i -ge 7) { 3.2 } else { 0 }) + $rnd.NextDouble() * 1.5, 1); LatencyKind = 'PC latency'
+                PingAvg = 31 + $rnd.Next(0, 5); Jitter = 2 + $rnd.Next(0, 3); LossPct = 0 }
+        })
+    }
+    @(Get-MatchReports | Sort-Object { [datetime]$_.Start })
+}
+function Get-TrendEvents($reports) {
+    $ev = @()
+    foreach ($h in @(Get-History)) { $a = "$(@($h.Action)[0])"; if ($a -in 'on', 'off', 'preset', 'autofix', 'drift') { try { $ev += [pscustomobject]@{ Time = [datetime]$h.Time; Kind = 'tweak'; Text = $(if ($a -eq 'on') { "On: $($h.Title)" } elseif ($a -eq 'off') { "Off: $($h.Title)" } else { "$($h.Title)" }) } } catch {} } }
+    foreach ($v in @($script:Backup.Custom['versionlog'] | Where-Object { $_ })) { try { $ev += [pscustomobject]@{ Time = [datetime]$v.Time; Kind = 'update'; Text = $(if ($v.What -eq 'Fortnite') { "Fortnite $($v.To)" } else { "Driver $($v.To)" }) } } catch {} }
+    if ($Snapshot -and $env:ZD_FAKE_MATCH -and $reports.Count -gt 7) {
+        $at = ([datetime]$reports[6].Start).AddHours(2)
+        $ev += [pscustomobject]@{ Time = $at; Kind = 'tweak'; Text = 'On: Turn off network power-saving' }, [pscustomobject]@{ Time = $at; Kind = 'tweak'; Text = 'On: Consistent timer resolution' }
+        $ev += [pscustomobject]@{ Time = ([datetime]$reports[3].Start).AddHours(1); Kind = 'update'; Text = 'Fortnite 42.40' }
+    }
+    # one marker per gap between two matches, listing what happened in it
+    $marks = @()
+    for ($i = 1; $i -lt $reports.Count; $i++) {
+        $a = [datetime]$reports[$i - 1].Start; $b = [datetime]$reports[$i].Start
+        $inGap = @($ev | Where-Object { $_.Time -gt $a -and $_.Time -le $b })
+        if (-not $inGap.Count) { continue }
+        $upd = @($inGap | Where-Object { $_.Kind -eq 'update' }); $tw = @($inGap | Where-Object { $_.Kind -eq 'tweak' })
+        $label = @(); if ($upd.Count) { $label += ($upd | ForEach-Object { $_.Text }) -join ', ' }; if ($tw.Count) { $label += "$($tw.Count) change$(if ($tw.Count -ne 1) { 's' })" }
+        $marks += [pscustomobject]@{ Index = $i; Label = ($label -join ' · '); Detail = (($inGap | ForEach-Object { $_.Text }) -join "`n"); Update = [bool]$upd.Count }
+    }
+    $marks
+}
+# chart colours: validated categorical slots 1 (blue) and 2 (orange), separate steps for light and dark
+function Get-TrendColors {
+    if ($script:Theme -eq 'light') { @{ S1 = '#2a78d6'; S2 = '#eb6834'; Grid = '#14000000'; Axis = '#6E6E73'; Ink = '#1C1C1E'; Ring = '#FFFFFF'; Mark = '#55000000' } }
+    else { @{ S1 = '#3987e5'; S2 = '#d95926'; Grid = '#1AFFFFFF'; Axis = '#8E8E93'; Ink = '#F5F5F7'; Ring = '#141416'; Mark = '#66FFFFFF' } }
+}
+function New-Brush([string]$hex) { $b = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)); $b.Freeze(); $b }
+# A small line chart drawn on a Canvas: one y-axis, 2 px lines, 8 px points with a surface ring, a tooltip on every
+# point and marker, and the latest value labelled at the end of each line.
+function New-TrendChart([string]$Title, $Series, [string]$Unit, $Reports, $Marks, [bool]$LowerBetter) {
+    $col = Get-TrendColors
+    $legend = if (@($Series).Count -ge 2) { ($Series | ForEach-Object { "<StackPanel Orientation='Horizontal' Margin='14,0,0,0'><Border Width='14' Height='3' CornerRadius='1.5' Background='$($_.Color)' VerticalAlignment='Center' Margin='0,0,6,0'/><TextBlock Text='$(Esc $_.Name)' FontSize='12' Foreground='{DynamicResource Label2}'/></StackPanel>" }) -join '' } else { '' }
+    $box = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Card}' Padding='18,14,18,10' Margin='0,0,0,12'>
+  <StackPanel>
+    <Grid><TextBlock Text='$(Esc $Title)' FontSize='14' FontWeight='SemiBold'/><StackPanel Orientation='Horizontal' HorizontalAlignment='Right'>$legend</StackPanel></Grid>
+    <Canvas x:Name='C' Height='170' Margin='0,10,0,0' ClipToBounds='False' Background='Transparent'/>
+  </StackPanel>
+</Border>
+"@)
+    $cv = $box.FindName('C')
+    $cv.Tag = @{ Series = $Series; Unit = $Unit; Reports = $Reports; Marks = $Marks; Col = $col }
+    $cv.Add_SizeChanged({ param($s, $e) Show-TrendChart $s })
+    $box
+}
+function Show-TrendChart($cv) {
+    $d = $cv.Tag; $col = $d.Col
+    $w = $cv.ActualWidth; $h = $cv.ActualHeight; if ($w -lt 50) { return }
+    $cv.Children.Clear()
+    $L = 46; $R = 64; $T = 18; $B = 22
+    $n = @($d.Reports).Count
+    $vals = @($d.Series | ForEach-Object { @($_.Values) } | Where-Object { $null -ne $_ })
+    if (-not $vals.Count) { return }
+    $min = ($vals | Measure-Object -Minimum).Minimum; $max = ($vals | Measure-Object -Maximum).Maximum
+    if ($max -eq $min) { $max += 1; $min -= 1 }
+    $pad = ($max - $min) * 0.15; $min = [Math]::Max(0, $min - $pad); $max = $max + $pad
+    $x = { param($i) if ($n -le 1) { $L + ($w - $L - $R) / 2 } else { $L + ($w - $L - $R) * $i / ($n - 1) } }
+    $y = { param($v) $T + ($h - $T - $B) * (1 - ($v - $min) / ($max - $min)) }
+    $whole = -not ($vals | Where-Object { $_ -ne [Math]::Round($_) })    # counts: no decimals on the axis
+    $fmt = { param($v) if ($whole -or $max - $min -ge 20) { '{0:0}' -f $v } else { '{0:0.#}' -f $v } }
+    # recessive grid and y labels
+    for ($g = 0; $g -le 3; $g++) {
+        $v = $min + ($max - $min) * $g / 3; $yy = & $y $v
+        $ln = New-Object Windows.Shapes.Line; $ln.X1 = $L; $ln.X2 = $w - $R; $ln.Y1 = $yy; $ln.Y2 = $yy; $ln.Stroke = New-Brush $col.Grid; $ln.StrokeThickness = 1
+        [void]$cv.Children.Add($ln)
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = "$(& $fmt $v)"; $tb.FontSize = 11; $tb.Foreground = New-Brush $col.Axis; $tb.Width = $L - 8; $tb.TextAlignment = 'Right'
+        [Windows.Controls.Canvas]::SetLeft($tb, 0); [Windows.Controls.Canvas]::SetTop($tb, $yy - 8); [void]$cv.Children.Add($tb)
+    }
+    # x labels: first and last match
+    foreach ($i in @(0, ($n - 1)) | Select-Object -Unique) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = ([datetime]$d.Reports[$i].Start).ToString('d MMM'); $tb.FontSize = 11; $tb.Foreground = New-Brush $col.Axis
+        [Windows.Controls.Canvas]::SetLeft($tb, (& $x $i) - 16); [Windows.Controls.Canvas]::SetTop($tb, $h - $B + 6); [void]$cv.Children.Add($tb)
+    }
+    # change / update markers between matches
+    foreach ($m in @($d.Marks)) {
+        $xx = ((& $x ($m.Index - 1)) + (& $x $m.Index)) / 2
+        $ln = New-Object Windows.Shapes.Line; $ln.X1 = $xx; $ln.X2 = $xx; $ln.Y1 = $T - 4; $ln.Y2 = $h - $B; $ln.Stroke = New-Brush $col.Mark; $ln.StrokeThickness = 1
+        $ln.StrokeDashArray = New-Object Windows.Media.DoubleCollection (, [double[]]@(3, 3)); [void]$cv.Children.Add($ln)
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $(if ($m.Label.Length -gt 26) { $m.Label.Substring(0, 25) + '…' } else { $m.Label }); $tb.FontSize = 10.5; $tb.Foreground = New-Brush $col.Axis
+        [Windows.Controls.Canvas]::SetLeft($tb, $xx + 4); [Windows.Controls.Canvas]::SetTop($tb, $T - 18); [void]$cv.Children.Add($tb)
+        $hit = New-Object Windows.Shapes.Rectangle; $hit.Width = 14; $hit.Height = $h - $B - $T + 18; $hit.Fill = [Windows.Media.Brushes]::Transparent; $hit.ToolTip = $m.Detail
+        [Windows.Controls.Canvas]::SetLeft($hit, $xx - 7); [Windows.Controls.Canvas]::SetTop($hit, $T - 18); [void]$cv.Children.Add($hit)
+    }
+    # lines, points, hover targets, end labels
+    foreach ($se in $d.Series) {
+        $stroke = New-Brush $se.Color
+        $pl = New-Object Windows.Shapes.Polyline; $pl.Stroke = $stroke; $pl.StrokeThickness = 2; $pl.StrokeLineJoin = 'Round'
+        $last = $null
+        for ($i = 0; $i -lt $n; $i++) { $v = @($se.Values)[$i]; if ($null -eq $v) { continue }; [void]$pl.Points.Add((New-Object Windows.Point (& $x $i), (& $y $v))); $last = @($i, $v) }
+        [void]$cv.Children.Add($pl)
+        for ($i = 0; $i -lt $n; $i++) {
+            $v = @($se.Values)[$i]; if ($null -eq $v) { continue }
+            $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 8; $dot.Height = 8; $dot.Fill = $stroke; $dot.Stroke = New-Brush $col.Ring; $dot.StrokeThickness = 2
+            [Windows.Controls.Canvas]::SetLeft($dot, (& $x $i) - 4); [Windows.Controls.Canvas]::SetTop($dot, (& $y $v) - 4); [void]$cv.Children.Add($dot)
+            $hit = New-Object Windows.Shapes.Ellipse; $hit.Width = 20; $hit.Height = 20; $hit.Fill = [Windows.Media.Brushes]::Transparent
+            $hit.ToolTip = "$(([datetime]$d.Reports[$i].Start).ToString('ddd d MMM, HH:mm'))`n$($se.Name): $(& $fmt $v) $($d.Unit)"
+            [Windows.Controls.Canvas]::SetLeft($hit, (& $x $i) - 10); [Windows.Controls.Canvas]::SetTop($hit, (& $y $v) - 10); [void]$cv.Children.Add($hit)
+        }
+        if ($last) {
+            $tb = New-Object Windows.Controls.TextBlock; $tb.Text = "$(& $fmt $last[1]) $($d.Unit)"; $tb.FontSize = 11.5; $tb.FontWeight = 'SemiBold'; $tb.Foreground = New-Brush $col.Ink
+            [Windows.Controls.Canvas]::SetLeft($tb, (& $x $last[0]) + 8); [Windows.Controls.Canvas]::SetTop($tb, (& $y $last[1]) - 8); [void]$cv.Children.Add($tb)
+        }
+    }
+}
+function New-TrendsPage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
+  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,0,16'>
+    <Grid>
+      <Ellipse Width='540' Height='540' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-320,0,0' IsHitTestVisible='False'>
+        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#550A84FF' Offset='0'/><GradientStop Color='#000A84FF' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
+      </Ellipse>
+      <StackPanel Margin='30,22,26,22'>
+        <TextBlock Text='TRENDS' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='40' Foreground='#FFFFFF'/>
+        <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,4,0,14'/>
+        <WrapPanel x:Name='Tiles'/>
+      </StackPanel>
+    </Grid>
+  </Border>
+  <StackPanel x:Name='Charts'/>
+  <Button x:Name='TableBtn' Content='Show as a table' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Margin='0,4,0,10'/>
+  <Border x:Name='TableBox' Style='{DynamicResource Card}' Padding='18,14' Visibility='Collapsed'><StackPanel x:Name='Table'/></Border>
+</StackPanel>
+"@)
+    $g = @{}; foreach ($n in 'Hero', 'Sub', 'Tiles', 'Charts', 'TableBtn', 'TableBox', 'Table') { $g[$n] = $root.FindName($n) }
+    $script:TrendsUi = $g
+    Set-RoundClip $g.Hero 22
+    $g.TableBtn.Add_Click({ $tb = $script:TrendsUi.TableBox; $tb.Visibility = if ($tb.Visibility -eq 'Visible') { 'Collapsed' } else { 'Visible' }; $script:TrendsUi.TableBtn.Content = if ($tb.Visibility -eq 'Visible') { 'Hide the table' } else { 'Show as a table' } })
+    $script:PageRefresh['Trends'] = { Update-TrendsPage }
+    Update-TrendsPage
+    New-PageScroll $root
+}
+function Update-TrendsPage {
+    $g = $script:TrendsUi; if (-not $g) { return }
+    $reps = @(Get-TrendReports)
+    $g.Charts.Children.Clear(); $g.Tiles.Children.Clear(); $g.Table.Children.Clear()
+    if ($reps.Count -lt 2) {
+        $g.Sub.Text = "$(if ($reps.Count) { 'One match so far.' } else { 'No matches yet.' }) Play a few matches with ZeroDelay open (the tray is enough) and they show up here as lines over time. $(if (-not (Test-Path $PresentMonExe)) { 'For FPS, stutters and latency, download PresentMon once on the Benchmark page.' })"
+        $g.TableBtn.Visibility = 'Collapsed'; return
+    }
+    $g.TableBtn.Visibility = 'Visible'
+    $marks = @(Get-TrendEvents $reps)
+    $col = Get-TrendColors
+    $num = { param($v) if ($null -eq $v -or "$v" -eq '') { $null } else { [double]$v } }
+    $avg = @($reps | ForEach-Object { & $num $_.Fps.Avg }); $low = @($reps | ForEach-Object { & $num $_.Fps.Low1 })
+    $stu = @($reps | ForEach-Object { & $num $_.StutterCount }); $lat = @($reps | ForEach-Object { & $num $_.Latency }); $png = @($reps | ForEach-Object { & $num $_.PingAvg })
+    $g.Sub.Text = "$($reps.Count) matches from $(([datetime]$reps[0].Start).ToString('d MMM')) to $(([datetime]$reps[-1].Start).ToString('d MMM')). Dashed lines mark tweak changes and updates: hover them to see what changed."
+    # headline: the last few matches against the ones before
+    $k = [Math]::Min(5, [Math]::Floor($reps.Count / 2))
+    $tile = {
+        param([string]$name, $series, [string]$unit, [bool]$lowerBetter)
+        $v = @($series | Where-Object { $null -ne $_ }); if ($v.Count -lt 2) { return }
+        $now = @($series[($series.Count - $k)..($series.Count - 1)] | Where-Object { $null -ne $_ }); $was = @($series[($series.Count - 2 * $k)..($series.Count - $k - 1)] | Where-Object { $null -ne $_ })
+        if (-not $now.Count -or -not $was.Count) { return }
+        $a = ($now | Measure-Object -Average).Average; $b = ($was | Measure-Object -Average).Average
+        $pct = if ($b) { ($a - $b) / $b * 100 } else { 0 }
+        $better = if ($lowerBetter) { $pct -lt 0 } else { $pct -gt 0 }
+        $flat = [Math]::Abs($pct) -lt 3
+        $state = if ($flat) { @('#8E8E93', '&#xE738;', 'about the same') } elseif ($better) { @('#30D158', $(if ($pct -gt 0) { '&#xE70E;' } else { '&#xE70D;' }), "$('{0:0}' -f [Math]::Abs($pct))% better") } else { @('#FF453A', $(if ($pct -gt 0) { '&#xE70E;' } else { '&#xE70D;' }), "$('{0:0}' -f [Math]::Abs($pct))% worse") }
+        $x = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,34,6'><TextBlock Text='$(Esc ("{0} {1}" -f $(if ($a -ge 20) { '{0:0}' -f $a } else { '{0:0.#}' -f $a }), $unit))' FontSize='24' FontWeight='Bold' Foreground='#FFFFFF'/><TextBlock Text='$(Esc $name)' FontSize='12' Foreground='#9A9AA5'/>" +
+            "<StackPanel Orientation='Horizontal' Margin='0,3,0,0'><TextBlock Text='$($state[1])' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Foreground='$($state[0])' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='$($state[2])' FontSize='12' FontWeight='SemiBold' Foreground='$($state[0])'/></StackPanel></StackPanel>")
+        [void]$script:TrendsUi.Tiles.Children.Add($x)
+    }
+    & $tile 'average FPS' $avg 'FPS' $false
+    & $tile '1% low FPS' $low 'FPS' $false
+    & $tile 'stutters per match' $stu '' $true
+    & $tile 'input latency' $lat 'ms' $true
+    & $tile 'ping' $png 'ms' $true
+    if ($g.Tiles.Children.Count) { [void]$g.Tiles.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='Last $k matches compared with the $k before.' FontSize='11.5' Foreground='#8A8A94' VerticalAlignment='Bottom' Margin='0,0,0,8'/>")) }
+    # small multiples, one measure each
+    if (@($avg | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'FPS' @(@{ Name = 'Average'; Values = $avg; Color = $col.S1 }, @{ Name = '1% low'; Values = $low; Color = $col.S2 }) 'FPS' $reps $marks $false)) }
+    if (@($stu | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'Stutters per match' @(@{ Name = 'Stutters'; Values = $stu; Color = $col.S1 }) '' $reps $marks $true)) }
+    if (@($lat | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart "Input latency ($(@($reps | Where-Object { $_.LatencyKind } | Select-Object -Last 1).LatencyKind))" @(@{ Name = 'Latency'; Values = $lat; Color = $col.S1 }) 'ms' $reps $marks $true)) }
+    if (@($png | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'Ping to Epic''s servers' @(@{ Name = 'Ping'; Values = $png; Color = $col.S1 }) 'ms' $reps $marks $true)) }
+    if (-not $g.Charts.Children.Count) { [void]$g.Charts.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='These matches have no frame or ping data yet. Download PresentMon on the Benchmark page for FPS, stutters and latency.' Foreground='#A1A1A6' TextWrapping='Wrap'/>")) }
+    # the same numbers as a table
+    $hdr = "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='170'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+           ((@('Match', 'Avg FPS', '1% low', 'Stutters', 'Latency', 'Ping') | ForEach-Object -Begin { $c = 0 } -Process { "<TextBlock Grid.Column='$c' Text='$_' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Label2}'/>"; $c++ }) -join '') + "</Grid>"
+    $rows = for ($i = $reps.Count - 1; $i -ge 0; $i--) {
+        $r = $reps[$i]; $cells = @(([datetime]$r.Start).ToString('ddd d MMM HH:mm'), $r.Fps.Avg, $r.Fps.Low1, $r.StutterCount, $(if ($r.Latency) { "$($r.Latency) ms" }), $(if ($null -ne $r.PingAvg) { "$($r.PingAvg) ms" }))
+        "<Grid Margin='0,0,0,4'><Grid.ColumnDefinitions><ColumnDefinition Width='170'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+        ((0..5 | ForEach-Object { "<TextBlock Grid.Column='$_' Text='$(Esc $(if ($null -ne $cells[$_] -and "$($cells[$_])" -ne '') { "$($cells[$_])" } else { '-' }))' FontSize='12.5'/>" }) -join '') + "</Grid>"
+    }
+    [void]$g.Table.Children.Add([ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>$hdr$($rows -join '')</StackPanel>"))
+}
+
 # --- System tray icon
 function Show-MainWindow {
     $window.Show()
@@ -10750,7 +11296,9 @@ function Get-PageContent([string]$Name) {
 function New-PageScroll($content) {
     $sv = New-Object Windows.Controls.ScrollViewer
     $sv.Style = $window.FindResource('OverlayScroll')
-    $sv.VerticalScrollBarVisibility = 'Auto'; $sv.Padding = '32,0,32,32'
+    # the scroll area clips at its edge: keep the spacing inside it so glows and hover halos are not cut off
+    $sv.VerticalScrollBarVisibility = 'Auto'; $sv.Padding = '18,0,18,18'
+    if ($content -is [Windows.FrameworkElement]) { $m = $content.Margin; $content.Margin = New-Object Windows.Thickness ($m.Left + 14), ($m.Top + 14), ($m.Right + 14), ($m.Bottom + 14) }
     $sv.Content = $content
     $sv
 }
@@ -10782,7 +11330,7 @@ function Update-Filter {
 $ui.Search.Add_TextChanged({ Update-Filter })
 $script:NavButtons = @{}
 $NavTop = @('Home', 'GameMode', 'Events', 'Health')
-$NavTools = @('ThisPC', 'Sync', 'Nvidia', 'Benchmark', 'Matches', 'Booster', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Debloat', 'Apps', 'Clean', 'Memory')
+$NavTools = @('ThisPC', 'Sync', 'Nvidia', 'Benchmark', 'Matches', 'Trends', 'Booster', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Debloat', 'Apps', 'Clean', 'Memory')
 $NavEnd = @('Settings')
 function Get-NavGroupOf([string]$Name) { if ($NavTop -contains $Name -or $NavEnd -contains $Name) { '' } elseif ($NavTools -contains $Name) { 'Tools' } else { 'Tweaks' } }
 $script:NavGroups = @{}
@@ -11023,7 +11571,7 @@ $ui.DriftIgnore.Add_Click({
 })
 $script:DriftTimer = New-Object Windows.Threading.DispatcherTimer
 $script:DriftTimer.Interval = [TimeSpan]::FromSeconds(90)
-$script:DriftTimer.Add_Tick({ Invoke-DriftCheck; Invoke-BoosterWatch })
+$script:DriftTimer.Add_Tick({ Invoke-DriftCheck; Invoke-BoosterWatch; $script:UpdTick = [int]$script:UpdTick + 1; if ($script:UpdTick % 7 -eq 0) { Invoke-UpdateCheck } })
 $script:LastDriftOnFocus = [datetime]::MinValue
 $window.Add_Activated({
     if ($Snapshot) { return }
