@@ -10,12 +10,12 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Installer for ZeroDelay, a Fortnite latency optimizer for Windows")]
 [assembly: AssemblyCompany("ZeroDelay contributors")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 static class Setup
 {
-    static readonly string[] Files = { "ZeroDelay.ps1", "ZeroDelay.ico", "install.ps1", "uninstall.ps1", "LICENSE.txt" };
+    static readonly string[] Files = { "ZeroDelay.ps1", "ZeroDelay.exe", "ZeroDelay.ico", "install.ps1", "uninstall.ps1", "LICENSE.txt" };
 
     [STAThread]
     static int Main(string[] args)

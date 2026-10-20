@@ -23,6 +23,13 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Match reports**: after each Fortnite session, the stutters (with what was busy at that moment), background apps
   that used your CPU, GPU heat or hardware slowdowns, and low memory. Stutter timing uses PresentMon.
 - **Mouse test**: measures your mouse's real polling rate (125 to 8000 Hz) and whether it is steady.
+- **Uninstall apps**: programs and Microsoft Store apps, with common Windows bloat labelled. **Force remove** skips a
+  broken uninstaller and deletes the app's own folders, registry keys (backed up first), shortcuts, services and tasks;
+  folders shared with other programs or holding games (Steam, Epic, Riot) are never listed.
+- **Clean up files**: temp folders, Windows Update downloads, Delivery Optimization cache, crash dumps, thumbnails,
+  browser/Discord caches and the Recycle Bin, with the size of each shown before anything is deleted.
+- **Memory (RAM)**: what uses your memory, closing heavy apps, and a one-time standby-list clear. No "RAM cleaner" that
+  forces apps to drop their memory: that causes the stutter it claims to fix.
 - **Light and dark mode** (or match Windows) with six accent colours.
 - **One-click updates**: ZeroDelay tells you when a new version is out, downloads it from the GitHub release, checks
   its SHA-256 against the release notes and reinstalls itself.
@@ -37,7 +44,8 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
    does not recognise it yet. Click **More info**, then **Run anyway**.
 3. Your browser may also warn that the file "isn't commonly downloaded". Choose **Keep** (in Edge: **...** > **Keep**
    > **Keep anyway**).
-4. Click **Install**. ZeroDelay asks for administrator rights when it starts, because it changes system settings.
+4. Click **Install**. ZeroDelay asks for administrator rights when it starts, because it changes system settings. The
+   prompt shows ZeroDelay's name with "Publisher: Unknown", since the app is not code-signed.
 
 Not comfortable running an unsigned file? Every line of code is in this repository: compare the SHA-256 on the
 release page, or build the setup yourself (see below).

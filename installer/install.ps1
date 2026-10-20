@@ -1,4 +1,4 @@
-﻿# ZeroDelay installer. Copies the app to %LOCALAPPDATA%\Programs\ZeroDelay for the current user,
+# ZeroDelay installer. Copies the app to %LOCALAPPDATA%\Programs\ZeroDelay for the current user,
 # adds Desktop and Start menu shortcuts, and registers an uninstaller under Settings > Apps.
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ZeroDelay'),
@@ -22,7 +22,7 @@ try {
         }
     }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    foreach ($f in 'ZeroDelay.ps1', 'ZeroDelay.ico', 'uninstall.ps1', 'LICENSE.txt') {
+    foreach ($f in 'ZeroDelay.ps1', 'ZeroDelay.exe', 'ZeroDelay.ico', 'uninstall.ps1', 'LICENSE.txt') {
         if (Test-Path (Join-Path $src $f)) { Copy-Item (Join-Path $src $f) (Join-Path $InstallDir $f) -Force }
     }
     # files from early versions that ran the app as FortniteOptimizer.ps1
@@ -32,6 +32,9 @@ try {
     $ico = Join-Path $InstallDir 'ZeroDelay.ico'
     $ps  = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
     $launchArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$app`""
+    # ZeroDelay.exe asks for admin rights under its own name and icon (older setups launched PowerShell directly)
+    $exe = Join-Path $InstallDir 'ZeroDelay.exe'
+    $hasExe = Test-Path $exe
 
     if (-not $NoShortcuts) {
         $ws = New-Object -ComObject WScript.Shell
@@ -41,7 +44,8 @@ try {
         )
         foreach ($l in $links) {
             $lnk = $ws.CreateShortcut($l)
-            $lnk.TargetPath = $ps; $lnk.Arguments = $launchArgs; $lnk.WorkingDirectory = $InstallDir
+            if ($hasExe) { $lnk.TargetPath = $exe; $lnk.Arguments = '' } else { $lnk.TargetPath = $ps; $lnk.Arguments = $launchArgs }
+            $lnk.WorkingDirectory = $InstallDir
             $lnk.IconLocation = "$ico,0"; $lnk.Description = 'ZeroDelay - Fortnite latency optimizer'
             $lnk.Save()
         }
@@ -62,10 +66,10 @@ try {
     }
 
     if ($Update) {
-        if (-not $NoLaunch) { Start-Process $ps -ArgumentList $launchArgs -WindowStyle Hidden }
+        if (-not $NoLaunch) { if ($hasExe) { Start-Process $exe } else { Start-Process $ps -ArgumentList $launchArgs -WindowStyle Hidden } }
     } elseif (-not $NoLaunch) {
         $r = [Windows.MessageBox]::Show("ZeroDelay is installed. You will find it on your Desktop and in the Start menu.`n`nOpen it now? Windows will ask for administrator permission, because ZeroDelay changes system settings.", 'ZeroDelay setup', 'YesNo', 'Information')
-        if ($r -eq 'Yes') { Start-Process $ps -ArgumentList $launchArgs -WindowStyle Hidden }
+        if ($r -eq 'Yes') { if ($hasExe) { Start-Process $exe } else { Start-Process $ps -ArgumentList $launchArgs -WindowStyle Hidden } }
     }
 } catch {
     [Windows.MessageBox]::Show("ZeroDelay could not be installed:`n`n$($_.Exception.Message)", 'ZeroDelay setup', 'OK', 'Error') | Out-Null

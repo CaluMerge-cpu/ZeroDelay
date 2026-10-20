@@ -17,18 +17,25 @@ param(
 # --- Self-elevate (HKLM tweaks, powercfg and network adapters need admin) ---
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $NoElevate -and -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # ZeroDelay.exe makes Windows' permission prompt show ZeroDelay's name and icon instead of PowerShell's
+    $launcher = Join-Path $PSScriptRoot 'ZeroDelay.exe'
+    if (Test-Path $launcher) {
+        try { if ($Tray) { Start-Process $launcher -ArgumentList '-Tray' } else { Start-Process $launcher } } catch {}
+        exit
+    }
     Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`"$(if ($Tray) { ' -Tray' })"
     exit
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+try { [Windows.Media.Animation.Timeline]::DesiredFrameRateProperty.OverrideMetadata([Windows.Media.Animation.Timeline], (New-Object Windows.FrameworkPropertyMetadata ([object][int]240))) } catch {}
 if (-not $Snapshot) {
     $created = $false
     $script:AppMutex = New-Object System.Threading.Mutex($true, 'Local\ZeroDelayApp', [ref]$created)
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.2.0'
+$AppVersion = '1.3.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -190,6 +197,63 @@ public static class FrameStats {
         m.StutterAtMs = at.ToArray();
         m.StutterMs = ms.ToArray();
         return m;
+    }
+}
+
+// Deep uninstall: files that stay locked are deleted by Windows at the next restart.
+public static class FileTools {
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    static extern bool MoveFileEx(string existing, string replacement, int flags);
+    public static bool DeleteAtRestart(string path) { return MoveFileEx(path, null, 0x4 /* MOVEFILE_DELAY_UNTIL_REBOOT */); }
+}
+
+// Memory page: clears the standby list once. Needs SeProfileSingleProcessPrivilege (admins have it, disabled by default).
+public static class MemTools {
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 4)]
+    struct TOKEN_PRIVILEGES { public int Count; public long Luid; public int Attr; }
+    [System.Runtime.InteropServices.DllImport("ntdll.dll")]
+    static extern int NtSetSystemInformation(int infoClass, ref int info, int length);
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES state, int length, IntPtr previous, IntPtr returnLength);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+    public static bool EnablePrivilege(string name) {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x28 /* ADJUST_PRIVILEGES | QUERY */, out token)) return false;
+        try {
+            long luid;
+            if (!LookupPrivilegeValue(null, name, out luid)) return false;
+            var tp = new TOKEN_PRIVILEGES { Count = 1, Luid = luid, Attr = 2 /* SE_PRIVILEGE_ENABLED */ };
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero)) return false;
+            return System.Runtime.InteropServices.Marshal.GetLastWin32Error() == 0;
+        } finally { CloseHandle(token); }
+    }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct PERFORMANCE_INFORMATION {
+        public int cb; public UIntPtr CommitTotal, CommitLimit, CommitPeak, PhysicalTotal, PhysicalAvailable, SystemCache, KernelTotal, KernelPaged, KernelNonpaged, PageSize;
+        public int HandleCount, ProcessCount, ThreadCount;
+    }
+    [System.Runtime.InteropServices.DllImport("psapi.dll", SetLastError = true)]
+    static extern bool GetPerformanceInfo(out PERFORMANCE_INFORMATION info, int size);
+    // [total, available, system cache] in bytes; works even when Windows' performance counters are switched off
+    public static long[] Physical() {
+        PERFORMANCE_INFORMATION pi;
+        int size = System.Runtime.InteropServices.Marshal.SizeOf(typeof(PERFORMANCE_INFORMATION));
+        if (!GetPerformanceInfo(out pi, size)) return null;
+        long page = (long)pi.PageSize.ToUInt64();
+        return new long[] { (long)pi.PhysicalTotal.ToUInt64() * page, (long)pi.PhysicalAvailable.ToUInt64() * page, (long)pi.SystemCache.ToUInt64() * page };
+    }
+    // 0 = done, -1 = no permission, anything else = NTSTATUS error
+    public static int PurgeStandby() {
+        if (!EnablePrivilege("SeProfileSingleProcessPrivilege")) return -1;
+        int command = 4;   // MemoryPurgeStandbyList
+        return NtSetSystemInformation(80 /* SystemMemoryListInformation */, ref command, 4);
     }
 }
 '@
@@ -3533,7 +3597,7 @@ $BadgeInfo = @{
     advanced = @{ Color = '#FF9F0A'; Label = 'Advanced'; Tip = 'Advanced: benefit depends on your hardware. Test with and without.' }
 }
 
-function Esc([string]$s) { [Security.SecurityElement]::Escape($s) }
+function Esc([string]$s) { [Security.SecurityElement]::Escape(($s -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')) }   # control characters (e.g. NULs in registry text) are not valid XAML
 
 # --- Motion. Short ease-out curves like macOS; switched off when Windows "Animation effects" is off.
 $script:Anim = [bool][Windows.SystemParameters]::ClientAreaAnimation -and (-not $Snapshot -or $env:ZD_ANIM)
@@ -3551,10 +3615,39 @@ function Show-Animated($el, [double]$dy = 10, [int]$ms = 260, [int]$delay = 0) {
     if (-not $script:Anim) { $el.Opacity = 1; return }
     $tt = New-Object Windows.Media.TranslateTransform 0, $dy
     $el.RenderTransform = $tt
+    $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
     $el.Opacity = 0
-    Start-Anim $el ([Windows.UIElement]::OpacityProperty) 0 1 $ms $delay
-    Start-Anim $tt ([Windows.Media.TranslateTransform]::YProperty) $dy 0 ($ms + 60) $delay
+    # Start once the new content has been laid out, so no frames are lost to building the page.
+    [void]$script:AnimQueue.Add(@{ El = $el; Tt = $tt; Dy = $dy; Ms = $ms; Delay = $delay })
+    if (-not $script:AnimPending) {
+        $script:AnimPending = $true
+        [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Loaded, [action] { Start-QueuedAnims })
+    }
 }
+$script:AnimQueue = New-Object Collections.ArrayList
+function Start-QueuedAnims {
+    $script:AnimPending = $false
+    $longest = 0
+    foreach ($q in @($script:AnimQueue)) {
+        # while it moves, the element is drawn as a cached bitmap: cheap for the GPU to slide and fade
+        try { $scale = [Windows.Media.VisualTreeHelper]::GetDpi($q.El).PixelsPerDip } catch { $scale = 1.0 }
+        $q.El.CacheMode = New-Object Windows.Media.BitmapCache ([double]$scale)
+        [void]$script:Uncache.Add($q.El)
+        Start-Anim $q.El ([Windows.UIElement]::OpacityProperty) 0 1 $q.Ms $q.Delay
+        Start-Anim $q.Tt ([Windows.Media.TranslateTransform]::YProperty) $q.Dy 0 ($q.Ms + 60) $q.Delay
+        $longest = [Math]::Max($longest, $q.Ms + 60 + $q.Delay)
+    }
+    $script:AnimQueue.Clear()
+    # back to sharp, live rendering once everything has landed
+    if (-not $script:UncacheTimer) {
+        $script:UncacheTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:UncacheTimer.Add_Tick({ $script:UncacheTimer.Stop(); foreach ($e in @($script:Uncache)) { $e.CacheMode = $null }; $script:Uncache.Clear() })
+    }
+    $script:UncacheTimer.Stop()
+    $script:UncacheTimer.Interval = [TimeSpan]::FromMilliseconds($longest + 80)
+    $script:UncacheTimer.Start()
+}
+$script:Uncache = New-Object Collections.ArrayList
 # Fades an element out, then collapses it.
 function Hide-Animated($el, [int]$ms = 200) {
     if (-not $el) { return }
@@ -3566,22 +3659,20 @@ function Hide-Animated($el, [int]$ms = 200) {
 function Start-CountUp($tb, [int]$to, [string]$suffix = '', [int]$ms = 600) {
     if (-not $script:Anim -or $to -le 0) { $tb.Text = "$to$suffix"; return }
     $script:CountJobs = @($script:CountJobs | Where-Object { $_ -and $_.Tb -ne $tb }) + @([pscustomobject]@{ Tb = $tb; To = $to; Suffix = $suffix; Start = Get-Date; Ms = $ms })
-    if (-not $script:CountTimer) {
-        $script:CountTimer = New-Object Windows.Threading.DispatcherTimer
-        $script:CountTimer.Interval = [TimeSpan]::FromMilliseconds(16)
-        $script:CountTimer.Add_Tick({
+    if (-not $script:CountHandler) {
+        $script:CountHandler = [EventHandler] {
             $left = @()
-            foreach ($j in $script:CountJobs) {
+            foreach ($j in @($script:CountJobs | Where-Object { $_ })) {
                 $t = [Math]::Min(1.0, ((Get-Date) - $j.Start).TotalMilliseconds / $j.Ms)
                 $e = 1 - [Math]::Pow(1 - $t, 3)
                 $j.Tb.Text = "$([int][Math]::Round($j.To * $e))$($j.Suffix)"
                 if ($t -lt 1) { $left += $j }
             }
             $script:CountJobs = $left
-            if (-not $left) { $script:CountTimer.Stop() }
-        })
+            if (-not $left) { [Windows.Media.CompositionTarget]::remove_Rendering($script:CountHandler); $script:CountOn = $false }
+        }
     }
-    $script:CountTimer.Start()
+    if (-not $script:CountOn) { [Windows.Media.CompositionTarget]::add_Rendering($script:CountHandler); $script:CountOn = $true }
 }
 
 function New-SectionHeader($t) {
@@ -4099,6 +4190,12 @@ $Categories = @(
        Note = 'Save your whole setup, switch between setups, and share one with a code.' }
     @{ Name = 'History';    Icon = [char]0xE81C; Title = 'History'; Page = 'History'
        Note = 'Everything ZeroDelay changed, newest first. Undo any single change.' }
+    @{ Name = 'Apps';       Icon = [char]0xE71D; Title = 'Uninstall apps'; Page = 'Apps'
+       Note = 'Remove programs and Microsoft Store apps you do not use. Fewer apps means fewer things starting and running in the background.' }
+    @{ Name = 'Clean';      Icon = [char]0xE74D; Title = 'Clean up files'; Page = 'Clean'
+       Note = 'Free disk space: temporary files, old update downloads, crash dumps and caches. You see the size of everything before anything is deleted.' }
+    @{ Name = 'Memory';     Icon = [char]0xE950; Title = 'Memory (RAM)'; Page = 'Memory'
+       Note = 'What is using your RAM right now, which apps to close, and a standby-memory clear for the PCs that need it.' }
     @{ Name = 'Settings';   Icon = [char]0xE713; Title = 'Settings'; Page = 'Settings' }
 )
 function New-HistoryPage {
@@ -5350,6 +5447,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.3.0' = @(
+        @{ T = 'Uninstall apps'; D = 'Tools > Uninstall apps lists your programs and Store apps. Force remove also deletes the files, registry keys, shortcuts, services and tasks an app leaves behind.' }
+        @{ T = 'Clean up files'; D = 'Temp files, old Windows Update downloads, crash dumps and caches. You see the size of each group before anything is deleted.' }
+        @{ T = 'Memory (RAM)'; D = 'See what uses your RAM, close the heavy apps, and clear standby memory if your PC needs it.' }
+        @{ T = 'Smoother animations'; D = 'Animations now run at your monitor''s refresh rate and start only after a page is ready.' }
+        @{ T = 'ZeroDelay asks for permission as ZeroDelay'; D = 'The Windows permission prompt now shows ZeroDelay''s name and icon instead of PowerShell.' }
+    )
     '1.2.0' = @(
         @{ T = 'One-click updates'; D = 'When a new version is out, press Update now. ZeroDelay downloads it from GitHub, checks it and reinstalls itself in about 10 seconds.' }
         @{ T = 'Match reports'; D = 'After each Fortnite session ZeroDelay shows its stutters with what was busy at that moment, GPU heat, background apps and memory. Tools > Match reports.' }
@@ -5795,6 +5899,769 @@ function Update-MatchesPage {
         if ($r.File) { $del.Tag = $r.File; $del.Add_Click({ param($s, $e) Remove-Item $s.Tag -Force -ErrorAction SilentlyContinue; Update-MatchesPage }) } else { $del.IsEnabled = $false }
         [void]$mu.List.Children.Add($card)
     }
+}
+
+# --- Background work: runs a script in its own runspace so the window never freezes, then calls Done on the UI thread.
+$script:BgJobs = New-Object Collections.ArrayList
+function Start-Background([string]$Script, [object[]]$ArgList = @(), [scriptblock]$Done) {
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($Script)
+    foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
+    [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $Done })
+    if (-not $script:BgTimer) {
+        $script:BgTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:BgTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+        $script:BgTimer.Add_Tick({
+            foreach ($j in @($script:BgJobs)) {
+                if (-not $j.Handle.IsCompleted) { continue }
+                $script:BgJobs.Remove($j)
+                $out = $null; $errs = @()
+                try { $out = $j.PS.EndInvoke($j.Handle) } catch { $errs += $_ }
+                $errs += @($j.PS.Streams.Error)
+                $j.PS.Dispose()
+                if ($j.Done) { try { & $j.Done @($out) $errs } catch { [Console]::Error.WriteLine("$_ $($_.InvocationInfo.PositionMessage)"); Show-Toast "Something went wrong: $($_.Exception.Message)" '#FF453A' } }
+            }
+            if (-not $script:BgJobs.Count) { $script:BgTimer.Stop() }
+        })
+    }
+    $script:BgTimer.Start()
+}
+function Format-Size([double]$Bytes) {
+    if ($Bytes -ge 1GB) { '{0:N1} GB' -f ($Bytes / 1GB) } elseif ($Bytes -ge 1MB) { '{0:N0} MB' -f ($Bytes / 1MB) } elseif ($Bytes -gt 0) { '{0:N0} KB' -f [Math]::Max(1, $Bytes / 1KB) } else { '0 MB' }
+}
+
+# =============================================================== Uninstall apps
+# Store apps Windows needs (or that are needed to get apps back) are never listed.
+$StoreProtected = @('Microsoft.WindowsStore', 'Microsoft.DesktopAppInstaller', 'Microsoft.SecHealthUI', 'Microsoft.StorePurchaseApp', 'Microsoft.Windows.Photos.DLC')
+# Preinstalled apps most people never open. Only labelled; nothing is removed unless you press Uninstall.
+$StoreBloat = @('Clipchamp.Clipchamp', 'Microsoft.BingNews', 'Microsoft.BingWeather', 'Microsoft.BingSearch', 'Microsoft.GetHelp', 'Microsoft.Getstarted',
+    'Microsoft.MicrosoftSolitaireCollection', 'Microsoft.People', 'Microsoft.PowerAutomateDesktop', 'Microsoft.Todos', 'Microsoft.WindowsFeedbackHub',
+    'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo', 'Microsoft.MicrosoftOfficeHub', 'Microsoft.549981C3F5F10', 'MicrosoftCorporationII.QuickAssist',
+    'Microsoft.WindowsMaps', 'Microsoft.Copilot', 'Microsoft.OutlookForWindows', 'MicrosoftTeams', 'MSTeams', 'Microsoft.MixedReality.Portal', 'Microsoft.SkypeApp')
+$AppScanScript = {
+    param($opt)
+    $list = New-Object Collections.ArrayList
+    $seen = @{}
+    foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
+        foreach ($k in Get-ChildItem $root -ErrorAction SilentlyContinue) {
+            $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+            if (-not $p.DisplayName -or -not $p.UninstallString -or $p.SystemComponent -eq 1 -or $p.ParentKeyName -or "$($p.ReleaseType)" -match 'Update|Hotfix') { continue }
+            if ($p.DisplayName -eq 'ZeroDelay') { continue }
+            $id = "$($p.DisplayName)|$($p.DisplayVersion)"
+            if ($seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+            $date = $null
+            if ("$($p.InstallDate)" -match '^(\d{4})(\d{2})(\d{2})$') { try { $date = Get-Date -Year $Matches[1] -Month $Matches[2] -Day $Matches[3] } catch {} }
+            [void]$list.Add([pscustomobject]@{ Kind = 'desktop'; Name = "$($p.DisplayName)".Trim(); Publisher = "$($p.Publisher)".Trim(); Version = "$($p.DisplayVersion)"
+                SizeMb = $(if ($p.EstimatedSize) { [Math]::Round($p.EstimatedSize / 1024.0) } else { $null }); Date = $date; Uninstall = "$($p.UninstallString)"; Id = $k.PSChildName; Bloat = $false
+                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:') })
+        }
+    }
+    foreach ($a in @(Get-AppxPackage -PackageTypeFilter Main -ErrorAction SilentlyContinue)) {
+        if ($a.IsFramework -or $a.NonRemovable -or "$($a.SignatureKind)" -eq 'System' -or $opt.Protected -contains $a.Name) { continue }
+        $dn = $null; $pub = $null
+        try { [xml]$m = Get-Content (Join-Path $a.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop; $dn = "$($m.Package.Properties.DisplayName)"; $pub = "$($m.Package.Properties.PublisherDisplayName)" } catch {}
+        if (-not $dn -or $dn -like 'ms-resource:*') { $dn = (($a.Name -replace '^[^.]+\.', '') -creplace '([a-z])([A-Z])', '$1 $2') }
+        if (-not $pub -or $pub -like 'ms-resource:*') { $pub = ($a.Publisher -replace '^CN=([^,]+).*', '$1') }
+        [void]$list.Add([pscustomobject]@{ Kind = 'store'; Name = $dn; Publisher = $pub; Version = "$($a.Version)"; SizeMb = $null; Date = $null
+            Full = $a.PackageFullName; Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name) })
+    }
+    $list
+}
+function New-AppsPage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='20,16' Margin='0,0,0,14'>
+    <StackPanel>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel Orientation='Horizontal'>
+          <Button x:Name='TabDesk' Content='Programs' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+          <Button x:Name='TabStore' Content='Store apps' Style='{DynamicResource Btn}'/>
+        </StackPanel>
+        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name or publisher'/>
+        <StackPanel Grid.Column='2' Orientation='Horizontal'>
+          <Button x:Name='SortName' Content='A to Z' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+          <Button x:Name='SortSize' Content='Biggest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+          <Button x:Name='SortDate' Content='Newest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+          <Button x:Name='Reload' Content='Refresh' Style='{DynamicResource Btn}'/>
+        </StackPanel>
+      </Grid>
+      <TextBlock x:Name='Hint' FontSize='12' Foreground='#98989D' Margin='0,12,0,0' TextWrapping='Wrap'/>
+    </StackPanel>
+  </Border>
+  <ContentControl x:Name='List'/>
+</StackPanel>
+"@)
+    $au = @{}; foreach ($n in 'TabDesk', 'TabStore', 'Find', 'SortName', 'SortSize', 'SortDate', 'Reload', 'Hint', 'List') { $au[$n] = $root.FindName($n) }
+    $script:AppsUi = $au
+    $script:AppsKind = 'desktop'; $script:AppsSort = 'name'; $script:AppsData = $null
+    $au.TabDesk.Add_Click({ $script:AppsKind = 'desktop'; Update-AppsList })
+    $au.TabStore.Add_Click({ $script:AppsKind = 'store'; Update-AppsList })
+    $au.SortName.Add_Click({ $script:AppsSort = 'name'; Update-AppsList })
+    $au.SortSize.Add_Click({ $script:AppsSort = 'size'; Update-AppsList })
+    $au.SortDate.Add_Click({ $script:AppsSort = 'date'; Update-AppsList })
+    $au.Reload.Add_Click({ Start-AppScan })
+    # filter as you type, after a short pause
+    $script:AppsFindTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:AppsFindTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $script:AppsFindTimer.Add_Tick({ $script:AppsFindTimer.Stop(); Update-AppsList })
+    $au.Find.Add_TextChanged({ $script:AppsFindTimer.Stop(); $script:AppsFindTimer.Start() })
+    Start-AppScan
+    New-PageScroll $root
+}
+function Start-AppScan {
+    $script:AppsUi.Hint.Text = 'Reading your installed apps...'
+    Start-Background $AppScanScript.ToString() @(@{ Protected = $StoreProtected; Bloat = $StoreBloat }) {
+        param($out, $errs)
+        $script:AppsData = @($out | Where-Object { $_ })
+        Update-AppsList
+    }
+}
+function Update-AppsList {
+    $au = $script:AppsUi
+    if ($null -eq $script:AppsData) { return }
+    foreach ($b in 'TabDesk', 'TabStore') {
+        $on = ($b -eq 'TabDesk') -eq ($script:AppsKind -eq 'desktop')
+        if ($on) { $au[$b].Background = ConvertTo-Brush '#0071E3'; $au[$b].Foreground = ConvertTo-Brush '#FFFFFF' }
+        else { $au[$b].ClearValue([Windows.Controls.Control]::BackgroundProperty); $au[$b].ClearValue([Windows.Controls.Control]::ForegroundProperty) }
+    }
+    $desk = @($script:AppsData | Where-Object { $_.Kind -eq 'desktop' }); $store = @($script:AppsData | Where-Object { $_.Kind -eq 'store' })
+    $au.TabDesk.Content = "Programs ($($desk.Count))"; $au.TabStore.Content = "Store apps ($($store.Count))"
+    foreach ($b in 'SortSize', 'SortDate') { $au[$b].Visibility = if ($script:AppsKind -eq 'desktop') { 'Visible' } else { 'Collapsed' } }
+    foreach ($b in 'SortName', 'SortSize', 'SortDate') { $au[$b].FontWeight = if ($b -eq "Sort$($script:AppsSort)") { 'Bold' } else { 'Normal' } }
+    $q = $au.Find.Text.Trim()
+    $items = if ($script:AppsKind -eq 'desktop') { $desk } else { $store }
+    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" }) }
+    $items = switch ($script:AppsSort) {
+        'size' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { [double]$_.SizeMb } -Descending) } else { @($items | Sort-Object Name) } }
+        'date' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { if ($_.Date) { $_.Date } else { [datetime]::MinValue } } -Descending) } else { @($items | Sort-Object Name) } }
+        default { @($items | Sort-Object @{ e = { -not $_.Bloat } }, Name) }
+    }
+    $au.Hint.Text = if ($script:AppsKind -eq 'desktop') { "Each program's own uninstaller opens when you press Uninstall: follow its steps. Showing $($items.Count)." }
+                    else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them. Showing $($items.Count)." }
+    $rows = for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
+        $a = $items[$i]
+        $sub = @($a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
+        $tag = if ($a.Bloat) { "<Border Background='#4E3E28' CornerRadius='5' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='#FF9F0A'/></Border>" } else { '' }
+        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='10' Padding='16,10' Margin='0,0,0,6'><Grid>" +
+        "<Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        "<StackPanel VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>$tag</StackPanel>" +
+        "<TextBlock Text='$(Esc ($sub -join '  ·  '))' FontSize='12' Foreground='#98989D' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/></StackPanel>" +
+        "<StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center' Margin='12,0,0,0'>" +
+        "<Button x:Name='U_$i' Content='Uninstall' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,6,0'/>" +
+        "<Button x:Name='F_$i' Content='Force remove' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Foreground='#FF453A' ToolTip='$(Esc $(if ($a.Kind -eq 'store') { 'Removes it for every account on this PC and stops Windows from installing it again for new accounts.' } else { 'Skips the app''s own uninstaller: closes it, then deletes its files, settings, shortcuts, services and tasks. For apps whose normal uninstall fails.' }))'/>" +
+        "</StackPanel></Grid></Border>"
+    }
+    if (-not $items.Count) { $rows = @("<TextBlock Text='Nothing matches.' Foreground='#98989D' FontSize='13' Margin='4,4,0,0'/>") }
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($rows -join '')</StackPanel>")
+    for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
+        $b = $panel.FindName("U_$i"); $b.Tag = $items[$i]
+        $b.Add_Click({ param($s, $e) Invoke-AppUninstall $s.Tag })
+        $b = $panel.FindName("F_$i"); $b.Tag = $items[$i]
+        $b.Add_Click({ param($s, $e) Invoke-ForceRemove $s.Tag })
+    }
+    $au.List.Content = $panel
+}
+function Invoke-AppUninstall($app) {
+    if ($app.Kind -eq 'store') {
+        $r = [Windows.MessageBox]::Show("Remove $($app.Name)?`n`nIt is removed for your Windows account. You can reinstall it from the Microsoft Store at any time.", 'Uninstall app', 'YesNo', 'Question')
+        if ($r -ne 'Yes') { return }
+        Show-Toast "Removing $($app.Name)..." '#A1A1A6'
+        $script:RemovingApp = $app.Name
+        Start-Background 'param($f) Remove-AppxPackage -Package $f -ErrorAction Stop' @($app.Full) {
+            param($out, $errs)
+            $name = $script:RemovingApp
+            if ($errs) { Show-Toast "$name could not be removed: $($errs[0].Exception.Message)" '#FF453A'; return }
+            Add-History "Removed app: $name" 'apps' $null
+            Show-Toast "$name was removed." '#30D158'
+            Start-AppScan
+        }
+        return
+    }
+    $r = [Windows.MessageBox]::Show("Uninstall $($app.Name)?`n`nIts own uninstaller opens next. Follow its steps; some ask you to restart.", 'Uninstall app', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    $cmd = $app.Uninstall.Trim()
+    if ($cmd -match '(?i)msiexec') {
+        $guid = [regex]::Match($cmd, '\{[0-9A-Fa-f-]{36}\}').Value
+        $file = 'msiexec.exe'; $argText = if ($guid) { "/x $guid" } else { ($cmd -replace '(?i)^.*?msiexec(\.exe)?"?\s*', '') -replace '(?i)/i', '/x' }
+    } elseif ($cmd.StartsWith('"')) {
+        $end = $cmd.IndexOf('"', 1); $file = $cmd.Substring(1, $end - 1); $argText = $cmd.Substring($end + 1).Trim()
+    } else {
+        $i = $cmd.ToLower().IndexOf('.exe')
+        if ($i -gt 0) { $file = $cmd.Substring(0, $i + 4); $argText = $cmd.Substring($i + 4).Trim() } else { $file = $cmd; $argText = '' }
+    }
+    try {
+        $proc = if ($argText) { Start-Process -FilePath $file -ArgumentList $argText -PassThru -ErrorAction Stop } else { Start-Process -FilePath $file -PassThru -ErrorAction Stop }
+    } catch { Show-Toast "The uninstaller could not be started: $($_.Exception.Message)" '#FF453A'; return }
+    # when the uninstaller closes, check whether the app is gone
+    $script:UninstallWatch = @{ Proc = $proc; App = $app; Since = Get-Date }
+    if (-not $script:UninstallTimer) {
+        $script:UninstallTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:UninstallTimer.Interval = [TimeSpan]::FromSeconds(1.5)
+        $script:UninstallTimer.Add_Tick({
+            $w = $script:UninstallWatch
+            if (-not $w.Proc.HasExited -and ((Get-Date) - $w.Since).TotalMinutes -lt 30) { return }
+            $script:UninstallTimer.Stop()
+            $gone = -not (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$($w.App.Id)") -and
+                    -not (Test-Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$($w.App.Id)") -and
+                    -not (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$($w.App.Id)")
+            if ($gone) { Add-History "Uninstalled: $($w.App.Name)" 'apps' $null }
+            Start-AppScan
+            Find-Leftovers $w.App $false
+        })
+    }
+    $script:UninstallTimer.Start()
+}
+
+# --- Deep uninstall: find what an app leaves behind (or everything of an app whose uninstaller is broken) and delete it.
+#     Only exact name matches and things that point into the app's own folders are listed, and system folders,
+#     Windows, other apps' shared roots and ZeroDelay itself are never touched.
+$LeftoverScan = {
+    param($job)
+    $a = $job.App
+    $win = "$env:WINDIR".TrimEnd('\').ToLower()
+    $never = @("$env:SystemDrive\", $env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA,
+        "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles\Common Files", "${env:ProgramFiles(x86)}\Common Files", "$env:ProgramData\Package Cache",
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+        [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments'), "$env:PUBLIC\Desktop", $env:PUBLIC, "$env:SystemDrive\Users", $env:TEMP) |
+        Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\').ToLower() }
+    function Test-SafePath([string]$p) {
+        if (-not $p) { return $false }
+        $l = $p.TrimEnd('\').ToLower()
+        if ($l.Length -lt 8 -or $l -notmatch '^[a-z]:\\') { return $false }
+        if ($never -contains $l) { return $false }
+        if ($l -eq $win -or $l.StartsWith("$win\")) { return $false }
+        if ($l -match '\\(microsoft|windows|windowsapps|zerodelay|fortnitelatencyoptimizer|nvidia corporation|common files|steamapps)(\\|$)') { return $false }
+        $true
+    }
+    # folders an app record points at: install location, and the folders of its icon and uninstaller
+    function Get-AppDirs($x) {
+        $d = @()
+        if ($x.InstallLocation) { $d += "$($x.InstallLocation)".Trim().Trim('"') }
+        foreach ($s in $x.Icon, $x.Uninstall) {
+            if (-not $s -or $s -match '(?i)msiexec|rundll32|://') { continue }
+            $exe = if ("$s".Trim().StartsWith('"')) { "$s".Trim().Split('"')[1] } else { ("$s" -split '(?i)(?<=\.exe)')[0] }
+            $exe = $exe -replace ',\s*-?\d+$', ''
+            if ($exe -and (Test-Path -LiteralPath $exe -PathType Leaf)) { $d += (Split-Path $exe -Parent) }
+        }
+        @($d | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | ForEach-Object { (Get-Item -LiteralPath $_ -Force).FullName.TrimEnd('\') } | Select-Object -Unique)
+    }
+    # where every OTHER installed program lives: a folder that holds any of them is shared, not this app's
+    $otherDirs = @(foreach ($o in @($job.Others)) { Get-AppDirs $o }) | ForEach-Object { $_.ToLower() } | Select-Object -Unique
+    # games installed by the Epic launcher (Fortnite, Rocket League, ...) are protected wherever they are
+    $epicList = "$env:ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat"
+    if (Test-Path $epicList) { try { $otherDirs = @($otherDirs) + @((Get-Content $epicList -Raw | ConvertFrom-Json).InstallationList | ForEach-Object { "$($_.InstallLocation)".TrimEnd('\').ToLower() } | Where-Object { $_ }) } catch {} }
+    function Test-Owned([string]$d) {
+        $dl = $d.TrimEnd('\').ToLower()
+        foreach ($o in $otherDirs) { if ($o -eq $dl -or $o.StartsWith("$dl\")) { return $false } }
+        # game libraries and launchers' shared roots are never one app's leftovers
+        foreach ($m in 'steamapps', 'Fortnite', 'FortniteGame', '.egstore', 'Riot Client', 'VALORANT', 'Games') { if (Test-Path -LiteralPath (Join-Path $d $m)) { return $false } }
+        $true
+    }
+    $out = New-Object Collections.ArrayList
+    function Add-Item($kind, $path, $label, $size = $null, $risky = $false) { [void]$out.Add([pscustomobject]@{ Kind = $kind; Path = $path; Label = $label; Size = $size; Risky = $risky }) }
+
+    $own = @(Get-AppDirs $a)
+    if ($a.InstallLocation -and $own) {
+        # with an install location, icon/uninstaller folders count only when they are inside it
+        $inst = $own[0].ToLower()
+        $own = @($own | Where-Object { $_.ToLower() -eq $inst -or $_.ToLower().StartsWith("$inst\") })
+    }
+    $dirs = @($own | Where-Object { (Test-SafePath $_) -and (Test-Owned $_) })
+    # names its folders and keys are likely to use: the display name without version/bitness, and its own folder's name
+    $base = ($a.Name -replace '\s*\((x64|x86|64-bit|32-bit|[^)]*bit[^)]*)\)', '' -replace '(?i)\s+(version\s+)?v?\d+(\.\d+)+.*$', '').Trim()
+    $names = @($a.Name.Trim(), $base) + @($dirs | ForEach-Object { Split-Path $_ -Leaf })
+    $names = @($names | Where-Object { $_.Length -ge 3 -and $_ -notmatch '^(microsoft|windows|common files|program files|nvidia|intel|amd|google|valve|epic games|steam|update|setup|app|apps|data|cache|temp|games|bin)$' } | Select-Object -Unique)
+    $pub = "$($a.Publisher)".Trim() -replace '[\\/:*?"<>|]', ''
+    foreach ($root in $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:APPDATA, $env:LOCALAPPDATA, "$env:LOCALAPPDATA\Programs") {
+        if (-not $root) { continue }
+        foreach ($n in $names) {
+            foreach ($c in @("$root\$n") + $(if ($pub) { @("$root\$pub\$n") } else { @() })) {
+                if ((Test-Path -LiteralPath $c -PathType Container) -and (Test-SafePath $c) -and (Test-Owned $c)) { $dirs += (Get-Item -LiteralPath $c -Force).FullName.TrimEnd('\') }
+            }
+        }
+    }
+    # keep only the outermost folders
+    $dirs = @($dirs | Select-Object -Unique | Sort-Object Length)
+    $top = @(); foreach ($d in $dirs) { if (-not ($top | Where-Object { $d.ToLower().StartsWith($_.ToLower() + '\') })) { $top += $d } }
+    foreach ($d in $top) {
+        $size = (Get-ChildItem -LiteralPath $d -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        Add-Item 'Folder' $d $d $size ($size -gt 10GB)
+    }
+    $inTop = { param($x) $x = "$x".Trim('"').ToLower(); foreach ($d in $top) { if ($x.StartsWith($d.ToLower() + '\') -or $x -eq $d.ToLower()) { return $true } }; $false }
+    # registry: the uninstall entry and keys named exactly like the app
+    if ($a.KeyPath -and (Test-Path $a.KeyPath)) { Add-Item 'Registry' $a.KeyPath "Uninstall entry: $($a.KeyPath)" }
+    foreach ($rb in 'HKCU:\Software', 'HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\WOW6432Node') {
+        foreach ($n in $names) {
+            foreach ($c in @("$rb\$n") + $(if ($pub) { @("$rb\$pub\$n") } else { @() })) { if (Test-Path $c) { Add-Item 'Registry' $c $c } }
+        }
+    }
+    # shortcuts, services, tasks and running programs that point into the app's own folders
+    if ($top) {
+        $sh = New-Object -ComObject WScript.Shell
+        foreach ($r in "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs", [Environment]::GetFolderPath('Desktop'), "$env:PUBLIC\Desktop") {
+            foreach ($lnk in Get-ChildItem -LiteralPath $r -Recurse -Filter *.lnk -Force -ErrorAction SilentlyContinue) {
+                try { if (& $inTop $sh.CreateShortcut($lnk.FullName).TargetPath) { Add-Item 'Shortcut' $lnk.FullName $lnk.FullName } } catch {}
+            }
+        }
+        foreach ($sv in Get-CimInstance Win32_Service -ErrorAction SilentlyContinue) {
+            $img = "$($sv.PathName)"; $img = if ($img.StartsWith('"')) { $img.Split('"')[1] } else { ($img -split '(?i)(?<=\.exe)')[0] }
+            if (& $inTop $img) { Add-Item 'Service' $sv.Name "Service: $($sv.DisplayName)" }
+        }
+        foreach ($t in Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            foreach ($act in @($t.Actions)) { if ($act.Execute -and (& $inTop ([Environment]::ExpandEnvironmentVariables($act.Execute)))) { Add-Item 'Task' "$($t.TaskPath)$($t.TaskName)" "Scheduled task: $($t.TaskPath)$($t.TaskName)"; break } }
+        }
+        $procs = @{}
+        foreach ($pr in Get-Process -ErrorAction SilentlyContinue) {
+            try { if ($pr.Path -and (& $inTop $pr.Path)) { if (-not $procs[$pr.ProcessName]) { $procs[$pr.ProcessName] = @() }; $procs[$pr.ProcessName] += $pr.Id } } catch {}
+        }
+        foreach ($k in $procs.Keys) { Add-Item 'Process' ($procs[$k] -join ',') "Running: $k$(if ($procs[$k].Count -gt 1) { " ($($procs[$k].Count))" }) (will be closed)" }
+    }
+    foreach ($r in "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs") {
+        foreach ($n in $names) { $c = "$r\$n"; if ((Test-Path -LiteralPath $c -PathType Container) -and -not ($out | Where-Object { $_.Path -eq $c })) { Add-Item 'Folder' $c $c 0 } }
+    }
+    # a shortcut inside a Start-menu folder that is itself listed goes with the folder
+    $folders = @($out | Where-Object { $_.Kind -eq 'Folder' } | ForEach-Object { $_.Path.ToLower() })
+    foreach ($x in $out) {
+        if ($x.Kind -eq 'Shortcut' -and ($folders | Where-Object { $x.Path.ToLower().StartsWith($_ + '\') })) { continue }
+        $x
+    }
+}
+$LeftoverRemove = {
+    param($job)
+    $res = New-Object Collections.ArrayList
+    function Note($item, $state, $msg = '') { [void]$res.Add([pscustomobject]@{ Label = $item.Label; Kind = $item.Kind; State = $state; Msg = $msg }) }
+    $items = @($job.Items)
+    foreach ($it in $items | Where-Object { $_.Kind -eq 'Process' }) { foreach ($id in "$($it.Path)" -split ',') { Stop-Process -Id ([int]$id) -Force -ErrorAction SilentlyContinue }; Note $it 'done' }
+    Start-Sleep -Milliseconds 600
+    foreach ($it in $items | Where-Object { $_.Kind -eq 'Service' }) {
+        Stop-Service -Name $it.Path -Force -ErrorAction SilentlyContinue
+        & sc.exe delete $it.Path | Out-Null
+        Note $it $(if ($LASTEXITCODE -eq 0) { 'done' } else { 'failed' })
+    }
+    foreach ($it in $items | Where-Object { $_.Kind -eq 'Task' }) {
+        $tp = $it.Path.Substring(0, $it.Path.LastIndexOf('\') + 1); $tn = $it.Path.Substring($it.Path.LastIndexOf('\') + 1)
+        try { Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false -ErrorAction Stop; Note $it 'done' } catch { Note $it 'failed' $_.Exception.Message }
+    }
+    foreach ($it in $items | Where-Object { $_.Kind -eq 'Registry' }) {
+        # backup first, so a key can be put back by double-clicking the .reg file
+        $native = $it.Path -replace '^HKLM:', 'HKLM' -replace '^HKCU:', 'HKCU'
+        $file = Join-Path $job.BackupDir ("{0}-{1}.reg" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), (($native -replace '[\\/:*?"<>| ]', '_') -replace '^(.{0,80}).*$', '$1'))
+        & reg.exe export $native $file /y | Out-Null
+        try { Remove-Item -Path $it.Path -Recurse -Force -ErrorAction Stop; Note $it 'done' } catch { Note $it 'failed' $_.Exception.Message }
+    }
+    foreach ($it in $items | Where-Object { $_.Kind -eq 'Shortcut' }) {
+        try { Remove-Item -LiteralPath $it.Path -Force -ErrorAction Stop; Note $it 'done' } catch { if (-not (Test-Path -LiteralPath $it.Path)) { Note $it 'done' } else { Note $it 'failed' } }
+    }
+    foreach ($it in $items | Where-Object { $_.Kind -eq 'Folder' } | Sort-Object { $_.Path.Length } -Descending) {
+        if (-not (Test-Path -LiteralPath $it.Path)) { Note $it 'done'; continue }
+        Remove-Item -LiteralPath $it.Path -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $it.Path) {
+            # brute force: take ownership, give Administrators full control, try again
+            & takeown.exe /f $it.Path /r /d y 2>&1 | Out-Null
+            & icacls.exe $it.Path /grant '*S-1-5-32-544:F' /t /c /q 2>&1 | Out-Null
+            Get-ChildItem -LiteralPath $it.Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+            Remove-Item -LiteralPath $it.Path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $it.Path) {
+            # still in use: Windows deletes what is left when the PC restarts
+            $left = @(Get-ChildItem -LiteralPath $it.Path -Recurse -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)
+            foreach ($f in $left) { [void][FileTools]::DeleteAtRestart($f.FullName) }
+            [void][FileTools]::DeleteAtRestart($it.Path)
+            Note $it 'restart'
+        } else { Note $it 'done' }
+    }
+    $res
+}
+function Find-Leftovers($app, [bool]$Forced) {
+    $script:LeftoverApp = $app; $script:LeftoverForced = $Forced
+    Show-Toast "Looking for what $($app.Name) left behind..." '#A1A1A6'
+    $others = @($script:AppsData | Where-Object { $_.Kind -eq 'desktop' -and $_.Id -ne $app.Id } | ForEach-Object { [pscustomobject]@{ InstallLocation = $_.InstallLocation; Icon = $_.Icon; Uninstall = $_.Uninstall } })
+    Start-Background $LeftoverScan.ToString() @(@{ App = $app; Others = $others }) {
+        param($out, $errs)
+        $items = @($out | Where-Object { $_ })
+        $app = $script:LeftoverApp
+        if (-not $items) {
+            if ($script:LeftoverForced) { Show-Toast "Nothing of $($app.Name) was found on this PC." '#A1A1A6' } else { Show-Toast "$($app.Name) is completely gone: no leftovers found." '#30D158' }
+            return
+        }
+        Show-LeftoverSheet $app $items $script:LeftoverForced
+    }
+}
+function Show-LeftoverSheet($app, $items, [bool]$Forced) {
+    $kinds = @{ Folder = 'Folder'; Registry = 'Registry'; Shortcut = 'Shortcut'; Service = 'Service'; Task = 'Task'; Process = 'Running' }
+    $rows = for ($i = 0; $i -lt $items.Count; $i++) {
+        $it = $items[$i]
+        $size = if ($it.Size) { "  ·  $(Format-Size $it.Size)" } else { '' }
+        if ($it.Risky) { $size += '  ·  very large, so not ticked: look inside before deleting' }
+        "<Grid Margin='0,0,0,8'><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='78'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+        "<CheckBox x:Name='L_$i' IsChecked='$(-not $it.Risky)' VerticalAlignment='Center' Margin='0,0,10,0'/>" +
+        "<Border Grid.Column='1' Background='#3A3A3C' CornerRadius='5' Padding='6,1,6,2' HorizontalAlignment='Left' VerticalAlignment='Center'><TextBlock Text='$($kinds[$it.Kind])' FontSize='11' Foreground='#D1D1D6'/></Border>" +
+        "<TextBlock Grid.Column='2' Text='$(Esc "$($it.Label)$size")' FontSize='12' Foreground='#D1D1D6' VerticalAlignment='Center' TextTrimming='CharacterEllipsis' ToolTip='$(Esc $it.Label)'/></Grid>"
+    }
+    $title = if ($Forced) { "Force remove $($app.Name)" } else { "$($app.Name) left these behind" }
+    $sub = if ($Forced) { "ZeroDelay found these parts of $($app.Name). Its own uninstaller is skipped. Untick anything you want to keep." }
+           else { "The uninstaller is done, but these parts of $($app.Name) are still on your PC. Untick anything you want to keep." }
+    $body = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <TextBlock Text='$(Esc $title)' FontSize='22' FontWeight='Bold' TextWrapping='Wrap'/>
+  <TextBlock Text='$(Esc $sub)' Foreground='#A1A1A6' FontSize='13' Margin='0,6,0,6' TextWrapping='Wrap'/>
+  <TextBlock Text='Registry keys are backed up to ZeroDelay&apos;s data folder first. Files that are in use are deleted when you restart.' Foreground='#98989D' FontSize='12' Margin='0,0,0,18' TextWrapping='Wrap'/>
+  $($rows -join '')
+  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,14,0,0'>
+    <Button x:Name='Keep' Content='Keep everything' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+    <Button x:Name='Del' Content='Delete selected' Style='{DynamicResource Btn}' Background='#FF453A' Foreground='#FFFFFF'/>
+  </StackPanel>
+</StackPanel>
+"@)
+    $script:LeftoverSheet = @{ Items = $items; Body = $body; App = $app }
+    $body.FindName('Keep').Add_Click({ Hide-Animated $ui.Wizard 200 })
+    $body.FindName('Del').Add_Click({ Remove-Leftovers })
+    $ui.WizardBody.Content = $body
+    $ui.Wizard.Visibility = 'Visible'
+    if ($script:Anim) { Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220; Show-Animated $ui.WizardBody 24 380 60 }
+}
+function Remove-Leftovers {
+    $sh = $script:LeftoverSheet
+    $chosen = @(for ($i = 0; $i -lt $sh.Items.Count; $i++) { if ($sh.Body.FindName("L_$i").IsChecked) { $sh.Items[$i] } })
+    if (-not $chosen) { Hide-Animated $ui.Wizard 200; return }
+    $r = [Windows.MessageBox]::Show("Delete $($chosen.Count) item$(if ($chosen.Count -ne 1) { 's' }) of $($sh.App.Name) for good?`n`nFolders and files cannot be brought back. Registry keys are backed up first.", 'Deep uninstall', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+    Hide-Animated $ui.Wizard 200
+    Show-Toast "Removing $($sh.App.Name)..." '#A1A1A6'
+    $backup = Join-Path $DataDir 'uninstall-backups'
+    New-Item -ItemType Directory -Force $backup | Out-Null
+    $script:LeftoverName = $sh.App.Name
+    Start-Background $LeftoverRemove.ToString() @(@{ Items = $chosen; BackupDir = $backup }) {
+        param($out, $errs)
+        $res = @($out | Where-Object { $_ })
+        $done = @($res | Where-Object { $_.State -eq 'done' }).Count; $later = @($res | Where-Object { $_.State -eq 'restart' }).Count; $fail = @($res | Where-Object { $_.State -eq 'failed' }).Count
+        Add-History "Deep uninstall: $($script:LeftoverName) ($done removed$(if ($later) { ", $later at restart" }))" 'apps' $null
+        $msg = "$($script:LeftoverName): $done item$(if ($done -ne 1) { 's' }) removed."
+        if ($later) { $msg += " $later will finish when you restart the PC." }
+        if ($fail) { $msg += " $fail could not be removed." }
+        Show-Toast $msg $(if ($fail) { '#FF9F0A' } else { '#30D158' })
+        Start-AppScan
+    }
+}
+$StoreForceScript = {
+    param($a)
+    $errs = @()
+    try { Remove-AppxPackage -Package $a.Full -AllUsers -ErrorAction Stop } catch { try { Remove-AppxPackage -Package $a.Full -ErrorAction Stop } catch { $errs += $_.Exception.Message } }
+    try { Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.DisplayName -eq $a.Id } | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction Stop | Out-Null } catch {}
+    if ($a.Family) { Remove-Item -LiteralPath (Join-Path $env:LOCALAPPDATA "Packages\$($a.Family)") -Recurse -Force -ErrorAction SilentlyContinue }
+    $errs
+}
+function Invoke-ForceRemove($app) {
+    if ($app.Kind -eq 'store') {
+        $r = [Windows.MessageBox]::Show("Force remove $($app.Name)?`n`nIt is removed for every account on this PC, its data folder is deleted, and Windows stops installing it for new accounts. You can still get it again from the Microsoft Store.", 'Force remove', 'YesNo', 'Warning')
+        if ($r -ne 'Yes') { return }
+        $script:RemovingApp = $app.Name
+        Show-Toast "Removing $($app.Name) for all accounts..." '#A1A1A6'
+        Start-Background $StoreForceScript.ToString() @($app) {
+            param($out, $errs)
+            $name = $script:RemovingApp
+            $fail = @($out | Where-Object { $_ }) + @($errs | ForEach-Object { "$_" })
+            if ($fail) { Show-Toast "$name could not be removed: $($fail[0])" '#FF453A'; return }
+            Add-History "Force removed app: $name" 'apps' $null
+            Show-Toast "$name was removed for all accounts." '#30D158'
+            Start-AppScan
+        }
+        return
+    }
+    $r = [Windows.MessageBox]::Show("Force remove $($app.Name)?`n`nZeroDelay skips its own uninstaller, closes it, and then shows you every file, registry key, shortcut, service and task it found, so you can delete them.`n`nUse this when the normal Uninstall does not work.", 'Force remove', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+    Find-Leftovers $app $true
+}
+
+# =============================================================== Clean up files
+$CleanTargets = @(
+    @{ Key = 'usertemp'; Title = 'Your temp folder'; Default = $true; Age = 2
+       Desc = 'Leftovers from installers and apps. Files used in the last 2 hours are kept, and files in use are skipped.'
+       Dirs = @($env:TEMP) }
+    @{ Key = 'wintemp'; Title = 'Windows temp folder'; Default = $true; Age = 2
+       Desc = 'The same for Windows itself and its services.'
+       Dirs = @("$env:WINDIR\Temp") }
+    @{ Key = 'wucache'; Title = 'Windows Update downloads'; Default = $true; Age = 0; Services = @('wuauserv', 'bits')
+       Desc = 'Update files Windows has already installed. If an update is downloading right now, it simply starts again.'
+       Dirs = @("$env:WINDIR\SoftwareDistribution\Download") }
+    @{ Key = 'deliveryopt'; Title = 'Delivery Optimization cache'; Default = $true; Age = 0; Cmd = 'Delete-DeliveryOptimizationCache'
+       Desc = 'Pieces of updates Windows keeps to share with other PCs.'
+       Dirs = @("$env:WINDIR\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache") }
+    @{ Key = 'dumps'; Title = 'Crash dumps and error reports'; Default = $true; Age = 0
+       Desc = 'Files Windows and apps write when something crashes. Only useful to developers.'
+       Dirs = @("$env:WINDIR\Minidump", "$env:LOCALAPPDATA\CrashDumps", "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
+                "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue")
+       Files = @("$env:WINDIR\MEMORY.DMP") }
+    @{ Key = 'thumbs'; Title = 'Thumbnail cache'; Default = $false; Age = 0
+       Desc = 'Small previews of your pictures and videos. Windows rebuilds them when you open those folders again.'
+       Files = @("$env:LOCALAPPDATA\Microsoft\Windows\Explorer\thumbcache_*.db") }
+    @{ Key = 'browsers'; Title = 'Browser and Discord caches'; Default = $false; Age = 0
+       Desc = 'Saved copies of websites (Chrome, Edge, Brave, Opera GX, Firefox) and Discord. Pages load a bit slower the first time afterwards. Close them first for the biggest result. Logins and history are not touched.'
+       Dirs = @(foreach ($b in "$env:LOCALAPPDATA\Google\Chrome\User Data", "$env:LOCALAPPDATA\Microsoft\Edge\User Data", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data") { foreach ($c in 'Cache', 'Code Cache', 'GPUCache') { "$b\*\$c" } }) +
+               @("$env:LOCALAPPDATA\Opera Software\Opera GX Stable\Cache", "$env:APPDATA\Opera Software\Opera GX Stable\Code Cache", "$env:APPDATA\Opera Software\Opera GX Stable\GPUCache",
+                 "$env:LOCALAPPDATA\Mozilla\Firefox\Profiles\*\cache2", "$env:APPDATA\discord\Cache", "$env:APPDATA\discord\Code Cache", "$env:APPDATA\discord\GPUCache") }
+    @{ Key = 'recycle'; Title = 'Recycle Bin'; Default = $false; Recycle = $true
+       Desc = 'Permanently deletes everything in the Recycle Bin. Look inside first if you are not sure.' }
+)
+# Scans (Clean = false) or deletes (Clean = true) the chosen targets; returns one result per target.
+$CleanWorker = {
+    param($job)
+    $now = Get-Date
+    foreach ($t in $job.Targets) {
+        if ($job.Keys -notcontains $t.Key) { continue }
+        $bytes = [long]0; $files = 0; $skipped = 0
+        if ($t.Recycle) {
+            try { $sh = New-Object -ComObject Shell.Application; foreach ($it in @($sh.Namespace(10).Items())) { $bytes += [long]$it.ExtendedProperty('Size'); $files++ } } catch {}
+            if ($job.Clean -and $files) { try { Clear-RecycleBin -Force -ErrorAction Stop } catch { $skipped = $files; $bytes = 0; $files = 0 } }
+            [pscustomobject]@{ Key = $t.Key; Bytes = $bytes; Files = $files; Skipped = $skipped }
+            continue
+        }
+        $wasRunning = @()
+        if ($job.Clean -and $t.Services) {
+            foreach ($sv in $t.Services) { $o = Get-Service $sv -ErrorAction SilentlyContinue; if ($o -and $o.Status -eq 'Running') { $wasRunning += $sv; Stop-Service $sv -Force -ErrorAction SilentlyContinue } }
+        }
+        $roots = @(foreach ($d in @($t.Dirs)) { if ($d) { Get-Item -Path $d -Force -ErrorAction SilentlyContinue | Where-Object { $_.PSIsContainer } } })
+        $items = @(foreach ($r in $roots) { Get-ChildItem -LiteralPath $r.FullName -Recurse -File -Force -ErrorAction SilentlyContinue })
+        $items += @(foreach ($f in @($t.Files)) { if ($f) { Get-Item -Path $f -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } } })
+        $cut = $now.AddHours(-[double]$t.Age)
+        foreach ($it in $items) {
+            if ($t.Age -and $it.LastWriteTime -gt $cut) { continue }
+            if (-not $job.Clean) { $bytes += $it.Length; $files++; continue }
+            try { Remove-Item -LiteralPath $it.FullName -Force -ErrorAction Stop; $bytes += $it.Length; $files++ } catch { $skipped++ }
+        }
+        if ($job.Clean) {
+            # empty folders left behind (deepest first); the top folders themselves stay
+            foreach ($r in $roots) {
+                Get-ChildItem -LiteralPath $r.FullName -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending |
+                    ForEach-Object { if (-not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } }
+            }
+            if ($t.Cmd -and (Get-Command $t.Cmd -ErrorAction SilentlyContinue)) { try { & $t.Cmd -Force -ErrorAction Stop } catch {} }
+            foreach ($sv in $wasRunning) { Start-Service $sv -ErrorAction SilentlyContinue }
+        }
+        [pscustomobject]@{ Key = $t.Key; Bytes = $bytes; Files = $files; Skipped = $skipped }
+    }
+}
+function New-CleanPage {
+    $rows = ($CleanTargets | ForEach-Object {
+        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='10' Padding='16,12' Margin='0,0,0,6'><Grid>" +
+        "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        "<CheckBox x:Name='C_$($_.Key)' VerticalAlignment='Center' Margin='0,0,14,0'/>" +
+        "<StackPanel Grid.Column='1'><TextBlock Text='$(Esc $_.Title)' FontSize='13.5' FontWeight='SemiBold'/><TextBlock Text='$(Esc $_.Desc)' FontSize='12' Foreground='#98989D' Margin='0,2,0,0' TextWrapping='Wrap'/></StackPanel>" +
+        "<TextBlock x:Name='S_$($_.Key)' Grid.Column='2' Text='...' FontSize='13' FontWeight='SemiBold' Foreground='#A1A1A6' VerticalAlignment='Center' Margin='16,0,0,0' MinWidth='70' TextAlignment='Right'/></Grid></Border>"
+    }) -join ''
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,18' Margin='0,0,0,14'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock x:Name='Total' Text='Scanning...' FontSize='26' FontWeight='Bold'/>
+        <TextBlock x:Name='Status' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,0,0' TextWrapping='Wrap'/>
+      </StackPanel>
+      <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+        <Button x:Name='Rescan' Content='Scan again' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+        <Button x:Name='Go' Content='Clean selected' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' IsEnabled='False'/>
+      </StackPanel>
+    </Grid>
+  </Border>
+  $rows
+  <TextBlock Text='Shader caches are left alone on purpose: Fortnite would rebuild them and stutter for your next few matches. If you ever need to, use Clear shader cache on the Potato graphics page.' FontSize='12' Foreground='#98989D' Margin='4,10,0,0' TextWrapping='Wrap'/>
+</StackPanel>
+"@)
+    $cu = @{ Total = $root.FindName('Total'); Status = $root.FindName('Status'); Rescan = $root.FindName('Rescan'); Go = $root.FindName('Go'); Check = @{}; Size = @{} }
+    foreach ($t in $CleanTargets) {
+        $cb = $root.FindName("C_$($t.Key)"); $cb.IsChecked = $t.Default; $cb.Add_Click({ Update-CleanTotal })
+        $cu.Check[$t.Key] = $cb; $cu.Size[$t.Key] = $root.FindName("S_$($t.Key)")
+    }
+    $script:CleanUi = $cu
+    $cu.Rescan.Add_Click({ Start-CleanScan })
+    $cu.Go.Add_Click({ Start-Clean })
+    Start-CleanScan
+    New-PageScroll $root
+}
+function Start-CleanScan {
+    $cu = $script:CleanUi
+    $cu.Total.Text = 'Scanning...'; $cu.Status.Text = 'Adding up what can be deleted. Nothing is deleted yet.'
+    $cu.Go.IsEnabled = $false; $cu.Rescan.IsEnabled = $false
+    foreach ($k in $cu.Size.Keys) { $cu.Size[$k].Text = '...' }
+    $script:CleanSizes = @{}
+    Start-Background $CleanWorker.ToString() @(@{ Targets = $CleanTargets; Keys = @($CleanTargets | ForEach-Object { $_.Key }); Clean = $false }) {
+        param($out, $errs)
+        $cu = $script:CleanUi
+        foreach ($r in @($out | Where-Object { $_ })) { $script:CleanSizes[$r.Key] = $r; $cu.Size[$r.Key].Text = Format-Size $r.Bytes }
+        $cu.Rescan.IsEnabled = $true
+        Update-CleanTotal
+    }
+}
+function Update-CleanTotal {
+    $cu = $script:CleanUi
+    if (-not $script:CleanSizes) { return }
+    $sum = [long]0; $n = 0
+    foreach ($k in $cu.Check.Keys) { if ($cu.Check[$k].IsChecked -and $script:CleanSizes[$k]) { $sum += $script:CleanSizes[$k].Bytes; $n++ } }
+    $cu.Total.Text = "$(Format-Size $sum) can be freed"
+    $cu.Status.Text = if ($n) { "From the $n ticked group$(if ($n -ne 1) { 's' }). Tick or untick groups below, then press Clean selected." } else { 'Tick the groups you want to clean.' }
+    $cu.Go.IsEnabled = $sum -gt 0
+    $script:CleanPlanned = $sum
+}
+function Start-Clean {
+    $cu = $script:CleanUi
+    $keys = @($cu.Check.Keys | Where-Object { $cu.Check[$_].IsChecked })
+    if (-not $keys) { return }
+    $extra = if ($keys -contains 'recycle') { "`n`nThis also empties the Recycle Bin." } else { '' }
+    $r = [Windows.MessageBox]::Show("Delete $(Format-Size $script:CleanPlanned) of files now?`n`nDeleted files cannot be brought back. Files that are in use are skipped.$extra", 'Clean up files', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    $cu.Go.IsEnabled = $false; $cu.Rescan.IsEnabled = $false
+    $cu.Total.Text = 'Cleaning...'; $cu.Status.Text = 'This can take a minute for big caches.'
+    Start-Background $CleanWorker.ToString() @(@{ Targets = $CleanTargets; Keys = $keys; Clean = $true }) {
+        param($out, $errs)
+        $res = @($out | Where-Object { $_ })
+        $freed = ($res | Measure-Object Bytes -Sum).Sum; $skip = ($res | Measure-Object Skipped -Sum).Sum
+        Add-History "Cleaned up $(Format-Size $freed) of files" 'clean' $null
+        Show-Toast ("Freed $(Format-Size $freed)." + $(if ($skip) { " $skip files were in use and were skipped." } else { '' })) '#30D158'
+        Start-CleanScan
+    }
+}
+
+# =============================================================== Memory (RAM)
+# Apps that Windows itself, your drivers, security or the game need: no Close button for these.
+$MemNoClose = @('System', 'Registry', 'Memory Compression', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'svchost', 'dwm', 'explorer', 'fontdrvhost',
+    'MsMpEng', 'NisSrv', 'SecurityHealthService', 'audiodg', 'spoolsv', 'sihost', 'ctfmon', 'RuntimeBroker', 'SearchHost', 'StartMenuExperienceHost', 'ShellExperienceHost',
+    'TextInputHost', 'Idle', 'WmiPrvSE', 'powershell', 'NVDisplay.Container', 'nvcontainer', 'FortniteClient-Win64-Shipping', 'EasyAntiCheat_EOS', 'EasyAntiCheat', 'MsSense',
+    'LsaIso', 'vmmem', 'vmcompute', 'dllhost', 'conhost', 'taskhostw', 'SgrmBroker', 'WUDFHost', 'atiesrxx', 'atieclxx', 'amdfendrsr')
+function Get-MemInfo {
+    $m = Get-CimInstance Win32_PerfRawData_PerfOS_Memory -ErrorAction SilentlyContinue
+    if (-not $m -or -not $m.AvailableBytes) {
+        # performance counters switched off (some optimizers do that): ask Windows directly; the system cache is
+        # close to the standby list, and whatever is available beyond it is free
+        $ph = [MemTools]::Physical()
+        if (-not $ph) { return [pscustomobject]@{ Total = 0 } }
+        $standby = [Math]::Min($ph[2], $ph[1])
+        return [pscustomobject]@{ Total = $ph[0]; Available = $ph[1]; InUse = $ph[0] - $ph[1]; Standby = $standby; Free = $ph[1] - $standby; Modified = 0 }
+    }
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $total = [long]$os.TotalVisibleMemorySize * 1KB
+    $standby = [long]$m.StandbyCacheCoreBytes + [long]$m.StandbyCacheNormalPriorityBytes + [long]$m.StandbyCacheReserveBytes
+    [pscustomobject]@{ Total = $total; Available = [long]$m.AvailableBytes; InUse = $total - [long]$m.AvailableBytes; Standby = $standby
+                       Free = [long]$m.FreeAndZeroPageListBytes; Modified = [long]$m.ModifiedPageListBytes }
+}
+function New-MemoryPage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,14'>
+    <StackPanel>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel>
+          <TextBlock Text='In use' Foreground='#A1A1A6' FontSize='12'/>
+          <TextBlock x:Name='Used' FontSize='30' FontWeight='Bold'/>
+        </StackPanel>
+        <Button x:Name='Purge' Grid.Column='1' Content='Free standby memory' Style='{DynamicResource Btn}' VerticalAlignment='Top'
+                ToolTip='Clears the standby list once (what ISLC and Mem Reduct do). Your apps keep all their memory.'/>
+      </Grid>
+      <Grid Height='10' Margin='0,12,0,0'>
+        <Border CornerRadius='5' Background='#3A3A3C'/>
+        <StackPanel Orientation='Horizontal'>
+          <Border x:Name='BarUse' Height='10' CornerRadius='5,0,0,5' Background='#0A84FF' Width='0'/>
+          <Border x:Name='BarStandby' Height='10' Background='#636366' Width='0'/>
+        </StackPanel>
+      </Grid>
+      <TextBlock x:Name='Parts' FontSize='12' Foreground='#A1A1A6' Margin='0,8,0,0'/>
+      <TextBlock x:Name='Verdict' FontSize='13' FontWeight='SemiBold' Margin='0,12,0,0' TextWrapping='Wrap'/>
+    </StackPanel>
+  </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,18' Margin='0,0,0,14'>
+    <StackPanel>
+      <TextBlock Text='Apps using the most memory' FontSize='14' FontWeight='SemiBold'/>
+      <TextBlock Text='Closing apps you are not using is the only thing that really frees RAM. Save your work in them first.' FontSize='12' Foreground='#98989D' Margin='0,3,0,10' TextWrapping='Wrap'/>
+      <ContentControl x:Name='Top'/>
+    </StackPanel>
+  </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,18'>
+    <StackPanel>
+      <TextBlock Text='Why there is no RAM cleaner' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
+      <TextBlock Foreground='#A1A1A6' FontSize='12.5' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'
+        Text='&#x2022;  Standby memory is a cache of files you used recently. It already counts as available: Windows hands it to Fortnite instantly, so a big standby number is normal and good.&#x0a;&#x2022;  Most RAM cleaners force every app to give its memory back. Windows then has to read it all back from the disk, which causes the very stutter they promise to fix. ZeroDelay does not do that.&#x0a;&#x2022;  Free standby memory clears the cache once. It only helps on the rare PCs where a full standby list causes stutter (what ISLC fixes); on most PCs nothing changes.'/>
+    </StackPanel>
+  </Border>
+</StackPanel>
+"@)
+    $mu = @{}; foreach ($n in 'Used', 'Purge', 'BarUse', 'BarStandby', 'Parts', 'Verdict', 'Top') { $mu[$n] = $root.FindName($n) }
+    $script:MemUi = $mu
+    $mu.Purge.Add_Click({ Invoke-StandbyPurge })
+    Update-MemoryPage
+    # refresh every 4 s while this page is on screen
+    $script:MemTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:MemTimer.Interval = [TimeSpan]::FromSeconds(4)
+    $script:MemTimer.Add_Tick({ if ($script:CurrentCat.Name -eq 'Memory' -and $window.IsVisible -and $window.WindowState -ne 'Minimized') { Update-MemoryPage } })
+    $script:MemTimer.Start()
+    New-PageScroll $root
+}
+function Update-MemoryPage {
+    $mu = $script:MemUi
+    $mi = Get-MemInfo
+    if (-not $mi.Total) { return }
+    $mu.Used.Text = "$(Format-Size $mi.InUse) of $(Format-Size $mi.Total)"
+    $w = [Math]::Max(0, $mu.BarUse.Parent.ActualWidth); if (-not $w) { $w = 700 }
+    $mu.BarUse.Width = $w * $mi.InUse / $mi.Total
+    $mu.BarStandby.Width = [Math]::Max(0, [Math]::Min($w - $mu.BarUse.Width, $w * $mi.Standby / $mi.Total))
+    $mu.Parts.Text = "Available $(Format-Size $mi.Available)   ·   of that, standby cache $(Format-Size $mi.Standby) and completely free $(Format-Size $mi.Free)"
+    $availGb = $mi.Available / 1GB
+    $v = if ($availGb -ge 6) { @("Plenty of memory available for Fortnite ($('{0:N1}' -f $availGb) GB). Nothing to do.", '#30D158') }
+         elseif ($availGb -ge 3) { @("Fortnite runs best with 6 GB or more available; you have $('{0:N1}' -f $availGb) GB. Close the apps below that you are not using.", '#FF9F0A') }
+         else { @("Only $('{0:N1}' -f $availGb) GB available. Fortnite will stutter while Windows swaps to the disk: close the biggest apps below.", '#FF453A') }
+    if ($mi.Total -lt 15GB) { $v[0] += ' With less than 16 GB in the PC, adding RAM is the biggest upgrade for Fortnite.' }
+    $mu.Verdict.Text = $v[0]; $mu.Verdict.Foreground = ConvertTo-Brush $v[1]
+    $groups = Get-Process -ErrorAction SilentlyContinue | Group-Object ProcessName | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; Count = $_.Count; Bytes = ($_.Group | Measure-Object WorkingSet64 -Sum).Sum; Procs = $_.Group }
+    } | Sort-Object Bytes -Descending | Select-Object -First 10
+    $max = [double]($groups | Select-Object -First 1).Bytes
+    $rows = for ($i = 0; $i -lt @($groups).Count; $i++) {
+        $g = $groups[$i]
+        $label = $g.Name
+        try { $d = $g.Procs[0].MainModule.FileVersionInfo.FileDescription; if ($d) { $label = $d } } catch {}
+        $canClose = $MemNoClose -notcontains $g.Name
+        "<Grid Margin='0,0,0,8'><Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='160'/><ColumnDefinition Width='80'/><ColumnDefinition Width='86'/></Grid.ColumnDefinitions>" +
+        "<TextBlock Text='$(Esc "$label$(if ($g.Count -gt 1) { " ($($g.Count))" })")' FontSize='13' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>" +
+        "<Border Grid.Column='1' Height='6' CornerRadius='3' Background='#3A3A3C' VerticalAlignment='Center'><Border Height='6' CornerRadius='3' Background='#0A84FF' HorizontalAlignment='Left' Width='$([int](160 * $g.Bytes / [Math]::Max([double]1, $max)))'/></Border>" +
+        "<TextBlock Grid.Column='2' Text='$(Format-Size $g.Bytes)' FontSize='12.5' Foreground='#D1D1D6' VerticalAlignment='Center' TextAlignment='Right'/>" +
+        $(if ($canClose) { "<Button x:Name='K_$i' Grid.Column='3' Content='Close' Style='{DynamicResource Btn}' Padding='12,4' FontSize='12' HorizontalAlignment='Right'/>" } else { "<TextBlock Grid.Column='3' Text='Windows' FontSize='11.5' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center' ToolTip='Part of Windows, your drivers or the game: not closed from here.'/>" }) +
+        "</Grid>"
+    }
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($rows -join '')</StackPanel>")
+    for ($i = 0; $i -lt @($groups).Count; $i++) {
+        $b = $panel.FindName("K_$i")
+        if ($b) { $b.Tag = $groups[$i].Name; $b.Add_Click({ param($s, $e) Close-AppGroup $s.Tag }) }
+    }
+    $mu.Top.Content = $panel
+}
+function Close-AppGroup([string]$Name) {
+    $procs = @(Get-Process -Name $Name -ErrorAction SilentlyContinue)
+    if (-not $procs) { return }
+    $r = [Windows.MessageBox]::Show("Close $Name ($($procs.Count) process$(if ($procs.Count -ne 1) { 'es' }))?`n`nZeroDelay asks it to close first and ends it if it does not. Unsaved work in it may be lost.", 'Close app', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    foreach ($p in $procs) { try { if ($p.MainWindowHandle -ne [IntPtr]::Zero) { [void]$p.CloseMainWindow() } } catch {} }
+    # anything still running after 3 s (tray apps have no window to close) is ended
+    $script:CloseName = $Name
+    $t = New-Object Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromSeconds(3)
+    $t.Add_Tick({ param($s, $e)
+        $s.Stop()
+        Get-Process -Name $script:CloseName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Show-Toast "$script:CloseName was closed." '#30D158'
+        if ($script:MemUi) { Update-MemoryPage }
+    })
+    $t.Start()
+}
+function Invoke-StandbyPurge {
+    $before = Get-MemInfo
+    $rc = [MemTools]::PurgeStandby()
+    if ($rc -eq -1) { Show-Toast 'Windows did not give ZeroDelay permission to clear standby memory.' '#FF9F0A'; return }
+    if ($rc -ne 0) { Show-Toast ('Windows refused to clear standby memory (error 0x{0:X8}).' -f $rc) '#FF9F0A'; return }
+    $after = Get-MemInfo
+    Show-Toast "Cleared $(Format-Size ([Math]::Max(0, $before.Standby - $after.Standby))) of standby cache. Your apps kept all their memory." '#30D158'
+    Update-MemoryPage
 }
 
 # --- System tray icon
@@ -6404,7 +7271,7 @@ if ($Snapshot) {
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Hardware-accelerated GPU scheduling', 'Consistent timer resolution') }; Update-RestartBar }
     $window.Add_ContentRendered({
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
-        $script:SnapTimer.Interval = [TimeSpan]::FromSeconds(1)
+        $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($(if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }))
         $script:SnapTimer.Add_Tick({ $script:SnapTimer.Stop(); Save-Snapshot })
         $script:SnapTimer.Start()
     })
