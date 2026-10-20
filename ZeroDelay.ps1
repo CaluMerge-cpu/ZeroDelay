@@ -28,6 +28,35 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
+$AppVersion = '1.1.0'
+$UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
+
+# --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
+#     which swaps those colours for light mode and the chosen accent colour as the window is built.
+Add-Type -AssemblyName System.Xaml
+Add-Type -ReferencedAssemblies ([Windows.Markup.XamlReader].Assembly.Location), ([Windows.Media.Brush].Assembly.Location),
+    ([Windows.DependencyObject].Assembly.Location), ([System.Xaml.XamlReader].Assembly.Location) -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+public static class ZdTheme {
+    public static readonly Dictionary<string, string> Map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    static readonly Regex Hex = new Regex("#([0-9A-Fa-f]{8}|[0-9A-Fa-f]{6})(?![0-9A-Fa-f])");
+    public static string Apply(string s) {
+        if (s == null || Map.Count == 0) return s;
+        return Hex.Replace(s, m => {
+            string h = m.Groups[1].Value, a = "";
+            if (h.Length == 8) { a = h.Substring(0, 2); h = h.Substring(2); }
+            string t;
+            return Map.TryGetValue(h, out t) ? "#" + a + t : m.Value;
+        });
+    }
+    public static object Parse(string xaml) { return System.Windows.Markup.XamlReader.Parse(Apply(xaml)); }
+    public static System.Windows.Media.Brush Brush(string c) {
+        return (System.Windows.Media.Brush)new System.Windows.Media.BrushConverter().ConvertFrom(Apply(c));
+    }
+}
+'@
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -2590,7 +2619,38 @@ foreach ($t in $Tweaks) { if ($PotatoIds -contains $t.Id) { $t.Potato = $true } 
 $script:Backup = Load-Backup
 $script:FortniteExe = Find-FortniteExe
 
-[xml]$xaml = @'
+# --- Appearance. Dark is the design palette; light mode maps each dark colour to its light partner.
+#     Accent = [text/icon colour, button fill (white text on it), soft tint behind icons].
+$Accents = [ordered]@{
+    blue     = @{ Name = 'Blue';     Dark = '0A84FF', '0071E3', '273A4F'; Light = '0071E3', '0071E3', 'DCEBFB' }
+    indigo   = @{ Name = 'Indigo';   Dark = '7D7AFF', '5856D6', '2E2D52'; Light = '5856D6', '5856D6', 'E6E5FB' }
+    purple   = @{ Name = 'Purple';   Dark = 'BF5AF2', '9A3FD0', '3F2A4F'; Light = '9A3FD0', '9A3FD0', 'F1E4FA' }
+    pink     = @{ Name = 'Pink';     Dark = 'FF5C7A', 'D6204A', '4F2630'; Light = 'D6204A', 'D6204A', 'FBE1E7' }
+    teal     = @{ Name = 'Teal';     Dark = '40C8E0', '0B7F93', '1F4048'; Light = '0B7F93', '0B7F93', 'D9F1F5' }
+    graphite = @{ Name = 'Graphite'; Dark = 'AEAEB2', '636366', '3A3A3C'; Light = '6E6E73', '636366', 'E5E5EA' }
+}
+$LightMap = @{
+    '1C1C1E' = 'F2F2F7'; '262628' = 'EBEBF0'; '2C2C2E' = 'FFFFFF'; '3A3A3C' = 'E8E8ED'; '48484A' = 'D2D2D7'; '38383A' = 'E0E0E5'
+    'F5F5F7' = '1D1D1F'; 'A1A1A6' = '6E6E73'; '98989D' = '86868B'; '8E8E93' = '86868B'; 'D1D1D6' = '3A3A3C'; 'E5E5EA' = '2C2C2E'
+    '5A5A5E' = 'B0B0B5'; '6E6E73' = 'A1A1A6'; '4D4D50' = 'C4C4C9'; '636366' = 'C7C7CC'; '4A4A4D' = 'C7C7CC'; '444446' = 'DADADF'
+    '3D3D41' = 'DCDCE1'; '38383B' = 'D8D8DD'; '303033' = 'EDEDF2'
+    '30D158' = '1FA34A'; 'FF9F0A' = 'D97706'; 'FF453A' = 'DC2626'; 'FFD60A' = 'B58900'
+    '2D4635' = 'D7F2DF'; '22382A' = 'E6F6EA'; '2F5A3D' = 'B9E3C6'; '4E3E28' = 'FCEBD2'
+}
+function Get-SystemTheme {
+    $v = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue).AppsUseLightTheme
+    if ($v -eq 1) { 'light' } else { 'dark' }
+}
+$script:ThemeMode = if ($env:ZD_THEME) { $env:ZD_THEME } elseif ($script:Backup.Custom['theme']) { "$($script:Backup.Custom['theme'])" } else { 'dark' }
+$script:Theme = switch ($script:ThemeMode) { 'light' { 'light' } 'system' { Get-SystemTheme } default { 'dark' } }
+$script:Accent = if ($env:ZD_ACCENT) { $env:ZD_ACCENT } elseif ($script:Backup.Custom['accent']) { "$($script:Backup.Custom['accent'])" } else { 'blue' }
+if (-not $Accents.Contains($script:Accent)) { $script:Accent = 'blue' }
+[ZdTheme]::Map.Clear()
+if ($script:Theme -eq 'light') { foreach ($k in $LightMap.Keys) { [ZdTheme]::Map[$k] = $LightMap[$k] } }
+$acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { $Accents[$script:Accent].Dark }
+[ZdTheme]::Map['0A84FF'] = $acc[0]; [ZdTheme]::Map['0071E3'] = $acc[1]; [ZdTheme]::Map['273A4F'] = $acc[2]
+
+[xml]$xaml = [ZdTheme]::Apply(@'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="ZeroDelay - Fortnite latency optimizer" Width="1380" Height="880" MinWidth="900" MinHeight="600"
@@ -2714,7 +2774,7 @@ $script:FortniteExe = Find-FortniteExe
               <Trigger Property="IsPressed" Value="True"><Setter TargetName="Bg" Property="Background" Value="#38383B"/></Trigger>
               <Trigger Property="IsChecked" Value="True">
                 <Setter TargetName="Bg" Property="Background" Value="#3D3D41"/>
-                <Setter Property="Foreground" Value="#FFFFFF"/>
+                <Setter Property="Foreground" Value="#F5F5F7"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -3187,6 +3247,22 @@ $script:FortniteExe = Find-FortniteExe
         </StackPanel>
       </Grid>
       <StackPanel Grid.Row="1">
+      <Border x:Name="UpdateBar" Margin="32,0,32,12" Background="#2C2C2E" BorderBrush="#38383A" BorderThickness="1" CornerRadius="12" Padding="12,12,16,12" Visibility="Collapsed">
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <Border Width="32" Height="32" CornerRadius="8" Background="#273A4F" VerticalAlignment="Center">
+            <TextBlock Text="&#xE896;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="16" Foreground="#0A84FF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <StackPanel Grid.Column="1" Margin="12,0,16,0" VerticalAlignment="Center">
+            <TextBlock x:Name="UpdateTitle" FontSize="13.5" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+            <TextBlock x:Name="UpdateText" FontSize="12" Foreground="#A1A1A6" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
+          </StackPanel>
+          <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+            <Button x:Name="UpdateLater" Content="Later" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
+            <Button x:Name="UpdateGet" Content="Download" Style="{StaticResource Btn}" Background="#0071E3" Foreground="#FFFFFF"/>
+          </StackPanel>
+        </Grid>
+      </Border>
       <Border x:Name="DriftBar" Margin="32,0,32,12" Background="#2C2C2E" BorderBrush="#38383A" BorderThickness="1" CornerRadius="12" Padding="12,12,16,12" Visibility="Collapsed">
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -3252,7 +3328,7 @@ $script:FortniteExe = Find-FortniteExe
     </Grid>
   </Grid>
 </Window>
-'@
+'@)
 
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 
@@ -3260,8 +3336,8 @@ $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader
 function New-LogoBitmap([int]$Size) {
     $dv = New-Object Windows.Media.DrawingVisual
     $dc = $dv.RenderOpen()
-    $mint = [Windows.Media.BrushConverter]::new().ConvertFrom('#2EE6A6')
-    $dark = [Windows.Media.BrushConverter]::new().ConvertFrom('#06281C')
+    $mint = [ZdTheme]::Brush('#2EE6A6')
+    $dark = [ZdTheme]::Brush('#06281C')
     $r = $Size * 0.26
     $dc.DrawRoundedRectangle($mint, $null, (New-Object Windows.Rect 0, 0, $Size, $Size), $r, $r)
     $face = New-Object Windows.Media.Typeface 'Segoe Fluent Icons, Segoe MDL2 Assets'
@@ -3298,9 +3374,10 @@ try { Add-Type -Namespace ZD -Name Dwm -MemberDefinition '[DllImport("dwmapi.dll
 $window.Add_SourceInitialized({
     try {
         $h = (New-Object Windows.Interop.WindowInteropHelper $window).Handle
-        $v = 1; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$v, 4)          # dark title bar
-        $v = 0x001E1C1C; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 35, [ref]$v, 4)  # caption colour #1C1C1E
-        $v = 0x003A3838; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 34, [ref]$v, 4)  # border colour #38383A
+        $dk = $script:Theme -ne 'light'
+        $v = [int]$dk; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$v, 4)                         # dark title bar
+        $v = if ($dk) { 0x001E1C1C } else { 0x00F7F2F2 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 35, [ref]$v, 4)  # caption = window colour
+        $v = if ($dk) { 0x003A3838 } else { 0x00E5E0E0 }; [void][ZD.Dwm]::DwmSetWindowAttribute($h, 34, [ref]$v, 4)  # border = separator
     } catch {}
 })
 $LogoIco = Join-Path $PSScriptRoot 'ZeroDelay.ico'
@@ -3311,7 +3388,8 @@ if (Test-Path $LogoIco) {
 $ui = @{}
 foreach ($n in 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
-            'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon') { $ui[$n] = $window.FindName($n) }
+            'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon',
+            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
     restart  = @{ Color = '#0A84FF'; Label = 'Needs restart'; Tip = 'Takes effect after you restart the PC.' }
@@ -3371,7 +3449,7 @@ function Start-CountUp($tb, [int]$to, [string]$suffix = '', [int]$ms = 600) {
 }
 
 function New-SectionHeader($t) {
-    $h = [Windows.Markup.XamlReader]::Parse(@"
+    $h = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,24,16,12'>
   <TextBlock Text='$(Esc $t.Header)' FontSize='20' FontWeight='Bold' Foreground='#F5F5F7'/>
   <TextBlock Text='$(Esc $t.Desc)' FontSize='13' Foreground='#A1A1A6' Margin='0,4,0,0' TextWrapping='Wrap' MaxWidth='720' HorizontalAlignment='Left'/>
@@ -3430,7 +3508,7 @@ function New-Card($t) {
   </Grid>
 </Border>
 "@
-    $card = [Windows.Markup.XamlReader]::Parse($cardXaml)
+    $card = [ZdTheme]::Parse($cardXaml)
     $card.Tag = $t
     $t.Card = $card
     $t.Toggle = $card.FindName('Toggle')
@@ -3441,7 +3519,7 @@ function New-Card($t) {
         $t.Toggle.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked) })
     }
     if ($t.Extra -eq 'fps') {
-        $panel = [Windows.Markup.XamlReader]::Parse(@"
+        $panel = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Orientation='Horizontal'>
   <TextBox Width='64' Padding='6,3' FontSize='13'/>
   <TextBlock Text='FPS  (0 = unlimited)' Foreground='#A1A1A6' FontSize='12' VerticalAlignment='Center' Margin='8,0,0,0'/>
@@ -3453,7 +3531,7 @@ function New-Card($t) {
         $extra.Content = $panel
     }
     if ($t.Extra -eq 'res') {
-        $panel = [Windows.Markup.XamlReader]::Parse(@"
+        $panel = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Orientation='Horizontal'>
   <TextBox Width='64' Padding='6,3' FontSize='13'/>
   <TextBlock Text='%  of screen resolution (25 to 99)' Foreground='#A1A1A6' FontSize='12' VerticalAlignment='Center' Margin='8,0,0,0'/>
@@ -3468,7 +3546,7 @@ function New-Card($t) {
     if ($t.Id -eq 'ping') {
         $script:PingText = New-Object Windows.Controls.TextBlock
         $script:PingText.FontFamily = 'Cascadia Mono, Consolas'; $script:PingText.FontSize = 11.5
-        $script:PingText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom('#D1D1D6')
+        $script:PingText.Foreground = [ZdTheme]::Brush('#D1D1D6')
         $script:PingText.TextWrapping = 'Wrap'
         $extra.Content = $script:PingText
     }
@@ -3509,7 +3587,7 @@ function Show-Toast([string]$msg, [string]$color = '#F5F5F7') {
         { $_ -in '#A1A1A6', '#0A84FF', '#0A84FF', '#A1A1A6' } { @(0xE946, '#0A84FF') }
         default { $null }
     }
-    if ($k) { $ui.ToastIcon.Text = [string][char]$k[0]; $ui.ToastIcon.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom($k[1]); $ui.ToastIcon.Visibility = 'Visible' }
+    if ($k) { $ui.ToastIcon.Text = [string][char]$k[0]; $ui.ToastIcon.Foreground = [ZdTheme]::Brush($k[1]); $ui.ToastIcon.Visibility = 'Visible' }
     else { $ui.ToastIcon.Visibility = 'Collapsed' }
     $wasHidden = $ui.Toast.Visibility -ne 'Visible'
     $ui.Toast.BeginAnimation([Windows.UIElement]::OpacityProperty, $null); $ui.Toast.Opacity = 1
@@ -3565,7 +3643,7 @@ function Update-PresetPreview($t) {
     # Score colour: green = very potato, amber = middle, grey = pretty.
     $color = if ($score -ge 70) { '#30D158' } elseif ($score -ge 35) { '#FFD60A' } else { '#8E8E93' }
     $barW = [int](2.6 * [Math]::Max(3, $score))
-    $panel = [Windows.Markup.XamlReader]::Parse(@"
+    $panel = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' CornerRadius='8' Background='#1C1C1E' BorderThickness='0' Padding='14,12'>
   <StackPanel>
     <StackPanel Orientation='Horizontal'>
@@ -3597,12 +3675,12 @@ function Update-BuilderScore {
     $b.BlurText.Text = $BlurNames[[int]$b.Blur.Value]
     $score = Get-PotatoScore (Get-BuilderValues)
     $color = if ($score -ge 70) { '#30D158' } elseif ($score -ge 35) { '#FFD60A' } else { '#8E8E93' }
-    $brush = [Windows.Media.BrushConverter]::new().ConvertFrom($color)
+    $brush = [ZdTheme]::Brush($color)
     $b.Score.Text = "$score%"; $b.Score.Foreground = $brush
     $b.Bar.Width = 2.6 * [Math]::Max(3, $score); $b.Bar.Background = $brush
 }
 function New-BuilderPanel($t) {
-    $panel = [Windows.Markup.XamlReader]::Parse(@"
+    $panel = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         CornerRadius='8' Background='#1C1C1E' BorderThickness='0' Padding='14,12'>
   <StackPanel>
@@ -3664,7 +3742,7 @@ function New-SessionPanel($t) {
         "<TextBlock Text='$(Esc $_.Name)' Foreground='#D1D1D6' FontSize='12' VerticalAlignment='Center'/>" +
         "<ToggleButton x:Name='S_$($_.Key)' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18'/></Grid>"
     }) -join ''
-    $panel = [Windows.Markup.XamlReader]::Parse(@"
+    $panel = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         CornerRadius='8' Background='#1C1C1E' BorderThickness='0' Padding='14,10'>
   <StackPanel>$rows</StackPanel>
@@ -3688,7 +3766,7 @@ function New-GameModePanel($t) {
         "<TextBlock Text='$(Esc $GameModeSteps[$_].Name)' Foreground='#D1D1D6' FontSize='12' VerticalAlignment='Center'/>" +
         "<ToggleButton x:Name='G_$_' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18'/></Grid>"
     }) -join ''
-    $panel = [Windows.Markup.XamlReader]::Parse(@"
+    $panel = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         CornerRadius='8' Background='#1C1C1E' BorderThickness='0' Padding='14,10'>
   <StackPanel>$rows</StackPanel>
@@ -3706,16 +3784,16 @@ function New-GameModePanel($t) {
 }
 function Update-GameModeUi {
     $on = Test-ZDGameMode
-    $mint = [Windows.Media.BrushConverter]::new().ConvertFrom('#30D158')
+    $mint = [ZdTheme]::Brush('#30D158')
     $ui.GmSwitch.IsChecked = $on
     $ui.GmStatus.Text = if ($on) { if (Test-FortniteRunning) { 'On · Fortnite running' } else { 'On' } } elseif ((Get-GameModePrefs).auto) { 'Auto-starts with Fortnite' } else { 'Off' }
-    $ui.GmStatus.Foreground = if ($on) { $mint } else { [Windows.Media.BrushConverter]::new().ConvertFrom('#A1A1A6') }
+    $ui.GmStatus.Foreground = if ($on) { $mint } else { [ZdTheme]::Brush('#A1A1A6') }
     $ui.GmPanel.ClearValue([Windows.Controls.Border]::BorderBrushProperty)
     $t = $Tweaks | Where-Object { $_.Id -eq 'gm-main' } | Select-Object -First 1
     if ($t -and $t.ActionBtn) {
         $t.ActionBtn.Content = if ($on) { 'Turn off' } else { 'Turn on' }
-        $t.ActionBtn.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($(if ($on) { '#2D4635' } else { '#0071E3' }))
-        $t.ActionBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom($(if ($on) { '#30D158' } else { '#FFFFFF' }))
+        $t.ActionBtn.Background = [ZdTheme]::Brush($(if ($on) { '#2D4635' } else { '#0071E3' }))
+        $t.ActionBtn.Foreground = [ZdTheme]::Brush($(if ($on) { '#30D158' } else { '#FFFFFF' }))
     }
 }
 
@@ -3724,8 +3802,8 @@ function Update-SessionCard {
     if (-not $t -or -not $t.ActionBtn) { return }
     $on = Test-GameSession
     $t.ActionBtn.Content = if ($on) { 'End session' } else { 'Start session' }
-    $t.ActionBtn.Background = [Windows.Media.BrushConverter]::new().ConvertFrom($(if ($on) { '#4E3E28' } else { '#3A3A3C' }))
-    $t.ActionBtn.Foreground = [Windows.Media.BrushConverter]::new().ConvertFrom($(if ($on) { '#FF9F0A' } else { '#F5F5F7' }))
+    $t.ActionBtn.Background = [ZdTheme]::Brush($(if ($on) { '#4E3E28' } else { '#3A3A3C' }))
+    $t.ActionBtn.Foreground = [ZdTheme]::Brush($(if ($on) { '#FF9F0A' } else { '#F5F5F7' }))
 }
 
 function Update-Card($t) {
@@ -3902,7 +3980,7 @@ function Update-HistoryPage {
         $when = try { ([datetime]$h.Time).ToString('dd MMM  HH:mm') } catch { $h.Time }
         $color = switch ($h.Action) { 'on' { '#30D158' } 'off' { '#FF9F0A' } default { '#0A84FF' } }
         $word = switch ($h.Action) { 'on' { 'Turned on' } 'off' { 'Turned off' } 'preset' { 'Applied' } 'gamemode' { 'Game Mode' } default { $h.Action } }
-        $row = [Windows.Markup.XamlReader]::Parse(@"
+        $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='16,10' Margin='0,0,0,8'>
   <Grid>
@@ -4022,7 +4100,7 @@ function Get-HealthIssues {
 }
 
 function New-HealthPage {
-    $root = [Windows.Markup.XamlReader]::Parse(@"
+    $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
     <Grid>
@@ -4083,7 +4161,7 @@ function Invoke-HealthScan {
     foreach ($i in $issues) {
         $color = switch ($i.Sev) { 3 { '#FF453A' } 2 { '#FFD60A' } default { '#0A84FF' } }
         $sevWord = switch ($i.Sev) { 3 { 'High impact' } 2 { 'Medium' } default { 'Info' } }
-        $row = [Windows.Markup.XamlReader]::Parse(@"
+        $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='18,14' Margin='0,0,0,10'>
   <Grid>
@@ -4226,7 +4304,7 @@ function Get-SetupSummary {
 }
 
 function New-BenchmarkPage {
-    $root = [Windows.Markup.XamlReader]::Parse(@"
+    $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
     <StackPanel>
@@ -4362,7 +4440,7 @@ function Update-BenchmarkPage {
         $when = try { ([datetime]$r.Time).ToString('dd MMM HH:mm') } catch { '' }
         $tag = if ($r -eq $best -and $runs.Count -gt 1) { "<Border Background='#2D4635' CornerRadius='5' Padding='7,2' Margin='10,0,0,0'><TextBlock Text='Best 1% low' FontSize='11' Foreground='#30D158' FontWeight='SemiBold'/></Border>" } else { '' }
         $lat = if ($r.Latency) { "$($r.Latency) ms $($r.LatencyKind)" } else { 'latency n/a' }
-        $row = [Windows.Markup.XamlReader]::Parse(@"
+        $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='18,14' Margin='0,0,0,10'>
   <Grid>
@@ -4395,7 +4473,7 @@ function Update-BenchmarkPage {
 $PingLogFile = Join-Path $env:TEMP 'zerodelay-ping.log'
 function New-PingPage {
     $regions = ($PingHosts | ForEach-Object { "<ComboBoxItem Content='$($_.Name)'/>" }) -join ''
-    $root = [Windows.Markup.XamlReader]::Parse(@"
+    $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
     <StackPanel>
@@ -4518,7 +4596,7 @@ function Add-PingSpike($time, $ms, $med) {
     $upd = if ((Get-Service wuauserv -ErrorAction SilentlyContinue).Status -eq 'Running') { 'Windows Update running' } else { $null }
     $what = @($busy) + @($upd) | Where-Object { $_ }
     $text = if ($ms -lt 0) { 'Packet lost' } else { "Spike to $ms ms (normal ~$med ms)" }
-    $row = [Windows.Markup.XamlReader]::Parse(@"
+    $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='16,10' Margin='0,0,0,8'>
   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='90'/><ColumnDefinition Width='230'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
     <TextBlock Text='$time' Foreground='#A1A1A6' FontSize='12'/>
@@ -4535,7 +4613,7 @@ function Add-PingSpike($time, $ms, $med) {
 # Fortnite: degrees per mouse count = sensitivity (as a fraction, 6% = 0.06) x 0.5555. Matches published pro tables within ~1%.
 $FortniteYaw = 0.5555
 function New-SensPage {
-    $root = [Windows.Markup.XamlReader]::Parse(@"
+    $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
     <StackPanel>
@@ -4672,7 +4750,7 @@ function Invoke-Profile($prof, [bool]$Strict) {
 }
 
 function New-ProfilesPage {
-    $root = [Windows.Markup.XamlReader]::Parse(@"
+    $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
     <StackPanel>
@@ -4724,7 +4802,7 @@ function Update-ProfilesPage {
     if (-not $list.Count) { $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'No profiles yet. Save your current setup above.'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'; [void]$pr.List.Children.Add($tb); return }
     foreach ($o in $list) {
         $when = try { ([datetime]$o.Created).ToString('dd MMM yyyy') } catch { '' }
-        $row = [Windows.Markup.XamlReader]::Parse(@"
+        $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='18,14' Margin='0,0,0,10'>
   <Grid>
@@ -4768,7 +4846,7 @@ function Get-HardwareSummary {
 function Show-Wizard {
     $hw = Get-HardwareSummary
     $script:WizHw = $hw
-    $body = [Windows.Markup.XamlReader]::Parse(@"
+    $body = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <TextBlock Text='Welcome to ZeroDelay' FontSize='24' FontWeight='Bold'/>
   <TextBlock Text='Three quick questions and ZeroDelay sets up your PC. You can change everything afterwards.' Foreground='#A1A1A6' FontSize='13' Margin='0,6,0,18' TextWrapping='Wrap'/>
@@ -4857,6 +4935,7 @@ function New-SettingsPage {
     $rows = @(
         @{ Key = 'closetotray'; Title = 'Closing the window keeps ZeroDelay in the tray'; Desc = 'The X button hides ZeroDelay next to the clock instead of quitting. Right-click the tray icon to exit.' }
         @{ Key = 'autofix';    Title = 'Automatically re-apply settings other programs change'; Desc = 'Instead of showing the orange bar, ZeroDelay quietly puts your settings back and tells you.' }
+        @{ Key = 'autoupdate'; Title = 'Check for new versions'; Desc = 'Asks GitHub when ZeroDelay starts and every 6 hours whether a newer version is out. Nothing is downloaded or installed unless you choose to.' }
     )
     $xr = ($rows | ForEach-Object {
         "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'><Grid>" +
@@ -4864,10 +4943,50 @@ function New-SettingsPage {
         "<StackPanel><TextBlock Text='$(Esc $_.Title)' FontSize='14' FontWeight='SemiBold'/><TextBlock Text='$(Esc $_.Desc)' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/></StackPanel>" +
         "<ToggleButton x:Name='S_$($_.Key)' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/></Grid></Border>"
     }) -join ''
-    $root = [Windows.Markup.XamlReader]::Parse(@"
+    $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+    <StackPanel>
+      <TextBlock Text='Appearance' FontSize='14' FontWeight='SemiBold'/>
+      <Grid Margin='0,14,0,0'>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='120'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+        <Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+        <TextBlock Text='Theme' Foreground='#A1A1A6' FontSize='12.5' VerticalAlignment='Center'/>
+        <StackPanel Grid.Column='1' Orientation='Horizontal'>
+          <Button x:Name='T_dark' Content='Dark' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='72'/>
+          <Button x:Name='T_light' Content='Light' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='72'/>
+          <Button x:Name='T_system' Content='Match Windows' Style='{DynamicResource Btn}'/>
+        </StackPanel>
+        <TextBlock Grid.Row='1' Text='Accent colour' Foreground='#A1A1A6' FontSize='12.5' VerticalAlignment='Center' Margin='0,14,0,0'/>
+        <StackPanel x:Name='Swatches' Grid.Row='1' Grid.Column='1' Orientation='Horizontal' Margin='0,14,0,0'/>
+      </Grid>
+      <Border x:Name='ThemeNote' Background='#1C1C1E' CornerRadius='8' Padding='14,10' Margin='0,16,0,0' Visibility='Collapsed'>
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+          <TextBlock Text='ZeroDelay restarts to switch its look. It takes about 3 seconds.' Foreground='#D1D1D6' FontSize='12.5' VerticalAlignment='Center' TextWrapping='Wrap'/>
+          <Button x:Name='ThemeApply' Grid.Column='1' Content='Restart ZeroDelay' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='12,0,0,0'/>
+        </Grid>
+      </Border>
+    </StackPanel>
+  </Border>
   $xr
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,6,0,10'>
+    <StackPanel>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel>
+          <TextBlock x:Name='VerTitle' FontSize='14' FontWeight='SemiBold'/>
+          <TextBlock x:Name='UpdStatus' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/>
+        </StackPanel>
+        <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+          <Button x:Name='UpdCheck' Content='Check for updates' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+          <Button x:Name='UpdGet' Content='Download' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='0,0,8,0' Visibility='Collapsed'/>
+          <Button x:Name='UpdRepo' Content='GitHub page' Style='{DynamicResource Btn}'/>
+        </StackPanel>
+      </Grid>
+    </StackPanel>
+  </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
     <StackPanel>
       <TextBlock Text='More' FontSize='14' FontWeight='SemiBold'/>
       <StackPanel Orientation='Horizontal' Margin='0,12,0,0'>
@@ -4879,7 +4998,8 @@ function New-SettingsPage {
   </Border>
 </StackPanel>
 "@)
-    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'Wizard', 'Folder', 'About') { $st[$n] = $root.FindName($n) }
+    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'S_autoupdate', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply',
+                              'VerTitle', 'UpdStatus', 'UpdCheck', 'UpdGet', 'UpdRepo') { $st[$n] = $root.FindName($n) }
     $script:SetUi = $st
     $st.S_closetotray.IsChecked = [bool](Get-Setting 'closetotray' $true)
     $st.S_autofix.IsChecked = [bool](Get-Setting 'autofix' $false)
@@ -4887,8 +5007,130 @@ function New-SettingsPage {
     $st.S_autofix.Add_Click({ param($s, $e) $script:Backup.Custom['autofix'] = [bool]$s.IsChecked; Save-Backup })
     $st.Wizard.Add_Click({ Show-Wizard })
     $st.Folder.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$DataDir`"" })
-    $st.About.Text = "ZeroDelay  ·  app: $PSCommandPath  ·  data and backups: $DataDir"
+    $st.About.Text = "ZeroDelay $AppVersion  ·  app: $PSCommandPath  ·  data and backups: $DataDir"
+    $st.S_autoupdate.IsChecked = [bool](Get-Setting 'autoupdate' $true)
+    $st.S_autoupdate.Add_Click({ param($s, $e)
+        $script:Backup.Custom['autoupdate'] = [bool]$s.IsChecked; Save-Backup
+        if ($s.IsChecked) { Start-UpdateCheck } else { $ui.UpdateBar.Visibility = 'Collapsed' }
+    })
+    # theme: Dark / Light / Match Windows
+    foreach ($m in 'dark', 'light', 'system') {
+        $st["T_$m"].Tag = $m
+        $st["T_$m"].Add_Click({ param($s, $e) $script:Backup.Custom['theme'] = $s.Tag; Save-Backup; Update-AppearanceUi })
+    }
+    # accent swatches: a coloured dot inside a ring that shows the current choice
+    foreach ($k in $Accents.Keys) {
+        $ring = New-Object Windows.Controls.Border
+        $ring.Width = 30; $ring.Height = 30; $ring.CornerRadius = 15; $ring.BorderThickness = 2; $ring.Padding = 3; $ring.Margin = '0,0,8,0'
+        $ring.Cursor = [Windows.Input.Cursors]::Hand; $ring.ToolTip = $Accents[$k].Name; $ring.Tag = $k; $ring.Background = [Windows.Media.Brushes]::Transparent
+        $dot = New-Object Windows.Shapes.Ellipse
+        $dot.Fill = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString("#$($Accents[$k].Dark[0])"))
+        $ring.Child = $dot
+        $ring.Add_MouseLeftButtonUp({ param($s, $e) $script:Backup.Custom['accent'] = $s.Tag; Save-Backup; Update-AppearanceUi })
+        [void]$st.Swatches.Children.Add($ring)
+    }
+    $st.ThemeApply.Add_Click({ Restart-ZeroDelay })
+    Update-AppearanceUi
+    # version and updates
+    $st.VerTitle.Text = "ZeroDelay $AppVersion"
+    $st.UpdCheck.Add_Click({ Start-UpdateCheck -Manual })
+    $st.UpdGet.Add_Click({ Open-UpdatePage })
+    $st.UpdRepo.Add_Click({ Start-Process "https://github.com/$UpdateRepo" })
+    Update-UpdateUi
     New-PageScroll $root
+}
+
+function Update-AppearanceUi {
+    $st = $script:SetUi; if (-not $st) { return }
+    $mode = Get-Setting 'theme' 'dark'
+    $acc = Get-Setting 'accent' 'blue'
+    foreach ($m in 'dark', 'light', 'system') {
+        $b = $st["T_$m"]
+        if ($m -eq $mode) { $b.Background = [ZdTheme]::Brush('#0071E3'); $b.Foreground = [ZdTheme]::Brush('#FFFFFF') }
+        else { $b.ClearValue([Windows.Controls.Control]::BackgroundProperty); $b.ClearValue([Windows.Controls.Control]::ForegroundProperty) }
+    }
+    $st.T_system.ToolTip = "Windows is set to $(Get-SystemTheme) mode."
+    foreach ($ring in $st.Swatches.Children) {
+        $ring.BorderBrush = if ($ring.Tag -eq $acc) { [ZdTheme]::Brush('#F5F5F7') } else { [Windows.Media.Brushes]::Transparent }
+    }
+    $changed = ($mode -ne $script:ThemeMode) -or ($acc -ne $script:Accent)
+    $st.ThemeNote.Visibility = if ($changed) { 'Visible' } else { 'Collapsed' }
+}
+# Closes this window and starts a fresh copy on the Settings page (used to switch theme).
+function Restart-ZeroDelay {
+    Save-Backup
+    $script:Relaunch = $true
+    $script:ReallyExit = $true
+    $window.Close()
+}
+
+# --- Update check: asks GitHub for the latest release. Runs in the background; never downloads anything itself.
+function Get-TagVersion([string]$Tag) {
+    $v = $null
+    if ([version]::TryParse(($Tag -replace '^[vV]', '' -replace '[^0-9.].*$', ''), [ref]$v)) { $v } else { $null }
+}
+function Start-UpdateCheck([switch]$Manual) {
+    if ($script:UpdateTask -and -not $script:UpdateTask.IsCompleted) { return }
+    $script:UpdateManual = [bool]$Manual
+    if ($Manual) { $script:UpdateSnoozed = $false }
+    if ($env:ZD_FAKE_UPDATE) { Set-UpdateResult @{ Tag = $env:ZD_FAKE_UPDATE; Url = "https://github.com/$UpdateRepo/releases" }; return }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object Net.WebClient
+        $wc.Headers['User-Agent'] = "ZeroDelay/$AppVersion"
+        $wc.Headers['Accept'] = 'application/vnd.github+json'
+        $script:UpdateTask = $wc.DownloadStringTaskAsync("https://api.github.com/repos/$UpdateRepo/releases/latest")
+    } catch { Set-UpdateResult $null 'Could not check for updates.'; return }
+    if ($script:SetUi) { $script:SetUi.UpdStatus.Text = 'Checking...' }
+    if (-not $script:UpdatePoll) {
+        $script:UpdatePoll = New-Object Windows.Threading.DispatcherTimer
+        $script:UpdatePoll.Interval = [TimeSpan]::FromMilliseconds(300)
+        $script:UpdatePoll.Add_Tick({
+            $task = $script:UpdateTask
+            if (-not $task -or -not $task.IsCompleted) { return }
+            $script:UpdatePoll.Stop()
+            if ($task.IsFaulted -or $task.IsCanceled) {
+                $msg = "$($task.Exception.InnerException.Message)"
+                Set-UpdateResult $null $(if ($msg -match '404') { 'No release has been published yet.' } else { 'Could not reach GitHub. Check your internet connection and try again.' })
+                return
+            }
+            try { $j = $task.Result | ConvertFrom-Json; Set-UpdateResult @{ Tag = "$($j.tag_name)"; Url = "$($j.html_url)" } }
+            catch { Set-UpdateResult $null 'GitHub sent an answer ZeroDelay could not read.' }
+        })
+    }
+    $script:UpdatePoll.Start()
+}
+function Set-UpdateResult($r, [string]$err) {
+    $script:UpdateChecked = Get-Date
+    if (-not $r) {
+        $script:UpdateError = $err
+        if ($script:UpdateManual) { Show-Toast $err '#FF9F0A' }
+        Update-UpdateUi; return
+    }
+    $script:UpdateError = $null
+    $latest = Get-TagVersion $r.Tag
+    $script:UpdateInfo = if ($latest -and $latest -gt [version]$AppVersion) { @{ Version = "$latest"; Url = $r.Url } } else { $null }
+    if ($script:UpdateManual -and -not $script:UpdateInfo) { Show-Toast "You have the latest version ($AppVersion)." '#30D158' }
+    Update-UpdateUi
+}
+function Update-UpdateUi {
+    $u = $script:UpdateInfo
+    if ($u -and -not $script:UpdateSnoozed) {
+        $ui.UpdateTitle.Text = "ZeroDelay $($u.Version) is available"
+        $ui.UpdateText.Text = "You have $AppVersion. Download the new setup, exit ZeroDelay from the tray, then run it. Your settings and backups are kept."
+        if ($ui.UpdateBar.Visibility -ne 'Visible') { $ui.UpdateBar.Visibility = 'Visible'; Show-Animated $ui.UpdateBar -8 260 }
+    } else { $ui.UpdateBar.Visibility = 'Collapsed' }
+    $st = $script:SetUi; if (-not $st) { return }
+    $st.UpdGet.Visibility = if ($u) { 'Visible' } else { 'Collapsed' }
+    if ($u) { $st.UpdGet.Content = "Download $($u.Version)" }
+    $st.UpdStatus.Text = if ($u) { "Version $($u.Version) is out. Download the setup and run it; your settings and backups are kept." }
+                         elseif ($script:UpdateError) { $script:UpdateError }
+                         elseif ($script:UpdateChecked) { "You have the latest version. Checked at $($script:UpdateChecked.ToString('HH:mm'))." }
+                         else { 'Not checked yet.' }
+}
+function Open-UpdatePage {
+    $url = if ($script:UpdateInfo) { $script:UpdateInfo.Url } else { "https://github.com/$UpdateRepo/releases/latest" }
+    Start-Process $url
 }
 
 # --- System tray icon
@@ -5168,7 +5410,7 @@ function Update-NvidiaPage {
     # checklist
     $tips = 'Settings > Features > NVIDIA Overlay: off unless you clip', 'Settings > Automatically optimize newly added games: off', 'System > Performance > Automatic tuning: off', 'Graphics > Global > Shader Cache Size: Driver default or larger', 'System > Displays > G-SYNC: on if your monitor supports it, then use the Tear-free preset'
     $x += New-NvSection 'Set by hand in the NVIDIA App' (($tips | ForEach-Object { New-NvRow '' "• $_" }) -join '')
-    $panel = [Windows.Markup.XamlReader]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$x</StackPanel>")
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$x</StackPanel>")
     $wire = @{
         TearFree = { Invoke-NvTearFree }; Lowest = { Invoke-NvLowest }; UndoSync = { Undo-NvSync }; HdrOff = { Disable-NvRtxHdr }
         Mcp = { try { $t = Invoke-NvMcp 'tools/list'; $script:NvMcpState = "Connected ($(@($t.tools).Count) tools)"; 'NVIDIA App connection works.' } catch { $script:NvMcpState = 'Not reachable (NVIDIA App closed or agents off)'; throw 'Could not reach the NVIDIA App connection.' } }
@@ -5191,7 +5433,7 @@ function Get-PageContent([string]$Name) {
     if (-not $script:Pages.ContainsKey($Name)) {
         $builder = Get-Command "New-$($Name)Page" -ErrorAction SilentlyContinue
         $script:Pages[$Name] = if ($builder) { & $builder } else {
-            $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Coming soon.'; $tb.Margin = '32,0,0,0'; $tb.Foreground = '#A1A1A6'; $tb }
+            $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Coming soon.'; $tb.Margin = '32,0,0,0'; $tb.Foreground = [ZdTheme]::Brush('#A1A1A6'); $tb }
     }
     $script:Pages[$Name]
 }
@@ -5203,7 +5445,7 @@ function New-PageScroll($content) {
     $sv.Content = $content
     $sv
 }
-function ConvertTo-Brush([string]$c) { [Windows.Media.BrushConverter]::new().ConvertFrom($c) }
+function ConvertTo-Brush([string]$c) { [ZdTheme]::Brush($c) }
 $script:CurrentCat = $Categories[0]
 function Update-Filter {
     $q = $ui.Search.Text.Trim()
@@ -5235,7 +5477,7 @@ foreach ($c in $Categories) {
         $lbl.Text = (Get-Culture).TextInfo.ToTitleCase($c.Section.ToLower()); $lbl.FontSize = 11; $lbl.FontWeight = 'SemiBold'; $lbl.Foreground = ConvertTo-Brush '#98989D'; $lbl.Margin = '10,16,0,6'
         [void]$ui.Nav.Children.Add($lbl)
     }
-    $rb = [Windows.Markup.XamlReader]::Parse(@"
+    $rb = [ZdTheme]::Parse(@"
 <RadioButton xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' GroupName='nav' Style='{DynamicResource NavButton}'>
   <StackPanel Orientation='Horizontal'>
     <TextBlock Text='$('&#x{0:X};' -f [int][char]$c.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' Width='20' TextAlignment='Center' VerticalAlignment='Center' Margin='0,0,10,0'>
@@ -5379,6 +5621,17 @@ $window.Add_Activated({
 })
 if (-not $Snapshot) { $script:DriftTimer.Start() }
 
+$ui.UpdateLater.Add_Click({ $script:UpdateSnoozed = $true; Hide-Animated $ui.UpdateBar 200 })
+$ui.UpdateGet.Add_Click({ Open-UpdatePage })
+# first check shortly after start (so it never slows the window opening), then every 6 hours
+$script:UpdateTimer = New-Object Windows.Threading.DispatcherTimer
+$script:UpdateTimer.Interval = [TimeSpan]::FromSeconds(6)
+$script:UpdateTimer.Add_Tick({
+    $script:UpdateTimer.Interval = [TimeSpan]::FromHours(6)
+    if (Get-Setting 'autoupdate' $true) { Start-UpdateCheck }
+})
+if (-not $Snapshot) { $script:UpdateTimer.Start() }
+
 $ui.RestartLater.Add_Click({
     # Hide until the next change that needs a restart; the pending list is kept until the PC restarts.
     $script:RestartSnoozed = $true
@@ -5467,6 +5720,7 @@ if ($Snapshot) {
         $sw.Restart(); [void](Get-ActivePowerScheme); [Console]::WriteLine("POWERCFG {0} ms" -f $sw.ElapsedMilliseconds)
     }    if ($env:ZD_SCAN -and $script:Health) { Invoke-HealthScan }
     if ($env:ZD_DRIFT) { Invoke-DriftCheck; if (-not $script:DriftItems) { $ui.DriftTitle.Text = '2 settings were changed back — ExitLag is running'; $ui.DriftText.Text = 'Turn off USB 3 link power-saving  ·  USB hubs never suspend'; $ui.DriftBar.Visibility = 'Visible' } }
+    if ($env:ZD_FAKE_UPDATE) { Start-UpdateCheck }
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Hardware-accelerated GPU scheduling', 'Consistent timer resolution') }; Update-RestartBar }
     $window.Add_ContentRendered({
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
@@ -5512,3 +5766,7 @@ $window.Add_Closed({
 })
 if (-not $Tray -or $Snapshot) { $window.Show() }
 [Windows.Threading.Dispatcher]::Run()
+if ($script:Relaunch) {
+    try { $script:AppMutex.ReleaseMutex(); $script:AppMutex.Dispose() } catch {}
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Page Settings$(if ($NoElevate) { ' -NoElevate' })"
+}

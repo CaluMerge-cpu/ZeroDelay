@@ -35,7 +35,7 @@ try {
         $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ZeroDelay'
         New-Item -Path $key -Force | Out-Null
         $props = @{
-            DisplayName = 'ZeroDelay'; DisplayVersion = '1.0.0'; Publisher = 'ZeroDelay'; DisplayIcon = $ico
+            DisplayName = 'ZeroDelay'; DisplayVersion = '1.1.0'; Publisher = 'ZeroDelay'; DisplayIcon = $ico
             InstallLocation = $InstallDir; NoModify = 1; NoRepair = 1
             UninstallString = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'uninstall.ps1')`""
         }

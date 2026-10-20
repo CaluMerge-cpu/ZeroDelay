@@ -20,17 +20,26 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   **Ping monitor** for Fortnite regions, **Sensitivity** calculator (eDPI, cm/360).
 - **Profiles** with share codes, **History** with per-change undo, **drift alerts** when another program changes your
   settings back, Windows restore point before applying.
+- **Light and dark mode** (or match Windows) with six accent colours, and an **update check** that tells you when a
+  new version is on GitHub.
 
-## Install
+## How to install
 
-Download `ZeroDelay-Setup.exe` from the Releases page and run it. It installs for your Windows account only
-(`%LOCALAPPDATA%\Programs\ZeroDelay`) and adds Desktop and Start menu shortcuts. Uninstall from
-Settings > Apps > ZeroDelay. Press **Restore all** in ZeroDelay first if you want your original settings back.
+1. Open the [latest release](../../releases/latest) and click **ZeroDelay-Setup.exe** under *Assets* to download it.
+2. Run it. Windows will probably show a blue **"Windows protected your PC"** screen. That is normal: ZeroDelay is a
+   free hobby project and is not code-signed (a signing certificate costs a few hundred dollars a year), so Windows
+   does not recognise it yet. Click **More info**, then **Run anyway**.
+3. Your browser may also warn that the file "isn't commonly downloaded". Choose **Keep** (in Edge: **...** > **Keep**
+   > **Keep anyway**).
+4. Click **Install**. ZeroDelay asks for administrator rights when it starts, because it changes system settings.
 
-The setup is not code-signed, so Windows SmartScreen may show "Windows protected your PC". Click **More info** >
-**Run anyway**, or build it yourself from source (below).
+Not comfortable running an unsigned file? Every line of code is in this repository: compare the SHA-256 on the
+release page, or build the setup yourself (see below).
 
-ZeroDelay needs administrator rights because it changes system settings. It asks once when it starts.
+ZeroDelay installs for your Windows account only (`%LOCALAPPDATA%\Programs\ZeroDelay`) and adds Desktop and Start menu
+shortcuts. **Updating:** ZeroDelay tells you when a new version is out; exit it from the tray icon and run the new
+setup. Your settings and backups are kept. **Uninstalling:** press **Restore all** in ZeroDelay first if you want your
+original settings back, then remove it from Settings > Apps > ZeroDelay.
 
 ## Run from source
 
@@ -55,8 +64,9 @@ This compiles `dist\ZeroDelay-Setup.exe` with the C# compiler that ships with Wi
 - No placebo tweaks: TCP/Nagle tweaks (Fortnite uses UDP), RAM cleaners, disabling Windows Update or security
   protections are deliberately not included.
 - Game files are only edited when Fortnite is closed. ZeroDelay never touches Fortnite's program files or anti-cheat.
-- ZeroDelay does not connect to the internet except for the optional PresentMon download (from Intel's GitHub) and
-  the optional ping test to Epic's servers.
+- ZeroDelay only connects to the internet for the update check (it reads the latest release number from GitHub and
+  never downloads or installs anything by itself; switch it off in Settings), the optional PresentMon download (from
+  Intel's GitHub) and the optional ping test to Epic's servers.
 
 ## License
 
