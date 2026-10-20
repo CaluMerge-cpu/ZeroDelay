@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.4.0'
+$AppVersion = '1.5.0'
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
 # --- Theme. The UI is written in the dark palette; every XAML string and brush goes through [ZdTheme],
@@ -205,6 +205,83 @@ public static class FileTools {
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
     static extern bool MoveFileEx(string existing, string replacement, int flags);
     public static bool DeleteAtRestart(string path) { return MoveFileEx(path, null, 0x4 /* MOVEFILE_DELAY_UNTIL_REBOOT */); }
+}
+
+// The Settings > Power mode slider (Balanced plan only): Best performance / Balanced / Best power efficiency
+public static class PowerOverlay {
+    [System.Runtime.InteropServices.DllImport("powrprof.dll")] static extern uint PowerGetEffectiveOverlayScheme(out Guid scheme);
+    [System.Runtime.InteropServices.DllImport("powrprof.dll")] static extern uint PowerSetActiveOverlayScheme(ref Guid scheme);
+    public static readonly Guid BestPerformance = new Guid("ded574b5-45a0-4f42-8737-46345c09c238");
+    public static readonly Guid Balanced = Guid.Empty;
+    public static readonly Guid BestEfficiency = new Guid("961cc777-2547-4f9d-8174-7d86181b8a7a");
+    public static Guid? Get() { Guid g; return PowerGetEffectiveOverlayScheme(out g) == 0 ? (Guid?)g : null; }
+    public static uint Set(Guid g) { return PowerSetActiveOverlayScheme(ref g); }
+}
+
+// Audio enhancements (system effects) per playback device, the same switch as Settings > Sound > Audio enhancements.
+public static class AudioFx {
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Pack = 4)]
+    struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 24)]
+    struct PROPVARIANT { [System.Runtime.InteropServices.FieldOffset(0)] public ushort vt; [System.Runtime.InteropServices.FieldOffset(8)] public uint ulVal; [System.Runtime.InteropServices.FieldOffset(8)] public IntPtr ptr; }
+    [System.Runtime.InteropServices.ComImport, System.Runtime.InteropServices.Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), System.Runtime.InteropServices.InterfaceType(System.Runtime.InteropServices.ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore {
+        int GetCount(out uint count);
+        int GetAt(uint i, out PROPERTYKEY key);
+        int GetValue(ref PROPERTYKEY key, out PROPVARIANT value);
+        int SetValue(ref PROPERTYKEY key, ref PROPVARIANT value);
+        int Commit();
+    }
+    [System.Runtime.InteropServices.ComImport, System.Runtime.InteropServices.Guid("D666063F-1587-4E43-81F1-B948E807363F"), System.Runtime.InteropServices.InterfaceType(System.Runtime.InteropServices.ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice {
+        int Activate(ref Guid iid, uint clsCtx, IntPtr activationParams, [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.IUnknown)] out object iface);
+        int OpenPropertyStore(uint stgmAccess, out IPropertyStore store);
+        int GetId([System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)] out string id);
+        int GetState(out uint state);
+    }
+    [System.Runtime.InteropServices.ComImport, System.Runtime.InteropServices.Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), System.Runtime.InteropServices.InterfaceType(System.Runtime.InteropServices.ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection { int GetCount(out uint count); int Item(uint i, out IMMDevice device); }
+    [System.Runtime.InteropServices.ComImport, System.Runtime.InteropServices.Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), System.Runtime.InteropServices.InterfaceType(System.Runtime.InteropServices.ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator { int EnumAudioEndpoints(int dataFlow, uint stateMask, out IMMDeviceCollection devices); }
+    [System.Runtime.InteropServices.ComImport, System.Runtime.InteropServices.Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumerator { }
+    static PROPERTYKEY DisableSysFx = new PROPERTYKEY { fmtid = new Guid("1da5d803-d492-4edd-8c23-e0c0ffee7f0e"), pid = 5 };
+    static PROPERTYKEY FriendlyName = new PROPERTYKEY { fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), pid = 14 };
+    public class Endpoint { public string Id; public string Name; public int Disabled = -1; }   // 1 = enhancements off, 0 = on, -1 = never set (on)
+    public static List<Endpoint> List() {
+        var list = new List<Endpoint>();
+        var en = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        IMMDeviceCollection col; en.EnumAudioEndpoints(0, 1, out col);
+        uint n; col.GetCount(out n);
+        for (uint i = 0; i < n; i++) {
+            IMMDevice d; col.Item(i, out d);
+            var e = new Endpoint(); d.GetId(out e.Id);
+            IPropertyStore ps; d.OpenPropertyStore(0, out ps);
+            PROPVARIANT v;
+            if (ps.GetValue(ref FriendlyName, out v) == 0 && v.vt == 31) e.Name = System.Runtime.InteropServices.Marshal.PtrToStringUni(v.ptr);
+            if (ps.GetValue(ref DisableSysFx, out v) == 0 && v.vt == 19) e.Disabled = (int)v.ulVal;
+            list.Add(e);
+        }
+        return list;
+    }
+    public static int Set(string id, int value) {   // value 1 / 0, or -1 to remove the setting
+        var en = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        IMMDeviceCollection col; en.EnumAudioEndpoints(0, 1, out col);
+        uint n; col.GetCount(out n);
+        for (uint i = 0; i < n; i++) {
+            IMMDevice d; col.Item(i, out d);
+            string did; d.GetId(out did);
+            if (did != id) continue;
+            IPropertyStore ps;
+            int hr = d.OpenPropertyStore(2, out ps);
+            if (hr != 0) return hr;
+            var v = new PROPVARIANT();
+            if (value < 0) v.vt = 0; else { v.vt = 19; v.ulVal = (uint)value; }
+            hr = ps.SetValue(ref DisableSysFx, ref v);
+            return hr != 0 ? hr : ps.Commit();
+        }
+        return -1;
+    }
 }
 
 // Memory page: clears the standby list once. Needs SeProfileSingleProcessPrivilege (admins have it, disabled by default).
@@ -815,6 +892,87 @@ function Set-FnLaunchArgsEnabled([string]$Value) {
     Set-Content -Path $f -Value $out -Encoding UTF8
 }
 
+# --- Several services in one card (vendor software): Svcs = @( @{ N = 'name'; D = defaultStart } ). Only the services
+#     that exist on this PC are touched; each one's start type is saved before it changes.
+function Get-SvcSetPresent($t) { @($t.Svcs | Where-Object { Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.N)" }) }
+function Test-SvcSet($t) {
+    $present = Get-SvcSetPresent $t
+    if (-not $present.Count) { return $null }
+    -not ($present | Where-Object { (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.N)" 'Start') -ne 4 })
+}
+function Enable-SvcSet($t) {
+    $present = Get-SvcSetPresent $t
+    if (-not $script:Backup.Custom.ContainsKey($t.Id)) {
+        $script:Backup.Custom[$t.Id] = @($present | ForEach-Object { @{ N = $_.N; Start = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.N)" 'Start') } })
+    }
+    foreach ($sv in $present) {
+        Set-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\$($sv.N)" 'Start' 4 'DWord'
+        Stop-Service -Name $sv.N -Force -ErrorAction SilentlyContinue
+    }
+}
+function Disable-SvcSet($t) {
+    $saved = @($script:Backup.Custom[$t.Id])
+    foreach ($sv in Get-SvcSetPresent $t) {
+        $b = $saved | Where-Object { $_.N -eq $sv.N } | Select-Object -First 1
+        $start = if ($b -and $null -ne $b.Start) { [int]$b.Start } else { [int]$sv.D }
+        Set-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\$($sv.N)" 'Start' $start 'DWord'
+        if ($start -eq 2) { Start-Service -Name $sv.N -ErrorAction SilentlyContinue }
+    }
+    $script:Backup.Custom.Remove($t.Id)
+}
+function New-VendorTweak([string]$Id, [string]$Title, [string]$Desc, [string]$Warn, $Svcs, [string]$Badge) {
+    @{ Id = $Id; Cat = 'Vendor'; Icon = [char]0xE74C; Rec = $false; Badge = $Badge; Svcs = $Svcs
+       Title = $Title; Desc = $Desc; Warn = $Warn
+       Requires = { @(Get-SvcSetPresent $t).Count -gt 0 }
+       Test = { Test-SvcSet $t }; On = { Enable-SvcSet $t }; Off = { Disable-SvcSet $t } }
+}
+
+# --- Is a desktop app installed? (Windows "App Paths" entry or a known file)
+function Test-AppInstalled([string]$Exe, [string[]]$Paths = @()) {
+    foreach ($h in 'HKLM:', 'HKCU:') { if (Test-Path "$h\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$Exe") { return $true } }
+    foreach ($p in $Paths) { if ($p -and (Test-Path $p)) { return $true } }
+    $false
+}
+
+# --- Opera GX keeps its settings in Chromium's "Local State" JSON. Only the one key is edited, as text, while Opera is closed.
+$OperaLocalState = "$env:APPDATA\Opera Software\Opera GX Stable\Local State"
+function Get-OperaHwAccel {
+    if (-not (Test-Path $OperaLocalState)) { return $null }
+    $txt = [IO.File]::ReadAllText($OperaLocalState)
+    if ($txt -match '"hardware_acceleration_mode"\s*:\s*\{[^{}]*"enabled"\s*:\s*(true|false)') { $Matches[1] -eq 'true' } else { 'absent' }
+}
+function Set-OperaHwAccel($Value) {   # $true / $false / 'absent' (remove the key)
+    if (Get-Process opera -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Opera GX*' }) { throw 'Close Opera GX first (it rewrites its settings when it closes).' }
+    $txt = [IO.File]::ReadAllText($OperaLocalState)
+    $txt = [regex]::Replace($txt, '"hardware_acceleration_mode"\s*:\s*\{[^{}]*\}\s*,?', '')
+    if ($Value -ne 'absent') { $txt = $txt -replace '^\s*\{', "{`"hardware_acceleration_mode`":{`"enabled`":$("$Value".ToLower())}," }
+    $txt = $txt -replace ',\s*\}', '}'
+    [IO.File]::WriteAllText($OperaLocalState, $txt, (New-Object Text.UTF8Encoding $false))
+}
+
+# --- Steam's config.vdf (text, tab-separated "key"  "value" lines). Edited only while Steam is closed.
+function Get-SteamConfig { $sp = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath; if ($sp) { $f = Join-Path ($sp -replace '/', '\') 'config\config.vdf'; if (Test-Path $f) { return $f } }; $null }
+function Get-VdfValue([string[]]$Lines, [string]$Key) { $m = $Lines | Where-Object { $_ -match "^\s*`"$Key`"\s+`"([^`"]*)`"" } | Select-Object -First 1; if ($m -match "`"$Key`"\s+`"([^`"]*)`"") { $Matches[1] } else { $null } }
+function Set-SteamAutoUpdateWindow([bool]$On, $Start, $End) {
+    if (Get-Process steam -ErrorAction SilentlyContinue) { throw 'Close Steam first (it rewrites its settings when it closes).' }
+    $f = Get-SteamConfig; if (-not $f) { throw 'Steam settings not found.' }
+    $lines = [IO.File]::ReadAllLines($f)
+    $out = New-Object Collections.Generic.List[string]
+    $done = $false
+    foreach ($ln in $lines) {
+        if ($ln -match '^(\s*)"AutoUpdateWindowEnabled"\s+"[^"]*"') {
+            $ind = $Matches[1]
+            $out.Add("$ind`"AutoUpdateWindowEnabled`"`t`t`"$([int]$On)`"")
+            if ($On) { $out.Add("$ind`"AutoUpdateWindowStart`"`t`t`"$Start`""); $out.Add("$ind`"AutoUpdateWindowEnd`"`t`t`"$End`"") }
+            $done = $true; continue
+        }
+        if ($ln -match '^\s*"AutoUpdateWindow(Start|End)"\s+"') { continue }   # rewritten above (or dropped when off and they were absent)
+        $out.Add($ln)
+    }
+    if (-not $done) { throw 'Steam settings file has no auto-update entry yet. Open Steam settings once, then try again.' }
+    [IO.File]::WriteAllLines($f, $out)
+}
+
 # --- Builds a card that disables a Windows service (Start = 4) and restores its default start type.
 function New-SvcTweak([string]$Id, [string]$Svc, [int]$Default, [string]$Title, [string]$Desc, [string]$Warn, [bool]$Rec, [string]$Badge) {
     @{ Id = $Id; Cat = 'Services'; Icon = [char]0xE912; Rec = $Rec; Badge = $Badge; Svc = $Svc
@@ -1130,17 +1288,54 @@ $SessionApps = @(
     @{ Key = 'exm';       Name = 'EXM';                  PathRx = '\\EXM\\EXM\.exe$';                     Main = 'EXM.exe' }
     @{ Key = 'onedrive';  Name = 'OneDrive';             PathRx = '\\OneDrive\.exe$';                      Main = 'OneDrive.exe' }
     @{ Key = 'teams';     Name = 'Microsoft Teams';      PathRx = '\\ms-teams\.exe$';                      Main = 'ms-teams.exe' }
-    @{ Key = 'phonelink'; Name = 'Phone Link, Widgets, Copilot'; PathRx = '\\(PhoneExperienceHost|Widgets|WidgetService|Copilot)\.exe$'; Main = $null }
+    @{ Key = 'phonelink'; Name = 'Phone Link, Widgets, Copilot'; PathRx = '\\(PhoneExperienceHost|CrossDeviceService|CrossDeviceResume|Widgets|WidgetService|Copilot)\.exe$'; Main = $null }
     @{ Key = 'wallpaper'; Name = 'Wallpaper Engine (paused, not closed)'; PathRx = '\\wallpaper_engine\\'; Main = $null; Pause = $true }
+    # RGB and monitoring software: polls sensors and lighting chips, a common cause of micro-stutter (the vendor's background
+    # service keeps fan curves and colours, so only the window/app is closed)
+    @{ Detect = 'SignalRGB'; Key = 'signalrgb';  Name = 'SignalRGB';                   PathRx = '\\SignalRgb(Launcher)?\.exe$';                 Main = 'SignalRgbLauncher.exe' }
+    @{ Detect = 'OpenRGB'; Key = 'openrgb';    Name = 'OpenRGB';                     PathRx = '\\OpenRGB\.exe$';                              Main = 'OpenRGB.exe' }
+    @{ Detect = 'NZXT CAM'; Key = 'nzxtcam';    Name = 'NZXT CAM';                    PathRx = '\\(NZXT CAM|cam_helper)\.exe$';                 Main = 'NZXT CAM.exe' }
+    @{ Detect = 'iCUE'; Key = 'icueui';     Name = 'Corsair iCUE (window)';       PathRx = '\\iCUE\.exe$';                                 Main = 'iCUE.exe' }
+    @{ Detect = 'Logitech G HUB'; Key = 'ghubui';     Name = 'Logitech G HUB (window)';     PathRx = '\\lghub\.exe$';                                Main = 'lghub.exe' }
+    @{ Detect = 'Armoury Crate'; Key = 'armouryui';  Name = 'Armoury Crate (window)';      PathRx = '\\(ArmouryCrate|ArmourySwAgent|ArmouryCrate\.UserSessionHelper)\.exe$'; Main = 'ArmouryCrate.exe' }
+    @{ Detect = 'MSI Center'; Key = 'msicenterui'; Name = 'MSI Center (window)';        PathRx = '\\(MSI Center|MSI\.CentralServer)\.exe$';       Main = 'MSI Center.exe' }
+    @{ Detect = 'Gigabyte Control Center|RGB Fusion|APP Center'; Key = 'gigabyte';   Name = 'Gigabyte Control Center / RGB Fusion'; PathRx = '\\(GCC|LEDKeeper2|RGBFusion|AppCenter)\.exe$'; Main = 'GCC.exe' }
+    @{ Detect = 'L-Connect'; Key = 'lconnect';   Name = 'Lian Li L-Connect';           PathRx = '\\L-Connect ?3\.exe$';                         Main = $null }
+    @{ Detect = 'HWiNFO|HWMonitor|AIDA64|Core Temp'; Key = 'hwmon';      Name = 'Hardware monitors (HWiNFO, HWMonitor, AIDA64, Core Temp)'; PathRx = '\\(HWiNFO64|HWiNFO32|HWMonitor|CoreTemp|aida64)\.exe$'; Main = $null }
+    @{ Detect = 'OMEN Gaming Hub'; Key = 'omenhub';    Name = 'Omen Gaming Hub';             PathRx = '\\(OmenCommandCenterBackground|HP\.Omen\.Overlay\.Helper|OMEN Gaming Hub)\.exe$'; Main = $null }
+    @{ Detect = 'Lenovo Vantage|Legion Zone'; Key = 'lenovoui';   Name = 'Lenovo Vantage / Legion Zone'; PathRx = '\\(LenovoVantage|LegionZone|Lenovo\.Modern\.ImController\.PluginHost)\.exe$'; Main = $null }
+    @{ Detect = 'SupportAssist'; Key = 'dellsa';     Name = 'Dell SupportAssist';          PathRx = '\\(SupportAssistUI|SupportAssistAgent|DDVDataCollector|DDVRulesProcessor)\.exe$'; Main = $null }
+    @{ Detect = 'Dropbox|Google Drive|iCloud'; Key = 'cloudsync';  Name = 'Dropbox, Google Drive, iCloud'; PathRx = '\\(Dropbox|GoogleDriveFS|iCloudServices|iCloudDrive|iCloudPhotos)\.exe$'; Main = $null }
+    @{ Detect = 'Rainmeter|Lively Wallpaper'; Key = 'desktopfx';  Name = 'Rainmeter / Lively Wallpaper'; PathRx = '\\(Rainmeter|Lively|Lively\.PlayerCefSharp|Lively\.PlayerMpv)\.exe$'; Main = 'Rainmeter.exe' }
+    # off by default: these are things many people want running during a match
+    @{ Detect = 'Steam|Battle\.net|EA app|Ubisoft Connect|GOG GALAXY|Riot Client'; Key = 'launchers';  Name = 'Idle game launchers (Steam, Battle.net, EA, Ubisoft, GOG, Riot)'; PathRx = '\\(steam|steamwebhelper|Battle\.net|EADesktop|EABackgroundService|UbisoftConnect|upc|GalaxyClient|GalaxyClient Helper|RiotClientServices|RiotClientUx|RiotClientUxRender)\.exe$'; Main = $null }
+    @{ Detect = 'Medal'; Key = 'medal';      Name = 'Medal (stops clip recording)'; PathRx = '\\(Medal|MedalEncoder|MedalRecorder)\.exe$';  Main = 'Medal.exe' }
+    @{ Detect = 'Overwolf|Outplayed|CurseForge'; Key = 'overwolf';   Name = 'Overwolf / Outplayed / CurseForge (stops clips and overlays)'; PathRx = '\\(Overwolf|OverwolfBrowser|OverwolfHelper|OverwolfHelper64|OverwolfLauncher|OverwolfStarter|CurseForge)\.exe$'; Main = 'OverwolfLauncher.exe' }
+    @{ Detect = 'Razer Cortex'; Key = 'razercortex'; Name = 'Razer Cortex';               PathRx = '\\(RazerCortex|Cortex|RzKLService)\.exe$';     Main = $null }
+    @{ Detect = 'SteelSeries GG'; Key = 'steelseries'; Name = 'SteelSeries GG (stops Sonar audio)'; PathRx = '\\(SteelSeriesGG|SteelSeriesGGClient|SteelSeriesEngine3)\.exe$'; Main = 'SteelSeriesGG.exe' }
 )
 $SessionFile = Join-Path $DataDir 'game-session.json'
 function Get-SessionPrefs {
     $p = @{}; foreach ($a in $SessionApps) { $p[$a.Key] = $true }
     $p['xbox'] = $true; $p['streamdock'] = $false   # Stream Dock stays open by default: many people use it mid-game
+    foreach ($k in 'launchers', 'medal', 'overwolf', 'razercortex', 'steelseries') { $p[$k] = $false }   # clip recorders, Sonar, launchers you may be using
     $saved = $script:Backup.Custom['sessionprefs']
     if ($saved -is [hashtable]) { foreach ($k in @($saved.Keys)) { $p[$k] = [bool]$saved[$k] } }
     elseif ($saved) { $saved.PSObject.Properties | ForEach-Object { $p[$_.Name] = [bool]$_.Value } }
     $p
+}
+# Display names from Settings > Apps, read once per refresh (used to show only Game Mode apps that exist on this PC)
+function Get-InstalledNames {
+    Get-Cached 'installednames' {
+        @(foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
+            foreach ($k in Get-ChildItem $root -ErrorAction SilentlyContinue) { $n = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).DisplayName; if ($n) { "$n" } }
+        })
+    }
+}
+function Test-SessionAppPresent($app) {
+    if (-not $app.Detect) { return $true }
+    if ((Get-InstalledNames) -match "^($($app.Detect))") { return $true }
+    (Get-AppProcesses $app).Count -gt 0
 }
 function Get-AppProcesses($app) {
     @(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -match $app.PathRx } catch { $false } })
@@ -2759,6 +2954,48 @@ $Tweaks = @(
        On    = { $a = Get-FnLaunchArgs; if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = $a.Enabled } }; Set-FnLaunchArgsEnabled 'False' }
        Off   = { $v = $script:Backup.Custom[$t.Id].Value; Set-FnLaunchArgsEnabled $(if ($v) { $v } else { 'True' }); $script:Backup.Custom.Remove($t.Id) } }
 
+    @{ Id = 'audiofx'; Cat = 'Input'; Icon = [char]0xE767; Rec = $true
+       Title = 'Turn off audio enhancements'
+       Desc  = 'The same as Settings > Sound > Audio enhancements: Off, for every playback device at once. Skips vendor effects (loudness EQ, virtual surround, Nahimic, Sonic Studio, Dolby) that add processing delay and CPU time to game sound.'
+       Warn  = 'Laptop speakers can sound thinner, because some makers tune them with these effects. You lose virtual surround and EQ effects you rely on.'
+       Requires = { @([AudioFx]::List()).Count -gt 0 }
+       Test  = { $eps = @([AudioFx]::List()); if (-not $eps.Count) { return $null }; -not ($eps | Where-Object { $_.Disabled -ne 1 }) }
+       On    = {
+           $eps = @([AudioFx]::List())
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @($eps | ForEach-Object { @{ Id = $_.Id; Value = $_.Disabled } }) }
+           $bad = 0; foreach ($e in $eps) { if ([AudioFx]::Set($e.Id, 1) -ne 0) { $bad++ } }
+           if ($bad -eq $eps.Count) { throw 'Windows did not let ZeroDelay change the sound devices.' } }
+       Off   = {
+           foreach ($b in @($script:Backup.Custom[$t.Id])) { [void][AudioFx]::Set($b.Id, [int]$b.Value) }
+           $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'activehours'; Cat = 'Storage'; Icon = [char]0xE72C; Rec = $true
+       Title = 'Windows Update: no restarts while you play'
+       Desc  = 'Sets Windows Update''s active hours to noon until 6 in the morning (the longest window Windows allows), so an update can never restart the PC during a session. Updates restart the PC in the morning instead.'
+       Warn  = 'You play in the morning. You can still move the window in Settings > Windows Update > Advanced options.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; N = 'ActiveHoursStart'; V = 12; D = 8; M = 8 }
+                  @{ P = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; N = 'ActiveHoursEnd'; V = 6; D = 17; M = 17 }
+                  @{ P = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; N = 'SmartActiveHoursState'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'searchclassic'; Cat = 'Background'; Icon = [char]0xE721; Rec = $true
+       Title = 'Search indexer: your folders only, not every drive'
+       Desc  = 'Windows Search''s "Enhanced" mode indexes every drive, including game files and shader caches, so it keeps re-reading files you never search for. Classic mode indexes only your Documents, Pictures, Music and Desktop.'
+       Warn  = 'You rely on Start search finding files on other drives. Only shown while Enhanced mode is on.'
+       Requires = { (Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows Search\Gather\Windows\SystemIndex' 'EnableFindMyFiles') -eq 1 -or $script:Backup.Custom.ContainsKey('searchclassic') -or ($script:Backup.Registry | Where-Object { $_.Tweak -eq 'searchclassic' }) }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows Search\Gather\Windows\SystemIndex'; N = 'EnableFindMyFiles'; V = 0; D = 1; M = 0 } )
+       After = { Restart-Service WSearch -Force -ErrorAction SilentlyContinue } }
+
+    @{ Id = 'powermode'; Cat = 'Power'; Icon = [char]0xE945; Rec = $true; Lat = $true
+       Title = 'Power mode slider: Best performance'
+       Desc  = 'On laptops and PCs that only offer the Balanced plan, the Settings "Power mode" slider is the real power plan: it decides CPU boost and background throttling. This moves it to Best performance.'
+       Warn  = 'Battery life drops noticeably. Only shown while the Balanced plan is active (the ZeroDelay and Ultimate plans ignore the slider).'
+       Requires = { (Get-ActivePowerScheme).Guid -eq '381b4222-f694-41f0-9685-ff5bb260df2e' -or $script:Backup.Custom.ContainsKey('powermode') }
+       Test  = { $g = [PowerOverlay]::Get(); if ($null -eq $g) { return $null }; $g -eq [PowerOverlay]::BestPerformance }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = "$([PowerOverlay]::Get())" } }
+           if ([PowerOverlay]::Set([PowerOverlay]::BestPerformance) -ne 0) { throw 'Windows refused to change the power mode.' } }
+       Off   = { $v = "$($script:Backup.Custom[$t.Id].Value)"; [void][PowerOverlay]::Set($(if ($v) { [Guid]$v } else { [PowerOverlay]::Balanced })); $script:Backup.Custom.Remove($t.Id) } }
+
     @{ Id = 'alttab-windows'; Cat = 'Visuals'; Icon = [char]0xE737; Rec = $true
        Title = 'Alt+Tab shows windows only'
        Desc  = 'Stops Windows 11 adding Edge tabs to Alt+Tab, so jumping out of and back into Fortnite takes fewer presses.'
@@ -2810,6 +3047,107 @@ $Tweaks = @(
        Test  = { Test-AdvDisplay 'RoamingPreferredBandType' 'Prefer 5' }
        On    = { Set-AdvDisplay 'wifi5ghz' 'RoamingPreferredBandType' 'Prefer 5' }
        Off   = { Reset-AdvProp 'wifi5ghz' 'RoamingPreferredBandType' 0 } }
+
+    # ======================================================= vendor software (1.5): shown only when installed
+    (New-VendorTweak 'v-armoury' 'ASUS Armoury Crate services' 'Stops the Armoury Crate service stack (device detection, update bridge, system analysis, link apps). Fan curves, performance modes and keyboard lighting live in the firmware, so they keep their last setting.' 'Armoury Crate will not open or apply new profiles; Aura Sync and update checks stop. ROG laptops: the Armoury key and per-app profile switching stop. Armoury updates turn these back on.' @(
+        @{ N = 'ArmouryCrateService'; D = 2 }, @{ N = 'ArmouryCrateControlInterface'; D = 2 }, @{ N = 'ROG Live Service'; D = 2 }, @{ N = 'AsusAppService'; D = 2 }, @{ N = 'ASUSOptimization'; D = 2 }, @{ N = 'ASUSSoftwareManager'; D = 2 },
+        @{ N = 'ASUSSwitch'; D = 2 }, @{ N = 'ASUSSystemAnalysis'; D = 2 }, @{ N = 'ASUSSystemDiagnosis'; D = 2 }, @{ N = 'ASUSLinkNear'; D = 2 }, @{ N = 'ASUSLinkRemote'; D = 2 }, @{ N = 'AsusROGLSLService'; D = 2 }, @{ N = 'AsusCertService'; D = 2 }, @{ N = 'AsusUpdateCheck'; D = 2 }) '')
+    (New-VendorTweak 'v-aura' 'ASUS Aura lighting service' 'Stops LightingService.exe, which polls motherboard, GPU and RAM RGB chips. The single most reported Armoury Crate stutter source (short 100% single-core spikes).' 'RGB freezes on its last colour or falls back to the firmware default; Aura Sync stops. Fans and performance are not affected.' @(@{ N = 'LightingService'; D = 2 }) '')
+    (New-VendorTweak 'v-aisuite' 'ASUS AI Suite 3 services' 'Stops the AI Suite services that read voltages, temperatures and fan speeds through the AsIO driver, a well-known DPC-latency source on older ASUS boards.' 'AI Suite (Fan Xpert, TurboV) will not open; fan curves fall back to the BIOS Q-Fan settings.' @(@{ N = 'asComSvc'; D = 2 }, @{ N = 'asHmComSvc'; D = 2 }) '')
+    (New-VendorTweak 'v-msicenter' 'MSI Center and Mystic Light services' 'Stops the MSI Center core service and the Mystic Light RGB service, which poll motherboard, GPU and RAM lighting.' 'MSI Center will not open; Mystic Light, Frozr fan control and Game Boost switching stop, and fans fall back to the BIOS curve. RGB keeps its last stored effect.' @(
+        @{ N = 'MSI_Center_Service'; D = 2 }, @{ N = 'MSI_Central_Service'; D = 2 }, @{ N = 'Mystic_Light_Service'; D = 2 }, @{ N = 'MSI_VoiceControl_Service'; D = 2 }, @{ N = 'LightKeeperService'; D = 2 }) '')
+    (New-VendorTweak 'v-icue' 'Corsair iCUE services' 'Stops the iCUE services that poll Corsair devices and the headset audio service. Reported by Corsair forum users as a cause of periodic 1-3 second freezes.' 'iCUE will not open; AIO and fan curves fall back to the firmware default (safe, but louder), RGB stops animating and headset EQ stops. On-board mouse DPI and keyboard macros keep working.' @(
+        @{ N = 'CorsairService'; D = 2 }, @{ N = 'CorsairLLAService'; D = 2 }, @{ N = 'CorsairDeviceControlService'; D = 2 }, @{ N = 'CorsairGamingAudioConfig'; D = 2 }) '')
+    (New-VendorTweak 'v-chroma' 'Razer Chroma SDK services' 'Stops the Chroma services that let games drive Razer lighting. Repeatedly reported as the Synapse part that lowers minimum FPS.' 'Game-synced Chroma lighting and Chroma Studio effects stop; static lighting set in Synapse stays.' @(
+        @{ N = 'Razer Chroma SDK Service'; D = 2 }, @{ N = 'Razer Chroma SDK Server'; D = 2 }, @{ N = 'Razer Chroma Stream Server'; D = 2 }) '')
+    (New-VendorTweak 'v-synapse' 'Razer Synapse core services' 'Stops the Synapse core services. Razer Game Manager is a known memory and CPU leak.' 'Synapse will not launch and cloud profiles stop syncing. On-board DPI stages, polling rate and macros keep working; devices without on-board memory lose custom bindings. Hypershift stops.' @(
+        @{ N = 'Razer Synapse Service'; D = 2 }, @{ N = 'Razer Game Manager Service 3'; D = 2 }, @{ N = 'Razer Central Service'; D = 2 }, @{ N = 'RzActionSvc'; D = 2 }, @{ N = 'Razer Elevation Service'; D = 3 }) 'restart')
+    (New-VendorTweak 'v-ghub' 'Logitech G HUB updater service' 'Stops the only service G HUB installs: its update checker. Lighting, macros and profiles run in a normal process and keep working.' 'G HUB stops auto-updating and may need this switched back on to start. On-board DPI and macro profiles keep working.' @(@{ N = 'LGHUBUpdaterService'; D = 2 }) '')
+    (New-VendorTweak 'v-lamparray' 'Logitech Dynamic Lighting bridge' 'Stops the Logitech LampArray service that re-polls device RGB for Windows Dynamic Lighting. Traced to 3-4 second stutters when a mouse wakes.' 'Windows Dynamic Lighting control of Logitech devices stops; G HUB lighting still works.' @(@{ N = 'logi_lamparray_service'; D = 2 }) '')
+    (New-VendorTweak 'v-inteldsa' 'Intel Driver & Support Assistant' 'Stops the Intel DSA background scanner that inventories hardware and checks for driver updates. Intel documents this as the way to disable it.' 'No automatic Intel driver update notifications. Intel DSA updates turn it back on.' @(@{ N = 'DSAService'; D = 2 }, @{ N = 'DSAUpdateService'; D = 3 }) '')
+    (New-VendorTweak 'v-intelgcc' 'Intel Graphics Command Center service' 'Stops the background service for Intel''s graphics app (hotkeys, per-app profiles, telemetry). The display driver itself is not affected.' 'The Intel graphics app may not open and its hotkeys stop. Intel driver updates reinstall it.' @(@{ N = 'igccservice'; D = 2 }, @{ N = 'igfxCUIService2.0.0.0'; D = 2 }) '')
+    (New-VendorTweak 'v-amdcrash' 'AMD Crash Defender service' 'Stops Adrenalin''s crash-detection and telemetry service, reported to fire false alarms and cause hitches on loading screens.' 'Adrenalin''s driver-timeout recovery and crash reports stop; the GPU driver keeps working. Adrenalin updates turn it back on.' @(@{ N = 'AMD Crash Defender Service'; D = 2 }) '')
+    (New-VendorTweak 'v-supportassist' 'Dell SupportAssist and Data Vault' 'Stops SupportAssist and the Dell Data Vault telemetry collectors. Dell forum users traced random audio and video stutter and USB receiver drops to them.' 'No automatic driver or BIOS update notifications and no Dell hardware scans. Nothing hardware-related breaks. Dell''s own scheduled task can turn these back on.' @(
+        @{ N = 'SupportAssistAgent'; D = 2 }, @{ N = 'Dell SupportAssist Remediation'; D = 2 }, @{ N = 'DDVDataCollector'; D = 2 }, @{ N = 'DDVRulesProcessor'; D = 2 }, @{ N = 'DDVCollectorSvcApi'; D = 2 }, @{ N = 'DellTechHub'; D = 2 }) '')
+    (New-VendorTweak 'v-delloptimizer' 'Dell Optimizer services' 'Stops Dell Optimizer''s app-learning and telemetry service and the client management service it uses.' 'ExpressResponse learning, ExpressConnect network steering, Intelligent Audio and presence detection stop. Battery settings already applied stay in the firmware.' @(@{ N = 'DellOptimizer'; D = 2 }, @{ N = 'DellClientManagementService'; D = 2 }) '')
+    (New-VendorTweak 'v-delldd' 'Dell Digital Delivery' 'Stops the service that downloads software bundled with the PC purchase.' 'Re-delivery of purchased software stops; nothing else.' @(@{ N = 'DellDigitalDelivery'; D = 2 }) '')
+    (New-VendorTweak 'v-awcc' 'Alienware Command Center service' 'Stops the AlienFX lighting, thermal-profile and overclock backend.' 'AWCC will not open; lighting freezes on the last profile; fan profiles fall back to the firmware default and the Fn+F1 performance key stops on laptops. Keep it on if your Alienware laptop relies on AWCC thermal modes.' @(@{ N = 'AWCCService'; D = 2 }) '')
+    (New-VendorTweak 'v-waves' 'Waves MaxxAudio service' 'Stops the Waves audio-effects service bundled with Dell, Alienware and some HP Realtek audio, repeatedly reported at a constant 25% CPU.' 'MaxxAudio EQ and dialog enhancement stop; plain Realtek audio keeps working. Dell audio driver updates reinstall it.' @(@{ N = 'WavesSysSvc'; D = 2 }) '')
+    (New-VendorTweak 'v-hpanalytics' 'HP Analytics (Touchpoint)' 'Stops the HP telemetry service.' 'HP telemetry only; nothing breaks. HP Support Assistant updates can turn it back on.' @(@{ N = 'HpTouchpointAnalyticsService'; D = 2 }) '')
+    (New-VendorTweak 'v-hphsa' 'HP Support Assistant helper services' 'Stops the HP helper services (App Helper, Diagnostics, Network, System Info) used for scans; HP App Helper is reported for high idle CPU.' 'HP Support Assistant diagnostics and update checks stop; no hardware feature is affected.' @(
+        @{ N = 'HPAppHelperCap'; D = 2 }, @{ N = 'HPDiagsCap'; D = 2 }, @{ N = 'HPNetworkCap'; D = 2 }, @{ N = 'HPSysInfoCap'; D = 2 }, @{ N = 'HPSupportSolutionsFrameworkService'; D = 3 }) '')
+    (New-VendorTweak 'v-omen' 'Omen Gaming Hub background service' 'Stops the HP Omen service used for fan, performance mode, lighting and the in-game overlay.' 'Omen Gaming Hub shows offline; performance mode, fan control, the Omen key and lighting stop responding (the firmware keeps the last mode).' @(@{ N = 'HPOmenCap'; D = 2 }) '')
+    (New-VendorTweak 'v-vantage' 'Lenovo Vantage services' 'Stops Lenovo Vantage and the System Interface Foundation it uses, both reported for high CPU and for respawning after updates.' 'Vantage and Legion features from the app stop: performance-mode switching, battery toggles, Legion lighting and hotkey OSD. Fn+Q firmware mode switching still works. Lenovo System Update turns these back on.' @(@{ N = 'LenovoVantageService'; D = 2 }, @{ N = 'ImControllerService'; D = 2 }) 'restart')
+    (New-VendorTweak 'v-acercare' 'Acer Care Center service' 'Stops the Acer Care Center backend (checkups, update checks, telemetry).' 'Acer Care Center and its update notifications stop. PredatorSense is separate and not touched.' @(@{ N = 'ACCSvc'; D = 2 }) '')
+    (New-VendorTweak 'v-adobe' 'Adobe background services' 'Stops Adobe Genuine Software, the Creative Cloud update service and the Acrobat updater, all reported for sustained CPU use at idle.' 'Creative Cloud and Acrobat stop auto-updating; a one-time "genuine software" notice may appear. The apps still launch and work.' @(
+        @{ N = 'AGSService'; D = 2 }, @{ N = 'AGMService'; D = 2 }, @{ N = 'AdobeUpdateService'; D = 2 }, @{ N = 'AdobeARMservice'; D = 2 }) '')
+    (New-VendorTweak 'v-overwolf' 'Overwolf updater service' 'Stops the updater used by Overwolf, Outplayed and CurseForge. The in-game overlay is a separate process (see Game Mode).' 'Overwolf apps stop auto-updating; they re-register the service on their next update.' @(@{ N = 'OverwolfUpdater'; D = 3 }) '')
+
+    # ======================================================= browsers and Steam (1.5): shown only when installed
+    @{ Id = 'chrome-bg'; Cat = 'Background'; Icon = [char]0xE774; Rec = $true
+       Title = 'Stop Chrome running in the background'
+       Desc  = 'Chrome no longer stays alive (tray icon, background extensions) after you close its last window, so it uses no CPU or RAM while you play.'
+       Warn  = 'If Chrome is in the tray right now, close it from there once. Chrome will show "managed by your organization".'
+       Requires = { Test-AppInstalled 'chrome.exe' @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; N = 'BackgroundModeEnabled'; V = 0; D = $null; M = 1 } ) }
+    @{ Id = 'brave-bg'; Cat = 'Background'; Icon = [char]0xE774; Rec = $true
+       Title = 'Stop Brave running in the background'
+       Desc  = 'Brave quits fully when its last window closes instead of idling in the tray.'
+       Warn  = 'Brave will show "managed by your organization".'
+       Requires = { Test-AppInstalled 'brave.exe' @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe") }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BackgroundModeEnabled'; V = 0; D = $null; M = 1 } ) }
+    @{ Id = 'chrome-sw'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Title = 'Chrome: no GPU use while open'
+       Desc  = 'Chrome renders on the CPU, so a browser left open on a second screen (YouTube, Twitch) stops competing with Fortnite for the graphics card.'
+       Warn  = 'Only useful if Chrome stays open while you play. Video uses more CPU. Takes effect after Chrome restarts.'
+       Requires = { Test-AppInstalled 'chrome.exe' @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Google\Chrome'; N = 'HardwareAccelerationModeEnabled'; V = 0; D = $null; M = 1 } ) }
+    @{ Id = 'brave-sw'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Title = 'Brave: no GPU use while open'
+       Desc  = 'Brave renders on the CPU, so it cannot take frame time from the game while open on another screen.'
+       Warn  = 'Only useful if Brave stays open while you play. Video uses more CPU. Takes effect after Brave restarts.'
+       Requires = { Test-AppInstalled 'brave.exe' @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe") }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'HardwareAccelerationModeEnabled'; V = 0; D = $null; M = 1 } ) }
+    @{ Id = 'edge-sw'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Title = 'Edge: no GPU use while open'
+       Desc  = 'Edge renders on the CPU, so it cannot take frame time from the game while open on another screen.'
+       Warn  = 'Only useful if Edge stays open while you play. Video uses more CPU. Takes effect after Edge restarts.'
+       Requires = { Test-AppInstalled 'msedge.exe' }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'HardwareAccelerationModeEnabled'; V = 0; D = $null; M = 1 } ) }
+    @{ Id = 'firefox-sw'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Title = 'Firefox: no GPU use while open'
+       Desc  = 'Firefox renders on the CPU, so it cannot take frame time from the game while open on another screen.'
+       Warn  = 'Only useful if Firefox stays open while you play. Video uses more CPU. Takes effect after Firefox restarts; the switch is greyed out in Firefox while this is on.'
+       Requires = { Test-AppInstalled 'firefox.exe' @("$env:ProgramFiles\Mozilla Firefox\firefox.exe") }
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Mozilla\Firefox'; N = 'HardwareAcceleration'; V = 0; D = $null; M = 1 } ) }
+    @{ Id = 'operagx-sw'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Title = 'Opera GX: no GPU use while open'
+       Desc  = 'Opera GX renders on the CPU, so it cannot take frame time from the game while open on another screen. Opera has no policy support, so its settings file is edited directly.'
+       Warn  = 'Only useful if Opera GX stays open while you play. Video uses more CPU. Opera GX must be closed first.'
+       Requires = { Test-Path $OperaLocalState }
+       Test  = { $v = Get-OperaHwAccel; if ($null -eq $v) { return $null }; $v -eq $false }
+       On    = { if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = "$(Get-OperaHwAccel)" } }; Set-OperaHwAccel $false }
+       Off   = { $v = "$($script:Backup.Custom[$t.Id].Value)"; Set-OperaHwAccel $(if ($v -eq 'True') { $true } elseif ($v -eq 'False') { $false } else { 'absent' }); $script:Backup.Custom.Remove($t.Id) } }
+    @{ Id = 'steam-webviews'; Cat = 'Background'; Icon = [char]0xE7FC; Rec = $false
+       Title = 'Steam: no GPU use for its windows'
+       Desc  = 'Steam''s store, library and friends windows render on the CPU, so Steam idling in the background takes no GPU time from Fortnite. Same as Steam Settings > Interface > GPU accelerated rendering: off.'
+       Warn  = 'Steam''s windows feel less smooth. Restart Steam afterwards.'
+       Requires = { [bool](Get-SteamConfig) }
+       Reg   = @( @{ P = 'HKCU:\Software\Valve\Steam'; N = 'GPUAccelWebViews'; V = 0; D = 1; M = 1 } ) }
+    @{ Id = 'steam-updatewindow'; Cat = 'Network'; Icon = [char]0xE7FC; Rec = $true; Lat = $true
+       Title = 'Steam: only update games at night'
+       Desc  = 'Steam cannot see that Fortnite is running, so it will start big game updates mid-match. This limits automatic updates to 3 to 6 in the morning. Downloads you start yourself still run at once.'
+       Warn  = 'Your PC is off at night and you want Steam games to update on their own. Close Steam before switching.'
+       Requires = { [bool](Get-SteamConfig) }
+       Test  = { $f = Get-SteamConfig; if (-not $f) { return $null }; $l = [IO.File]::ReadAllLines($f); $v = Get-VdfValue $l 'AutoUpdateWindowEnabled'; if ($null -eq $v) { return $null }; $v -eq '1' }
+       On    = {
+           $l = [IO.File]::ReadAllLines((Get-SteamConfig))
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Enabled = (Get-VdfValue $l 'AutoUpdateWindowEnabled'); Start = (Get-VdfValue $l 'AutoUpdateWindowStart'); End = (Get-VdfValue $l 'AutoUpdateWindowEnd') } }
+           Set-SteamAutoUpdateWindow $true 3 6 }
+       Off   = {
+           $b = $script:Backup.Custom[$t.Id]
+           if ($b -and $b.Enabled -eq '1') { Set-SteamAutoUpdateWindow $true $b.Start $b.End } else { Set-SteamAutoUpdateWindow $false 0 0 }
+           $script:Backup.Custom.Remove($t.Id) } }
 
     # ======================================================= Desktop visuals
     @{ Id = 'menudelay'; Cat = 'Visuals'; Icon = [char]0xE700; Rec = $false
@@ -4163,18 +4501,21 @@ function Invoke-Builder($t) {
 # Game-session card: one switch per app, saved between launches.
 function New-SessionPanel($t) {
     $prefs = Get-SessionPrefs
-    $rows = ($SessionApps | ForEach-Object {
+    $shown = @($SessionApps | Where-Object { Test-SessionAppPresent $_ })
+    $rows = ($shown | ForEach-Object {
         "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
         "<TextBlock Text='$(Esc $_.Name)' Foreground='#D1D1D6' FontSize='12' VerticalAlignment='Center'/>" +
         "<ToggleButton x:Name='S_$($_.Key)' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18'/></Grid>"
     }) -join ''
     $panel = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-        CornerRadius='8' Background='#1C1C1E' BorderThickness='0' Padding='14,10'>
-  <StackPanel>$rows</StackPanel>
+        CornerRadius='8' Background='#1C1C1E' BorderThickness='0' Padding='14,10,6,10'>
+  <ScrollViewer Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' MaxHeight='238' Padding='0,0,8,0'>
+    <StackPanel>$rows</StackPanel>
+  </ScrollViewer>
 </Border>
 "@)
-    foreach ($a in $SessionApps) {
+    foreach ($a in $shown) {
         $sw = $panel.FindName("S_$($a.Key)")
         $sw.IsChecked = [bool]$prefs[$a.Key]; $sw.Tag = $a.Key
         $sw.Add_Click({
@@ -4241,6 +4582,9 @@ function Update-Card($t) {
     if (-not $t.Toggle) { return }
     $state = Invoke-TweakTest $t
     $t.State = $state
+    # a card for hardware or software this PC does not have is hidden rather than shown greyed out
+    $t.Hidden = [bool]($t.Requires -and $null -eq $state -and -not (& $t.Requires))
+    if ($t.Hidden) { $t.Card.Visibility = 'Collapsed' }
     if ($null -eq $state) {
         $t.Toggle.IsEnabled = $false
         $t.Toggle.IsChecked = $false
@@ -4367,6 +4711,8 @@ $Categories = @(
     @{ Name = 'Network';    Icon = [char]0xE839; Title = 'Network' }
     @{ Name = 'Background'; Icon = [char]0xE895; Title = 'Background & privacy' }
     @{ Name = 'Services';   Icon = [char]0xE912; Title = 'Services & tasks' }
+    @{ Name = 'Vendor';     Icon = [char]0xE74C; Title = 'Vendor software'
+       Note = 'Services from PC, motherboard and peripheral makers that are known stutter sources. Only the ones installed on this PC are shown; each card says what stops working.' }
     @{ Name = 'Storage';    Icon = [char]0xEDA2; Title = 'Storage & updates' }
     @{ Name = 'Visuals';    Icon = [char]0xE790; Title = 'Desktop visuals' }
     @{ Name = 'Startup';    Icon = [char]0xE768; Title = 'Startup apps' }
@@ -4495,15 +4841,154 @@ function Get-HealthIssues {
         if ((St $id) -eq $false) { $tw = $Tweaks | Where-Object { $_.Id -eq $id }; Add-Issue 2 "Old tweak to repair: $($tw.Title)" $tw.Desc $id }
     }
     if ((St 'dvr') -eq $false) { Add-Issue 2 'Game Bar background recording is on' 'Background capture costs GPU time and causes frame spikes.' 'dvr' }
-    # --- memory
-    $ram = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue)
-    if ($ram.Count) {
+    # --- memory: speed (XMP/EXPO) and channels
+    $ram = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Where-Object { $_.Capacity -gt 0 })
+    $lpddr = ($ram | Where-Object { $_.SMBIOSMemoryType -in 30, 35 }).Count -gt 0   # soldered laptop RAM: no profile, always multi-channel
+    if ($ram.Count -and -not $lpddr) {
         $run = ($ram | Measure-Object ConfiguredClockSpeed -Minimum).Minimum
+        $rated = ($ram | Measure-Object Speed -Maximum).Maximum
         $isDdr5 = ($ram | Where-Object { $_.SMBIOSMemoryType -eq 34 }).Count -gt 0
-        if (($isDdr5 -and $run -le 4800) -or (-not $isDdr5 -and $run -le 2666)) {
-            Add-Issue 2 "RAM runs at $run MT/s" 'That is the slow default speed. Turn on XMP (Intel) or EXPO (AMD) in your BIOS to run it at its rated speed.' $null $null
+        $jedec = if ($isDdr5) { 4800, 5200, 5600 } else { 2133, 2400, 2666, 2933 }
+        if ($run -and $rated -and $run -lt $rated) {
+            Add-Issue 3 "RAM runs at $run MT/s but is rated for $rated MT/s" 'Motherboards start RAM at a slow safe speed until you turn on its profile. Restart, enter the BIOS (Del or F2 while booting) and enable XMP (Intel) or EXPO / DOCP (AMD), then save. Fortnite is CPU-bound at high FPS, and memory speed directly raises 1% lows.' $null $null
+        } elseif ($run -and $jedec -contains $run) {
+            Add-Issue 2 "RAM runs at $run MT/s, a slow default speed" 'If your kit is rated higher (most gaming kits are), enable XMP (Intel) or EXPO / DOCP (AMD) in the BIOS to run it at its rated speed. That directly raises 1% lows in Fortnite.' $null $null
+        }
+        if ($ram.Count -eq 1) {
+            Add-Issue 3 'Only one RAM stick is installed' 'Two sticks run in dual channel, which doubles memory bandwidth. In CPU-bound games like Fortnite, single channel costs roughly 5 to 30% FPS and much worse 1% lows. Add a second identical stick.' $null $null
+        } elseif ($ram.Count -ge 2) {
+            $chan = @($ram | ForEach-Object { $x = "$($_.BankLabel) $($_.DeviceLocator)"; if ($x -match '(?i)CHANNEL\s*([A-D])|Channel([A-D])|DIMM[_ ]?([A-D])\d|\b([A-D])\d\b') { ($Matches[1] + $Matches[2] + $Matches[3] + $Matches[4]).ToUpper() } })
+            if ($chan.Count -eq $ram.Count -and ($chan | Sort-Object -Unique).Count -eq 1) {
+                Add-Issue 3 'Both RAM sticks sit in the same channel' "They are in slots $(($ram | ForEach-Object { $_.DeviceLocator }) -join ' and '). Move one so they use slots A2 and B2 (the 2nd and 4th from the CPU on most boards; check the manual). Dual channel doubles memory bandwidth." $null $null
+            }
         }
     }
+    # --- Windows Update restarts
+    $wu = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' -ErrorAction SilentlyContinue
+    if ($wu.IsExpedited -eq 1) {
+        Add-Issue 3 'Windows may restart in the middle of a match ("Get me up to date" is on)' 'This Windows Update option restarts the PC as soon as an update is installed, even during your active hours. Updates still install with it off; Windows just waits for a quiet time.' $null `
+            { Set-RegValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'IsExpedited' 0 'DWord'; '"Get me up to date" switched off.' } 'Switch off'
+    }
+    # --- graphics card link (negotiated maximum; the live link drops at idle, so it is not used)
+    $smi = "$env:WINDIR\System32\nvidia-smi.exe"
+    if (Test-Path $smi) {
+        try {
+            $q = (& $smi --query-gpu=name,pcie.link.gen.max,pcie.link.gen.gpumax,pcie.link.width.max --format=csv,noheader 2>$null | Select-Object -First 1) -split ',\s*'
+            if ($q.Count -ge 4) {
+                $gname = $q[0]; $genMax = [int]$q[1]; $genGpu = [int]$q[2]; $wMax = [int]$q[3]
+                $nativeNarrow = $gname -match '4060|3050|5050|5060|6400|6500|7600|A380|B570|B580'
+                if ($wMax -lt 16 -and -not $nativeNarrow) {
+                    Add-Issue 2 "Your $gname has only $wMax of its 16 PCIe lanes" 'Make sure the card sits in the top x16 slot (the one wired to the CPU) and is pushed fully in. On many boards the second or third M.2 slot takes 8 lanes from the graphics slot: move that SSD to another M.2 socket.' $null $null
+                } elseif ($genMax -lt $genGpu -and $genMax -le 3) {
+                    Add-Issue 1 "Your $gname runs at PCIe $genMax, but supports PCIe $genGpu" 'Check the BIOS setting for the graphics slot: it should be Auto or Gen 4/5, not Gen 3. The FPS cost is small (1 to 2%), larger on 8 GB cards.' $null $null
+                }
+            }
+        } catch {}
+    }
+    # --- CPU held back by heat or a power limit (firmware events, last 7 days)
+    try {
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 50 -ErrorAction Stop)
+        if ($ev.Count) {
+            Add-Issue 3 "Your CPU was held below its normal speed $($ev.Count) time$(if ($ev.Count -ne 1) { 's' }) this week" 'Windows logged the firmware capping CPU speed, usually heat or a power limit. That costs far more FPS than any software setting. Clean dust from the CPU cooler, check it is seated and the pump runs, and look in the BIOS for a power or thermal limit (PL1/PL2, PPT, Eco mode) left on. Laptops: lift it off the desk and use the performance mode on mains.' $null $null
+        }
+    } catch {}
+    # --- where Fortnite lives
+    $fnDir = $null
+    try { $dat = "$env:ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat"; if (Test-Path $dat) { $fnDir = ((Get-Content $dat -Raw | ConvertFrom-Json).InstallationList | Where-Object { $_.AppName -eq 'Fortnite' } | Select-Object -First 1).InstallLocation } } catch {}
+    function Get-DiskForPath([string]$Path) {
+        try {
+            $letter = (Split-Path -Qualifier $Path).TrimEnd(':')
+            $part = Get-Partition -DriveLetter $letter -ErrorAction Stop
+            Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.DeviceId -eq "$($part.DiskNumber)" } | Select-Object -First 1
+        } catch { $null }
+    }
+    if ($fnDir) {
+        $pd = Get-DiskForPath $fnDir
+        if ($pd -and ($pd.MediaType -eq 'HDD' -or $pd.SpindleSpeed -gt 0)) {
+            Add-Issue 3 "Fortnite is on $($pd.FriendlyName), a mechanical hard drive" 'Fortnite streams textures and buildings while you play; a hard drive cannot keep up, causing hitching, late-loading textures and long load screens. Move it to an SSD: Epic Games Launcher > Library > Fortnite > Manage lets you reinstall to another drive.' $null $null
+        } elseif ($pd -and $pd.BusType -eq 'USB') {
+            Add-Issue 2 "Fortnite is on an external USB drive ($($pd.FriendlyName))" 'USB drives are slower and share bandwidth with other USB devices. Move Fortnite to an internal SSD if you can.' $null $null
+        }
+    }
+    $sys = Get-DiskForPath $env:SystemDrive
+    if ($sys -and ($sys.MediaType -eq 'HDD' -or $sys.SpindleSpeed -gt 0)) {
+        Add-Issue 2 "Windows is on a mechanical hard drive ($($sys.FriendlyName))" 'Fortnite''s shader and DirectX caches live on the Windows drive, so a slow system drive means stutter on new shaders and slow loading. An SSD for Windows is the biggest upgrade for this PC.' $null $null
+    }
+    # --- page file
+    $pf = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)
+    if (-not $pf.Count) {
+        Add-Issue 3 'The page file is switched off' 'Unreal Engine 5 reserves more memory than it uses; without a page file Windows refuses those reservations and Fortnite crashes with "Out of memory", even with 32 GB of RAM. Turning it off saves nothing. Settings > System > About > Advanced system settings > Performance > Advanced > Virtual memory: tick "Automatically manage".' $null $null
+    } else {
+        foreach ($x in $pf) { $pdd = Get-DiskForPath $x.Name; if ($pdd -and ($pdd.MediaType -eq 'HDD' -or $pdd.SpindleSpeed -gt 0)) { Add-Issue 2 "The page file is on a mechanical hard drive ($($pdd.FriendlyName))" 'Every time Windows spills memory to it, the game stutters. Move the page file to your fastest SSD in Settings > System > About > Advanced system settings > Performance > Advanced > Virtual memory.' $null $null } }
+        try { $cs = Get-CimInstance Win32_ComputerSystem; $pfs = @(Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue); if ($cs.AutomaticManagedPagefile -eq $false -and $pfs.Count -and ($pfs | Measure-Object MaximumSize -Maximum).Maximum -lt 4096) { Add-Issue 2 "The page file is fixed at $(($pfs | Measure-Object MaximumSize -Maximum).Maximum) MB" 'That is too small for Unreal Engine 5 and causes "Out of memory" crashes. Set it to "Automatically manage", or at least 4096 to 16384 MB, in Virtual memory settings.' $null $null } } catch {}
+    }
+    # --- power mode slider (Balanced plan only), battery, Energy Saver
+    if ((Get-ActivePowerScheme).Guid -eq '381b4222-f694-41f0-9685-ff5bb260df2e') {
+        $ov = [PowerOverlay]::Get()
+        if ($ov -eq [PowerOverlay]::BestEfficiency) { Add-Issue 3 'Power mode is set to Best power efficiency' 'On this plan the Power mode slider is the real power setting: Best power efficiency caps the CPU boost and throttles background work, costing FPS and adding frame-time spikes.' 'powermode' }
+        elseif ($ov -eq [PowerOverlay]::Balanced) { Add-Issue 2 'Power mode is set to Balanced' 'On this plan the Power mode slider decides CPU boost; Best performance keeps clocks up between frames.' 'powermode' }
+    }
+    try {
+        [void][Windows.System.Power.PowerManager, Windows.System.Power, ContentType = WindowsRuntime]
+        if ("$([Windows.System.Power.PowerManager]::EnergySaverStatus)" -eq 'On') { Add-Issue 3 'Energy Saver is on' 'Energy Saver caps CPU and GPU clocks and throttles background work. Turn it off in Quick Settings (Win+A); on desktops check Settings > System > Power > Energy saver > "Always use energy saver" is off.' $null $null }
+        if ("$([Windows.System.Power.PowerManager]::BatteryStatus)" -eq 'Discharging') { Add-Issue 3 'The laptop is running on battery' 'On battery most laptops halve the GPU power limit and cap the CPU. Plug in the charger before you play.' $null $null }
+    } catch {}
+    # --- monitors: cable and mixed refresh rates
+    try {
+        $dsp = @(Get-Displays)
+        $main = $dsp | Where-Object Primary | Select-Object -First 1
+        $conn = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -ErrorAction SilentlyContinue)
+        $ids = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue)
+        if ($main -and $conn.Count -and $ids.Count) {
+            $mid = $ids | Where-Object { $n = -join ($_.UserFriendlyName | Where-Object { $_ } | ForEach-Object { [char]$_ }); $n -and $main.Monitor -like "*$($n.Trim())*" } | Select-Object -First 1
+            $mc = if ($mid) { $conn | Where-Object { $_.InstanceName -eq $mid.InstanceName } | Select-Object -First 1 }
+            if ($mc -and $mc.VideoOutputTechnology -eq 5 -and $main.Hz -ge 144 -and ((Test-VrrActive) -eq $false)) {
+                Add-Issue 1 "$($main.Monitor) is connected with HDMI" 'HDMI 2.0 tops out at 1440p 144 Hz, and NVIDIA G-SYNC Compatible is certified over DisplayPort on most monitors; some monitors hide their top refresh rates on HDMI. If both the monitor and the graphics card have a DisplayPort socket, use a DisplayPort cable (or HDMI 2.1 on both ends).' $null $null
+            }
+        }
+        $rates = @($dsp | ForEach-Object { $_.Hz } | Where-Object { $_ } | Sort-Object -Unique)
+        if ($rates.Count -gt 1 -and $main) {
+            $bad = @($rates | Where-Object { $_ -ne $main.Hz -and ($main.Hz % $_) -ne 0 })
+            if ($bad.Count -and (St 'fullscreen') -eq $false) {
+                Add-Issue 2 "Monitors run at $($rates -join ' and ') Hz" "Windows composes the desktop at one rate; a video or animated page moving on the $($bad[0]) Hz screen can make a windowed game stutter. Set the second monitor to a divisor of the main one ($([int]($main.Hz / 2)) Hz, for example), play in exclusive fullscreen, or pause videos on the second screen while you play." $null $null
+            }
+        }
+    } catch {}
+    # --- AMD chipset software and the X3D scheduler driver
+    try {
+        $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+        if ($cpu.Manufacturer -eq 'AuthenticAMD') {
+            if (-not ((Get-InstalledNames) -match '^AMD Chipset Software')) { Add-Issue 2 'AMD chipset software is not installed' 'The chipset package installs the Ryzen power-management provisioning (how fast cores ramp and park). Download "AMD Chipset Software" for your socket from amd.com/support and install it.' $null $null }
+            if ($cpu.Name -match '79[05]0X3D|99[05]0X3D' -and -not (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like 'AMD 3D V-Cache Performance Optimizer*' })) {
+                Add-Issue 3 'The AMD 3D V-Cache Performance Optimizer driver is missing' 'On dual-die X3D CPUs this driver keeps games on the V-Cache die. Without it Fortnite can run on the slow die and lose 10 to 20% FPS. Install AMD Chipset Software from amd.com/support and keep Windows Game Mode on (the driver uses it to detect games).' $null $null
+            }
+        }
+    } catch {}
+    # --- mouse behind a USB hub
+    try {
+        $mice = @(Get-PnpDevice -Class Mouse -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'HID\VID_*' })
+        $hubs = @()
+        foreach ($m in $mice) {
+            $id = $m.InstanceId
+            for ($hop = 0; $hop -lt 8 -and $id; $hop++) {
+                $parent = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent -ErrorAction Stop).Data
+                if (-not $parent) { break }
+                $pd2 = Get-PnpDevice -InstanceId $parent -ErrorAction SilentlyContinue
+                if ($pd2 -and $pd2.Class -eq 'USB' -and $pd2.FriendlyName -match 'Hub' -and $pd2.FriendlyName -notmatch 'Root Hub') { $hubs += $pd2.FriendlyName; break }
+                if ($pd2 -and $pd2.FriendlyName -match 'Root Hub|Host Controller') { break }
+                $id = $parent
+            }
+        }
+        if ($hubs.Count) { Add-Issue 2 "Your mouse is plugged into a USB hub ($($hubs | Select-Object -Unique | Select-Object -First 1))" 'Hubs (including the ones inside monitors, keyboards and docks) add polling jitter and share bandwidth with everything else on them. Plug the mouse or its wireless receiver straight into a USB port on the motherboard, ideally a USB 2.0 port away from USB 3 drives.' $null $null }
+    } catch {}
+    # --- Defender scans while you play
+    try {
+        $mp = Get-MpPreference -ErrorAction Stop
+        if ($mp.ScanOnlyIfIdleEnabled -eq $false) {
+            Add-Issue 2 'Defender may start a scheduled scan while you play' 'A scan reads tens of thousands of files and spikes disk and CPU. With "only when idle" on, Windows waits until you step away. Real-time protection is not affected.' $null `
+                { Set-MpPreference -ScanOnlyIfIdleEnabled $true -ErrorAction Stop; 'Defender scans now wait until the PC is idle.' } 'Only when idle'
+        }
+    } catch {}
     # --- other tools that undo settings
     $tools = @{ 'ExitLag' = 'ExitLag'; 'EXM' = 'EXM'; 'GearUP' = 'GearUP Booster'; 'RazerCortex' = 'Razer Cortex'; 'ProcessLasso' = 'Process Lasso'; 'WTFast' = 'WTFast'; 'NoPing' = 'NoPing' }
     $running = foreach ($k in $tools.Keys) { if (Get-Process -Name "$k*" -ErrorAction SilentlyContinue) { $tools[$k] } }
@@ -5646,6 +6131,14 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.5.0' = @(
+        @{ T = 'Vendor software tab'; D = 'Services from ASUS, MSI, Corsair, Razer, Logitech, Dell, HP, Lenovo, Intel, AMD and Adobe that are known stutter sources. Only what is installed on your PC is shown, and each card says what stops working.' }
+        @{ T = '12 new Health checks'; D = 'RAM below its rated speed or in single channel, the graphics card on fewer PCIe lanes, Fortnite on a hard drive, no page file, CPU held back by heat, a mouse on a USB hub, Windows Update restarts, Defender scan timing and more.' }
+        @{ T = 'Browsers and Steam'; D = 'Stop Chrome and Brave running in the background, keep browsers off the GPU while you play, and let Steam update games only at night.' }
+        @{ T = 'Audio enhancements off'; D = 'One switch for every playback device, the same as Settings > Sound.' }
+        @{ T = 'Game Mode closes more'; D = 'RGB and monitoring apps (SignalRGB, OpenRGB, NZXT CAM, iCUE, G HUB, HWiNFO...), cloud sync and live wallpapers. Clip recorders and launchers are listed too, off by default.' }
+        @{ T = 'Cards you cannot use are hidden'; D = 'Tweaks for hardware or software this PC does not have no longer show up greyed out.' }
+    )
     '1.4.0' = @(
         @{ T = '18 new researched tweaks'; D = 'Found by checking Microsoft, NVIDIA and Epic documentation and measured guides. About 120 placebo or harmful tweaks were rejected on purpose.' }
         @{ T = 'Power and drives'; D = 'Full speed for Intel performance cores, and NVMe/SATA drives that never doze mid-match.' }
@@ -7204,7 +7697,7 @@ function Update-Filter {
                 elseif ($script:CurrentCat.Name -eq 'Latency') { [bool]$t.Lat }
                 elseif ($script:CurrentCat.Name -eq 'Potato') { [bool]$t.Potato }
                 else { $script:CurrentCat.Name -eq 'All' -or $t.Cat -eq $script:CurrentCat.Name }
-        $t.Card.Visibility = if ($show) { 'Visible' } else { 'Collapsed' }
+        $t.Card.Visibility = if ($show -and -not $t.Hidden) { 'Visible' } else { 'Collapsed' }
     }
 }
 $ui.Search.Add_TextChanged({ Update-Filter })

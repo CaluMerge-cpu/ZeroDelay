@@ -14,8 +14,12 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   "% potato" score, and NVIDIA texture-blur levels.
 - **NVIDIA page**: G-SYNC / V-Sync / Reflex / frame-cap check with tear-free and lowest-latency presets, Smooth Motion
   and RTX HDR checks, overlay and Instant Replay status, driver update check.
-- **Health check**: one scan for the problems that cost the most (mouse acceleration, wrong FPS cap, power settings,
-  leftovers from other optimizers) with one-click fixes.
+- **Health check**: one scan for the problems that cost the most, with one-click fixes where possible: mouse
+  acceleration, wrong FPS cap, power settings, RAM below its rated speed or in single channel, the graphics card on
+  fewer PCIe lanes, Fortnite on a hard drive, no page file, CPU held back by heat, a mouse on a USB hub, Windows Update
+  restarts mid-match, Defender scan timing, leftovers from other optimizers.
+- **Vendor software**: services from ASUS, MSI, Corsair, Razer, Logitech, Dell, HP, Lenovo, Intel, AMD and Adobe that
+  are documented stutter sources. Only what is installed is shown, and each card says what stops working.
 - **Benchmark** with Intel PresentMon (average FPS, 1% and 0.1% lows, latency, before/after comparison),
   **Ping monitor** for Fortnite regions, **Sensitivity** calculator (eDPI, cm/360).
 - **Profiles** with share codes, **History** with per-change undo, **drift alerts** when another program changes your
