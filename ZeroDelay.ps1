@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.10.0'
+$AppVersion = '1.10.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -4604,7 +4604,7 @@ if ($script:Glass) {
           </StackPanel>
           <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
             <Button x:Name="DriftIgnore" Content="Keep their change" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-            <Button x:Name="DriftFix" Content="Re-apply" Style="{StaticResource Btn}" Background="#0071E3" Foreground="#FFFFFF"/>
+            <Button x:Name="DriftFix" Content="Review" Style="{StaticResource Btn}" Background="#0071E3" Foreground="#FFFFFF"/>
           </StackPanel>
         </Grid>
       </Border>
@@ -6105,6 +6105,26 @@ function Invoke-BoosterWatch {
         if ($script:BoosterUi) { Update-BoosterPage }
     }
 }
+# installed (not only running) optimizers and boosters
+function Get-InstalledOptimizers {
+    $names = Get-InstalledNames
+    @(foreach ($k in $KnownOptimizers.Keys) { if (($names -match "^$k") -or (Get-Process -Name "$k*" -ErrorAction SilentlyContinue)) { $KnownOptimizers[$k] } })
+}
+# what switching a card on would change, as "name: now -> new" lines (registry and Fortnite settings)
+function Get-TweakChanges($t) {
+    $out = @()
+    foreach ($r in @($t.Reg)) {
+        if (-not $r -or -not $r.P) { continue }
+        $cur = Get-RegValue $r.P $r.N
+        if ("$cur" -ne "$($r.V)") { $out += "$($r.N): $(if ($null -eq $cur) { 'not set' } else { $cur }) → $($r.V)" }
+    }
+    if ($t.Ini -and (Test-Path $IniPath)) {
+        $lines = Get-Content $IniPath
+        foreach ($k in $t.Ini.Keys) { $cur = Get-IniValue $lines $k; if ("$cur" -ne "$($t.Ini[$k][0])") { $out += "${k}: $(if ($null -eq $cur) { 'not set' } else { $cur }) → $($t.Ini[$k][0])" } }
+    }
+    if ($t.Dx) { $cur = Get-DxValue $t.Dx.K; $out += "$($t.Dx.K): $(if ($null -eq $cur) { 'not set' } else { $cur }) → $($t.Dx.V)" }
+    @($out | Select-Object -First 4)
+}
 function Get-RunningOptimizers { @(foreach ($k in $KnownOptimizers.Keys) { if (Get-Process -Name "$k*" -ErrorAction SilentlyContinue) { $KnownOptimizers[$k] } }) }
 function ConvertTo-OrderedTable($o) {
     $h = [ordered]@{}
@@ -6176,14 +6196,15 @@ function Invoke-DriftCheck {
             return
         }
         $who = Get-RunningOptimizers
-        if ($script:Backup.Custom['autofix']) {
+        $others = @(Get-InstalledOptimizers)
+        if ($script:Backup.Custom['autofix'] -and -not $others.Count) {
             $msg = Repair-Drift $items
             $ui.DriftBar.Visibility = 'Collapsed'
             Add-History "Auto-fixed $($items.Count) changed setting(s)$(if ($who) { " ($($who -join ', ') running)" })" 'autofix' $null
             Show-Toast "Something changed your settings$(if ($who) { " ($($who -join ', ') is running)" }). $msg" '#FF9F0A'
             return
         }
-        $ui.DriftTitle.Text = "$($items.Count) setting$(if ($items.Count -ne 1) { 's were' } else { ' was' }) changed back" + $(if ($who) { " — $($who -join ', ') is running" } else { ' by another program or an update' })
+        $ui.DriftTitle.Text = "$($items.Count) setting$(if ($items.Count -ne 1) { 's were' } else { ' was' }) changed back" + $(if ($who) { " — $($who -join ', ') is running" } elseif ($others.Count) { " — $($others -join ', ') is installed" } else { ' by another program or an update' }) + $(if ($script:Backup.Custom['autofix'] -and $others.Count) { '. Auto-fix waits for you while another optimizer is installed.' } else { '' })
         $ui.DriftText.Text = ($items | ForEach-Object Title) -join '  ·  '
         if ($ui.DriftBar.Visibility -ne 'Visible') { $ui.DriftBar.Visibility = 'Visible'; Show-Animated $ui.DriftBar -8 260 }
     } finally { $script:DriftBusy = $false }
@@ -6607,6 +6628,78 @@ function Update-BenchmarkPage {
     }
 }
 
+# =============================================================== Ping check
+# Network tweaks that can raise ping on some connections and switch live (no restart): measured one by one.
+$PingCheckIds = 'qos', 'intmod', 'itr', 'flowcontrol', 'coalescing', 'uro', 'rss', 'eee', 'greeneth', 'advancedeee', 'nicpower', 'netthrottle', 'wifipower', 'roaming', 'rtkpower'
+$PingCheckScript = @'
+param($h, $n)
+$p = New-Object Net.NetworkInformation.Ping; $ms = @(); $lost = 0
+for ($i = 0; $i -lt $n; $i++) { try { $x = $p.Send($h, 1000); if ($x.Status -eq 'Success') { $ms += [int]$x.RoundtripTime } else { $lost++ } } catch { $lost++ }; Start-Sleep -Milliseconds 120 }
+$s = @($ms | Sort-Object)
+[pscustomobject]@{ Median = $(if ($s.Count) { $s[[int][Math]::Floor($s.Count / 2)] } else { $null }); Lost = $lost; Count = $s.Count }
+'@
+function Start-PingCheck {
+    $pg = $script:PingUi
+    if ($script:PcRun) { return }
+    if (Test-FortniteRunning) { Show-Toast 'Close Fortnite first: the check briefly drops your connection.' '#FF9F0A'; return }
+    $region = $pg.Region.SelectedItem.Content
+    $h = ($PingHosts | Where-Object { $_.Name -eq "$region" } | Select-Object -First 1).Host
+    if (-not $h) { $h = ($PingHosts | Where-Object { $_.Name -eq (Get-PlayRegionName) } | Select-Object -First 1).Host }
+    $cands = @($PingCheckIds | ForEach-Object { Find-Tweak $_ } | Where-Object { $_ -and $_.Toggle -and -not $_.Hidden -and $_.State -eq $true })
+    $steps = New-Object Collections.ArrayList
+    [void]$steps.Add(@{ Kind = 'measure'; Key = 'base1' })
+    foreach ($t in $cands) { [void]$steps.Add(@{ Kind = 'off'; T = $t }); [void]$steps.Add(@{ Kind = 'measure'; Key = $t.Id; T = $t }); [void]$steps.Add(@{ Kind = 'on'; T = $t }) }
+    [void]$steps.Add(@{ Kind = 'measure'; Key = 'base2' })
+    $script:PcRun = @{ Host = $h; Region = "$region"; Steps = $steps; I = 0; Res = @{}; Busy = $false; Cands = $cands }
+    $pg.PcGo.IsEnabled = $false; $pg.PcResult.Children.Clear()
+    if (-not $script:PcTimer) { $script:PcTimer = New-Object Windows.Threading.DispatcherTimer; $script:PcTimer.Interval = [TimeSpan]::FromMilliseconds(300); $script:PcTimer.Add_Tick({ Step-PingCheck }) }
+    $script:PcTimer.Start()
+}
+function Step-PingCheck {
+    $r = $script:PcRun; $pg = $script:PingUi
+    if (-not $r -or $r.Busy) { return }
+    if ($r.Wait -and (Get-Date) -lt $r.Wait) { return }
+    if ($r.I -ge $r.Steps.Count) { $script:PcTimer.Stop(); Complete-PingCheck; return }
+    $st = $r.Steps[$r.I]; $r.I++
+    switch ($st.Kind) {
+        'measure' {
+            $pg.PcStatus.Text = "Measuring ping to $($r.Region) $(if ($st.T) { "with '$($st.T.Title)' off" } else { 'as it is now' })...  (step $($r.I) of $($r.Steps.Count))"
+            $r.Busy = $true; $script:PcKey = $st.Key
+            Start-Background $PingCheckScript @($r.Host, 25) { param($out, $errs) $x = @($out | Where-Object { $_ }) | Select-Object -First 1; $script:PcRun.Res[$script:PcKey] = $x; $script:PcRun.Busy = $false }
+        }
+        'off' { $pg.PcStatus.Text = "Switching '$($st.T.Title)' off for a moment..."; try { Invoke-TweakOff $st.T } catch {}; $r.Wait = (Get-Date).AddSeconds(3) }
+        'on'  { $pg.PcStatus.Text = "Switching '$($st.T.Title)' back on..."; try { Invoke-TweakOn $st.T } catch { Show-Toast "Could not switch '$($st.T.Title)' back on: $($_.Exception.Message)" '#FF9F0A' }; Clear-ReadCache; Update-Card $st.T; $r.Wait = (Get-Date).AddSeconds(3) }
+    }
+}
+function Complete-PingCheck {
+    $r = $script:PcRun; $pg = $script:PingUi
+    $script:PcRun = $null; $pg.PcGo.IsEnabled = $true
+    $b1 = $r.Res['base1'].Median; $b2 = $r.Res['base2'].Median
+    if ($null -eq $b1 -or $null -eq $b2) { $pg.PcStatus.Text = 'No answer from the ping server: check your connection and try again.'; return }
+    $base = ($b1 + $b2) / 2; $noise = [Math]::Max(3, [Math]::Abs($b1 - $b2))
+    $pg.PcStatus.Text = "Your ping to $($r.Region) with everything as it is: $([int]$base) ms (it moved $([int][Math]::Abs($b1 - $b2)) ms between the first and last measurement, so smaller differences are noise)."
+    $rows = foreach ($t in $r.Cands) {
+        $m = $r.Res[$t.Id].Median; if ($null -eq $m) { continue }
+        $d = $base - $m
+        $state = if ($d -gt $noise) { @('#FF453A', "Your ping is about $([int]$d) ms lower with this off: switch it off.", $true) } elseif ($d -lt -$noise) { @('#30D158', "Helps: ping is about $([int](-$d)) ms higher without it.", $false) } else { @('#A1A1A6', 'No difference to your ping.', $false) }
+        @{ T = $t; Off = $m; State = $state }
+    }
+    $x = for ($i = 0; $i -lt @($rows).Count; $i++) {
+        $w = $rows[$i]
+        "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='300'/><ColumnDefinition Width='110'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        "<TextBlock Text='$(Esc $w.T.Title)' FontSize='13' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/><TextBlock Grid.Column='1' Text='$([int]$w.Off) ms off' FontSize='12.5'/>" +
+        "<TextBlock Grid.Column='2' Text='$(Esc $w.State[1])' FontSize='12.5' Foreground='$($w.State[0])' TextWrapping='Wrap'/>" +
+        $(if ($w.State[2]) { "<Button x:Name='P_$i' Grid.Column='3' Content='Switch off' Style='{DynamicResource Btn}' Padding='12,4' FontSize='12' Margin='10,0,0,0'/>" } else { '' }) + "</Grid>"
+    }
+    $ip4 = Find-Tweak 'preferipv4'
+    if ($ip4 -and $ip4.State) { $x = @($x) + "<TextBlock Text='Prefer IPv4 over IPv6 is on but cannot be tested this way (Epic&apos;s ping servers only answer over IPv4, and it needs a restart). If your ping got worse right after switching it on, switch it off and restart to compare.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,0'/>" }
+    if (-not @($rows).Count) { $x = @("<TextBlock Text='None of the network tweaks that can affect ping are on, so none of them changed it. Ping also changes with the time of day and your provider: run the check again later to compare.' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap'/>") + @($x) }
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($x -join '')</StackPanel>")
+    for ($i = 0; $i -lt @($rows).Count; $i++) { $b = $panel.FindName("P_$i"); if ($b) { $b.Tag = $rows[$i].T; $b.Add_Click({ param($s, $e) Switch-Tweak $s.Tag $false; $s.IsEnabled = $false; $s.Content = 'Off' }) } }
+    $pg.PcResult.Children.Clear(); [void]$pg.PcResult.Children.Add($panel)
+    Add-History "Ping check: $([int]$base) ms to $($r.Region)" 'ping' $null
+}
+
 # =============================================================== Ping monitor
 $PingLogFile = Join-Path $env:TEMP 'zerodelay-ping.log'
 function New-PingPage {
@@ -6635,16 +6728,31 @@ function New-PingPage {
       <TextBlock Text='Last 2 minutes. Red marks are spikes or lost packets.' Foreground='#98989D' FontSize='11.5' Margin='0,6,0,0'/>
     </StackPanel>
   </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,18' Margin='0,0,0,16'>
+    <StackPanel>
+      <Grid>
+        <StackPanel>
+          <TextBlock Text='Did a tweak change your ping?' FontSize='15' FontWeight='SemiBold'/>
+          <TextBlock x:Name='PcHint' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' MaxWidth='720' HorizontalAlignment='Left' Margin='0,4,0,0'
+                     Text='Measures your ping, then switches each network tweak that is on off for a moment, measures again and switches it back. Takes about a minute; your connection drops for a second a few times, so do not run it in a match.'/>
+        </StackPanel>
+        <Button x:Name='PcGo' Content='Run ping check' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Right' VerticalAlignment='Top'/>
+      </Grid>
+      <TextBlock x:Name='PcStatus' FontSize='12.5' FontWeight='SemiBold' Foreground='#0A84FF' Margin='0,10,0,0' TextWrapping='Wrap'/>
+      <StackPanel x:Name='PcResult' Margin='0,8,0,0'/>
+    </StackPanel>
+  </Border>
   <TextBlock Text='Spikes' FontSize='16' FontWeight='SemiBold' Margin='0,0,0,8'/>
   <StackPanel x:Name='Spikes'/>
 </StackPanel>
 "@)
-    $pg = @{}; foreach ($n in 'Region', 'Go', 'Now', 'Avg', 'Jit', 'Loss', 'Graph', 'Spikes') { $pg[$n] = $root.FindName($n) }
+    $pg = @{}; foreach ($n in 'Region', 'Go', 'Now', 'Avg', 'Jit', 'Loss', 'Graph', 'Spikes', 'PcHint', 'PcGo', 'PcStatus', 'PcResult') { $pg[$n] = $root.FindName($n) }
+    $pg.PcGo.Add_Click({ Start-PingCheck })
     $script:PingUi = $pg
-    $saved = $script:Backup.Custom['pingregion']
+    $saved = Get-PlayRegionName
     $idx = [Math]::Max(0, [array]::IndexOf([string[]]($PingHosts | ForEach-Object { $_.Name }), "$saved"))
     $pg.Region.SelectedIndex = $idx
-    $pg.Region.Add_SelectionChanged({ $script:Backup.Custom['pingregion'] = $PingHosts[$script:PingUi.Region.SelectedIndex].Name; Save-Backup })
+    $pg.Region.Add_SelectionChanged({ $nm = $PingHosts[$script:PingUi.Region.SelectedIndex].Name; $code = $EventRegions.Keys | Where-Object { $EventRegions[$_] -eq $nm } | Select-Object -First 1; if ($code) { Set-PlayRegion $code } else { $script:Backup.Custom['pingregion'] = $nm; Save-Backup } })
     $pg.Go.Add_Click({ if ($script:PingMonJob) { Stop-PingMonitor } else { Start-PingMonitor } })
     $script:PingMonTimer = New-Object Windows.Threading.DispatcherTimer
     $script:PingMonTimer.Interval = [TimeSpan]::FromSeconds(1)
@@ -7358,6 +7466,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.10.1' = @(
+        @{ T = 'Your region everywhere'; D = 'Game Mode, the Ping monitor, match reports and Tournaments now all use the region you play in Fortnite (no more NA East ping for EU players). Click the ping on Game Mode to pick another region.' }
+        @{ T = 'Ping check'; D = 'Ping got worse after a tweak? Tools > Ping monitor > Run ping check measures your ping with each network tweak switched off for a moment and tells you which one to switch off.' }
+        @{ T = 'Review before changing back'; D = 'When another program or an update changes a setting back, ZeroDelay shows what it is now and what it would set, and you tick what to change. It never re-applies by itself while another optimizer is installed. Optimize shows the exact values too.' }
+    )
     '1.10.0' = @(
         @{ T = 'A/B test with a replay'; D = 'On the Benchmark page: pick a tweak, play the same Fortnite replay a few times while ZeroDelay records (Ctrl+F9 inside the game), and it tells you if the change is a real gain or just noise.' }
         @{ T = 'Trends'; D = 'A new Tools > Trends page shows your matches over time (FPS, 1% lows, stutters, input latency and ping), with dashed lines where tweaks changed or Fortnite and the driver updated, and the last matches compared with the ones before.' }
@@ -7701,8 +7814,7 @@ function Invoke-UpdateCheck {
 }
 # Epic's ping server for the region you play (Tournaments region, else Fortnite's own setting, else the Ping monitor's)
 function Get-MatchPingHost {
-    $name = try { $EventRegions[(Get-EventsRegion)] } catch { $null }
-    if (-not $name) { $name = Get-Setting 'pingregion' 'Europe' }
+    $name = try { Get-PlayRegionName } catch { 'Europe' }
     $h = $PingHosts | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     $script:MatchPingRegion = $name
     if ($h) { $h.Host } else { $null }
@@ -9658,7 +9770,7 @@ function New-GameModePage {
             <WrapPanel Margin='0,30,0,0'>
               <StackPanel Margin='0,0,44,16'>
                 <StackPanel Orientation='Horizontal'><TextBlock x:Name='PingVal' Text='-' FontSize='38' FontWeight='Bold' Foreground='#2EE6A6' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms' FontSize='13' Foreground='#2EE6A6' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
-                <TextBlock x:Name='PingLbl' Text='Ping' FontSize='12' Foreground='#9A9AA5'/>
+                <TextBlock x:Name='PingLbl' Text='Ping' FontSize='12' Foreground='#9A9AA5' Cursor='Hand' ToolTip='Click to pick your Fortnite region'/>
               </StackPanel>
               <StackPanel Margin='0,0,44,16'>
                 <TextBlock x:Name='AppsVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/>
@@ -9742,6 +9854,7 @@ function New-GameModePage {
 "@)
     $g = @{}; foreach ($n in 'StatePill', 'StateDot', 'StateText', 'StateSub', 'PingVal', 'PingLbl', 'AppsVal', 'AppsLbl', 'MemVal', 'StepsVal', 'DoneText', 'TimerDot', 'Timer', 'Start', 'StartText', 'Power', 'PowerIcon', 'Chips', 'Tools', 'CpuVal', 'GpuTVal', 'GpuUVal', 'MemPctVal') { $g[$n] = $root.FindName($n) }
     $script:GmUi = $g
+    $g.PingLbl.Add_MouseLeftButtonUp({ param($s, $e) Show-RegionMenu $s { $script:GmTick = 0; $script:GmUi.PingVal.Text = '-'; $script:GmUi.PingLbl.Text = "Ping to $(Get-PlayRegionName)  ▾" } })
     Set-RoundClip $root.Children[0] 26   # glows stay inside the rounded corners
     $script:GmFilter = 'all'
     foreach ($c in @(@('all', 'All'), @('steps', 'Boost'), @('apps', 'Apps'), @('auto', 'Auto'))) {
@@ -9774,7 +9887,7 @@ function New-GameModePage {
             $script:GmTick++
             if ($script:GmTick % 3 -eq 1 -and -not $script:GmStatBusy) {
                 $script:GmStatBusy = $true
-                $region = Get-Setting 'pingregion' $null
+                $region = Get-PlayRegionName
                 $hostEntry = $PingHosts | Where-Object { $_.Name -eq $region } | Select-Object -First 1; if (-not $hostEntry) { $hostEntry = $PingHosts[0] }
                 $script:GmPingName = $hostEntry.Name
                 Start-Background $GmStatScript.ToString() @($hostEntry.Host, @($SessionApps | ForEach-Object { @{ Key = $_.Key; PathRx = $_.PathRx } })) {
@@ -9788,7 +9901,7 @@ function New-GameModePage {
                     $g.GpuUVal.Text = if ($null -ne $r.GpuUtil) { "$($r.GpuUtil)%" } else { '-' }
                     $g.MemPctVal.Text = if ($null -ne $r.MemPct) { "$($r.MemPct)%" } else { '-' }
                     $g.PingVal.Text = if ($null -ne $r.Ping) { "$($r.Ping)" } else { '-' }
-                    $g.PingLbl.Text = "Ping to $($script:GmPingName)"
+                    $g.PingLbl.Text = "Ping to $($script:GmPingName)  ▾"
                     $g.GpuTVal.Foreground = ConvertTo-Brush $(if ($r.GpuTemp -ge 83) { '#FF453A' } elseif ($r.GpuTemp -ge 75) { '#FF9F0A' } else { '#FFFFFF' })
                     $changed = (@($r.Running.Keys) -join ',') -ne (@($script:GmRunningPaths.Keys) -join ',')
                     $script:GmRunningPaths = $r.Running
@@ -9942,6 +10055,20 @@ function Get-FortniteRegion {
     if ($r) { $r.Region } else { $null }
 }
 function Get-EventsRegion { $s = Get-Setting 'eventsregion' $null; if ($s -and $EventRegions.Contains($s)) { $s } else { $d = Get-FortniteRegion; if ($d) { $d } else { 'EU' } } }
+# The region you play in, as the ping servers name it ("Europe"): chosen by you, else what Fortnite last used, else Europe.
+# Game Mode, the Ping monitor, match reports and Tournaments all use it.
+function Show-RegionMenu($Target, [scriptblock]$Then) {
+    $menu = New-Object Windows.Controls.ContextMenu
+    $cur = Get-EventsRegion
+    foreach ($k in $EventRegions.Keys) {
+        $mi = New-Object Windows.Controls.MenuItem; $mi.Header = $EventRegions[$k]; $mi.IsCheckable = $true; $mi.IsChecked = $k -eq $cur; $mi.Tag = @{ Code = $k; Then = $Then }
+        $mi.Add_Click({ param($s, $e) Set-PlayRegion $s.Tag.Code; if ($s.Tag.Then) { & $s.Tag.Then }; if ($script:EventsUi) { Update-EventsHeader }; Show-Toast "Your region is now $($EventRegions[$s.Tag.Code])." '#30D158' })
+        [void]$menu.Items.Add($mi)
+    }
+    $menu.PlacementTarget = $Target; $menu.IsOpen = $true
+}
+function Get-PlayRegionName { $n = $EventRegions[(Get-EventsRegion)]; if ($n) { $n } else { 'Europe' } }
+function Set-PlayRegion([string]$Code) { $script:Backup.Custom['eventsregion'] = $Code; $script:Backup.Custom['pingregion'] = $EventRegions[$Code]; Save-Backup }
 # tournament_epicgames_s42_rankedcupsoloreload_eu -> Ranked Cup Solo Reload
 $TourneyWords = 'championship', 'evaluation', 'performance', 'qualifier', 'contender', 'zerobuild', 'victory', 'console', 'reload', 'ranked', 'squads', 'finals', 'mobile', 'chance', 'solos', 'trios', 'final', 'blitz', 'arena', 'elite', 'duos', 'solo', 'duo', 'cash', 'fncs', 'last', 'cups', 'cup', 'lcq', 'zb', 'og', 'br'
 function Format-TournamentName([string]$Id) {
@@ -10128,7 +10255,7 @@ function New-EventsPage {
     foreach ($k in $EventRegions.Keys) {
         $b = $root.FindName("R_$k"); $b.Tag = $k
         $b.Add_Click({ param($s, $e)
-            $script:Backup.Custom['eventsregion'] = $s.Tag; Save-Backup
+            Set-PlayRegion $s.Tag
             Update-EventsHeader
             if ($script:EventsWeb) { $script:EventsWeb.Source = [Uri](Get-EventsUrl $s.Tag) }
             Update-EventsReady
@@ -11448,6 +11575,7 @@ function Show-OptimizeChooser {
             "<CheckBox x:Name='C_$($t.ChooseIdx)' VerticalAlignment='Top' Margin='0,2,10,0'/>" +
             "<StackPanel Grid.Column='1'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>$badge</StackPanel>" +
             "<TextBlock Text='$(Esc $t.Desc)' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/>" +
+            $(if (($chg = @(Get-TweakChanges $t)).Count) { "<TextBlock Text='$((Esc ($chg -join "`n")) -replace "`n", '&#x0a;')' FontSize='11.5' Foreground='#8A8A94' FontFamily='Cascadia Mono, Consolas, Segoe UI' TextWrapping='Wrap' Margin='0,3,0,0'/>" } else { '' }) +
             $(if ($t.Warn) { "<TextBlock Text='$(Esc "Skip it if: $($t.Warn)")' FontSize='11.5' Foreground='#FF9F0A' TextWrapping='Wrap' Margin='0,3,0,0'/>" } else { '' }) +
             "</StackPanel></Grid></Border>"
         }
@@ -11548,14 +11676,53 @@ $ui.GmSwitch.Add_Click({
     Show-Toast $msg '#30D158'
 })
 
-$ui.DriftFix.Add_Click({
-    $window.Cursor = [Windows.Input.Cursors]::Wait
-    $msg = Repair-Drift $script:DriftItems
-    $window.Cursor = $null
-    $ui.DriftBar.Visibility = 'Collapsed'
-    Add-History "Re-applied $(@($script:DriftItems).Count) changed setting(s)" 'drift' $null
-    Show-Toast $msg '#30D158'
-})
+$ui.DriftFix.Add_Click({ Show-DriftReview })
+# Shows each changed setting with what it is now and what ZeroDelay would set; only the ticked ones change.
+function Show-DriftReview {
+    $items = @($script:DriftItems); if (-not $items.Count) { return }
+    $i = 0
+    $rows = foreach ($it in $items) {
+        $it | Add-Member -NotePropertyName Idx -NotePropertyValue $i -Force; $i++
+        $ch = if ($it.Kind -eq 'tweak') { @(Get-TweakChanges $it.T) } else { @() }
+        $detail = if ($ch.Count) { ($ch -join "`n") } elseif ($it.Kind -eq 'tweak') { 'ZeroDelay switches this card back on.' } else { 'ZeroDelay sets this back to your saved value.' }
+        "<Border Background='#14FFFFFF' CornerRadius='10' Padding='12,9' Margin='0,0,0,6'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+        "<CheckBox x:Name='D_$($it.Idx)' IsChecked='True' VerticalAlignment='Top' Margin='0,2,10,0'/>" +
+        "<StackPanel Grid.Column='1'><TextBlock Text='$(Esc $it.Title)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>" +
+        "<TextBlock Text='$((Esc $detail) -replace "`n", '&#x0a;')' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0' FontFamily='Cascadia Mono, Consolas, Segoe UI'/></StackPanel></Grid></Border>"
+    }
+    $others = @(Get-InstalledOptimizers)
+    $body = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <TextBlock Text='Review before changing anything' FontSize='22' FontWeight='Bold'/>
+  <TextBlock Text='$(Esc "These settings were changed after ZeroDelay set them$(if ($others.Count) { ", probably by $($others -join ', ')" }). Each one shows what it is now and what ZeroDelay would set. Untick anything you want to leave as it is.")' Foreground='#A1A1A6' FontSize='13' Margin='0,6,0,14' TextWrapping='Wrap'/>
+  $($rows -join '')
+  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,14,0,0'>
+    <Button x:Name='Cancel' Content='Cancel' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='90'/>
+    <Button x:Name='Go' Content='Change the ticked ones' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' MinWidth='150'/>
+  </StackPanel>
+</StackPanel>
+"@)
+    $script:DriftBody = $body
+    $body.FindName('Cancel').Add_Click({ Hide-Animated $ui.Wizard 200 })
+    $body.FindName('Go').Add_Click({
+        $all = @($script:DriftItems)
+        $pick = @($all | Where-Object { $script:DriftBody.FindName("D_$($_.Idx)").IsChecked })
+        $keep = @($all | Where-Object { -not $script:DriftBody.FindName("D_$($_.Idx)").IsChecked })
+        Hide-Animated $ui.Wizard 200
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        $msg = if ($pick.Count) { Repair-Drift $pick } else { 'Nothing changed.' }
+        # unticked ones: the other program's value stays, and ZeroDelay stops watching them
+        foreach ($k in $keep) { switch ($k.Kind) { 'tweak' { Set-Applied $k.T.Id $false; Update-Card $k.T } 'preset' { $script:Backup.Custom.Remove('lastpreset') } 'nvlod' { $script:Backup.Custom.Remove('nvlodvalue') } } }
+        if ($keep.Count) { Save-Backup; Update-Summary }
+        $window.Cursor = $null
+        $ui.DriftBar.Visibility = 'Collapsed'
+        if ($pick.Count) { Add-History "Re-applied $($pick.Count) changed setting(s) after review" 'drift' $null }
+        Show-Toast "$msg$(if ($keep.Count) { " Kept $($keep.Count) as the other program set them." })" '#30D158'
+    })
+    $ui.WizardBody.Content = $body
+    $ui.Wizard.Visibility = 'Visible'
+    if ($script:Anim) { Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220; Show-Animated $ui.WizardBody 24 380 60 }
+}
 $ui.DriftIgnore.Add_Click({
     # Accept the other program's values: stop watching these settings.
     foreach ($i in @($script:DriftItems)) {
