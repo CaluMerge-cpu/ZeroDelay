@@ -49,6 +49,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   stutter while shaders rebuild.
 - **Benchmark** with Intel PresentMon (average FPS, 1% and 0.1% lows, latency, before/after comparison) and a guided **A/B test with a replay** that says whether a change is a real gain or run-to-run noise,
   **Ping monitor** for Fortnite regions with a **Ping check** that finds which network tweak raised your ping and can fix it automatically (kept only if ping really drops), **Sensitivity** calculator (eDPI, cm/360).
+- **Pause all tweaks** (Settings): turn off everything ZeroDelay switched on at once and bring exactly those back later.
 - **Profiles** with share codes, **History** with per-change undo, **drift alerts** when another program changes your
   settings back, Windows restore point before applying.
 - **Match reports**: after each Fortnite session, the stutters (with what was busy at that moment), background apps

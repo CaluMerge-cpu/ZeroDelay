@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.10.2'
+$AppVersion = '1.10.3'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -7249,6 +7249,16 @@ function New-SettingsPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text='All tweaks on' FontSize='14' FontWeight='SemiBold'/>
+        <TextBlock x:Name='PauseText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/>
+      </StackPanel>
+      <ToggleButton x:Name='S_pause' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center' ToolTip='Off: every tweak ZeroDelay switched on is turned off and remembered. On: they all come back.'/>
+    </Grid>
+  </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
     <StackPanel>
       <TextBlock Text='Appearance' FontSize='14' FontWeight='SemiBold'/>
       <Grid Margin='0,14,0,0'>
@@ -7307,8 +7317,12 @@ function New-SettingsPage {
   </Border>
 </StackPanel>
 "@)
-    $st = @{}; foreach ($n in 'S_closetotray', 'S_autofix', 'S_autoupdate', 'S_startup', 'S_matchreport', 'UpdReport', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply', 'S_glass',
+    $st = @{}; foreach ($n in 'S_pause', 'PauseText', 'S_closetotray', 'S_autofix', 'S_autoupdate', 'S_startup', 'S_matchreport', 'UpdReport', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply', 'S_glass',
                               'VerTitle', 'UpdStatus', 'UpdCheck', 'UpdGet', 'UpdRepo') { $st[$n] = $root.FindName($n) }
+    $script:PauseUi = $st
+    if ($script:PageRefresh['Settings']) { $prev = $script:PageRefresh['Settings']; $script:PageRefresh['Settings'] = { & $prev; Update-PauseCard }.GetNewClosure() } else { $script:PageRefresh['Settings'] = { Update-PauseCard } }
+    $st.S_pause.Add_Click({ param($s, $e) if ($s.IsChecked) { Resume-AllTweaks } else { Suspend-AllTweaks } })
+    Update-PauseCard
     $script:SetUi = $st
     $st.S_closetotray.IsChecked = [bool](Get-Setting 'closetotray' $true)
     $st.S_autofix.IsChecked = [bool](Get-Setting 'autofix' $false)
@@ -7519,6 +7533,9 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.10.3' = @(
+        @{ T = 'Pause all tweaks'; D = 'Settings > All tweaks on: switch it off to turn off every tweak ZeroDelay switched on at once, for example to compare or to find a problem. ZeroDelay remembers them and puts exactly those back when you switch it on again.' }
+    )
     '1.10.2' = @(
         @{ T = 'Check and fix automatically'; D = 'Tools > Ping monitor now has a Check and fix automatically button: it switches off only the network tweaks that clearly raise your ping, measures again, and keeps the change only if your ping really dropped. Otherwise it puts everything back.' }
         @{ T = 'A fairer ping check'; D = 'Each tweak is now measured right between two measurements with it on, so normal ping drift during the check no longer makes several tweaks look bad. Each row shows the on / off / on numbers.' }
@@ -8410,6 +8427,7 @@ function Complete-StateRefresh {
         } else { Update-All }    # worker failed: do it here
         if ($script:EventsUi) { Update-EventsReady }
         Test-AfterBoot; Update-RestartBar
+        Update-PauseCard
         Invoke-UpdateCheck
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
 }
@@ -11843,6 +11861,50 @@ $ui.RestartNow.Add_Click({
     else { shutdown.exe /l }
 })
 
+# --- Pause: every tweak ZeroDelay switched on goes off and is remembered; resuming switches exactly those back on.
+function Get-PausedTweaks { $p = $script:Backup.Custom['paused']; if ($p) { @($p.Ids | Where-Object { $_ }) } else { @() } }
+function Update-PauseCard {
+    $st = $script:PauseUi; if (-not $st) { return }
+    $p = $script:Backup.Custom['paused']
+    if ($p) {
+        $when = try { ([datetime]$p.Time).ToString('d MMM, HH:mm') } catch { '' }
+        $st.S_pause.IsChecked = $false
+        $st.PauseText.Text = "Paused since $($when): $(@($p.Ids).Count) tweak$(if (@($p.Ids).Count -ne 1) { 's are' } else { ' is' }) off. Switch this on to put exactly those back. Tweaks you switch on yourself in the meantime still work."
+    } else {
+        $n = @(Get-Applied | ForEach-Object { Find-Tweak $_ } | Where-Object { $_ -and $_.Toggle -and $_.State -eq $true }).Count
+        $st.S_pause.IsChecked = $true
+        $st.PauseText.Text = "All $n tweak$(if ($n -ne 1) { 's' }) ZeroDelay switched on are active. Switch this off to turn them all off at once, for example to compare or to find a problem; ZeroDelay remembers them and puts them back when you switch it on again."
+    }
+}
+function Suspend-AllTweaks {
+    $list = @(Get-Applied | ForEach-Object { Find-Tweak $_ } | Where-Object { $_ -and $_.Toggle -and $_.State -eq $true })
+    if (-not $list.Count) { Show-Toast 'No tweaks are on, so there is nothing to pause.' '#A1A1A6'; Update-PauseCard; return }
+    $r = Show-ZdDialog "Turn off all $($list.Count) tweaks ZeroDelay switched on?`n`nZeroDelay remembers them: switch All tweaks on back on to put exactly these back. Some need a restart to take effect either way." 'Pause all tweaks' 'YesNo' 'Question'
+    if ($r -ne 'Yes') { Update-PauseCard; return }
+    $window.Cursor = [Windows.Input.Cursors]::Wait
+    $done = @(); $failed = @()
+    foreach ($t in $list) { try { Invoke-TweakOff $t; $done += $t.Id } catch { $failed += $t.Title } }
+    $script:Backup.Custom['paused'] = @{ Ids = $done; Time = (Get-Date).ToString('o') }
+    Save-Backup
+    Add-History "Paused all tweaks ($($done.Count))" 'pause' $null
+    Update-All
+    $window.Cursor = $null
+    Update-PauseCard
+    Show-Toast "Paused: $($done.Count) tweaks are off.$(if ($failed) { " Could not switch off: $($failed -join ', ')." })" $(if ($failed) { '#FF9F0A' } else { '#30D158' })
+}
+function Resume-AllTweaks {
+    $ids = @(Get-PausedTweaks)
+    if (-not $ids.Count) { Update-PauseCard; return }
+    $window.Cursor = [Windows.Input.Cursors]::Wait
+    $ok = 0; $failed = @()
+    foreach ($id in $ids) { $t = Find-Tweak $id; if (-not $t -or -not $t.Toggle -or $t.State -eq $true) { continue }; try { Invoke-TweakOn $t; $ok++ } catch { $failed += $t.Title } }
+    $script:Backup.Custom.Remove('paused'); Save-Backup
+    Add-History "Resumed all tweaks ($ok)" 'resume' $null
+    Update-All
+    $window.Cursor = $null
+    Update-PauseCard
+    Show-Toast "Back on: $ok tweak$(if ($ok -ne 1) { 's' }).$(if ($failed) { " Could not switch on: $($failed -join ', ')." })" $(if ($failed) { '#FF9F0A' } else { '#30D158' })
+}
 $ui.RestoreAll.Add_Click({
     $r = (Show-ZdDialog ('Put every setting this app changed back to how it was?') ('Restore all') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
@@ -11859,6 +11921,7 @@ $ui.RestoreAll.Add_Click({
     }
     Update-All
     $window.Cursor = $null
+    $script:Backup.Custom.Remove('paused'); Save-Backup; Update-PauseCard
     if ($failed) { Show-Toast "Restored, except: $($failed -join ', ')." '#FF9F0A' }
     else { Show-Toast 'All original settings restored. Restart to fully undo restart-only tweaks.' '#30D158' }
 })
