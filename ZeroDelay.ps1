@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.10.3'
+$AppVersion = '1.11.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -1789,6 +1789,177 @@ function Sync-Service([string]$Name) {
     elseif ($start -eq 2) { Start-Service $Name -ErrorAction SilentlyContinue }
 }
 
+# --- Helpers for the research round 3 cards (1.11)
+$CopilotAppKey = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Microsoft.Copilot_8wekyb3d8bbwe'
+function Get-CopilotStartup { @(Get-ChildItem -LiteralPath $CopilotAppKey -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.GetValue('State') }) }
+function Get-TouchScreens { @(Get-PnpDevice -Class HIDClass -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like '*touch screen*' }) }
+# *SelectiveSuspend of connected USB network adapters (NDIS selective suspend, Microsoft standard keyword)
+function Get-UsbNicSuspend {
+    $usb = @(Get-UpAdapters | Where-Object { "$($_.PnPDeviceID)" -like 'USB\*' } | ForEach-Object { $_.Name })
+    if (-not $usb.Count) { return @() }
+    @(Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq '*SelectiveSuspend' -and $usb -contains $_.Name })
+}
+function Get-WifiAdapters { @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.NdisPhysicalMedium -eq 9 }) }
+# PNP id + name of every graphics adapter, read once (the cards ask several times)
+function Get-GpuIds {
+    if ($null -eq $script:GpuIdsCache) { $script:GpuIdsCache = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { "$($_.PNPDeviceID) $($_.Name)" }) }
+    $script:GpuIdsCache
+}
+# battery percentage at which Energy Saver switches itself on (the on-battery value of the current plan)
+function Get-EsThreshold {
+    $o = powercfg /qh scheme_current SUB_ENERGYSAVER ESBATTTHRESHOLD 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $hex = @($o | Where-Object { $_ -match ':\s*0x[0-9a-fA-F]+\s*$' } | ForEach-Object { [Convert]::ToInt32(($_ -replace '.*0x', '').Trim(), 16) })
+    if ($hex.Count -lt 2) { return $null }
+    $hex[-1]
+}
+# the adapter Windows sends internet traffic through
+function Get-InternetRoute {
+    $r = @(Find-NetRoute -RemoteIPAddress '1.1.1.1' -ErrorAction SilentlyContinue)
+    $route = $r | Where-Object { $_.PSObject.Properties['NextHop'] } | Select-Object -First 1
+    if (-not $route) { return $null }
+    [pscustomobject]@{ NextHop = $route.NextHop; Adapter = (Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue) }
+}
+
+function Get-LinkReport {
+    $eth = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.NdisPhysicalMedium -eq 14 -and $_.Status -eq 'Up' })
+    if (-not $eth.Count) { return 'No network cable is connected right now. This check is for wired connections; on Wi-Fi, use Check your Wi-Fi signal instead.' }
+    $out = foreach ($a in $eth) {
+        $mbps = [math]::Round([double]$a.ReceiveLinkSpeed / 1e6)
+        $speed = if ($mbps -ge 1000) { "$([math]::Round($mbps / 1000, 1)) Gbit/s" } else { "$mbps Mbit/s" }
+        $sd = Get-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*SpeedDuplex' -ErrorAction SilentlyContinue
+        $canGig = [bool]($sd -and (@($sd.ValidDisplayValues) -match '(\d(\.\d)?\s*Gbps|1000\s*Mbps)'))
+        $st = Get-NetAdapterStatistics -Name $a.Name -ErrorAction SilentlyContinue
+        $errs = if ($st) { [int64]$st.ReceivedPacketErrors + [int64]$st.OutboundPacketErrors } else { 0 }
+        $pkts = if ($st) { [int64]$st.ReceivedUnicastPackets + [int64]$st.SentUnicastPackets } else { 0 }
+        $lines = @("$($a.Name) ($($a.InterfaceDescription)): $speed, $(if ($a.FullDuplex -eq $false) { 'HALF duplex' } else { 'full duplex' }).")
+        if ($st) { $lines += "Packet errors since Windows started: $($st.ReceivedPacketErrors) received, $($st.OutboundPacketErrors) sent, out of $pkts packets." }
+        $bad = $false
+        if ($mbps -le 100 -and $canGig) { $bad = $true; $lines += "Problem: your card supports 1 Gbit/s or more but connected at $mbps Mbit/s. That usually means a damaged cable or a bad wire pair (gigabit needs all 8 wires, 100 Mbit/s only 4). Try another Cat5e/Cat6 cable and another router port, and reseat both ends. An old router or switch with 100 Mbit/s ports causes this too." }
+        if ($a.FullDuplex -eq $false) { $bad = $true; $lines += 'Problem: half duplex means the link cannot send and receive at the same time. Set Speed & Duplex back to Auto Negotiation (Device Manager > your adapter > Advanced) and check the cable.' }
+        if ($sd -and "$($sd.RegistryValue[0])" -ne '0' -and "$($sd.DisplayValue)" -notmatch 'Auto') { $lines += "Note: Speed & Duplex is forced to '$($sd.DisplayValue)'. Auto Negotiation is safer; a forced speed can cause a duplex mismatch." }
+        if ($pkts -gt 10000 -and $errs / [double]$pkts -gt 0.0001) { $bad = $true; $lines += 'Problem: the error count is high, which points to a bad cable, a bad port, or interference. Swap the cable first.' }
+        if (-not $bad) { $lines += 'This link looks healthy.' }
+        $lines -join "`n"
+    }
+    $out -join "`n`n"
+}
+
+$script:RouterTestBusy = $false
+function Start-RouterTest {
+    if ($script:RouterTestBusy) { throw 'The router test is already running.' }
+    $r = Get-InternetRoute
+    $gw = if ($r) { "$($r.NextHop)" } else { $null }
+    if (-not $gw -or $gw -eq '0.0.0.0' -or $gw -eq '::') { throw 'No router found. Are you connected to a network?' }
+    $script:RouterTestBusy = $true
+    $script:RouterTestWifi = [bool]($r.Adapter -and $r.Adapter.NdisPhysicalMedium -eq 9)
+    Invoke-Worker @'
+param($gw)
+$p = New-Object System.Net.NetworkInformation.Ping; $r = @()
+for ($i = 0; $i -lt 200; $i++) {
+    try { $x = $p.Send($gw, 1000); $r += $(if ($x.Status -eq 'Success') { [int]$x.RoundtripTime } else { -1 }) } catch { $r += -1 }
+    Start-Sleep -Milliseconds 100
+}
+@{ R = $r }
+'@ @($gw) {
+        param($out, $errs)
+        $script:RouterTestBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable])) { Show-Toast 'The router test could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-RouterTestText @($res.R) $script:RouterTestWifi) 'Link to your router' 'OK' 'Information')
+    }
+}
+function Get-RouterTestText([int[]]$R, [bool]$Wifi) {
+    $ok = @($R | Where-Object { $_ -ge 0 } | Sort-Object)
+    $loss = [math]::Round(100 * ($R.Count - $ok.Count) / [math]::Max(1, $R.Count), 1)
+    if (-not $ok.Count) { return 'Your router did not answer at all. Many routers block ping, so this test cannot judge your home network then. The Ping monitor still measures your connection to Fortnite.' }
+    $med = $ok[[int][math]::Floor(($ok.Count - 1) / 2)]; $p95 = $ok[[int][math]::Floor(0.95 * ($ok.Count - 1))]; $max = $ok[-1]
+    $spikes = @($ok | Where-Object { $_ -gt 20 }).Count
+    $how = if ($Wifi) { 'Wi-Fi' } else { 'cable' }
+    $ms = { param($v) if ($v -lt 1) { 'under 1 ms' } else { "$v ms" } }
+    $s = "Over $how, $($R.Count) pings to your router: typical $(& $ms $med), 95% at $(& $ms $p95) or less, worst $(& $ms $max), $spikes over 20 ms, $loss% lost.`n`n"
+    $good = if ($Wifi) { $med -le 5 -and $p95 -le 15 -and $loss -lt 1 } else { $med -le 2 -and $p95 -le 5 -and $loss -lt 1 }
+    if ($good) { $s += 'Your home network is clean. If your Fortnite ping still spikes, the cause is your internet line or the route to the server, not your PC, cable or Wi-Fi. Run the Bufferbloat test to check the line.' }
+    elseif ($Wifi) { $s += 'Your Wi-Fi adds the spikes. Move closer to the router, use its 5 GHz network (see Prefer 5 GHz), run Check your Wi-Fi signal, or best of all use a cable. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.' }
+    else { $s += 'There are spikes even on the cable. Run Check your cable connection, make sure nobody is downloading or streaming heavily (see the Bufferbloat test), and check Find traffic shapers. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.' }
+    $s
+}
+
+function Get-WifiReport {
+    $o = @(netsh wlan show interfaces 2>$null)
+    if (-not @(Get-WifiAdapters).Count) { return 'This PC has no Wi-Fi adapter turned on.' }
+    if ("$o" -match 'denied|location') { return 'Windows did not allow reading the Wi-Fi details. On Windows 11 24H2 and newer this needs Location: Settings > Privacy & security > Location > on, and "Let desktop apps access your location" on. Then run this check again.' }
+    $get = { param($label) foreach ($l in $o) { if ($l -match "^\s*$label\s*:\s*(.+)$") { return $Matches[1].Trim() } }; $null }
+    $state = & $get 'State'; $sig = & $get 'Signal'; $band = & $get 'Band'; $radio = & $get 'Radio type'; $ch = & $get 'Channel'; $ssid = & $get 'SSID'; $rx = & $get 'Receive rate \(Mbps\)'
+    if (-not $sig) {
+        if ($state -and $state -notmatch '^connected') { return 'Wi-Fi is not connected right now.' }
+        return "ZeroDelay could not read the details in your Windows language. This is what Windows reports:`n`n" + (($o | Where-Object { $_.Trim() } | Select-Object -First 18) -join "`n")
+    }
+    $s = "Network: $ssid`nSignal: $sig   Band: $(if ($band) { $band } else { '?' })   Channel: $ch`nWi-Fi type: $radio   Link speed: $rx Mbit/s`n"
+    $warn = @()
+    $pct = if ($sig -match '(\d+)') { [int]$Matches[1] } else { 100 }
+    if ($pct -lt 60) { $warn += "Weak signal ($pct%). Move closer to the router, keep walls and metal out of the way, or use a cable. A weak signal causes retries, which show up as ping spikes." }
+    if ("$band$ch" -match '2\.4' -or ($ch -match '^\d+$' -and [int]$ch -le 14)) { $warn += 'You are on 2.4 GHz, which is crowded and shares the air with Bluetooth headphones and controllers. Use your router''s 5 GHz network, or turn on Wi-Fi: prefer the 5 GHz band.' }
+    if ($radio -match '802\.11[abgn]$') { $warn += "Your connection uses an older Wi-Fi standard ($radio). If your router supports Wi-Fi 5 or 6 (802.11ac/ax), check that it is on and that this PC's driver is current." }
+    if (Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -like '*Wi-Fi Direct Virtual Adapter*' -and $_.Status -eq 'Up' }) { $warn += 'Mobile hotspot or Wi-Fi Direct is on. The Wi-Fi card then shares its airtime between two networks; turn the hotspot off while you play.' }
+    if ($warn.Count) { $s + "`n" + ($warn -join "`n`n") } else { $s + "`nThis looks good. If your ping still spikes, run Test the link to your router." }
+}
+
+function Get-VpnReport {
+    $r = Get-InternetRoute
+    if (-not $r -or -not $r.Adapter) { return 'No internet route found. Are you connected?' }
+    $a = $r.Adapter
+    $vpnRx = 'TAP|Wintun|WireGuard|ZeroTier|Hamachi|Radmin|WARP|Cloudflare|Tailscale|OpenVPN|NordLynx|Proton|Mullvad|Surfshark|ExpressVPN|Windscribe|VPN'
+    $s = "Your internet traffic leaves through: $($a.Name) ($($a.InterfaceDescription)).`n`n"
+    $split = @(Get-NetRoute -DestinationPrefix '0.0.0.0/1' -ErrorAction SilentlyContinue)
+    if ($a.InterfaceDescription -match 'Hyper-V') { $s += 'That is a Hyper-V virtual switch in front of your real adapter. That is fine and adds no real delay.' }
+    elseif ($a.InterfaceDescription -match $vpnRx -or -not $a.HardwareInterface -or $split.Count) {
+        $s += 'Problem: your traffic goes through a VPN or virtual network adapter. Fortnite''s packets then take a detour through the VPN server, which usually adds ping and can make Fortnite pick the wrong region. Disconnect the VPN while you play, or exclude Fortnite in the VPN''s split-tunnelling settings.'
+    } else { $s += 'Good: that is a real network adapter, not a VPN.' }
+    $other = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.ifIndex -ne $a.ifIndex -and $_.InterfaceDescription -match $vpnRx })
+    if ($other.Count) { $s += "`n`nAlso connected, but not carrying your internet traffic: $(($other | ForEach-Object { $_.InterfaceDescription }) -join ', ')." }
+    $s
+}
+
+function Get-NetFilterReport {
+    $shaperRx = 'Killer|cFos|GameFirst|LAN Manager|Rivet|SmartByte|Network Manager|Bandwidth|Traffic|Prioriti'
+    $lines = @(); $shapers = 0
+    foreach ($a in Get-UpAdapters) {
+        $b = @(Get-NetAdapterBinding -Name $a.Name -AllBindings -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -and $_.ComponentID -notlike 'ms_*' })
+        foreach ($x in $b) {
+            $isShaper = "$($x.DisplayName) $($x.ComponentID)" -match $shaperRx
+            if ($isShaper) { $shapers++ }
+            $lines += "$($a.Name): $($x.DisplayName)$(if ($isShaper) { '   <- traffic shaper' })"
+        }
+    }
+    if (-not $lines.Count) { return 'No add-on network filters are attached to your connection. Nothing here can slow your packets down.' }
+    $s = "Add-on drivers attached to your connection:`n" + ($lines -join "`n") + "`n`n"
+    if ($shapers) { $s += 'Traffic shapers re-order and throttle traffic and have been reported to throttle upload or add lag. Turn off the shaping in their app first (Killer Intelligence Center: Prioritization Engine and Advanced Stream Detect off; cFosSpeed / MSI LAN Manager / ASUS GameFirst: traffic shaping off), or uninstall the app. Then compare with the Ping check.' }
+    else { $s += 'None of these is a known traffic shaper. VPNs, antivirus, virtual machines and capture tools (Npcap) also attach here; leave them unless you suspect one.' }
+    $s + "`n`nTo test one item: Control Panel > Network Connections > right-click your adapter > Properties > untick it > OK, then run the Ping check. Tick it again to undo."
+}
+
+function Get-NicDriverReport {
+    $ads = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Disabled' })
+    if (-not $ads.Count) { return 'No network adapter found.' }
+    $out = foreach ($a in $ads) {
+        $d = try { ([datetime]$a.DriverDate).ToString('d MMM yyyy') } catch { "$($a.DriverDate)" }
+        $l = @("$($a.Name): $($a.InterfaceDescription)`nDriver $($a.DriverVersion) from $($a.DriverProvider), dated $d.")
+        if ($a.InterfaceDescription -match 'I22[56]') {
+            $v = try { [version]$a.DriverVersion } catch { $null }
+            $need = if ($v -and $v.Major -ge 2) { [version]'2.1.3.15' } else { [version]'1.1.4.42' }
+            if ($v -and $v -lt $need) { $l += "Update needed: Intel 2.5G (I225-V / I226-V) cards have a known disconnect and spike bug. Intel recommends driver $need or newer, plus the firmware (NVM) update that only your motherboard or laptop maker provides: get both from their support page." }
+            else { $l += 'The driver is new enough for the known Intel 2.5G disconnect bug. If you still get drops, also install the latest BIOS / LAN firmware from your motherboard maker.' }
+        } elseif ($a.InterfaceDescription -match 'Realtek' -and $a.DriverProvider -match 'Microsoft') {
+            $l += 'This is Microsoft''s basic driver for a Realtek card. The Realtek driver from your motherboard maker or realtek.com exposes the power-saving settings ZeroDelay''s network cards switch off.'
+        } elseif ($a.InterfaceDescription -match 'Killer') {
+            $l += 'Killer cards come with traffic-shaping software; see Find traffic shapers on your network adapter.'
+        } else { $l += 'Nothing known to fix. If you get drops, install the newest LAN driver from your motherboard or laptop maker.' }
+        $l -join "`n"
+    }
+    $out -join "`n`n"
+}
+
 # --- Network adapter advanced properties (standard *Keywords)
 function Test-AdvProp([string]$Keyword, $Value) {
     $props = @(Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq $Keyword })
@@ -3334,6 +3505,388 @@ $Tweaks = @(
        Test  = { Test-AdvDisplay 'RoamingPreferredBandType' 'Prefer 5' }
        On    = { Set-AdvDisplay 'wifi5ghz' 'RoamingPreferredBandType' 'Prefer 5' }
        Off   = { Reset-AdvProp 'wifi5ghz' 'RoamingPreferredBandType' 0 } }
+
+    # ======================================================= research round 3 (1.11)
+    # ---------------------------------------------------------------- Input
+    @{ Id = 'prtscsnip'; Cat = 'Input'; Icon = [char]0xE722; Rec = $false; Badge = 'signout'
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22000 }
+       Title = 'Stop Print Screen opening the Snipping Tool'
+       Desc  = 'On Windows 11 a stray Print Screen press opens the screen-capture overlay, which takes focus and can drop fullscreen Fortnite to the desktop mid-fight.'
+       Warn  = 'You take screenshots with the Print Screen key. Win+Shift+S still opens the Snipping Tool.'
+       Reg   = @( @{ P = 'HKCU:\Control Panel\Keyboard'; N = 'PrintScreenKeyForSnippingEnabled'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'accshortcuts'; Cat = 'Input'; Icon = [char]0xE8C9; Rec = $true; Badge = 'signout'
+       Title = 'Block the Mouse Keys and High Contrast shortcuts'
+       Desc  = 'Left Alt + Left Shift + Num Lock or Print Screen pops an accessibility prompt mid-game, and High Contrast switches the whole Windows theme. Completes the Sticky Keys card.'
+       Warn  = 'You turn Mouse Keys or High Contrast on with these shortcuts. Both stay available in Settings > Accessibility.'
+       # Only the "shortcut active" bit (0x4) is cleared; every other bit of the flags stays as it was.
+       Test  = {
+           $a = Get-RegValue 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags'; $b = Get-RegValue 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags'
+           if ($null -eq $a -or $null -eq $b) { return $null }
+           -not ([int]$a -band 4) -and -not ([int]$b -band 4)
+       }
+       On    = {
+           foreach ($k in 'MouseKeys', 'HighContrast') {
+               $p = "HKCU:\Control Panel\Accessibility\$k"; $v = Get-RegValue $p 'Flags'
+               if ($null -ne $v) { Set-RegTracked $t.Id $p 'Flags' ([string]([int]$v -band -bnot 4)) 'String' }
+           }
+       }
+       Off   = {
+           if (Restore-RegTweak $t.Id) { return }
+           foreach ($k in 'MouseKeys', 'HighContrast') {
+               $p = "HKCU:\Control Panel\Accessibility\$k"; $v = Get-RegValue $p 'Flags'
+               if ($null -ne $v) { Set-RegValue $p 'Flags' ([string]([int]$v -bor 4)) 'String' }
+           }
+       } }
+
+    @{ Id = 'winkey'; Cat = 'Input'; Icon = [char]0xE765; Rec = $false; Badge = 'restart'
+       Title = 'Turn off the Windows keys'
+       Desc  = 'Hitting a Windows key next to Ctrl or Alt opens Start and drops you out of fullscreen Fortnite. This switches both Windows keys off in the keyboard driver.'
+       Warn  = 'You use Win+ shortcuts (Win+R, Win+L, Win+Shift+S, Win+V), your keyboard already has a Windows-key lock, or you remap keys with SharpKeys or PowerToys. ZeroDelay never overwrites an existing key remap.'
+       # Scancode Map (Microsoft "scan code mapper"): left and right Windows keys mapped to nothing.
+       Test  = {
+           $cur = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Keyboard Layout' 'Scancode Map'
+           $map = [byte[]](0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0x5B, 0xE0, 0, 0, 0x5C, 0xE0, 0, 0, 0, 0)
+           $null -ne $cur -and [BitConverter]::ToString([byte[]]$cur) -eq [BitConverter]::ToString($map)
+       }
+       On    = {
+           $p = 'HKLM:\SYSTEM\CurrentControlSet\Control\Keyboard Layout'
+           $map = [byte[]](0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0x5B, 0xE0, 0, 0, 0x5C, 0xE0, 0, 0, 0, 0)
+           $cur = Get-RegValue $p 'Scancode Map'
+           if ($null -ne $cur -and [BitConverter]::ToString([byte[]]$cur) -ne [BitConverter]::ToString($map)) { throw 'This PC already has its own key remapping. ZeroDelay leaves it alone.' }
+           Set-RegTracked $t.Id $p 'Scancode Map' $map 'Binary'
+       }
+       Off   = {
+           if (Restore-RegTweak $t.Id) { return }
+           $p = 'HKLM:\SYSTEM\CurrentControlSet\Control\Keyboard Layout'
+           $map = [byte[]](0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0x5B, 0xE0, 0, 0, 0x5C, 0xE0, 0, 0, 0, 0)
+           $cur = Get-RegValue $p 'Scancode Map'
+           if ($null -ne $cur -and [BitConverter]::ToString([byte[]]$cur) -eq [BitConverter]::ToString($map)) { Remove-RegValue $p 'Scancode Map' }
+       } }
+
+    @{ Id = 'touchpadmouse'; Cat = 'Input'; Icon = [char]0xEFA5; Rec = $false; Badge = 'signout'
+       Requires = { (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad') -and [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) }
+       Title = 'Laptops: touchpad off while a mouse is plugged in'
+       Desc  = 'A palm brushing the touchpad while you hold WASD makes stray clicks and cursor jumps. This turns the touchpad off whenever a mouse is connected.'
+       Warn  = 'You use the touchpad and a mouse at the same time.'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad'; N = 'LeaveOnWithMouse'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'touchscreen'; Cat = 'Input'; Icon = [char]0xE815; Rec = $false
+       Requires = { [bool](Get-TouchScreens) }
+       Title = 'Touch laptops: turn off the touchscreen'
+       Desc  = 'Touchscreen laptops can register ghost or palm touches that click outside the game and steal focus. This switches the touchscreen off in Device Manager.'
+       Warn  = 'You use your 2-in-1 as a tablet or with touch. Switch this off again to get touch back.'
+       Test  = { $d = @(Get-TouchScreens); if (-not $d.Count) { return $null }; -not ($d | Where-Object { $_.Status -eq 'OK' }) }
+       On    = {
+           $d = @(Get-TouchScreens | Where-Object { $_.Status -eq 'OK' })
+           $script:Backup.Custom[$t.Id] = @(@($script:Backup.Custom[$t.Id] | Where-Object { $_ }) + @($d | ForEach-Object { $_.InstanceId }) | Select-Object -Unique)
+           foreach ($x in $d) { Disable-PnpDevice -InstanceId $x.InstanceId -Confirm:$false -ErrorAction Stop }
+       }
+       Off   = {
+           $ids = @($script:Backup.Custom[$t.Id] | Where-Object { $_ })
+           if (-not $ids.Count) { $ids = @(Get-TouchScreens | ForEach-Object { $_.InstanceId }) }
+           foreach ($i in $ids) { Enable-PnpDevice -InstanceId $i -Confirm:$false -ErrorAction SilentlyContinue }
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    @{ Id = 'usb3dongle'; Cat = 'Input'; Icon = [char]0xE88E; Action = 'Show how'
+       Title = 'Wireless mouse or headset: move the receiver (advice)'
+       Desc  = 'USB 3 ports, cables and drives give off radio noise in the 2.4 GHz band, which makes a wireless receiver lag or skip (Intel measured it). Plug the receiver into a USB 2 port or a short extension cable near the mouse.'
+       Warn  = ''
+       Run   = {
+           $rx = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'Receiver|Lightspeed|HyperSpeed|Dongle|Unifying|Wireless' } | ForEach-Object { $_.FriendlyName } | Select-Object -Unique -First 4)
+           $found = if ($rx.Count) { "Found on this PC: $($rx -join ', ').`n`n" } else { "No wireless receiver found by name on this PC; if your mouse and headset are wired, you can skip this.`n`n" }
+           [void](Show-ZdDialog ("$($found)1. Plug the receiver into a USB 2 port (usually black, not blue or red), or into the extension cable or dock that came with the mouse.`n`n2. Put the receiver within about 30 cm of the mouse, in line of sight.`n`n3. Keep it away from USB 3 drives, USB 3 hubs and their cables, and from the Wi-Fi router.`n`n4. Do not plug a USB 3 drive into the port right next to the receiver.") ('Wireless receiver placement') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'monitorgamemode'; Cat = 'Graphics'; Icon = [char]0xE7F4; Action = 'Show how'; Lat = $true
+       Title = 'TV or monitor: picture Game Mode on (advice)'
+       Desc  = 'TVs and some monitors add tens of milliseconds of picture processing unless their own Game Mode (ALLM) is on. RTINGS measures 20 ms or more between the modes on many TVs.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("On the TV or monitor itself (its remote or menu buttons):`n`n1. Picture mode: Game (or turn on Auto Low Latency Mode / ALLM, sometimes called Game Optimizer, Game Booster or Instant Game Response).`n`n2. Turn off motion smoothing (TruMotion, Motion Plus, MotionFlow), noise reduction and dynamic contrast.`n`n3. Use the HDMI port marked 4K@120 / 144 Hz or the DisplayPort if there is one.`n`nMost gaming monitors have no picture processing to switch off; then this changes nothing and you can skip it. Turn Overdrive / Response time to the middle setting, not the fastest, to avoid ghost trails.") ('Display game mode') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'drr'; Cat = 'Graphics'; Icon = [char]0xE7F4; Action = 'Open setting'; Lat = $true
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22000 -and [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) }
+       Title = 'Laptops: turn off Dynamic Refresh Rate'
+       Desc  = 'On 120 Hz+ laptop screens, Windows can drop the refresh rate toward 60 Hz to save battery. Microsoft says this can cap the refresh rate in games.'
+       Warn  = ''
+       Run   = { Start-Process 'ms-settings:display-advanced'; 'Switch off "Dynamic refresh rate", or pick a fixed rate instead of "Dynamic".' } }
+
+    # ------------------------------------------------------------- Graphics
+    @{ Id = 'nvrefresh'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Title = 'NVIDIA: highest refresh rate in fullscreen'
+       Desc  = 'Tells the driver to use your monitor''s top refresh rate when Fortnite runs in true fullscreen, so a stretched or custom resolution cannot silently fall back to 60 Hz.'
+       Warn  = 'You deliberately play below your monitor''s top refresh rate (for example to strobe at 120 Hz). Borderless is not affected.'
+       Nv    = @{ Profile = 'Fortnite'; Id = 0x0064B541; V = 1 } }
+
+    @{ Id = 'nvfilters'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false
+       Title = 'NVIDIA: game filters and photo mode off'
+       Desc  = 'NVIDIA game filters post-process every frame and cost up to about 10% FPS in tests. This blocks them and photo mode for Fortnite only.'
+       Warn  = 'You use NVIDIA filters such as sharpening or digital vibrance in Fortnite on purpose.'
+       Nv    = @{ Profile = 'Fortnite'; Id = 0x1075D972; V = 0 } }
+
+    @{ Id = 'd3dcache-keep'; Cat = 'Graphics'; Icon = [char]0xE74E; Rec = $false
+       Requires = { Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\D3D Shader Cache' }
+       Title = 'Stop Windows auto-deleting the shader cache'
+       Desc  = 'Windows'' automatic cleanup may empty the DirectX shader cache, so shaders compile again and the next matches stutter. Matters most on AMD and Intel graphics.'
+       Warn  = 'Your system drive is nearly full: the cache can grow to a few GB. The Clear shader cache button still works.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\D3D Shader Cache'; N = 'Autorun'; V = 0; D = 1; M = 1 } ) }
+
+    @{ Id = 'amd-antilag'; Cat = 'Graphics'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_1002' -and $_ -notmatch 'Graphics$' }) }
+       Title = 'AMD: Radeon Anti-Lag on, Chill off (guided)'
+       Desc  = 'Fortnite has no Reflex on AMD cards, so Radeon Anti-Lag is what stops frames queuing up behind the GPU. Radeon Chill must be off: it lowers your FPS when you move less.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("AMD Software (right-click the desktop > AMD Software: Adrenalin Edition):`n`n1. Gaming > Games > Fortnite (add it with 'Add a game' if it is missing).`n`n2. Radeon Anti-Lag: On.`n`n3. Radeon Chill: Off. Radeon Boost: Off.`n`n4. Do not turn on HYPR-RX for Fortnite: it also switches on Boost and Fluid Motion Frames.`n`nAMD does not offer these settings to other programs, so ZeroDelay cannot set them for you. 'Anti-Lag 2' needs support built into the game, which Fortnite does not have, so plain Anti-Lag is the right one.") ('AMD Anti-Lag for Fortnite') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'amd-afmf'; Cat = 'Graphics'; Icon = [char]0xE740; Action = 'Show how'; Lat = $true
+       Requires = { [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_1002' -and $_ -notmatch 'Graphics$' }) }
+       Title = 'AMD: Fluid Motion Frames off for Fortnite (guided)'
+       Desc  = 'AMD''s driver frame generation inserts made-up frames and adds input delay; AMD itself says it is not ideal for fast competitive games. Keep it off for Fortnite.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("AMD Software > Gaming > Games > Fortnite:`n`nAMD Fluid Motion Frames: Off.`n`nThe per-game setting wins over the global one, so other games can keep it. HYPR-RX turns it on, so do not use HYPR-RX for Fortnite.`n`nCheck in a match: the AMD overlay (Alt+R) shows whether Fluid Motion Frames is active, and Alt+Shift+G toggles it.") ('AMD Fluid Motion Frames') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'intel-lowlat'; Cat = 'Graphics'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_8086' -and $_ -match 'Arc' }) }
+       Title = 'Intel Arc: Low Latency Mode on (guided)'
+       Desc  = 'Intel''s driver Low Latency Mode stops the CPU queuing frames ahead of the GPU in DirectX 11 games, which includes Fortnite''s Performance mode.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Intel Graphics Software > Graphics > Frame Delivery (per game for FortniteClient-Win64-Shipping.exe, or global):`n`nLow Latency Mode: On.`n`nIf you see crashes with 'On + Boost', use plain 'On'.`n`nThe driver setting only applies to DirectX 11, which Fortnite uses in Performance mode. In DirectX 12 mode it does nothing.") ('Intel Low Latency Mode') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'nvapp-autoopt'; Cat = 'Graphics'; Icon = [char]0xE72E; Action = 'Show how'
+       Requires = { Test-Path "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App" }
+       Title = 'NVIDIA App: stop it auto-optimizing Fortnite (guided)'
+       Desc  = 'With automatic optimization on, the NVIDIA App can rewrite Fortnite''s settings file with its own picks and undo your low-latency choices.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("NVIDIA App > Settings > Features:`n`n'Automatically optimize newly added games and apps': Off.`n`nThen open Graphics > Fortnite. If the tile says 'Optimized', press Restore, and do not press Optimize again.`n`nZeroDelay's 'Stop auto-detect overwriting settings' card stops Fortnite's own benchmark from doing the same thing.") ('NVIDIA App optimization') ('OK') ('Information')); 'Shown.' } }
+
+    # ------------------------------------------------------------- Fortnite
+    @{ Id = 'fn-dlss'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' -and $_ -match 'RTX' }) -and -not ((Test-Path $IniPath) -and (Get-IniValue (Get-Content $IniPath) 'PreferredFeatureLevel') -eq 'es31') }
+       Title = 'Use DLSS upscaling (RTX, DirectX 12)'
+       Desc  = 'In DirectX 12, DLSS renders fewer pixels and upscales them cleanly, which gives more FPS and lower latency than native resolution or Epic''s TSR when your graphics card is the limit.'
+       Warn  = 'You play in Performance mode (no DLSS there), or your GPU usage is well under 90% (CPU-limited, so no gain). Your DLSS quality choice is kept. Fortnite must be closed.'
+       Ini   = @{ FortAntiAliasingMethod = @('DLSS', $null) } }
+
+    # ------------------------------------------------------ System / Repair
+    @{ Id = 'pagefile-auto'; Cat = 'System'; Icon = [char]0xE964; Rec = $false; Badge = 'restart'
+       Title = 'Let Windows manage the page file'
+       Desc  = 'A turned-off or tiny page file makes Unreal Engine games stutter when memory runs short, and can crash them with "Out of memory". This puts it back on automatic.'
+       Warn  = 'You set a fixed page file on purpose and know your peak memory use. Your old setting is saved and comes back if you switch this off.'
+       Test  = { $v = @(Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'PagingFiles'); [bool]($v | Where-Object { "$_" -like '?:\*' }) }
+       On    = { Set-RegTracked $t.Id 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'PagingFiles' ([string[]]@('?:\pagefile.sys')) 'MultiString' }
+       Off   = { [void](Restore-RegTweak $t.Id) } }
+
+    @{ Id = 'trim-on'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true
+       Title = 'Make sure SSD TRIM is on'
+       Desc  = 'Repairs a common bad tweak: with TRIM or the weekly Optimize Drives task off, an SSD slows down on writes over time, which shows up as hitches while Fortnite streams or patches.'
+       Warn  = 'Your storage vendor told you to keep delete notifications off (RAID or SAN setups).'
+       Test  = {
+           $o = "$(fsutil behavior query DisableDeleteNotify 2>$null)"
+           if ($o -notmatch 'NTFS DisableDeleteNotify\s*=\s*(\d)') { return $null }
+           $Matches[1] -eq '0' -and (Get-TaskStates)['\Microsoft\Windows\Defrag\ScheduledDefrag'] -ne 'Disabled'
+       }
+       On    = {
+           $o = "$(fsutil behavior query DisableDeleteNotify 2>$null)"
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) {
+               $script:Backup.Custom[$t.Id] = @{ Ntfs = $(if ($o -match 'NTFS DisableDeleteNotify\s*=\s*(\d)') { $Matches[1] } else { '0' }); Task = (Get-TaskStates)['\Microsoft\Windows\Defrag\ScheduledDefrag'] }
+           }
+           fsutil behavior set DisableDeleteNotify NTFS 0 | Out-Null
+           if ($LASTEXITCODE -ne 0) { throw 'Windows refused the TRIM setting.' }
+           Enable-ScheduledTask -TaskPath '\Microsoft\Windows\Defrag\' -TaskName 'ScheduledDefrag' -ErrorAction SilentlyContinue | Out-Null
+       }
+       Off   = {
+           $b = $script:Backup.Custom[$t.Id]
+           if ($b -and "$($b.Ntfs)" -eq '1') { fsutil behavior set DisableDeleteNotify NTFS 1 | Out-Null }
+           if ($b -and "$($b.Task)" -eq 'Disabled') { Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Defrag\' -TaskName 'ScheduledDefrag' -ErrorAction SilentlyContinue | Out-Null }
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    @{ Id = 'searchbackoff'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true
+       Title = 'Make the search indexer back off while you play'
+       Desc  = 'Removes a setting some "faster indexing" guides change: with backoff off, Windows Search keeps indexing at full speed even while your game is running.'
+       Warn  = 'Your IT department set this on purpose. On a home PC there is no downside.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; N = 'DisableBackoff'; V = 0; D = $null; M = 0 } )
+       After = { if ((Get-Service WSearch -ErrorAction SilentlyContinue).Status -eq 'Running') { Restart-Service WSearch -Force -ErrorAction SilentlyContinue } } }
+
+    # ------------------------------------------------------------ Background
+    @{ Id = 'defender-lowprio'; Cat = 'Background'; Icon = [char]0xE83D; Rec = $true
+       Title = 'Run Defender scans at low priority'
+       Desc  = 'Scheduled Defender scans run at low CPU priority, so a scan that starts while you play gives way to the game. Works together with the scan CPU limit.'
+       Warn  = 'Your PC is managed by work or school IT. Otherwise there is no real downside: protection is unchanged, scans just take longer.'
+       Test  = { [bool](Get-MpPreference -ErrorAction Stop).EnableLowCpuPriority }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = [bool](Get-MpPreference -ErrorAction Stop).EnableLowCpuPriority }
+           Set-MpPreference -EnableLowCpuPriority $true -ErrorAction Stop
+       }
+       Off   = { Set-MpPreference -EnableLowCpuPriority ([bool]$script:Backup.Custom[$t.Id]); $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'startup-teams'; Cat = 'Background'; Icon = [char]0xE716; Rec = $false; Badge = 'signout'
+       Requires = { Test-Path 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\MSTeams_8wekyb3d8bbwe\TeamsTfwStartupTask' }
+       Title = 'Stop Teams starting with Windows'
+       Desc  = 'New Teams starts at sign-in and sits in the background with hundreds of MB of RAM and regular CPU use. This switches the autostart off without uninstalling it, the same way Settings does.'
+       Warn  = 'You need Teams calls or chat notifications the moment you sign in.'
+       Reg   = @( @{ P = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\MSTeams_8wekyb3d8bbwe\TeamsTfwStartupTask'; N = 'State'; V = 1; D = 2; M = 2 } ) }
+
+    @{ Id = 'startup-copilot'; Cat = 'Background'; Icon = [char]0xE716; Rec = $false; Badge = 'signout'
+       Requires = { [bool](Get-CopilotStartup) }
+       Title = 'Stop the Copilot app starting with Windows'
+       Desc  = 'The Copilot app can launch at sign-in and keep a WebView2 process alive in the background. This switches its autostart off without removing it.'
+       Warn  = 'You use Copilot right after signing in or with the Copilot key.'
+       Test  = { $s = @(Get-CopilotStartup); if (-not $s.Count) { return $null }; -not ($s | Where-Object { $_.GetValue('State') -in 2, 4 }) }
+       On    = { foreach ($k in @(Get-CopilotStartup)) { Set-RegTracked $t.Id "$($script:CopilotAppKey)\$($k.PSChildName)" 'State' 1 } }
+       Off   = { if (-not (Restore-RegTweak $t.Id)) { foreach ($k in @(Get-CopilotStartup)) { Set-RegValue "$($script:CopilotAppKey)\$($k.PSChildName)" 'State' 2 'DWord' } } } }
+
+    @{ Id = 'phonelink'; Cat = 'Background'; Icon = [char]0xE8EA; Rec = $false; Badge = 'restart'
+       Title = 'Turn off Phone Link'
+       Desc  = 'Stops this PC linking to your phone, so Phone Link and the cross-device host stop syncing messages, photos and notifications in the background.'
+       Warn  = 'You use Phone Link for texts, calls or photos on the PC, or the phone panel in Start.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; N = 'EnableMmx'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'resume-off'; Cat = 'Background'; Icon = [char]0xE8EA; Rec = $false; Badge = 'signout'
+       Requires = { Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' }
+       Title = 'Turn off Resume from your phone'
+       Desc  = 'Windows 11''s Resume keeps a process running that waits for apps on your phone to continue on the PC. This turns it off.'
+       Warn  = 'You pick up OneDrive files or browser tabs from your phone on this PC.'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration'; N = 'IsResumeAllowed'; V = 0; D = 1; M = 1 } ) }
+
+    (New-SvcTweak 'svc-aifabric' 'WSAIFabricSvc' 2 'Turn off the Windows AI Fabric service' 'On Windows 11 24H2 and newer this service hosts on-device AI (WorkloadsSessionHost.exe), which MSI and users report using several GB of RAM and constant CPU even with Recall off.' 'You use Recall, Click to Do, Live Captions translation or Windows Studio Effects. Turning it off may also clear Recall''s saved snapshots.' $false 'advanced')
+
+    # --------------------------------------------------------- Storage / Power
+    @{ Id = 'storagesense'; Cat = 'Storage'; Icon = [char]0xEDA2; Rec = $false
+       Title = 'Turn off Storage Sense'
+       Desc  = 'Stops Windows deleting temp files, emptying the Recycle Bin and making OneDrive files online-only on its own schedule or when the disk runs low, which causes disk bursts you did not start.'
+       Warn  = 'Your drive is nearly full and you rely on Windows to clean up. ZeroDelay''s Clean temp files does the same job when you choose.'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense'; N = 'AllowStorageSenseGlobal'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'energysaver-auto'; Cat = 'Power'; Icon = [char]0xEBA6; Rec = $false
+       Requires = { [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) }
+       Title = 'Laptops: Energy Saver never switches on by itself'
+       Desc  = 'On battery, Windows turns on Energy Saver at a set percentage, which locks the power mode and lowers performance in the middle of a match.'
+       Warn  = 'You play on battery and want the extra minutes more than steady FPS.'
+       Test  = { $v = Get-EsThreshold; if ($null -eq $v) { return $null }; $v -eq 0 }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = (Get-EsThreshold) } }
+           powercfg /setdcvalueindex scheme_current SUB_ENERGYSAVER ESBATTTHRESHOLD 0
+           if ($LASTEXITCODE -ne 0) { throw 'Windows refused the power setting.' }
+           powercfg /setactive scheme_current
+       }
+       Off   = {
+           $b = $script:Backup.Custom[$t.Id]; $v = if ($b -and $null -ne $b.Value) { [int]$b.Value } else { 20 }
+           powercfg /setdcvalueindex scheme_current SUB_ENERGYSAVER ESBATTTHRESHOLD $v; powercfg /setactive scheme_current
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    # ---------------------------------------------------------------- Network
+    @{ Id = 'lan-wifioff'; Cat = 'Network'; Icon = [char]0xE701; Rec = $false; Lat = $true
+       Requires = { [bool](Get-WifiAdapters) -and [bool](Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.NdisPhysicalMedium -eq 14 }) }
+       Title = 'Turn off Wi-Fi while you play on a cable'
+       Desc  = 'If you play on a cable, the Wi-Fi card still scans for networks in the background and can take your traffic if the cable link blips. This switches the Wi-Fi card off.'
+       Warn  = 'You use Wi-Fi and the cable at the same time on purpose, or you unplug the cable often: switch this off again to get Wi-Fi back.'
+       Test  = { $w = @(Get-WifiAdapters); if (-not $w.Count) { return $null }; -not ($w | Where-Object { $_.Status -ne 'Disabled' }) }
+       On    = {
+           if (-not (Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.NdisPhysicalMedium -eq 14 })) { throw 'No network cable is connected. Plug it in first, or you would be left without internet.' }
+           $w = @(Get-WifiAdapters | Where-Object { $_.Status -ne 'Disabled' })
+           $script:Backup.Custom[$t.Id] = @(@($script:Backup.Custom[$t.Id] | Where-Object { $_ }) + @($w | ForEach-Object { $_.Name }) | Select-Object -Unique)
+           foreach ($a in $w) { Disable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop }
+       }
+       Off   = {
+           $names = @($script:Backup.Custom[$t.Id] | Where-Object { $_ })
+           if (-not $names.Count) { $names = @(Get-WifiAdapters | ForEach-Object { $_.Name }) }
+           foreach ($n in $names) { Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue }
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    @{ Id = 'uploadcap'; Cat = 'Network'; Icon = [char]0xE898; Rec = $false; Lat = $true
+       Title = 'Cap upload of cloud sync and torrent apps'
+       Desc  = 'Limits Dropbox, Google Drive, MEGA, iCloud and torrent clients to about 4 Mbit/s upload, so a sync cannot fill your upload and cause bufferbloat lag. Fortnite''s own traffic is not touched.'
+       Warn  = 'You need fast uploads from these apps, or the Bufferbloat test already shows a clean upload.'
+       Test  = { [bool](Get-NetQosPolicy -ErrorAction Stop | Where-Object { $_.Name -like 'ZeroDelay cap *' }) }
+       On    = {
+           foreach ($exe in 'Dropbox.exe', 'GoogleDriveFS.exe', 'MEGAsync.exe', 'iCloudDrive.exe', 'qbittorrent.exe', 'BitTorrent.exe', 'uTorrent.exe') {
+               if (-not (Get-NetQosPolicy -Name "ZeroDelay cap $exe" -ErrorAction SilentlyContinue)) {
+                   New-NetQosPolicy -Name "ZeroDelay cap $exe" -AppPathNameMatchCondition $exe -ThrottleRateActionBitsPerSecond 4000000 -NetworkProfile All -ErrorAction Stop | Out-Null
+               }
+           }
+       }
+       Off   = { Get-NetQosPolicy -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ZeroDelay cap *' } | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue } }
+
+    @{ Id = 'bitscap'; Cat = 'Network'; Icon = [char]0xE896; Rec = $false; Lat = $true
+       Title = 'Cap background BITS downloads'
+       Desc  = 'Limits Windows'' Background Intelligent Transfer Service, used by some updaters and apps, to 10 Mbit/s so its downloads cannot fill a slower connection while you play.'
+       Warn  = 'Your connection is faster than about 100 Mbit/s and the Bufferbloat test is clean: then this only slows background updates.'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'EnableBITSMaxBandwidth'; V = 1; D = $null }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'MaxTransferRateOnSchedule'; V = 10000; D = $null }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'MaxTransferRateOffSchedule'; V = 10000; D = $null }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'MaxBandwidthValidFrom'; V = 0; D = $null }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'MaxBandwidthValidTo'; V = 23; D = $null }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'UseSystemMaximum'; V = 0; D = $null }
+       )
+       After = { Restart-Service BITS -Force -ErrorAction SilentlyContinue } }
+
+    @{ Id = 'idlerestrict'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false
+       Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq '*IdleRestriction' }) }
+       Title = 'Newer network drivers: no power-down while you are at the PC'
+       Desc  = 'Intel I225/I226 2.x and other new-style drivers have their own idle power-down. This lets the card power down only when you are away, never while you use the PC.'
+       Warn  = 'Never really. Applying briefly reconnects the adapter.'
+       Test  = { Test-AdvProp '*IdleRestriction' 1 }
+       On    = { Set-AdvProp 'idlerestrict' '*IdleRestriction' 1 }
+       Off   = { Reset-AdvProp 'idlerestrict' '*IdleRestriction' 0 } }
+
+    @{ Id = 'usbnic-ss'; Cat = 'Network'; Icon = [char]0xE88E; Rec = $false
+       Requires = { [bool](Get-UsbNicSuspend) }
+       Title = 'USB network adapters: no sleep when idle'
+       Desc  = 'Stops a USB Ethernet or USB Wi-Fi adapter putting itself to sleep after 5 idle seconds, which can cause a spike or short drop when traffic starts again, for example in the lobby.'
+       Warn  = 'You are on a laptop on battery: the adapter uses a little more power. Applying briefly reconnects the adapter.'
+       Test  = { $p = @(Get-UsbNicSuspend); if (-not $p.Count) { return $null }; -not ($p | Where-Object { "$($_.RegistryValue[0])" -ne '0' }) }
+       On    = {
+           $p = @(Get-UsbNicSuspend)
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @($p | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = "$($_.RegistryValue[0])" } }) }
+           foreach ($x in $p) { Set-NetAdapterAdvancedProperty -Name $x.Name -RegistryKeyword '*SelectiveSuspend' -RegistryValue 0 -ErrorAction Stop }
+       }
+       Off   = {
+           $saved = @($script:Backup.Custom[$t.Id] | Where-Object { $_.Name })
+           if ($saved.Count) { foreach ($o in $saved) { Set-NetAdapterAdvancedProperty -Name $o.Name -RegistryKeyword '*SelectiveSuspend' -RegistryValue $o.Value -ErrorAction SilentlyContinue } }
+           else { foreach ($x in @(Get-UsbNicSuspend)) { Set-NetAdapterAdvancedProperty -Name $x.Name -RegistryKeyword '*SelectiveSuspend' -RegistryValue 1 -ErrorAction SilentlyContinue } }
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    @{ Id = 'linkcheck'; Cat = 'Network'; Icon = [char]0xE839; Action = 'Check'; Lat = $true
+       Title = 'Check your cable connection'
+       Desc  = 'Checks that your Ethernet link runs at full speed with no errors. A damaged cable often falls back to 100 Mbit/s and loses packets without telling you.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-LinkReport) 'Cable connection' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'lanjitter'; Cat = 'Network'; Icon = [char]0xE909; Action = 'Run test'; Lat = $true
+       Title = 'Test the link to your router'
+       Desc  = 'Pings your own router for about 20 seconds to show whether lag spikes start inside your home (Wi-Fi, cable, PC) or out on the internet.'
+       Warn  = ''
+       Run   = { Start-RouterTest; 'Testing the link to your router for about 20 seconds...' } }
+
+    @{ Id = 'wificheck'; Cat = 'Network'; Icon = [char]0xE701; Action = 'Check'; Lat = $true
+       Requires = { [bool](Get-WifiAdapters) }
+       Title = 'Check your Wi-Fi signal and band'
+       Desc  = 'Shows signal strength, band and Wi-Fi standard, and warns about what hurts ping: a weak signal, 2.4 GHz with Bluetooth audio, or this PC''s hotspot being on.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-WifiReport) 'Wi-Fi check' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'vpnroute'; Cat = 'Network'; Icon = [char]0xE72E; Action = 'Check'; Lat = $true
+       Title = 'Check Fortnite is not going through a VPN'
+       Desc  = 'Checks which adapter your internet traffic actually leaves through, and warns if a VPN or virtual adapter (WARP, Hamachi, Radmin, ZeroTier, Tailscale, WireGuard, OpenVPN) is carrying it and adding ping.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-VpnReport) 'VPN check' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'netfilters'; Cat = 'Network'; Icon = [char]0xE9F9; Action = 'Check'; Lat = $true
+       Title = 'Find traffic shapers on your network adapter'
+       Desc  = 'Lists add-on filter drivers attached to your connection, such as Killer Prioritization Engine, cFosSpeed, MSI LAN Manager or ASUS GameFirst, and how to switch them off to compare your ping.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-NetFilterReport) 'Network filters' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'nicdriver'; Cat = 'Network'; Icon = [char]0xE896; Action = 'Check'
+       Title = 'Check your network driver'
+       Desc  = 'Shows your network card''s driver, and warns Intel I225-V / I226-V owners about the known disconnect bug that needs a newer driver and firmware from the board maker.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-NicDriverReport) 'Network driver' 'OK' 'Information'); 'Checked.' } }
 
     # ======================================================= Creator tab (1.7)
     @{ Id = 'cr-autosave'; Cat = 'Creator'; Icon = [char]0xE74E; Rec = $true; Requires = { [bool](Get-PrPrefsFile) }
@@ -7533,6 +8086,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.11.0' = @(
+        @{ T = '38 new optimizations'; D = 'A new research round added cards across every tab. Nothing is switched on for you: pick what you want, as always.' }
+        @{ T = 'Input'; D = 'Stop Print Screen opening the Snipping Tool, block the Mouse Keys and High Contrast shortcuts, turn off the Windows keys, and touchpad / touchscreen switches for laptops.' }
+        @{ T = 'Graphics'; D = 'NVIDIA: highest refresh rate in fullscreen and game filters off. Fortnite: DLSS upscaling on RTX. Guided steps for AMD Anti-Lag, AMD Fluid Motion Frames, Intel Arc Low Latency Mode and the NVIDIA App.' }
+        @{ T = 'Network'; D = 'Checks for your cable, Wi-Fi signal, VPN routing, traffic shapers and network driver, a router link test, plus Wi-Fi off while on a cable and upload caps for cloud sync and BITS.' }
+        @{ T = 'Background and system'; D = 'Defender scans at low priority, Teams and Copilot autostart off, Phone Link, Resume, Storage Sense and the AI Fabric service off, page file back on automatic, and repairs for SSD TRIM and indexer backoff.' }
+    )
     '1.10.3' = @(
         @{ T = 'Pause all tweaks'; D = 'Settings > All tweaks on: switch it off to turn off every tweak ZeroDelay switched on at once, for example to compare or to find a problem. ZeroDelay remembers them and puts exactly those back when you switch it on again.' }
     )

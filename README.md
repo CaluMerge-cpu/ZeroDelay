@@ -15,8 +15,12 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
   advice for undervolting and cooling an older card.
 
-- **160+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
+- **190+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
+- **Network checks**: your cable's link speed and errors, Wi-Fi signal and band, a 20-second test of the link to your router
+  (home network or internet line?), VPN routing, traffic shapers such as Killer or cFosSpeed, and the Intel 2.5G driver bug.
+- **Guided cards** for settings no program can change safely: AMD Anti-Lag and Fluid Motion Frames, Intel Arc Low Latency
+  Mode, NVIDIA App auto-optimize, TV/monitor game mode and wireless receiver placement.
 - **Game Mode**: a booster-style dashboard with a Start Game button (turns Game Mode on and launches Fortnite), a
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses

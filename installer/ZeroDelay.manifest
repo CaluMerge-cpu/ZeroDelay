@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.10.3.0" name="ZeroDelay"/>
+  <assemblyIdentity version="1.11.0.0" name="ZeroDelay"/>
   <!-- ZeroDelay changes system settings, so Windows asks for administrator rights once when it starts. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
