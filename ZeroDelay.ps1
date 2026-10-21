@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.10.1'
+$AppVersion = '1.10.2'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -6638,7 +6638,10 @@ for ($i = 0; $i -lt $n; $i++) { try { $x = $p.Send($h, 1000); if ($x.Status -eq 
 $s = @($ms | Sort-Object)
 [pscustomobject]@{ Median = $(if ($s.Count) { $s[[int][Math]::Floor($s.Count / 2)] } else { $null }); Lost = $lost; Count = $s.Count }
 '@
-function Start-PingCheck {
+# Each tweak is measured between two "everything on" measurements taken right before and right after it, so a ping
+# that drifts during the check (it often does over a minute) cancels out. A tweak only counts as raising your ping when
+# the gap is clearly bigger than how much the two "on" measurements next to it differ.
+function Start-PingCheck([switch]$Fix) {
     $pg = $script:PingUi
     if ($script:PcRun) { return }
     if (Test-FortniteRunning) { Show-Toast 'Close Fortnite first: the check briefly drops your connection.' '#FF9F0A'; return }
@@ -6647,11 +6650,13 @@ function Start-PingCheck {
     if (-not $h) { $h = ($PingHosts | Where-Object { $_.Name -eq (Get-PlayRegionName) } | Select-Object -First 1).Host }
     $cands = @($PingCheckIds | ForEach-Object { Find-Tweak $_ } | Where-Object { $_ -and $_.Toggle -and -not $_.Hidden -and $_.State -eq $true })
     $steps = New-Object Collections.ArrayList
-    [void]$steps.Add(@{ Kind = 'measure'; Key = 'base1' })
-    foreach ($t in $cands) { [void]$steps.Add(@{ Kind = 'off'; T = $t }); [void]$steps.Add(@{ Kind = 'measure'; Key = $t.Id; T = $t }); [void]$steps.Add(@{ Kind = 'on'; T = $t }) }
-    [void]$steps.Add(@{ Kind = 'measure'; Key = 'base2' })
-    $script:PcRun = @{ Host = $h; Region = "$region"; Steps = $steps; I = 0; Res = @{}; Busy = $false; Cands = $cands }
-    $pg.PcGo.IsEnabled = $false; $pg.PcResult.Children.Clear()
+    [void]$steps.Add(@{ Kind = 'measure'; Key = 'on:start' })
+    foreach ($t in $cands) {
+        [void]$steps.Add(@{ Kind = 'off'; T = $t }); [void]$steps.Add(@{ Kind = 'measure'; Key = "off:$($t.Id)"; T = $t })
+        [void]$steps.Add(@{ Kind = 'on'; T = $t }); [void]$steps.Add(@{ Kind = 'measure'; Key = "on:$($t.Id)" })
+    }
+    $script:PcRun = @{ Host = $h; Region = "$region"; Steps = $steps; I = 0; Res = @{}; Busy = $false; Cands = $cands; Fix = [bool]$Fix; Phase = 'check' }
+    $pg.PcGo.IsEnabled = $false; $pg.PcFix.IsEnabled = $false; $pg.PcResult.Children.Clear()
     if (-not $script:PcTimer) { $script:PcTimer = New-Object Windows.Threading.DispatcherTimer; $script:PcTimer.Interval = [TimeSpan]::FromMilliseconds(300); $script:PcTimer.Add_Tick({ Step-PingCheck }) }
     $script:PcTimer.Start()
 }
@@ -6659,45 +6664,89 @@ function Step-PingCheck {
     $r = $script:PcRun; $pg = $script:PingUi
     if (-not $r -or $r.Busy) { return }
     if ($r.Wait -and (Get-Date) -lt $r.Wait) { return }
-    if ($r.I -ge $r.Steps.Count) { $script:PcTimer.Stop(); Complete-PingCheck; return }
+    if ($r.I -ge $r.Steps.Count) { $script:PcTimer.Stop(); if ($r.Phase -eq 'check') { Complete-PingCheck } else { Complete-PingFix }; return }
     $st = $r.Steps[$r.I]; $r.I++
     switch ($st.Kind) {
         'measure' {
-            $pg.PcStatus.Text = "Measuring ping to $($r.Region) $(if ($st.T) { "with '$($st.T.Title)' off" } else { 'as it is now' })...  (step $($r.I) of $($r.Steps.Count))"
+            $what = if ($st.Key -like 'off:*') { "with '$($st.T.Title)' off" } elseif ($st.Key -like 'fix:after') { 'with the fixes' } else { 'with everything on' }
+            $pg.PcStatus.Text = "Measuring ping to $($r.Region) $what...  (step $($r.I) of $($r.Steps.Count))"
             $r.Busy = $true; $script:PcKey = $st.Key
-            Start-Background $PingCheckScript @($r.Host, 25) { param($out, $errs) $x = @($out | Where-Object { $_ }) | Select-Object -First 1; $script:PcRun.Res[$script:PcKey] = $x; $script:PcRun.Busy = $false }
+            Start-Background $PingCheckScript @($r.Host, 30) { param($out, $errs) $x = @($out | Where-Object { $_ }) | Select-Object -First 1; $script:PcRun.Res[$script:PcKey] = $x; $script:PcRun.Busy = $false }
         }
-        'off' { $pg.PcStatus.Text = "Switching '$($st.T.Title)' off for a moment..."; try { Invoke-TweakOff $st.T } catch {}; $r.Wait = (Get-Date).AddSeconds(3) }
-        'on'  { $pg.PcStatus.Text = "Switching '$($st.T.Title)' back on..."; try { Invoke-TweakOn $st.T } catch { Show-Toast "Could not switch '$($st.T.Title)' back on: $($_.Exception.Message)" '#FF9F0A' }; Clear-ReadCache; Update-Card $st.T; $r.Wait = (Get-Date).AddSeconds(3) }
+        'off' { $pg.PcStatus.Text = "Switching '$($st.T.Title)' off..."; try { Invoke-TweakOff $st.T } catch {}; if ($st.Keep) { Clear-ReadCache; Update-Card $st.T }; $r.Wait = (Get-Date).AddSeconds(5) }
+        'on'  { $pg.PcStatus.Text = "Switching '$($st.T.Title)' back on..."; try { Invoke-TweakOn $st.T } catch { Show-Toast "Could not switch '$($st.T.Title)' back on: $($_.Exception.Message)" '#FF9F0A' }; Clear-ReadCache; Update-Card $st.T; $r.Wait = (Get-Date).AddSeconds(5) }
     }
 }
 function Complete-PingCheck {
     $r = $script:PcRun; $pg = $script:PingUi
-    $script:PcRun = $null; $pg.PcGo.IsEnabled = $true
-    $b1 = $r.Res['base1'].Median; $b2 = $r.Res['base2'].Median
-    if ($null -eq $b1 -or $null -eq $b2) { $pg.PcStatus.Text = 'No answer from the ping server: check your connection and try again.'; return }
-    $base = ($b1 + $b2) / 2; $noise = [Math]::Max(3, [Math]::Abs($b1 - $b2))
-    $pg.PcStatus.Text = "Your ping to $($r.Region) with everything as it is: $([int]$base) ms (it moved $([int][Math]::Abs($b1 - $b2)) ms between the first and last measurement, so smaller differences are noise)."
-    $rows = foreach ($t in $r.Cands) {
-        $m = $r.Res[$t.Id].Median; if ($null -eq $m) { continue }
-        $d = $base - $m
-        $state = if ($d -gt $noise) { @('#FF453A', "Your ping is about $([int]$d) ms lower with this off: switch it off.", $true) } elseif ($d -lt -$noise) { @('#30D158', "Helps: ping is about $([int](-$d)) ms higher without it.", $false) } else { @('#A1A1A6', 'No difference to your ping.', $false) }
-        @{ T = $t; Off = $m; State = $state }
+    $med = { param($k) $x = $r.Res[$k]; if ($x) { $x.Median } else { $null } }
+    $ons = @($r.Res.Keys | Where-Object { $_ -like 'on:*' } | ForEach-Object { & $med $_ } | Where-Object { $null -ne $_ })
+    if (-not $ons.Count) { $script:PcRun = $null; $pg.PcGo.IsEnabled = $true; $pg.PcFix.IsEnabled = $true; $pg.PcStatus.Text = 'No answer from the ping server: check your connection and try again.'; return }
+    $base = ($ons | Measure-Object -Average).Average
+    $rows = @(); $prev = 'on:start'
+    foreach ($t in $r.Cands) {
+        $off = & $med "off:$($t.Id)"; $before = & $med $prev; $after = & $med "on:$($t.Id)"; $prev = "on:$($t.Id)"
+        if ($null -eq $off -or $null -eq $before -or $null -eq $after) { continue }
+        $onAvg = ($before + $after) / 2; $noise = [Math]::Abs($before - $after)
+        $gap = $onAvg - $off                                  # how much lower ping is with the tweak off
+        $need = [Math]::Max(4, 2 * $noise)                    # must beat the drift right next to it
+        $state = if ($gap -ge $need) { @('#FF453A', "Ping about $([int][Math]::Round($gap)) ms lower with this off ($([int]$before) / $([int]$off) / $([int]$after) ms). Switch it off.", $true) }
+                 elseif ($gap -le -$need) { @('#30D158', "Helps: ping about $([int][Math]::Round(-$gap)) ms higher without it.", $false) }
+                 else { @('#A1A1A6', "No clear difference ($([int]$before) / $([int]$off) / $([int]$after) ms: on / off / on).", $false) }
+        $rows += @{ T = $t; Off = $off; Gap = $gap; State = $state }
     }
-    $x = for ($i = 0; $i -lt @($rows).Count; $i++) {
+    $r.Rows = $rows; $r.Base = $base
+    $bad = @($rows | Where-Object { $_.State[2] })
+    $pg.PcStatus.Text = "Your ping to $($r.Region) with everything on: about $([int][Math]::Round($base)) ms. $(if ($bad.Count) { "$($bad.Count) tweak$(if ($bad.Count -ne 1) { 's' }) clearly raise$(if ($bad.Count -eq 1) { 's' }) it." } else { 'None of the tweaks clearly changes it.' })"
+    Show-PingCheckRows $r
+    Add-History "Ping check: about $([int]$base) ms to $($r.Region)$(if ($bad.Count) { ", $($bad.Count) tweak(s) raise it" })" 'ping' $null
+    if ($r.Fix -and $bad.Count) { Start-PingFix $r $bad; return }
+    $script:PcRun = $null; $pg.PcGo.IsEnabled = $true; $pg.PcFix.IsEnabled = $true
+    if ($r.Fix) { Show-Toast 'Nothing to fix: none of the network tweaks clearly raises your ping.' '#30D158' }
+}
+function Show-PingCheckRows($r) {
+    $pg = $script:PingUi; $rows = @($r.Rows)
+    $x = for ($i = 0; $i -lt $rows.Count; $i++) {
         $w = $rows[$i]
-        "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='300'/><ColumnDefinition Width='110'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
-        "<TextBlock Text='$(Esc $w.T.Title)' FontSize='13' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/><TextBlock Grid.Column='1' Text='$([int]$w.Off) ms off' FontSize='12.5'/>" +
-        "<TextBlock Grid.Column='2' Text='$(Esc $w.State[1])' FontSize='12.5' Foreground='$($w.State[0])' TextWrapping='Wrap'/>" +
-        $(if ($w.State[2]) { "<Button x:Name='P_$i' Grid.Column='3' Content='Switch off' Style='{DynamicResource Btn}' Padding='12,4' FontSize='12' Margin='10,0,0,0'/>" } else { '' }) + "</Grid>"
+        "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='300'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        "<TextBlock Text='$(Esc $w.T.Title)' FontSize='13' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>" +
+        "<TextBlock Grid.Column='1' Text='$(Esc $w.State[1])' FontSize='12.5' Foreground='$($w.State[0])' TextWrapping='Wrap'/>" +
+        $(if ($w.State[2] -and -not $r.Fix) { "<Button x:Name='P_$i' Grid.Column='2' Content='Switch off' Style='{DynamicResource Btn}' Padding='12,4' FontSize='12' Margin='10,0,0,0'/>" } else { '' }) + "</Grid>"
     }
     $ip4 = Find-Tweak 'preferipv4'
     if ($ip4 -and $ip4.State) { $x = @($x) + "<TextBlock Text='Prefer IPv4 over IPv6 is on but cannot be tested this way (Epic&apos;s ping servers only answer over IPv4, and it needs a restart). If your ping got worse right after switching it on, switch it off and restart to compare.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,0'/>" }
-    if (-not @($rows).Count) { $x = @("<TextBlock Text='None of the network tweaks that can affect ping are on, so none of them changed it. Ping also changes with the time of day and your provider: run the check again later to compare.' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap'/>") + @($x) }
+    if (-not $rows.Count) { $x = @("<TextBlock Text='None of the network tweaks that can affect ping are on, so none of them changed it. Ping also changes with the time of day and your provider: run the check again later to compare.' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap'/>") + @($x) }
     $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($x -join '')</StackPanel>")
-    for ($i = 0; $i -lt @($rows).Count; $i++) { $b = $panel.FindName("P_$i"); if ($b) { $b.Tag = $rows[$i].T; $b.Add_Click({ param($s, $e) Switch-Tweak $s.Tag $false; $s.IsEnabled = $false; $s.Content = 'Off' }) } }
+    for ($i = 0; $i -lt $rows.Count; $i++) { $b = $panel.FindName("P_$i"); if ($b) { $b.Tag = $rows[$i].T; $b.Add_Click({ param($s, $e) Switch-Tweak $s.Tag $false; $s.IsEnabled = $false; $s.Content = 'Off' }) } }
     $pg.PcResult.Children.Clear(); [void]$pg.PcResult.Children.Add($panel)
-    Add-History "Ping check: $([int]$base) ms to $($r.Region)" 'ping' $null
+}
+# The fix: measure, switch off what raised ping, measure again. Kept only when ping really went down; otherwise undone.
+function Start-PingFix($r, $bad) {
+    $steps = New-Object Collections.ArrayList
+    [void]$steps.Add(@{ Kind = 'measure'; Key = 'fix:before' })
+    foreach ($w in $bad) { [void]$steps.Add(@{ Kind = 'off'; T = $w.T; Keep = $true }) }
+    [void]$steps.Add(@{ Kind = 'measure'; Key = 'fix:after' })
+    $r.Steps = $steps; $r.I = 0; $r.Phase = 'fix'; $r.Bad = $bad
+    $script:PingUi.PcStatus.Text = "Switching off $($bad.Count) tweak$(if ($bad.Count -ne 1) { 's' }) and checking that your ping really drops..."
+    $script:PcTimer.Start()
+}
+function Complete-PingFix {
+    $r = $script:PcRun; $pg = $script:PingUi
+    $script:PcRun = $null; $pg.PcGo.IsEnabled = $true; $pg.PcFix.IsEnabled = $true
+    $b = $r.Res['fix:before'].Median; $a = $r.Res['fix:after'].Median
+    $names = ($r.Bad | ForEach-Object { $_.T.Title }) -join ', '
+    if ($null -ne $b -and $null -ne $a -and $a -le $b - 3) {
+        foreach ($w in $r.Bad) { Set-Applied $w.T.Id $false; Add-History "Ping fix: switched off $($w.T.Title)" 'off' $w.T.Id }
+        Save-Backup; Update-Summary
+        $pg.PcStatus.Text = "Fixed: ping to $($r.Region) went from $([int]$b) ms to $([int]$a) ms. Switched off: $names."
+        Show-Toast "Ping $([int]$b) → $([int]$a) ms. Switched off $($r.Bad.Count) tweak$(if ($r.Bad.Count -ne 1) { 's' })." '#30D158'
+    } else {
+        # no real gain: put them back on
+        foreach ($w in $r.Bad) { try { Invoke-TweakOn $w.T } catch {}; Clear-ReadCache; Update-Card $w.T }
+        Update-Summary
+        $pg.PcStatus.Text = "Tried switching off $names, but your ping did not really drop ($(if ($null -ne $b) { [int]$b } else { '?' }) → $(if ($null -ne $a) { [int]$a } else { '?' }) ms), so everything was put back. Your ping difference is more likely your connection or the time of day."
+        Show-Toast 'No real gain, so nothing was changed.' '#A1A1A6'
+    }
 }
 
 # =============================================================== Ping monitor
@@ -6734,9 +6783,12 @@ function New-PingPage {
         <StackPanel>
           <TextBlock Text='Did a tweak change your ping?' FontSize='15' FontWeight='SemiBold'/>
           <TextBlock x:Name='PcHint' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' MaxWidth='720' HorizontalAlignment='Left' Margin='0,4,0,0'
-                     Text='Measures your ping, then switches each network tweak that is on off for a moment, measures again and switches it back. Takes about a minute; your connection drops for a second a few times, so do not run it in a match.'/>
+                     Text='Measures your ping with each network tweak switched off for a moment, right between two measurements with it on, so normal ping drift does not fool it. Fix automatically then switches off only what clearly raises your ping, measures again and keeps it only if ping really dropped. Takes 1-2 minutes; your connection drops for a second a few times, so do not run it in a match.'/>
         </StackPanel>
-        <Button x:Name='PcGo' Content='Run ping check' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Right' VerticalAlignment='Top'/>
+        <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' VerticalAlignment='Top'>
+          <Button x:Name='PcGo' Content='Only check' Style='{DynamicResource Btn}' Margin='0,0,8,0' ToolTip='Measure and show the result; change nothing'/>
+          <Button x:Name='PcFix' Content='Check and fix automatically' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' ToolTip='Switches off only the tweaks that clearly raise your ping, then measures again and keeps the change only if ping really dropped'/>
+        </StackPanel>
       </Grid>
       <TextBlock x:Name='PcStatus' FontSize='12.5' FontWeight='SemiBold' Foreground='#0A84FF' Margin='0,10,0,0' TextWrapping='Wrap'/>
       <StackPanel x:Name='PcResult' Margin='0,8,0,0'/>
@@ -6746,8 +6798,9 @@ function New-PingPage {
   <StackPanel x:Name='Spikes'/>
 </StackPanel>
 "@)
-    $pg = @{}; foreach ($n in 'Region', 'Go', 'Now', 'Avg', 'Jit', 'Loss', 'Graph', 'Spikes', 'PcHint', 'PcGo', 'PcStatus', 'PcResult') { $pg[$n] = $root.FindName($n) }
+    $pg = @{}; foreach ($n in 'Region', 'Go', 'Now', 'Avg', 'Jit', 'Loss', 'Graph', 'Spikes', 'PcHint', 'PcGo', 'PcFix', 'PcStatus', 'PcResult') { $pg[$n] = $root.FindName($n) }
     $pg.PcGo.Add_Click({ Start-PingCheck })
+    $pg.PcFix.Add_Click({ Start-PingCheck -Fix })
     $script:PingUi = $pg
     $saved = Get-PlayRegionName
     $idx = [Math]::Max(0, [array]::IndexOf([string[]]($PingHosts | ForEach-Object { $_.Name }), "$saved"))
@@ -7466,6 +7519,10 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.10.2' = @(
+        @{ T = 'Check and fix automatically'; D = 'Tools > Ping monitor now has a Check and fix automatically button: it switches off only the network tweaks that clearly raise your ping, measures again, and keeps the change only if your ping really dropped. Otherwise it puts everything back.' }
+        @{ T = 'A fairer ping check'; D = 'Each tweak is now measured right between two measurements with it on, so normal ping drift during the check no longer makes several tweaks look bad. Each row shows the on / off / on numbers.' }
+    )
     '1.10.1' = @(
         @{ T = 'Your region everywhere'; D = 'Game Mode, the Ping monitor, match reports and Tournaments now all use the region you play in Fortnite (no more NA East ping for EU players). Click the ping on Game Mode to pick another region.' }
         @{ T = 'Ping check'; D = 'Ping got worse after a tweak? Tools > Ping monitor > Run ping check measures your ping with each network tweak switched off for a moment and tells you which one to switch off.' }
