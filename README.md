@@ -15,12 +15,18 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
   advice for undervolting and cooling an older card.
 
-- **190+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
+- **220+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
 - **Network checks**: your cable's link speed and errors, Wi-Fi signal and band, a 20-second test of the link to your router
   (home network or internet line?), VPN routing, traffic shapers such as Killer or cFosSpeed, and the Intel 2.5G driver bug.
 - **Guided cards** for settings no program can change safely: AMD Anti-Lag and Fluid Motion Frames, Intel Arc Low Latency
   Mode, NVIDIA App auto-optimize, TV/monitor game mode and wireless receiver placement.
+- **Counter-Strike 2 tab** (when CS2 is installed): Reflex, V-Sync or Valve's G-SYNC combo, Boost Player Contrast, AO,
+  anti-aliasing, FSR, particles, shaders, shadows, FPS caps, the telemetry HUD and network settings, each a single CS2 setting that
+  is backed up and undone exactly (CS2 must be closed). Plus NVIDIA settings and GPU choice for cs2.exe, a **Valve server ping**
+  through Valve's relay list that can set your matchmaking ping limit, and checks for launch options (dead ones and the
+  VAC-blocking `-insecure`), Steam overlay/downloads/recording, CS2 version and drive, and sensitivity in cm/360. VAC-safe:
+  nothing touches the game files or anti-cheat.
 - **Game Mode**: a booster-style dashboard with a Start Game button (turns Game Mode on and launches Fortnite), a
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses

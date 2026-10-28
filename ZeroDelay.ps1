@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.11.0'
+$AppVersion = '1.12.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -1312,8 +1312,9 @@ function Remove-RegTracked([string]$Tweak, [string]$Path, [string]$Name) {
     Remove-RegValue $Path $Name
 }
 # --- Cleanup tweaks: Remove = @( @{ P; N } ). "On" means the values are gone.
-function Test-RemoveTweak($t) { -not ($t.Remove | Where-Object { $null -ne (Get-RegValue $_.P $_.N) }) }
-function Enable-RemoveTweak($t) { foreach ($e in $t.Remove) { Remove-RegTracked $t.Id $e.P $e.N } }
+# $t['Remove'], not $t.Remove: on a hashtable without that key, .Remove is the built-in method and always truthy
+function Test-RemoveTweak($t) { -not ($t['Remove'] | Where-Object { $null -ne (Get-RegValue $_.P $_.N) }) }
+function Enable-RemoveTweak($t) { foreach ($e in $t['Remove']) { Remove-RegTracked $t.Id $e.P $e.N } }
 function Disable-RemoveTweak($t) { [void](Restore-RegTweak $t.Id) }
 
 function Get-NvidiaClassKey {
@@ -1787,6 +1788,227 @@ function Sync-Service([string]$Name) {
     $start = Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" 'Start'
     if ($start -eq 4) { Stop-Service $Name -Force -ErrorAction SilentlyContinue }
     elseif ($start -eq 2) { Start-Service $Name -ErrorAction SilentlyContinue }
+}
+
+
+# --- Counter-Strike 2 (1.12): config files in <Steam>\userdata\<account>\730\local\cfg.
+#     cs2_video.txt (Video tab, CRLF) and cs2_machine_convars.vcfg (machine convars, LF) are local-only (not Steam
+#     Cloud). CS2 rewrites the .vcfg files when it exits, so every edit needs the game closed.
+#     Cs = @{ File = 'video' | 'machine'; Keys = [ordered]@{ key = value } }. A value of $null removes the key.
+function Get-SteamPath {
+    $p = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+    if ($p) { $p = $p -replace '/', '\' }
+    if ($p -and (Test-Path $p)) { $p } else { $null }
+}
+function Get-Cs2Dir {
+    if ($null -ne $script:Cs2DirCache) { return $script:Cs2DirCache }
+    $script:Cs2DirCache = ''
+    $steam = Get-SteamPath
+    if ($steam) {
+        $libs = @($steam)
+        $lf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+        if (Test-Path $lf) { foreach ($m in [regex]::Matches([IO.File]::ReadAllText($lf), '"path"\s+"([^"]+)"')) { $libs += $m.Groups[1].Value -replace '\\\\', '\' } }
+        foreach ($l in $libs | Select-Object -Unique) {
+            $d = Join-Path $l 'steamapps\common\Counter-Strike Global Offensive'
+            if ((Test-Path (Join-Path $l 'steamapps\appmanifest_730.acf')) -and (Test-Path (Join-Path $d 'game\bin\win64\cs2.exe'))) { $script:Cs2DirCache = $d; break }
+        }
+    }
+    $script:Cs2DirCache
+}
+# the config folder of the Steam account that played CS2 last
+function Get-Cs2CfgDir {
+    $steam = Get-SteamPath; if (-not $steam) { return $null }
+    $best = Get-ChildItem (Join-Path $steam 'userdata') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $d = Join-Path $_.FullName '730\local\cfg'
+        if (Test-Path (Join-Path $d 'cs2_video.txt')) { Get-Item $d }
+    } | Sort-Object { $f = Join-Path $_.FullName 'cs2_machine_convars.vcfg'; if (Test-Path $f) { (Get-Item $f).LastWriteTime } else { $_.LastWriteTime } } -Descending | Select-Object -First 1
+    if ($best) { $best.FullName } else { $null }
+}
+function Test-Cs2Installed { [bool](Get-Cs2Dir) }
+function Test-Cs2Running { [bool](Get-Process cs2 -ErrorAction SilentlyContinue) }
+function Assert-Cs2Closed { if (Test-Cs2Running) { throw 'Close Counter-Strike 2 first: it rewrites its settings when it exits.' } }
+function Get-CsFile([string]$Which) {
+    $d = Get-Cs2CfgDir; if (-not $d) { return $null }
+    Join-Path $d $(if ($Which -eq 'machine') { 'cs2_machine_convars.vcfg' } else { 'cs2_video.txt' })
+}
+function Get-CsValue([string]$Which, [string]$Key) {
+    $f = Get-CsFile $Which; if (-not $f -or -not (Test-Path $f)) { return $null }
+    $m = [regex]::Match([IO.File]::ReadAllText($f), "(?m)^\s*`"$([regex]::Escape($Key))`"\s+`"([^`"]*)`"")
+    if ($m.Success) { $m.Groups[1].Value } else { $null }
+}
+# Changes one key in place, keeping the file's line endings and leaving every other line alone. $null removes it.
+function Set-CsValue([string]$Which, [string]$Key, $Value) {
+    $f = Get-CsFile $Which
+    if (-not $f -or -not (Test-Path $f)) { throw 'CS2 settings file not found. Start CS2 once first.' }
+    $text = [IO.File]::ReadAllText($f)
+    $nl = if ($text -match "`r`n") { "`r`n" } else { "`n" }
+    $rx = "(?m)^(\s*`"$([regex]::Escape($Key))`"\s+`")([^`"]*)(`"[^\r\n]*)"
+    if ($null -eq $Value) {
+        $text = [regex]::Replace($text, "(?m)^\s*`"$([regex]::Escape($Key))`"\s+`"[^`"]*`"[^\n]*\n", '')
+    } elseif ([regex]::IsMatch($text, $rx)) {
+        $text = [regex]::Replace($text, $rx, { param($m) $m.Groups[1].Value + $Value + $m.Groups[3].Value })
+    } else {
+        # new key: before the closing brace of the settings block (video) or of the "convars" block (vcfg)
+        $last = $text.LastIndexOf('}')
+        $close = if ($Which -eq 'machine') { $text.LastIndexOf('}', [Math]::Max(0, $last - 1)) } else { $last }
+        if ($close -lt 0) { throw 'The CS2 settings file looks damaged. Nothing was changed.' }
+        $lineStart = $text.LastIndexOf("`n", $close) + 1
+        $indent = if ($Which -eq 'machine') { "`t`t" } else { "`t" }
+        $text = $text.Insert($lineStart, "$indent`"$Key`"`t`t`"$Value`"$nl")
+    }
+    if (([regex]::Matches($text, '\{')).Count -ne ([regex]::Matches($text, '\}')).Count) { throw 'Could not edit the CS2 settings safely. Nothing was changed.' }
+    [IO.File]::WriteAllText($f, $text, (New-Object Text.UTF8Encoding $false))
+}
+function Test-CsTweak($t) {
+    $f = Get-CsFile $t.Cs.File; if (-not $f -or -not (Test-Path $f)) { return $null }
+    foreach ($k in @($t.Cs.Keys.Keys)) { if ("$(Get-CsValue $t.Cs.File $k)" -ne "$($t.Cs.Keys[$k])") { return $false } }
+    $true
+}
+function Enable-CsTweak($t) {
+    Assert-Cs2Closed
+    if (-not $script:Backup.Custom.ContainsKey($t.Id)) {
+        $old = @{}; foreach ($k in @($t.Cs.Keys.Keys)) { $old[$k] = Get-CsValue $t.Cs.File $k }
+        $script:Backup.Custom[$t.Id] = @{ File = $t.Cs.File; Values = $old }
+    }
+    foreach ($k in @($t.Cs.Keys.Keys)) { Set-CsValue $t.Cs.File $k $t.Cs.Keys[$k] }
+}
+function Disable-CsTweak($t) {
+    Assert-Cs2Closed
+    $b = $script:Backup.Custom[$t.Id]
+    $file = if ($b -and $b.File) { "$($b.File)" } else { $t.Cs.File }
+    $keys = if ($b -and $b.Values) { if ($b.Values -is [System.Collections.IDictionary]) { @($b.Values.Keys) } else { @($b.Values.PSObject.Properties.Name) } } else { @($t.Cs.Keys.Keys) }
+    foreach ($k in $keys) {
+        $v = if ($b -and $b.Values) { $b.Values.$k } else { $null }
+        Set-CsValue $file $k $v
+    }
+    $script:Backup.Custom.Remove($t.Id)
+}
+
+$Cs2Profile = 'Counter-strike 2'   # NVIDIA's predefined driver profile for cs2.exe (lower-case s)
+function Get-Cs2Exe { $d = Get-Cs2Dir; if ($d) { Join-Path $d 'game\bin\win64\cs2.exe' } else { $null } }
+function Test-CsFullscreen { (Get-CsValue video 'setting.fullscreen') -eq '1' }
+# the Steam account folder (userdata\<id>) that owns the CS2 config ZeroDelay edits
+function Get-CsAccountDir { $d = Get-Cs2CfgDir; if ($d) { Split-Path (Split-Path (Split-Path $d -Parent) -Parent) -Parent } else { $null } }
+# value of a key inside the "730" block of a Steam .vdf (nearest enclosing numbered block)
+function Get-VdfAppValue([string]$Text, [string]$Key, [string]$App = '730') {
+    foreach ($m in [regex]::Matches($Text, "`"$([regex]::Escape($Key))`"\s+`"((?:[^`"\\]|\\.)*)`"", 'IgnoreCase')) {
+        $before = $Text.Substring(0, $m.Index)
+        $blk = [regex]::Matches($before, '"(\d+)"\s*\{')
+        if ($blk.Count -and $blk[$blk.Count - 1].Groups[1].Value -eq $App) { return ($m.Groups[1].Value -replace '\\"', '"' -replace '\\\\', '\') }
+    }
+    $null
+}
+
+function Get-CsLaunchReport {
+    $acc = Get-CsAccountDir
+    if (-not $acc) { return 'Could not find your Steam account folder for CS2. Start CS2 once, then try again.' }
+    $lc = Join-Path $acc 'config\localconfig.vdf'
+    $text = if (Test-Path $lc) { [IO.File]::ReadAllText($lc) } else { '' }
+    $opt = Get-VdfAppValue $text 'LaunchOptions'
+    $out = @()
+    if (-not "$opt".Trim()) { $out += 'Launch options: none. That is the best default for CS2.' }
+    else {
+        $out += "Launch options: $opt"
+        $tok = @([regex]::Matches($opt, '"[^"]*"|\S+') | ForEach-Object { $_.Value })
+        $flag = { param($names) @($tok | Where-Object { $names -contains $_.ToLower() }) }
+        $vac = & $flag @('-insecure', '-untrusted', '-tools')
+        if ($vac.Count) { $out += "PROBLEM: $($vac -join ' ') stops you joining official matchmaking and VAC-secured servers. Remove it unless you use it on purpose for offline work." }
+        $dead = & $flag @('-novid', '-nojoy', '-tickrate', '-freq', '-refresh', '-d3d9ex', '-nod3d9ex', '-dxlevel', '-noreflex', '-softparticlesdefaultoff', '-forcenovsync', '-limitvsconst', '-noaafonts', '-heapsize', '+mat_queue_mode', '+cl_forcepreload', '+r_dynamic', '+mat_disable_fancy_blending', '+mat_picmip', '+cl_cmdrate', '+cl_updaterate', '+cl_interp', '+cl_interp_ratio', '+rate')
+        if ($dead.Count) { $out += "Does nothing in CS2 (CS:GO leftovers): $($dead -join ' '). Harmless, but you can remove them." }
+        $cpu = & $flag @('-threads', '-high', '-mainthreadpriority', '-processheap', '-realtime', '-low')
+        if ($cpu.Count) { $out += "Not read by CS2: $($cpu -join ' '). CS2 sizes its own threads and Windows handles priority, so these do nothing." }
+        if (& $flag @('-allow_third_party_software')) { $out += 'Note: -allow_third_party_software turns off CS2''s trusted mode, which Valve ties to Trust Factor. Keep it only if you use OBS Game Capture or similar tools that hook into the game.' }
+        if (& $flag @('-vulkan')) { $out += 'Note: -vulkan switches CS2 off its default DirectX 11 renderer, where Reflex and Anti-Lag 2 are best supported and tests showed lower latency. Remove it unless Vulkan fixes a problem for you.' }
+        if (& $flag @('+fps_max')) { $out += 'Note: +fps_max in the launch options overrides the in-game FPS setting every start. Set the cap in the game instead.' }
+    }
+    $ov = Get-VdfAppValue $text 'OverlayAppEnable'
+    if ($ov -eq '0') { $out += "`nSteam overlay: off for CS2." } else { $out += "`nSteam overlay: on for CS2. If you never use Shift+Tab, Steam screenshots or recording in CS2, you can turn it off there to remove one hook from every frame (small, unmeasured gain)." }
+    $cfg = Join-Path (Get-SteamPath) 'config\config.vdf'
+    if ((Test-Path $cfg) -and [IO.File]::ReadAllText($cfg) -match '"AllowDownloadsDuringGameplay"\s+"1"') { $out += 'Steam downloads during gameplay: ON. Updates can fill your connection mid-match: turn it off in Steam > Settings > Downloads.' }
+    else { $out += 'Steam downloads during gameplay: off. Good.' }
+    $rec = Join-Path $acc 'gamerecordings\video'
+    if (Get-ChildItem $rec -Directory -Filter 'bg_*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-14) }) { $out += 'Steam Game Recording records in the background. It costs some GPU, CPU and disk: switch to "Record manually" in Steam > Settings > Game Recording if you do not use the clips.' }
+    $out += "`nTo change launch options: Steam > Library > right-click Counter-Strike 2 > Properties > General. ZeroDelay does not edit Steam's files, because Steam rewrites them while it runs."
+    $out -join "`n"
+}
+
+function Get-CsInstallReport {
+    $d = Get-Cs2Dir; if (-not $d) { return 'CS2 is not installed.' }
+    $lib = Split-Path (Split-Path (Split-Path $d -Parent) -Parent) -Parent
+    $acf = Join-Path $lib 'steamapps\appmanifest_730.acf'
+    $a = if (Test-Path $acf) { [IO.File]::ReadAllText($acf) } else { '' }
+    $build = if ($a -match '"buildid"\s+"(\d+)"') { $Matches[1] } else { '?' }
+    $inf = Join-Path $d 'game\csgo\steam.inf'
+    $ver = if ((Test-Path $inf) -and ((Get-Content $inf -Raw) -match 'PatchVersion=([\d.]+)')) { $Matches[1] } else { '?' }
+    $s = "Counter-Strike 2 version $ver (build $build)`nInstalled in: $d`nRunning now: $(if (Test-Cs2Running) { 'yes' } else { 'no' })`nSettings folder: $(if (Get-Cs2CfgDir) { 'found' } else { 'not found - start CS2 once' })`n"
+    $disk = try { $n = (Get-Partition -DriveLetter $d.Substring(0, 1) -ErrorAction Stop).DiskNumber; Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.DeviceId -eq "$n" } | Select-Object -First 1 } catch { $null }
+    if ($disk) {
+        $s += "`nDrive: $($disk.FriendlyName), $($disk.MediaType), $($disk.BusType)`n"
+        $s += if ($disk.MediaType -eq 'HDD') { 'CS2 is on a hard drive. Maps load much more slowly and assets can hitch: move it to an SSD in Steam > Properties > Installed Files > Move install folder.' } else { 'Good: CS2 is on an SSD.' }
+    }
+    $s
+}
+
+function Get-CsSensReport {
+    $d = Get-Cs2CfgDir
+    $f = if ($d) { Join-Path $d 'cs2_user_convars_0_slot0.vcfg' } else { $null }
+    if (-not $f -or -not (Test-Path $f)) { return 'Could not find your CS2 settings. Start CS2 once first.' }
+    $t = [IO.File]::ReadAllText($f)
+    $get = { param($k, $def) $m = [regex]::Match($t, "(?m)^\s*`"$k`"\s+`"([^`"]*)`""); if ($m.Success) { [double]::Parse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } else { $def } }
+    $sens = & $get 'sensitivity' 1.25; $yaw = & $get 'm_yaw' 0.022; $zoom = & $get 'zoom_sensitivity_ratio' 1.0
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $s = "Your CS2 sensitivity: $($sens.ToString('0.###', $inv))   (zoom ratio $($zoom.ToString('0.##', $inv)))`n`n"
+    foreach ($dpi in 400, 800, 1600, 3200) {
+        $cm = 360 / ($dpi * $sens * $yaw) * 2.54
+        $s += "At $dpi DPI: eDPI $([math]::Round($dpi * $sens)), $($cm.ToString('0.0', $inv)) cm per 360 turn`n"
+    }
+    $s += "`nSame aim in other games: CS:GO $($sens.ToString('0.###', $inv)) - Valorant $(($sens / 3.1818).ToString('0.###', $inv)) - Fortnite about $(($sens / 25.25 * 100).ToString('0.#', $inv))% (approximate)."
+    $s += "`n`nCS2 always reads your mouse raw, so Windows pointer speed and Enhance pointer precision do not change your aim in game. Change sensitivity in CS2 only."
+    $s
+}
+
+# Ping to Valve's CS2 datacenters through their public relay list (Steam Datagram Relay), measured in the background.
+$script:CsPingBusy = $false
+function Start-CsRegionPing {
+    if ($script:CsPingBusy) { throw 'The CS2 server ping is already running.' }
+    $script:CsPingBusy = $true
+    Invoke-Worker @'
+$cfg = Invoke-RestMethod 'https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730' -TimeoutSec 15
+$pops = @()
+foreach ($p in $cfg.pops.PSObject.Properties) {
+    $v = $p.Value
+    if (-not $v.relays -or $p.Name -match '^d' -or "$($v.desc)" -match 'China|Hetzner|Alibaba|Tencent') { continue }
+    $pops += [pscustomobject]@{ Code = $p.Name; Desc = "$($v.desc)"; Ips = @($v.relays | Select-Object -First 2 | ForEach-Object { $_.ipv4 }) }
+}
+$res = @{}
+for ($round = 0; $round -lt 3; $round++) {
+    $jobs = foreach ($p in $pops) { foreach ($ip in $p.Ips) { [pscustomobject]@{ Code = $p.Code; Task = (New-Object System.Net.NetworkInformation.Ping).SendPingAsync($ip, 1500) } } }
+    try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($jobs | ForEach-Object { $_.Task }), 5000) | Out-Null } catch {}
+    foreach ($j in $jobs) {
+        if (-not $res.ContainsKey($j.Code)) { $res[$j.Code] = @() }
+        $ok = $j.Task.Status -eq 'RanToCompletion' -and $j.Task.Result.Status -eq 'Success'
+        $res[$j.Code] += $(if ($ok) { [int]$j.Task.Result.RoundtripTime } else { -1 })
+    }
+}
+@{ Rows = @($pops | ForEach-Object { $r = @($res[$_.Code] | Where-Object { $_ -ge 0 } | Sort-Object); @{ Code = $_.Code; Desc = $_.Desc; Ms = $(if ($r.Count) { $r[0] } else { -1 }) } }) }
+'@ @() {
+        param($out, $errs)
+        $script:CsPingBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable]) -or -not @($res.Rows).Count) { Show-Toast 'Could not reach Valve''s server list. Check your internet connection.' '#FF9F0A'; return }
+        $rows = @($res.Rows | Where-Object { $_.Ms -ge 0 } | Sort-Object { $_.Ms })
+        if (-not $rows.Count) { Show-Toast 'No Valve server answered. Your network may block ping.' '#FF9F0A'; return }
+        $script:CsBestPing = [int]$rows[0].Ms
+        $lines = @($rows | Select-Object -First 12 | ForEach-Object { "$($_.Ms) ms   $($_.Desc)" })
+        $want = [Math]::Min(350, [Math]::Max(50, [int]([Math]::Ceiling(($script:CsBestPing + 30) / 5.0) * 5)))
+        $cur = Get-CsValue machine 'mm_dedicated_search_maxping'; if (-not $cur) { $cur = '150' }
+        $msg = "Your ping to Valve's CS2 datacenters (nearest first):`n`n$($lines -join "`n")`n`nCS2's Max Acceptable Matchmaking Ping is $cur ms. A limit of $want ms keeps you on your nearest datacenters; queues can get a little longer.`n`nSet it to $want ms?"
+        $r = Show-ZdDialog $msg 'CS2 server ping' 'YesNo' 'Question'
+        if ($r -ne 'Yes') { return }
+        $script:CsMaxPingWant = $want
+        $t = $Tweaks | Where-Object { $_.Id -eq 'cs-maxping' } | Select-Object -First 1
+        try { Invoke-TweakOn $t; Update-Card $t; Update-Summary; Show-Toast "CS2 matchmaking ping limit set to $want ms." '#30D158' } catch { Show-Toast $_.Exception.Message '#FF9F0A' }
+    }
 }
 
 # --- Helpers for the research round 3 cards (1.11)
@@ -2319,7 +2541,8 @@ $Tweaks = @(
        }
        Off   = {
            Remove-NetQosPolicy -Name 'ZeroDelay Fortnite' -Confirm:$false -ErrorAction SilentlyContinue
-           [void](Restore-RegTweak 'qos')
+           if (Get-NetQosPolicy -Name 'ZeroDelay CS2' -ErrorAction SilentlyContinue) { $script:Backup.Registry | Where-Object { $_.Tweak -eq 'qos' } | ForEach-Object { $_.Tweak = 'cs-qos' } }
+           else { [void](Restore-RegTweak 'qos') }
            $script:Backup.Custom.Remove('qos')
        } }
 
@@ -3888,6 +4111,266 @@ $Tweaks = @(
        Warn  = ''
        Run   = { [void](Show-ZdDialog (Get-NicDriverReport) 'Network driver' 'OK' 'Information'); 'Checked.' } }
 
+    # ======================================================= Counter-Strike 2 tab (1.12)
+    # Video tab values live in cs2_video.txt, machine convars in cs2_machine_convars.vcfg. CS2 must be closed.
+    @{ Id = 'cs-reflex'; Cat = 'CS2'; Icon = [char]0xE945; Rec = $true; Lat = $true
+       Title = 'NVIDIA Reflex / AMD Anti-Lag 2 on'
+       Desc  = 'Stops the CPU queuing frames ahead of the graphics card, so your mouse movement reaches the screen sooner. NVIDIA measured up to 35% lower system latency in CS2.'
+       Warn  = 'Your graphics card has no Reflex or Anti-Lag 2 (Intel, older AMD): the game greys the option out. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.r_low_latency' = '1' } }
+       Test  = { if (-not (Get-CsFile video) -or -not (Test-Path (Get-CsFile video))) { return $null }; (Get-CsValue video 'setting.r_low_latency') -in '1', '2' } }
+
+    @{ Id = 'cs-reflexboost'; Cat = 'CS2'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-Cs2Installed) -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' }) }
+       Title = 'NVIDIA Reflex: On + Boost'
+       Desc  = 'Also keeps the graphics card''s clocks high when the CPU is the limit, which CS2 often is, for the lowest possible latency.'
+       Warn  = 'You are on a laptop or the PC runs hot: Boost uses more power, and NVIDIA says it can cost a little FPS. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.r_low_latency' = '2' } } }
+
+    @{ Id = 'cs-vsync-off'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Title = 'Turn off V-Sync (fixed-refresh monitor)'
+       Desc  = 'Lets frames reach the screen as soon as they are ready instead of waiting for the monitor, which removes V-Sync''s queuing delay.'
+       Warn  = 'Screen tearing bothers you more than the delay. With G-SYNC, use the G-SYNC card instead. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.mat_vsync' = '0' } }
+       Test  = { if (Test-MainVrrOn) { return $null }; Test-CsTweak $t } }
+
+    @{ Id = 'cs-vrr-combo'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { (Test-Cs2Installed) -and (Test-MainVrrOn) }
+       Title = 'G-SYNC: V-Sync on + Reflex on (Valve''s advice)'
+       Desc  = 'With G-SYNC, V-Sync together with Reflex keeps CS2 inside the variable refresh range: no tearing, and Reflex caps your FPS just below the refresh rate so V-Sync adds no queue. CS2 itself recommends this.'
+       Warn  = 'You want the absolute lowest latency and accept tearing: uncapped with Reflex is a fraction of a millisecond faster. CS2 must be closed.'
+       Test  = { if (-not (Test-MainVrrOn)) { return $null }; (Get-CsValue video 'setting.mat_vsync') -eq '1' -and (Get-CsValue video 'setting.r_low_latency') -in '1', '2' }
+       On    = {
+           $k = [ordered]@{ 'setting.mat_vsync' = '1' }
+           if ((Get-CsValue video 'setting.r_low_latency') -notin '1', '2') { $k['setting.r_low_latency'] = '1' }
+           Enable-CsTweak @{ Id = $t.Id; Cs = @{ File = 'video'; Keys = $k } }
+       }
+       Off   = { Disable-CsTweak @{ Id = $t.Id; Cs = @{ File = 'video'; Keys = [ordered]@{ 'setting.mat_vsync' = $null } } } } }
+
+    @{ Id = 'cs-fpsmax'; Cat = 'CS2'; Icon = [char]0xE9D9; Rec = $false; Lat = $true
+       Title = 'Lift the 400 FPS cap (with Reflex)'
+       Desc  = 'CS2 caps at 400 FPS by default. With Reflex on, letting a fast PC run uncapped gives the lowest latency; Reflex keeps the frame queue empty.'
+       Warn  = 'You use the G-SYNC card (Reflex sets the cap there), you are on a laptop, or you want less heat and fan noise. Without Reflex, a cap your PC holds steadily is better. CS2 must be closed.'
+       Cs    = @{ File = 'machine'; Keys = [ordered]@{ 'fps_max' = '0' } } }
+
+    @{ Id = 'cs-menufps'; Cat = 'CS2'; Icon = [char]0xE9D9; Rec = $false
+       Title = 'Cap menu FPS at 120'
+       Desc  = 'Stops CS2 burning power and heat in the menus between matches. No effect in matches.'
+       Warn  = 'You want a smoother menu. CS2 must be closed.'
+       Cs    = @{ File = 'machine'; Keys = [ordered]@{ 'fps_max_ui$2' = '120' } } }
+
+    @{ Id = 'cs-contrast'; Cat = 'CS2'; Icon = [char]0xE7B3; Rec = $true
+       Title = 'Boost Player Contrast on'
+       Desc  = 'Makes enemy models stand out against dark or busy backgrounds. Valve made it for exactly that.'
+       Warn  = 'Your graphics card is very weak: Valve says it can cost some performance. CS2 must be closed.'
+       Cs    = @{ File = 'machine'; Keys = [ordered]@{ 'r_player_visibility_mode' = '1' } } }
+
+    @{ Id = 'cs-dynshadows'; Cat = 'CS2'; Icon = [char]0xE793; Rec = $true
+       Title = 'Keep Dynamic Shadows on All'
+       Desc  = 'Keeps the shadows players cast from every light, which can give an enemy away before you see them. Valve warns that "Sun Only" is a competitive disadvantage.'
+       Warn  = 'Your PC cannot hold a playable frame rate otherwise. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.videocfg_dynamic_shadows' = '1' } } }
+
+    @{ Id = 'cs-ao-off'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $false
+       Title = 'Turn off Ambient Occlusion'
+       Desc  = 'Removes soft corner shading that costs GPU time and gives no competitive information. Valve''s own performance test turns it off first.'
+       Warn  = 'You want CS2 to look its best. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.videocfg_ao_detail' = '0' } } }
+
+    @{ Id = 'cs-cmaa'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $false
+       Title = 'Anti-aliasing: CMAA2 instead of MSAA'
+       Desc  = 'Swaps multisample anti-aliasing for Valve''s cheap post-process edge smoothing, which cuts GPU load while keeping edges clean.'
+       Warn  = 'You have GPU headroom to spare, or 4x MSAA helps you read far-away heads: CMAA2 is a little softer on thin distant edges. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.msaa_samples' = '0'; 'setting.r_csgo_cmaa_enable' = '1' } } }
+
+    @{ Id = 'cs-fsr-off'; Cat = 'CS2'; Icon = [char]0xE7B3; Rec = $true
+       Title = 'Turn off FSR upscaling'
+       Desc  = 'Renders at full resolution so distant enemies stay sharp instead of being upscaled and blurred. Autoconfig turns FSR on by itself on weaker PCs.'
+       Warn  = 'Your PC needs FSR to stay playable. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.videocfg_fsr_detail' = '0' } } }
+
+    @{ Id = 'cs-particles-low'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $false
+       Title = 'Particle Detail: Low'
+       Desc  = 'Simplifies fire, sparks and impact effects and turns off particle shadows, which helps FPS in hectic utility fights. Smokes block vision exactly the same.'
+       Warn  = 'You want the full effects. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.videocfg_particle_detail' = '0' } } }
+
+    @{ Id = 'cs-shaders-low'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $false
+       Title = 'Shader Detail: Low'
+       Desc  = 'Simpler lighting and surface shading for higher, steadier FPS. Valve uses Low on its two lowest hardware tiers.'
+       Warn  = 'You prefer how maps and skins look on High. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.shaderquality' = '0' } } }
+
+    @{ Id = 'cs-shadows-medium'; Cat = 'CS2'; Icon = [char]0xE793; Rec = $false
+       Title = 'Global Shadow Quality: Medium'
+       Desc  = 'Lowers shadow-map resolution, one of the heavier CPU and GPU costs, while keeping the player shadows that matter. Low is avoided on purpose: it loses shadow detail on maps like Nuke.'
+       Warn  = 'Your PC already holds your frame rate easily. CS2 must be closed.'
+       Cs    = @{ File = 'video'; Keys = [ordered]@{ 'setting.videocfg_shadow_quality' = '1' } }
+       Test  = { $v = Get-CsValue video 'setting.videocfg_shadow_quality'; if ($null -eq $v) { return $null }; [int]$v -le 1 } }
+
+    # ------------------------------------------------------------- CS2 network
+    @{ Id = 'cs-telemetry'; Cat = 'CS2'; Icon = [char]0xE9D9; Rec = $false
+       Title = 'Show ping, packet loss and jitter on the HUD'
+       Desc  = 'Turns on CS2''s own network readout, so you can see in the moment whether lag comes from your connection (loss, late packets, jitter) or your PC.'
+       Warn  = 'You want a completely clean HUD. CS2 must be closed.'
+       Cs    = @{ File = 'machine'; Keys = [ordered]@{ 'cl_hud_telemetry_ping_show' = '2'; 'cl_hud_telemetry_net_misdelivery_show' = '2'; 'cl_hud_telemetry_net_detailed' = '1' } } }
+
+    @{ Id = 'cs-rate'; Cat = 'CS2'; Icon = [char]0xE839; Rec = $true; Lat = $true
+       Title = 'Game bandwidth: Unrestricted'
+       Desc  = 'Makes sure "Max Acceptable Game Traffic Bandwidth" is not stuck on a low old preset, which can starve CS2 of updates in busy fights.'
+       Warn  = 'Your connection is very slow (under about 8 Mbit/s) or shared on a weak link, and you lowered it on purpose. CS2 must be closed.'
+       Cs    = @{ File = 'machine'; Keys = [ordered]@{ 'rate' = '786432' } }
+       Test  = { $f = Get-CsFile machine; if (-not $f -or -not (Test-Path $f)) { return $null }; $v = Get-CsValue machine 'rate'; $null -eq $v -or [int]$v -ge 786432 } }
+
+    @{ Id = 'cs-netbuffer'; Cat = 'CS2'; Icon = [char]0xE839; Rec = $false; Lat = $true
+       Title = 'No extra packet-loss buffering'
+       Desc  = 'Keeps "Buffering to smooth over packet loss" at 0. Every buffered tick adds about 16 ms of delay, and CS2 already smooths normal jitter by itself.'
+       Warn  = 'The telemetry HUD keeps showing packet loss on a connection you cannot fix: then 1 tick is smoother. CS2 must be closed.'
+       Cs    = @{ File = 'machine'; Keys = [ordered]@{ 'cl_net_buffer_ticks' = '0' } }
+       Test  = { $f = Get-CsFile machine; if (-not $f -or -not (Test-Path $f)) { return $null }; "$(Get-CsValue machine 'cl_net_buffer_ticks')" -in '', '0' } }
+
+    @{ Id = 'cs-maxping'; Cat = 'CS2'; Icon = [char]0xE909; Rec = $false; Lat = $true
+       Requires = { Test-Cs2Installed }
+       Title = 'Matchmaking ping limit from your real ping'
+       Desc  = 'Sets "Max Acceptable Matchmaking Ping" just above your ping to the nearest Valve datacenter, so CS2 prefers servers close to you instead of up to 150 ms away. Run CS2 server ping to measure it.'
+       Warn  = 'Short queues matter more to you than ping, or you live far from every datacenter. CS2 must be closed.'
+       Test  = { $f = Get-CsFile machine; if (-not $f -or -not (Test-Path $f)) { return $null }; $v = Get-CsValue machine 'mm_dedicated_search_maxping'; $null -ne $v -and [int]$v -lt 150 }
+       On    = {
+           if (-not $script:CsMaxPingWant) { throw 'Run CS2 server ping first: it measures which limit fits you.' }
+           Enable-CsTweak @{ Id = $t.Id; Cs = @{ File = 'machine'; Keys = [ordered]@{ 'mm_dedicated_search_maxping' = "$($script:CsMaxPingWant)" } } }
+       }
+       Off   = { Disable-CsTweak @{ Id = $t.Id; Cs = @{ File = 'machine'; Keys = [ordered]@{ 'mm_dedicated_search_maxping' = $null } } } } }
+
+    @{ Id = 'cs-regionping'; Cat = 'CS2'; Icon = [char]0xE909; Action = 'Test ping'; Lat = $true
+       Requires = { Test-Cs2Installed }
+       Title = 'CS2 server ping'
+       Desc  = 'Measures your ping to every Valve CS2 datacenter through Valve''s own relay list, and offers to set your matchmaking ping limit from the result.'
+       Warn  = ''
+       Run   = { Start-CsRegionPing; 'Pinging Valve''s CS2 datacenters...' } }
+
+    @{ Id = 'cs-qos'; Cat = 'CS2'; Icon = [char]0xE8B1; Rec = $false; Badge = 'advanced'
+       Requires = { Test-Cs2Installed }
+       Title = 'Prioritise CS2 traffic (QoS)'
+       Desc  = 'Tags CS2''s game packets as high-priority (DSCP 46), so a router or Wi-Fi access point that honours priority sends them ahead of downloads and streams.'
+       Warn  = 'Your router has no QoS / SQM: most internet providers ignore the tag, so it is harmless but does nothing.'
+       Test  = { [bool](Get-NetQosPolicy -Name 'ZeroDelay CS2' -ErrorAction SilentlyContinue) }
+       On    = {
+           if (-not ($script:Backup.Registry | Where-Object { $_.Path -eq 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\QoS' -and $_.Name -eq 'Do not use NLA' })) { Set-RegTracked 'cs-qos' 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\QoS' 'Do not use NLA' '1' 'String' }
+           if (-not (Get-NetQosPolicy -Name 'ZeroDelay CS2' -ErrorAction SilentlyContinue)) {
+               New-NetQosPolicy -Name 'ZeroDelay CS2' -AppPathNameMatchCondition 'cs2.exe' -DSCPAction 46 -NetworkProfile All -IPProtocolMatchCondition UDP | Out-Null
+           }
+       }
+       Off   = {
+           Remove-NetQosPolicy -Name 'ZeroDelay CS2' -Confirm:$false -ErrorAction SilentlyContinue
+           # the Fortnite policy may still need the setting: hand it over instead of removing it
+           if (Get-NetQosPolicy -Name 'ZeroDelay Fortnite' -ErrorAction SilentlyContinue) { $script:Backup.Registry | Where-Object { $_.Tweak -eq 'cs-qos' } | ForEach-Object { $_.Tweak = 'qos' } }
+           else { [void](Restore-RegTweak 'cs-qos') }
+       } }
+
+    # --------------------------------------------------------- CS2 driver / Windows
+    @{ Id = 'cs-gpupref'; Cat = 'CS2'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-Cs2Installed) -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run CS2 on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning cs2.exe to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard (see Check which GPU drives each monitor): then frames are copied across. Restart CS2 after changing it.'
+       Test  = { $e = Get-Cs2Exe; if (-not $e) { return $null }; "$(Get-RegValue $GpuPrefKey $e)" -match 'GpuPreference=2;' }
+       On    = {
+           $e = Get-Cs2Exe; $cur = "$(Get-RegValue $GpuPrefKey $e)"
+           $new = if ($cur -match 'GpuPreference=\d;') { $cur -replace 'GpuPreference=\d;', 'GpuPreference=2;' } else { "GpuPreference=2;$cur" }
+           Set-RegTracked $t.Id $GpuPrefKey $e $new 'String'
+       }
+       Off   = { if (-not (Restore-RegTweak $t.Id)) { $e = Get-Cs2Exe; $v = "$(Get-RegValue $GpuPrefKey $e)" -replace 'GpuPreference=2;', ''; if ($v) { Set-RegValue $GpuPrefKey $e $v 'String' } else { Remove-RegValue $GpuPrefKey $e } } } }
+
+    @{ Id = 'cs-smoothmotion'; Cat = 'CS2'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { Test-Cs2Installed }
+       Title = 'NVIDIA: keep Smooth Motion off for CS2'
+       Desc  = 'NVIDIA''s driver frame generation is allowed for CS2, and if it is switched on globally it inserts generated frames that add input delay. This pins it off for CS2.'
+       Warn  = 'You want generated frames in CS2. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Counter-strike 2'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'cs-nvpower'; Cat = 'CS2'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { Test-Cs2Installed }
+       Title = 'NVIDIA: prefer maximum performance for CS2'
+       Desc  = 'At high FPS CS2 often leaves the graphics card half idle, so the driver drops its clocks and each frame takes longer. This keeps clocks up while CS2 runs.'
+       Warn  = 'You use Reflex On + Boost (it does the same, so this card hides), or you are on a laptop on battery.'
+       Nv    = @{ Profile = 'Counter-strike 2'; Id = 0x1057EB71; V = 1 }
+       Test  = { if ((Get-CsValue video 'setting.r_low_latency') -eq '2') { return $null }; Test-NvTweak $t } }
+
+    @{ Id = 'cs-nvrefresh'; Cat = 'CS2'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-Cs2Installed }
+       Title = 'NVIDIA: highest refresh rate in CS2 fullscreen'
+       Desc  = 'Stretched or low resolutions in exclusive fullscreen can silently fall back to 60 Hz. This makes the driver always use your monitor''s top refresh rate for CS2.'
+       Warn  = 'You deliberately play below your top refresh rate. Only shown when CS2 runs in exclusive fullscreen.'
+       Nv    = @{ Profile = 'Counter-strike 2'; Id = 0x0064B541; V = 1 }
+       Test  = { if (-not (Test-CsFullscreen)) { return $null }; Test-NvTweak $t } }
+
+    @{ Id = 'cs-fso'; Cat = 'CS2'; Icon = [char]0xE740; Rec = $false; Badge = 'advanced'
+       Requires = { Test-Cs2Installed }
+       Title = 'Disable fullscreen optimizations for CS2'
+       Desc  = 'In exclusive fullscreen, makes Windows give CS2 real exclusive fullscreen instead of its "optimized" borderless path, so pop-ups cannot push the game back through the desktop compositor. Often makes no difference: test it.'
+       Warn  = 'You alt-tab a lot (slower), or use Windows HDR in CS2. Only shown when CS2 runs in exclusive fullscreen.'
+       Test  = { $e = Get-Cs2Exe; if (-not $e -or -not (Test-CsFullscreen)) { return $null }; "$(Get-RegValue $LayersKey $e)" -match 'DISABLEDXMAXIMIZEDWINDOWEDMODE' }
+       On    = {
+           $e = Get-Cs2Exe; $cur = Get-RegValue $LayersKey $e
+           Set-RegTracked $t.Id $LayersKey $e $(if ($cur) { "$cur DISABLEDXMAXIMIZEDWINDOWEDMODE" } else { '~ DISABLEDXMAXIMIZEDWINDOWEDMODE' }) 'String'
+       }
+       Off   = {
+           if (-not (Restore-RegTweak $t.Id)) {
+               $e = Get-Cs2Exe; $cur = "$(Get-RegValue $LayersKey $e)" -replace '\s*DISABLEDXMAXIMIZEDWINDOWEDMODE', ''
+               if ($cur.Trim() -in '', '~') { Remove-RegValue $LayersKey $e } else { Set-RegValue $LayersKey $e $cur 'String' }
+           }
+       } }
+
+    @{ Id = 'cs-amd-antilag2'; Cat = 'CS2'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { (Test-Cs2Installed) -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_1002' -and $_ -notmatch 'Graphics$' }) }
+       Title = 'AMD: use CS2''s built-in Anti-Lag 2 (guided)'
+       Desc  = 'CS2 has AMD Anti-Lag 2 built in by Valve and AMD, which is the VAC-safe way to cut input lag on Radeon. The 2023 bans came from the old driver-side Anti-Lag+, which AMD withdrew.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("1. Update AMD Software: Adrenalin Edition to 24.6.1 or newer.`n`n2. In CS2: Settings > Video > Advanced Video > AMD Anti-Lag 2: Enabled.`n`n3. In Adrenalin > Gaming > Counter-Strike 2: Radeon Chill Off, Radeon Boost Off, AMD Fluid Motion Frames Off, and do not use HYPR-RX (it turns Boost and Fluid Motion Frames on). Leave the driver's own Radeon Anti-Lag at default; the game's Anti-Lag 2 does the work.`n`nNever install the old 23.10.1 driver or any tool that hooks into CS2 to cut latency: that is what got players VAC-banned in 2023.") ('AMD and CS2') ('OK') ('Information')); 'Shown.' } }
+
+    # -------------------------------------------------------------- CS2 checks
+    @{ Id = 'cs-launchcheck'; Cat = 'CS2'; Icon = [char]0xE9D9; Action = 'Check'
+       Requires = { Test-Cs2Installed }
+       Title = 'Check launch options and Steam settings'
+       Desc  = 'Finds launch options that do nothing in CS2 (-novid, -threads, -high, -tickrate...), ones that block VAC matchmaking (-insecure), and Steam''s overlay, downloads and background recording.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-CsLaunchReport) 'CS2 launch options and Steam' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'cs-install'; Cat = 'CS2'; Icon = [char]0xEDA2; Action = 'Check'
+       Requires = { Test-Cs2Installed }
+       Title = 'CS2 version and drive check'
+       Desc  = 'Shows your CS2 version and where it is installed, and checks it is on an SSD: on a hard drive maps load slowly and assets can hitch.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-CsInstallReport) 'CS2 install' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'cs-sens'; Cat = 'CS2'; Icon = [char]0xE962; Action = 'Show'
+       Requires = { Test-Cs2Installed }
+       Title = 'Your CS2 sensitivity in cm/360'
+       Desc  = 'Reads your CS2 sensitivity and shows it as eDPI and centimetres per 360 turn, with the same aim in CS:GO, Valorant and Fortnite. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-CsSensReport) 'CS2 sensitivity' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'cs-netadvice'; Cat = 'CS2'; Icon = [char]0xE839; Action = 'Show how'
+       Requires = { Test-Cs2Installed }
+       Title = 'Read your connection in CS2 (advice)'
+       Desc  = 'CS2 can print its own live measurement of ping, packet loss and jitter. Here is how to read it, and what to change when it shows a problem.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("1. Settings > Game > Enable Developer Console: Yes.`n`n2. In a match, open the console (`` key) and type:  net_connections_status`n   It shows CS2's own ping, loss and jitter to the server.`n`n3. Or switch on the HUD readout with the 'Show ping, packet loss and jitter' card.`n`nWhat to do:`n- Loss or jitter on Wi-Fi: use a cable, or see the Network tab's Wi-Fi check.`n- Loss on a cable too: run Test the link to your router (Network tab). If your home network is clean, the problem is your line or route.`n- Only if loss stays and you cannot fix it: set 'Buffering to smooth over packet loss' to 1 (adds about 16 ms).") ('Your connection in CS2') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'cs-mouseadvice'; Cat = 'CS2'; Icon = [char]0xE962; Action = 'Show how'
+       Requires = { Test-Cs2Installed }
+       Title = 'Mouse settings that matter in CS2 (advice)'
+       Desc  = 'CS2 always reads your mouse raw, so Windows pointer settings do not change your aim. What does matter: sensitivity in CS2 and, on some PCs, a very high polling rate.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("- CS2 uses raw input always (m_rawinput no longer exists). Windows pointer speed and Enhance pointer precision only affect the desktop and menus.`n`n- Change aim speed with CS2's sensitivity, not m_yaw.`n`n- 4000 or 8000 Hz polling costs CPU time on every frame. If CS2 stutters or your FPS drops with such a mouse, set 1000 or 2000 Hz in the mouse software and compare with the same FPS cap. A strong CPU often handles 4000 Hz fine.") ('Mouse in CS2') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'cs-shaderwarm'; Cat = 'CS2'; Icon = [char]0xE895; Action = 'Show how'
+       Requires = { Test-Cs2Installed }
+       Title = 'After an update: warm up before Premier (advice)'
+       Desc  = 'A new graphics driver or CS2 update throws away the compiled shaders, so the first rounds can hitch while they rebuild. Play a few minutes of Deathmatch first.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("After a graphics driver update or a big CS2 update:`n`n1. Start a Deathmatch or a practice map for 3 to 5 minutes and walk around.`n2. Then queue for Premier or Competitive.`n`nDo not clear the shader cache (Potato > Clear shader cache) right before you play: that causes the same rebuild.") ('Shader warm-up') ('OK') ('Information')); 'Shown.' } }
+
     # ======================================================= Creator tab (1.7)
     @{ Id = 'cr-autosave'; Cat = 'Creator'; Icon = [char]0xE74E; Rec = $true; Requires = { [bool](Get-PrPrefsFile) }
        Title = 'Premiere: auto-save every 15 minutes'
@@ -4255,7 +4738,7 @@ function Invoke-TweakTest($t) {
         if ($t.Requires -and -not (& $t.Requires)) { return $null }
         if ($t.Test) { $r = & $t.Test } elseif ($t.Reg) { $r = Test-RegTweak $t } elseif ($t.Ini) { $r = Test-IniTweak $t }
         elseif ($t.Power) { $r = Test-PowerTweak $t } elseif ($t.Dx) { $r = Test-DxTweak $t } elseif ($t.Tasks) { $r = Test-TaskTweak $t }
-        elseif ($t.Remove) { $r = Test-RemoveTweak $t } elseif ($t.Nv) { $r = Test-NvTweak $t } else { return $null }
+        elseif ($t['Remove']) { $r = Test-RemoveTweak $t } elseif ($t.Nv) { $r = Test-NvTweak $t } elseif ($t.Cs) { $r = Test-CsTweak $t } else { return $null }
         if ($null -eq $r) { return $null }
         [bool]$r
     } catch { $null }
@@ -4304,7 +4787,7 @@ function Set-Applied([string]$Id, [bool]$On) {
 function Invoke-TweakOn($t) {
     if ($t.Id -eq 'sticky') { try { [void][AccessKeys]::Write(506, 122, 58) } catch {} }
     if ($t.On) { & $t.On } elseif ($t.Reg) { Enable-RegTweak $t } elseif ($t.Ini) { Enable-IniTweak $t }
-    elseif ($t.Power) { Enable-PowerTweak $t } elseif ($t.Dx) { Enable-DxTweak $t } elseif ($t.Tasks) { Enable-TaskTweak $t } elseif ($t.Remove) { Enable-RemoveTweak $t } elseif ($t.Nv) { Enable-NvTweak $t }
+    elseif ($t.Power) { Enable-PowerTweak $t } elseif ($t.Dx) { Enable-DxTweak $t } elseif ($t.Tasks) { Enable-TaskTweak $t } elseif ($t['Remove']) { Enable-RemoveTweak $t } elseif ($t.Nv) { Enable-NvTweak $t } elseif ($t.Cs) { Enable-CsTweak $t }
     if ($t.After) { & $t.After }
     Set-Applied $t.Id $true
     Save-Backup
@@ -4315,7 +4798,7 @@ function Invoke-TweakOn($t) {
 function Invoke-TweakOff($t) {
     if ($t.Id -eq 'sticky') { try { [void][AccessKeys]::Write(510, 126, 62) } catch {} }
     if ($t.Off) { & $t.Off } elseif ($t.Reg) { Disable-RegTweak $t } elseif ($t.Ini) { Disable-IniTweak $t }
-    elseif ($t.Power) { Disable-PowerTweak $t } elseif ($t.Dx) { Disable-DxTweak $t } elseif ($t.Tasks) { Disable-TaskTweak $t } elseif ($t.Remove) { Disable-RemoveTweak $t } elseif ($t.Nv) { Disable-NvTweak $t }
+    elseif ($t.Power) { Disable-PowerTweak $t } elseif ($t.Dx) { Disable-DxTweak $t } elseif ($t.Tasks) { Disable-TaskTweak $t } elseif ($t['Remove']) { Disable-RemoveTweak $t } elseif ($t.Nv) { Disable-NvTweak $t } elseif ($t.Cs) { Disable-CsTweak $t }
     if ($t.After) { & $t.After }
     Set-Applied $t.Id $false
     Save-Backup
@@ -4414,6 +4897,7 @@ foreach ($t in $Tweaks) { if ($PotatoIds -contains $t.Id) { $t.Potato = $true } 
 # Cards shown on the GTX 1080 Ti tab (alongside the ones made for it)
 $Gtx1080Ids = @('perfmode', 'meshquality', 'nanite', 'reflex', 'vsync', 'fullscreen', 'fpscap', 'vrrcap', 'motionblur', 'grass', 'nvpower', 'hags', 'gpu-msi', 'shadercache')
 foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
+foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
 # ==================================================================== UI ===
 
@@ -6140,6 +6624,8 @@ $Categories = @(
     @{ Name = 'Creator';    Icon = [char]0xE714; Title = 'Creator'; Requires = { Test-CreatorPc }
        Note = 'For Premiere Pro, After Effects, Photoshop, Media Encoder and OBS. Close the app before you flip a switch: Adobe apps and OBS rewrite their settings when they close.' }
     @{ Name = 'Fortnite';   Icon = [char]0xE7FC; Title = 'Fortnite' }
+    @{ Name = 'CS2';        Icon = [char]0xE7FC; Title = 'Counter-Strike 2'; Requires = { Test-Cs2Installed }
+       Note = 'CS2 settings, driver settings for cs2.exe, checks and a Valve server ping. Close CS2 before you flip a switch: it rewrites its settings when it exits. Everything here is a normal game setting, so it is VAC-safe; nothing touches the game files or anti-cheat.' }
     @{ Name = 'System';     Icon = [char]0xE7F8; Title = 'System' }
     @{ Name = 'Power';      Icon = [char]0xE945; Title = 'Power & CPU' }
     @{ Name = 'Graphics';   Icon = [char]0xE7F4; Title = 'Graphics' }
@@ -6676,6 +7162,7 @@ function Get-TweakChanges($t) {
         foreach ($k in $t.Ini.Keys) { $cur = Get-IniValue $lines $k; if ("$cur" -ne "$($t.Ini[$k][0])") { $out += "${k}: $(if ($null -eq $cur) { 'not set' } else { $cur }) → $($t.Ini[$k][0])" } }
     }
     if ($t.Dx) { $cur = Get-DxValue $t.Dx.K; $out += "$($t.Dx.K): $(if ($null -eq $cur) { 'not set' } else { $cur }) → $($t.Dx.V)" }
+    if ($t.Cs) { foreach ($k in @($t.Cs.Keys.Keys)) { $cur = Get-CsValue $t.Cs.File $k; if ("$cur" -ne "$($t.Cs.Keys[$k])") { $out += "$($k -replace '^setting\.', ''): $(if ($null -eq $cur) { 'game default' } else { $cur }) → $($t.Cs.Keys[$k])" } } }
     @($out | Select-Object -First 4)
 }
 function Get-RunningOptimizers { @(foreach ($k in $KnownOptimizers.Keys) { if (Get-Process -Name "$k*" -ErrorAction SilentlyContinue) { $KnownOptimizers[$k] } }) }
@@ -6692,6 +7179,7 @@ function Get-Drift {
         $t = $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1
         if (-not $t -or -not $t.Toggle) { continue }
         # Fortnite leaves out keys at their default and cannot be edited while running; skip those cases.
+        if ($t.Cs -and (Test-Cs2Running)) { continue }
         if ($t.Ini -and ((Test-FortniteRunning) -or -not (Test-Path $IniPath) -or -not ($t.Ini.Keys | Where-Object { $null -ne (Get-IniValue (Get-Content $IniPath) $_) }))) { continue }
         if ((Invoke-TweakTest $t) -eq $false) { $items += [pscustomobject]@{ Kind = 'tweak'; T = $t; Title = $t.Title } }
     }
@@ -8086,6 +8574,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.12.0' = @(
+        @{ T = 'Counter-Strike 2 tab'; D = 'Shown when CS2 is installed. Reflex, V-Sync or Valve''s G-SYNC combo, Boost Player Contrast, AO, anti-aliasing, FSR, particles, shaders and shadows, FPS caps, the telemetry HUD and network settings: each one a single CS2 setting, backed up and undone exactly.' }
+        @{ T = 'CS2 server ping'; D = 'Your ping to every Valve datacenter, measured through Valve''s own relay list, with one click to set CS2''s matchmaking ping limit from it.' }
+        @{ T = 'CS2 checks'; D = 'Launch options that do nothing in CS2 or block VAC matchmaking, Steam overlay, downloads and recording, CS2 version and drive, your sensitivity in cm/360, plus NVIDIA driver settings and GPU choice for cs2.exe and guided steps for AMD Anti-Lag 2.' }
+    )
     '1.11.0' = @(
         @{ T = '38 new optimizations'; D = 'A new research round added cards across every tab. Nothing is switched on for you: pick what you want, as always.' }
         @{ T = 'Input'; D = 'Stop Print Screen opening the Snipping Tool, block the Mouse Keys and High Contrast shortcuts, turn off the Windows keys, and touchpad / touchscreen switches for laptops.' }
