@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.12.0'
+$AppVersion = '1.12.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -6526,7 +6526,7 @@ function Update-RestartBar {
     $what = if ($n -eq 1) { '1 change' } else { "$n changes" }
     $ui.RestartTitle.Text = if ($restart) { "Restart needed for $what to take effect" } else { "Sign out and back in for $what to take effect" }
     $boot = try { [datetime]$script:BootId } catch { $null }
-    $when = @($script:Pending.Items | ForEach-Object { try { [datetime]$script:PendingAdded[$_] } catch {} } | Sort-Object | Select-Object -First 1)
+    $when = @($script:Pending.Items | Where-Object { $_ } | ForEach-Object { try { [datetime]$script:PendingAdded[$_] } catch {} } | Sort-Object | Select-Object -First 1)
     $fmt = { param($d) if ($d.Date -eq (Get-Date).Date) { "today $($d.ToString('HH:mm'))" } else { $d.ToString('d MMM HH:mm') } }
     $ui.RestartText.Text = ($script:Pending.Items -join '  ·  ') +
         $(if ($boot) { "   —   Windows last restarted $(& $fmt $boot)$(if ($when) { ", these were changed $(& $fmt $when[0])" }). $(if ($restart) { 'Use Restart (not only closing ZeroDelay).' } else { 'Signing out or restarting both work.' })" } else { '' })
@@ -8438,6 +8438,7 @@ function Update-AppearanceUi {
 function Restart-ZeroDelay {
     Save-Backup
     $script:Relaunch = $true
+    $script:RelaunchPage = 'Settings'
     $script:ReallyExit = $true
     $window.Close()
 }
@@ -8574,6 +8575,10 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.12.1' = @(
+        @{ T = 'No more sudden closing'; D = 'An error in a button or a background timer used to close ZeroDelay without a word. Now it shows a short message, keeps running and writes the details to crash.log in ZeroDelay''s data folder.' }
+        @{ T = 'Updates take over'; D = 'If an older ZeroDelay was still running in the tray when you updated, opening ZeroDelay showed the old version. It now restarts into the new one.' }
+    )
     '1.12.0' = @(
         @{ T = 'Counter-Strike 2 tab'; D = 'Shown when CS2 is installed. Reflex, V-Sync or Valve''s G-SYNC combo, Boost Player Contrast, AO, anti-aliasing, FSR, particles, shaders and shadows, FPS caps, the telemetry HUD and network settings: each one a single CS2 setting, backed up and undone exactly.' }
         @{ T = 'CS2 server ping'; D = 'Your ping to every Valve datacenter, measured through Valve''s own relay list, with one click to set CS2''s matchmaking ping limit from it.' }
@@ -13085,7 +13090,13 @@ if (-not $Snapshot) {
     # a second launch signals this one to come to the front
     $script:ShowTimer = New-Object Windows.Threading.DispatcherTimer
     $script:ShowTimer.Interval = [TimeSpan]::FromMilliseconds(400)
-    $script:ShowTimer.Add_Tick({ if ($script:ShowSignal.WaitOne(0)) { Show-MainWindow } })
+    $script:ShowTimer.Add_Tick({
+        if (-not $script:ShowSignal.WaitOne(0)) { return }
+        # ZeroDelay was updated while this copy kept running (for example in the tray): start the new version
+        $disk = try { if ((Get-Content -LiteralPath $PSCommandPath -TotalCount 60 | Out-String) -match "\`$AppVersion = '([\d.]+)'") { [version]$Matches[1] } } catch { $null }
+        if ($disk -and $disk -gt [version]$AppVersion) { Save-Backup; $script:Relaunch = $true; $script:RelaunchPage = $null; $script:ReallyExit = $true; $window.Close(); return }
+        Show-MainWindow
+    })
     $script:ShowTimer.Start()
 }
 $window.Add_Closed({
@@ -13117,8 +13128,31 @@ $script:StartupGuard = New-Object Windows.Threading.DispatcherTimer
 $script:StartupGuard.Interval = [TimeSpan]::FromSeconds(30)
 $script:StartupGuard.Add_Tick({ $script:StartupGuard.Stop(); if (-not $script:StartupDone) { Update-All; Show-AfterStartup } })
 $script:StartupGuard.Start()
-[Windows.Threading.Dispatcher]::Run()
+# --- Crash guard. The app runs its own message loop, so an error that escapes any button or timer handler would end
+#     the loop and the window would just vanish. It is logged to crash.log instead, and ZeroDelay keeps running.
+$CrashLog = Join-Path $DataDir 'crash.log'
+function Write-CrashLog($Ex, [string]$Where) {
+    try {
+        $er = if ($Ex -is [System.Management.Automation.IContainsErrorRecord]) { $Ex.ErrorRecord } else { $null }
+        $at = if ($er -and $er.InvocationInfo) { "line $($er.InvocationInfo.ScriptLineNumber): $("$($er.InvocationInfo.Line)".Trim())" } else { '' }
+        $txt = "==== $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))  ZeroDelay $AppVersion  ($Where)`r`n$($Ex.GetType().FullName): $($Ex.Message)`r`n$at`r`n$(if ($er) { $er.ScriptStackTrace })`r`n$($Ex.StackTrace)`r`n"
+        if ((Test-Path $CrashLog) -and (Get-Item $CrashLog).Length -gt 256KB) { Move-Item $CrashLog "$CrashLog.old" -Force }
+        Add-Content -Path $CrashLog -Value $txt -Encoding UTF8
+    } catch {}
+}
+$script:LastCrashToast = [datetime]::MinValue
+$window.Dispatcher.Add_UnhandledException({
+    param($s, $e)
+    $e.Handled = $true
+    Write-CrashLog $e.Exception 'handled'
+    if (((Get-Date) - $script:LastCrashToast).TotalSeconds -gt 5) {
+        $script:LastCrashToast = Get-Date
+        try { Show-Toast "Something went wrong: $($e.Exception.Message) ZeroDelay kept running; details are in crash.log." '#FF9F0A' } catch {}
+    }
+})
+[AppDomain]::CurrentDomain.add_UnhandledException({ param($s, $e) Write-CrashLog $e.ExceptionObject 'fatal' })
+try { [Windows.Threading.Dispatcher]::Run() } catch { Write-CrashLog $_.Exception 'message loop'; throw }
 if ($script:Relaunch) {
     try { $script:AppMutex.ReleaseMutex(); $script:AppMutex.Dispose() } catch {}
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Page Settings$(if ($NoElevate) { ' -NoElevate' })"
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`"$(if ($script:RelaunchPage) { " -Page $($script:RelaunchPage)" })$(if ($NoElevate) { ' -NoElevate' })"
 }
