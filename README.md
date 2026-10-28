@@ -15,7 +15,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
   advice for undervolting and cooling an older card.
 
-- **220+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
+- **240+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
 - **Network checks**: your cable's link speed and errors, Wi-Fi signal and band, a 20-second test of the link to your router
   (home network or internet line?), VPN routing, traffic shapers such as Killer or cFosSpeed, and the Intel 2.5G driver bug.
@@ -27,6 +27,11 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   through Valve's relay list that can set your matchmaking ping limit, and checks for launch options (dead ones and the
   VAC-blocking `-insecure`), Steam overlay/downloads/recording, CS2 version and drive, and sensitivity in cm/360. VAC-safe:
   nothing touches the game files or anti-cheat.
+- **Your real matches**: reads Fortnite's own log for ping, jitter and packet loss per match, real in-match stutters (loading
+  screens left out), which graphics card and renderer Fortnite used, whether Reflex was on, and recent crashes.
+- **Fortnite subregion ping**: Epic's regions have servers in several cities (Europe: Germany, France, UK); ZeroDelay pings
+  each one so you can set Fortnite's Subregion Preference, plus a one-minute jitter and loss test, a route check that shows
+  where lag starts, and Epic's live server status.
 - **Game Mode**: a booster-style dashboard with a Start Game button (turns Game Mode on and launches Fortnite), a
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses

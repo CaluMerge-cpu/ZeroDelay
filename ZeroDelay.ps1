@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.12.1'
+$AppVersion = '1.13.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -2011,6 +2011,375 @@ for ($round = 0; $round -lt 3; $round++) {
     }
 }
 
+
+# --- Research round 4 (1.13): Fortnite log checks, network tests, repairs
+$FnSaved = Join-Path $env:LOCALAPPDATA 'FortniteGame\Saved'
+# Fortnite keeps its log open while running: read it without locking it
+function Read-SharedText([string]$Path) {
+    $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try { $sr = New-Object IO.StreamReader $fs; $sr.ReadToEnd() } finally { $fs.Close() }
+}
+function Get-FnLogs([int]$Count = 5) { @(Get-ChildItem (Join-Path $FnSaved 'Logs') -Filter 'FortniteGame*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $Count) }
+function ConvertFrom-FnStamp([string]$s) { try { [datetime]::ParseExact($s, 'yyyy.MM.dd-HH.mm.ss:fff', [Globalization.CultureInfo]::InvariantCulture) } catch { $null } }
+
+# per-match network numbers Fortnite itself logs at the end of each game phase
+function Get-FnNetReport {
+    $logs = Get-FnLogs 6
+    if (-not $logs.Count) { return 'No Fortnite logs found. Play a match first.' }
+    $rows = @()
+    foreach ($l in $logs) {
+        $t = try { Read-SharedText $l.FullName } catch { continue }
+        $cur = $null
+        foreach ($m in [regex]::Matches($t, '(?m)^\[([\d.\-:]+)\].*EndGamePhase_ClientMetrics (\w+) Stats:(.*)$')) {
+            $f = @{}; foreach ($kv in [regex]::Matches($m.Groups[3].Value, '(\w+): (-?[\d.]+)')) { $f[$kv.Groups[1].Value] = [double]::Parse($kv.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture) }
+            if ($m.Groups[2].Value -eq 'General') { $cur = @{ Time = ConvertFrom-FnStamp $m.Groups[1].Value }; $rows += $cur }
+            if ($cur) { foreach ($k in $f.Keys) { $cur[$k] = $f[$k] } }
+        }
+    }
+    $rows = @($rows | Where-Object { $_.DurationSec -ge 60 -and $_.ContainsKey('PingRTT') } | Sort-Object { $_.Time } -Descending | Select-Object -First 8)
+    if (-not $rows.Count) { return 'Fortnite has not logged any finished match phases yet (or the log format changed after an update).' }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $lines = foreach ($r in $rows) {
+        $when = if ($r.Time) { $r.Time.ToString('d MMM HH:mm') } else { '?' }
+        "{0}: ping {1} ms (max {2}), jitter {3} ms, loss in {4}% / out {5}%" -f $when, $r.PingRTT, $r.MaxPing, ([double]$r.AverageJitter).ToString('0.0', $inv), ([double]$r.InPacketsLostPercentage).ToString('0.##', $inv), ([double]$r.OutPacketsLostPercentage).ToString('0.##', $inv)
+    }
+    $bad = @()
+    if ($rows | Where-Object { $_.InPacketsLostPercentage -gt 0.5 -or $_.OutPacketsLostPercentage -gt 0.5 }) { $bad += 'Packet loss above 0.5% in some matches: that causes rubber-banding and missed shots. Run Test the link to your router and the Jitter and loss test to find where it starts.' }
+    if ($rows | Where-Object { $_.AverageJitter -gt 5 }) { $bad += 'Jitter above 5 ms: usually Wi-Fi or a busy connection. Check the Bufferbloat test and use a cable if you can.' }
+    if ($rows | Where-Object { $_.PercentFramesOverBadPingThreshold -gt 1 }) { $bad += 'Some matches spent more than 1% of the time over Fortnite''s bad-ping limit.' }
+    $s = "Measured by Fortnite itself in your last matches:`n`n$($lines -join "`n")`n`n"
+    $s + $(if ($bad.Count) { $bad -join "`n`n" } else { 'Your matches were clean: no meaningful packet loss or jitter. If the game still feels laggy, compare your ping per subregion with Fortnite subregion ping.' })
+}
+
+# what Fortnite actually ran on last time, read from its own log
+function Get-FnRendererReport {
+    $l = Get-FnLogs 1
+    if (-not $l.Count) { return 'No Fortnite log found. Start Fortnite once first.' }
+    $t = Read-SharedText $l[0].FullName
+    $out = @()
+    $id = [regex]::Match($t, 'Chosen D3D12 Adapter Id = (\d+)')
+    $names = @{}; foreach ($m in [regex]::Matches($t, 'Found D3D12 adapter (\d+): ([^\(\r\n]+)')) { $names[$m.Groups[1].Value] = $m.Groups[2].Value.Trim() }
+    if ($id.Success -and $names[$id.Groups[1].Value]) {
+        $gpu = $names[$id.Groups[1].Value]
+        $out += "Graphics card used: $gpu"
+        if ($gpu -match 'Radeon\(TM\) Graphics|Radeon Graphics$|UHD|Iris|Intel\(R\) Graphics' -and ($names.Values | Where-Object { $_ -match 'GeForce|RTX|GTX|Radeon RX|Arc A|Arc B' })) { $out += 'PROBLEM: Fortnite ran on the integrated graphics while a graphics card is installed. Turn on Run Fortnite on the high-performance GPU and plug your monitor into the graphics card.' }
+    }
+    $fl = [regex]::Matches($t, 'RHI D3D12 with Feature Level (\w+) is supported and will be used')
+    if ($fl.Count) { $lv = $fl[$fl.Count - 1].Groups[1].Value; $out += "Renderer: DirectX 12 $(if ($lv -eq 'ES3_1') { '(Performance mode)' } else { "($lv, full DirectX 12)" })" }
+    elseif ($t -match 'Loading RHI module D3D11RHI') { $out += 'Renderer: DirectX 11 was forced. Fortnite no longer supports it; remove -d3d11 or -dx11 from your launch options.' }
+    $rf = [regex]::Matches($t, 'Reflex Low Latency mode: ([^\r\n]+)')
+    if ($rf.Count) { $out += "NVIDIA Reflex: $($rf[$rf.Count - 1].Groups[1].Value.Trim())" }
+    $sc = [regex]::Matches($t, 'After: [^\r\n]*Size=\((\d+),(\d+)\)[^\r\n]*Fullscreen=(\d), AllowTearing=(\d)')
+    if ($sc.Count) {
+        $g = $sc[$sc.Count - 1].Groups
+        $out += "Window: $($g[1].Value)x$($g[2].Value), $(if ($g[3].Value -eq '1') { 'true fullscreen' } else { 'borderless or windowed' }), tearing $(if ($g[4].Value -eq '1') { 'allowed (lowest latency)' } else { 'not allowed (V-Sync-like)' })"
+    }
+    $vr = [regex]::Match($t, 'Adapter has (\d+)MB of dedicated video memory')
+    if ($vr.Success) { $mb = [int]$vr.Groups[1].Value; $out += "Video memory: $([math]::Round($mb / 1024, 1)) GB$(if ($mb -lt 7500) { ' - under 8 GB: Low textures stops texture hitching.' })" }
+    if (-not $out.Count) { return 'Could not read the details from Fortnite''s log; the format may have changed after an update.' }
+    "From Fortnite's last launch ($($l[0].LastWriteTime.ToString('d MMM HH:mm'))):`n`n" + ($out -join "`n")
+}
+
+# real in-match hitches from Fortnite's own detector, without loading screens and mode switches
+function Get-FnHitchReport {
+    $logs = Get-FnLogs 3
+    if (-not $logs.Count) { return 'No Fortnite logs found. Play a match first.' }
+    $res = @()
+    foreach ($l in $logs) {
+        $t = try { Read-SharedText $l.FullName } catch { continue }
+        $starts = @([regex]::Matches($t, '(?m)^\[([\d.\-:]+)\][^\r\n]*MatchState changed[^\r\n]*current=InProgress'))
+        if (-not $starts.Count) { continue }
+        # a loading screen starting (PausedSlotMask not 0) or the match ending; mask 0 is the screen going away at match start
+        $ends = @([regex]::Matches($t, '(?m)^\[([\d.\-:]+)\][^\r\n]*(Name: LoadingScreen, PausedSlotMask: [1-9]|MatchState changed[^\r\n]*current=(WaitingPostMatch|LeavingMap))'))
+        $marks = @([regex]::Matches($t, '(?m)^\[([\d.\-:]+)\][^\r\n]*(Swapchain Resized|UpdateResolutionsWindowedArray|RespawnLoading)') | ForEach-Object { ConvertFrom-FnStamp $_.Groups[1].Value } | Where-Object { $_ })
+        $hitches = @([regex]::Matches($t, '(?m)^\[([\d.\-:]+)\][^\r\n]*HITCHHUNTER: Hitch in (\w+) of ([\d.]+) ms'))
+        $last = [regex]::Matches($t.Substring([Math]::Max(0, $t.Length - 4000)), '(?m)^\[([\d.\-:]+)\]'); $lastTs = if ($last.Count) { ConvertFrom-FnStamp $last[$last.Count - 1].Groups[1].Value } else { $null }
+        foreach ($s in $starts) {
+            $e = $ends | Where-Object { $_.Index -gt $s.Index } | Select-Object -First 1
+            $eIdx = if ($e) { $e.Index } else { $t.Length }
+            $t0 = ConvertFrom-FnStamp $s.Groups[1].Value; $t1 = if ($e) { ConvertFrom-FnStamp $e.Groups[1].Value } else { $lastTs }
+            if (-not $t0 -or -not $t1 -or ($t1 - $t0).TotalMinutes -lt 1) { continue }
+            $in = @(foreach ($h in $hitches) {
+                if ($h.Index -le $s.Index -or $h.Index -ge $eIdx -or [double]::Parse($h.Groups[3].Value, [Globalization.CultureInfo]::InvariantCulture) -lt 50) { continue }
+                $ht = ConvertFrom-FnStamp $h.Groups[1].Value; $near = $false
+                foreach ($mk in $marks) { if ([math]::Abs(($mk - $ht).TotalSeconds) -le 1) { $near = $true; break } }
+                if (-not $near) { $h }
+            })
+            $res += [pscustomobject]@{ Start = $t0; Minutes = ($t1 - $t0).TotalMinutes; Count = $in.Count; Cpu = @($in | Where-Object { $_.Groups[2].Value -eq 'GameThread' }).Count; Worst = $(if ($in.Count) { ($in | ForEach-Object { [double]::Parse($_.Groups[3].Value, [Globalization.CultureInfo]::InvariantCulture) } | Measure-Object -Maximum).Maximum } else { 0 }) }
+        }
+    }
+    if (-not $res.Count) { return 'No finished matches in Fortnite''s recent logs yet.' }
+    $res = @($res | Sort-Object Start -Descending | Select-Object -First 8)
+    $lines = foreach ($r in $res) { "{0}: {1} stutter{4} over 50 ms in {2} min{3}" -f $r.Start.ToString('d MMM HH:mm'), $r.Count, [int]$r.Minutes, $(if ($r.Count) { " (worst $([int]$r.Worst) ms)" } else { '' }), $(if ($r.Count -ne 1) { 's' } else { '' }) }
+    $total = ($res | Measure-Object Count -Sum).Sum; $cpu = ($res | Measure-Object Cpu -Sum).Sum; $min = ($res | Measure-Object Minutes -Sum).Sum
+    $rate = if ($min) { $total / $min } else { 0 }
+    $s = "Real in-match stutters from Fortnite's own detector (loading screens and window switches left out):`n`n$($lines -join "`n")`n`n"
+    if ($rate -lt 0.2) { $s += 'That is smooth: well under one stutter every five minutes.' }
+    else {
+        $s += "About $([math]::Round($rate, 1)) per minute. "
+        $s += if ($total -and $cpu / $total -gt 0.6) { 'Most are on the game thread (CPU, memory or loading new areas): try Low textures under 8 GB of video memory, medium view distance, and check Fortnite is on an SSD.' } else { 'Most are on the rendering side (shaders or the graphics card): the first matches after a Fortnite or driver update always stutter while shaders rebuild; if it stays, check the graphics settings and driver.' }
+    }
+    $s
+}
+
+# big Fortnite logs take seconds to read: build the report in the background worker, then show it
+$script:ReportBusy = @{}
+$script:ReportTitles = @{ 'Get-FnHitchReport' = 'Stutters in your matches'; 'Get-FnNetReport' = 'Your matches, measured by Fortnite' }
+function Start-BackgroundReport([string]$Fn) {
+    if ($script:ReportBusy[$Fn]) { throw 'Already reading Fortnite''s logs.' }
+    $script:ReportBusy[$Fn] = $true
+    Invoke-Worker 'param($fn) @{ Fn = $fn; Text = "$(& $fn)" }' @($Fn) {
+        param($out, $errs)
+        $r = Get-WorkerResult $out
+        if ($r -is [hashtable]) { $script:ReportBusy[$r.Fn] = $false; [void](Show-ZdDialog $r.Text $script:ReportTitles[$r.Fn] 'OK' 'Information') }
+        else { $script:ReportBusy.Clear(); Show-Toast 'Could not read Fortnite''s logs.' '#FF9F0A' }
+    }
+}
+function Get-FnCrashReport {
+    $dirs = @(Get-ChildItem (Join-Path $FnSaved 'Crashes') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-14) } | Sort-Object LastWriteTime -Descending)
+    if (-not $dirs.Count) { return 'No Fortnite crashes in the last 14 days.' }
+    $lines = foreach ($d in $dirs | Select-Object -First 5) {
+        $x = Join-Path $d.FullName 'CrashContext.runtime-xml'
+        $msg = if (Test-Path $x) { $m = [regex]::Match((Get-Content $x -Raw -ErrorAction SilentlyContinue), '<ErrorMessage>([^<]*)</ErrorMessage>'); if ($m.Success) { ($m.Groups[1].Value -split '\r?\n')[0].Trim() } } else { $null }
+        "$($d.LastWriteTime.ToString('d MMM HH:mm')): $(if ($msg) { $msg } else { 'crash (no details)' })"
+    }
+    $all = $lines -join "`n"
+    $tip = if ($all -match 'GPU|DXGI|DEVICE_REMOVED|D3D') { 'Graphics-related crashes: remove any GPU overclock or undervolt, update the graphics driver, then verify Fortnite.' }
+           elseif ($all -match 'video memory') { 'Out of video memory: turn on Low textures.' }
+           elseif ($all -match 'Out of memory') { 'Out of memory: make sure the page file is on automatic (System tab).' }
+           else { 'Run Epic''s file check: Epic Games Launcher > Library > Fortnite > ... > Manage > Verify.' }
+    "$($dirs.Count) Fortnite crash$(if ($dirs.Count -ne 1) { 'es' }) in the last 14 days:`n`n$all`n`n$tip"
+}
+
+function Get-FnReplayReport {
+    $d = Join-Path $FnSaved 'Demos'
+    $f = @(Get-ChildItem $d -Filter '*.replay' -File -ErrorAction SilentlyContinue)
+    if (-not $f.Count) { return 'No Fortnite replays on disk.' }
+    $mb = [int](($f | Measure-Object Length -Sum).Sum / 1MB); $un = @($f | Where-Object { $_.Name -like 'UnsavedReplay-*' }).Count
+    "$($f.Count) replays use $mb MB ($un unsaved, recorded automatically).`n`n$(if ($mb -gt 2048) { 'That is a lot: delete old ones in Fortnite > Career > Replays, or switch automatic recording off (Settings > Game > Replays).' } else { 'Nothing to worry about.' }) ZeroDelay does not delete replays, so you never lose a saved clip."
+}
+
+function Get-FnEngineIniReport {
+    $p = Join-Path $FnSaved 'Config\WindowsClient\Engine.ini'
+    if (-not (Test-Path $p)) { return 'No user Engine.ini: Fortnite runs with its own engine settings. Good.' }
+    $sec = ''; $hits = @()
+    foreach ($line in Get-Content $p -ErrorAction SilentlyContinue) {
+        if ($line -match '^\s*\[(.+)\]') { $sec = $Matches[1]; continue }
+        if ($line -match '^\s*(Paths|CachedClientID)\s*=' -or -not $line.Trim()) { continue }
+        if ($sec -match 'SystemSettings|ConsoleVariables|RendererSettings|Script/Engine\.Engine|TextureStreaming' -or $line -match '^\s*(r|t|fx|foliage|sg)\.') { $hits += "[$sec] $($line.Trim())" }
+    }
+    if (-not $hits.Count) { return 'Engine.ini only holds Fortnite''s own entries. Good.' }
+    "Another tool added engine settings to Fortnite's Engine.ini ($($hits.Count) lines):`n`n$(($hits | Select-Object -First 12) -join "`n")$(if ($hits.Count -gt 12) { "`n..." })`n`nThese are unsupported edits that can cause crashes or odd behaviour. To remove them: close Fortnite and rename Engine.ini to Engine.ini.bak in $(Split-Path $p); Fortnite creates a clean one. ZeroDelay does not edit this file."
+}
+
+# --- Fortnite subregions: Epic's ping hosts hand out servers in several cities; measure each one
+$AwsCity = @{ 'us-east-1' = 'Virginia'; 'us-east-2' = 'Ohio'; 'us-west-1' = 'N. California'; 'us-west-2' = 'Oregon'; 'ca-central-1' = 'Canada'
+              'eu-central-1' = 'Germany'; 'eu-west-1' = 'Ireland'; 'eu-west-2' = 'UK'; 'eu-west-3' = 'France'; 'eu-north-1' = 'Sweden'; 'eu-south-1' = 'Italy'
+              'ap-northeast-1' = 'Tokyo'; 'ap-southeast-1' = 'Singapore'; 'ap-southeast-2' = 'Sydney'; 'ap-south-1' = 'Mumbai'; 'sa-east-1' = 'Sao Paulo'; 'me-south-1' = 'Bahrain'; 'me-central-1' = 'UAE' }
+$script:FnSubBusy = $false
+function Start-FnSubPing {
+    if ($script:FnSubBusy) { throw 'The subregion ping is already running.' }
+    $script:FnSubBusy = $true
+    Invoke-Worker @'
+param($hosts, $city)
+$ips = @()
+foreach ($h in $hosts) {
+    foreach ($a in @(Resolve-DnsName $h.Host -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' })) {
+        $name = try { (Resolve-DnsName $a.IPAddress -Type PTR -QuickTimeout -ErrorAction Stop | Select-Object -First 1).NameHost } catch { '' }
+        $sub = if ($name -match '\.compute-1\.') { 'us-east-1' } elseif ($name -match '\.([a-z]{2}-[a-z]+-\d)\.') { $Matches[1] } else { '' }
+        $ips += [pscustomobject]@{ Region = $h.Name; Ip = $a.IPAddress; Sub = $(if ($sub -and $city[$sub]) { $city[$sub] } elseif ($sub) { $sub } else { $h.Name }) }
+    }
+}
+$ips = @($ips | Sort-Object Ip -Unique)
+$rtt = @{}
+for ($round = 0; $round -lt 8; $round++) {
+    $jobs = foreach ($x in $ips) { [pscustomobject]@{ Ip = $x.Ip; T = (New-Object System.Net.NetworkInformation.Ping).SendPingAsync($x.Ip, 1000) } }
+    try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($jobs | ForEach-Object { $_.T }), 3000) | Out-Null } catch {}
+    foreach ($j in $jobs) { if (-not $rtt[$j.Ip]) { $rtt[$j.Ip] = @() }; $rtt[$j.Ip] += $(if ($j.T.Status -eq 'RanToCompletion' -and $j.T.Result.Status -eq 'Success') { [int]$j.T.Result.RoundtripTime } else { -1 }) }
+    Start-Sleep -Milliseconds 200
+}
+@{ Rows = @($ips | ForEach-Object { $ok = @($rtt[$_.Ip] | Where-Object { $_ -ge 0 } | Sort-Object); [pscustomobject]@{ Region = $_.Region; Sub = $_.Sub; Ip = $_.Ip; Med = $(if ($ok.Count) { $ok[[int][math]::Floor(($ok.Count - 1) / 2)] } else { -1 }); Loss = [int](100 * (8 - $ok.Count) / 8) } }) }
+'@ @(, @($PingHosts | ForEach-Object { @{ Name = $_.Name; Host = $_.Host } })) + @(, $AwsCity) {
+        param($out, $errs)
+        $script:FnSubBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable]) -or -not @($res.Rows).Count) { Show-Toast 'Could not reach Epic''s ping servers. Check your connection.' '#FF9F0A'; return }
+        $rows = @($res.Rows | Where-Object { $_.Med -ge 0 })
+        $mine = Get-PlayRegionName
+        $best = $rows | Where-Object { $_.Region -eq $mine } | Sort-Object { $_.Med } | Select-Object -First 1
+        if ($best) { $script:FnBestIp = $best.Ip; $script:FnBestName = "$($best.Sub) ($($best.Region))" }
+        $lines = foreach ($g in $rows | Group-Object { $_.Region } | Sort-Object { ($_.Group | Measure-Object Med -Minimum).Minimum }) {
+            $subs = foreach ($sg in $g.Group | Group-Object { $_.Sub } | Sort-Object { ($_.Group | Measure-Object Med -Minimum).Minimum }) { "$($sg.Name) $(($sg.Group | Measure-Object Med -Minimum).Minimum) ms" }
+            "$(if ($g.Name -eq $mine) { '> ' })$($g.Name): $($subs -join '  ·  ')"
+        }
+        $tip = if ($best) { "`n`nYour best server in $mine is $($best.Sub) at $($best.Med) ms. In Fortnite: Settings > Game > Matchmaking Region: $mine (not Auto, which also leaves the subregion on Auto), then Subregion Preference: $($best.Sub)." } else { '' }
+        [void](Show-ZdDialog ("Ping to every Fortnite server city (lowest per city):`n`n$($lines -join "`n")$tip`n`nICMP ping approximates the game ping; Fortnite's Net Debug Stats show the exact in-game number. Results are wrong while a ping booster or VPN is running.") 'Fortnite subregion ping' 'OK' 'Information')
+    }
+}
+
+# 300 pings in one minute to the best Fortnite server: jitter, spikes and loss
+$script:FnLineBusy = $false
+function Start-FnLineTest {
+    if ($script:FnLineBusy) { throw 'The line test is already running.' }
+    $hostName = ($PingHosts | Where-Object { $_.Name -eq (Get-PlayRegionName) } | Select-Object -First 1).Host
+    if (-not $hostName) { $hostName = $PingHosts[0].Host }
+    $script:FnLineBusy = $true
+    Invoke-Worker @'
+param($ip, $hostName)
+if (-not $ip) {
+    $cand = @(Resolve-DnsName $hostName -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress })
+    $p = New-Object System.Net.NetworkInformation.Ping
+    $ip = $cand | Sort-Object { $s = @(1..3 | ForEach-Object { try { $r = $p.Send($_, 1000); if ($r.Status -eq 'Success') { $r.RoundtripTime } else { 9999 } } catch { 9999 } }); ($s | Measure-Object -Minimum).Minimum } | Select-Object -First 1
+}
+if (-not $ip) { return @{ Err = 'Could not find a Fortnite server to test.' } }
+$p = New-Object System.Net.NetworkInformation.Ping; $r = @()
+for ($i = 0; $i -lt 300; $i++) { try { $x = $p.Send($ip, 1000); $r += $(if ($x.Status -eq 'Success') { [int]$x.RoundtripTime } else { -1 }) } catch { $r += -1 }; Start-Sleep -Milliseconds 200 }
+@{ Ip = $ip; R = $r }
+'@ @($script:FnBestIp, $hostName) {
+        param($out, $errs)
+        $script:FnLineBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable]) -or $res.Err) { Show-Toast $(if ($res.Err) { $res.Err } else { 'The line test could not run.' }) '#FF9F0A'; return }
+        $all = @($res.R); $ok = @($all | Where-Object { $_ -ge 0 }); $sorted = @($ok | Sort-Object)
+        if (-not $ok.Count) { [void](Show-ZdDialog 'The Fortnite server did not answer any ping. Your network may block ping, or a booster or VPN is running.' 'Jitter and loss test' 'OK' 'Information'); return }
+        $loss = [math]::Round(100 * ($all.Count - $ok.Count) / $all.Count, 1)
+        $med = $sorted[[int][math]::Floor(($sorted.Count - 1) / 2)]; $p95 = $sorted[[int][math]::Floor(0.95 * ($sorted.Count - 1))]; $max = $sorted[-1]
+        $d = for ($i = 1; $i -lt $ok.Count; $i++) { [math]::Abs($ok[$i] - $ok[$i - 1]) }
+        $jit = if ($d) { [math]::Round(($d | Measure-Object -Average).Average, 1) } else { 0 }
+        $spikes = @($ok | Where-Object { $_ -gt 2 * $med + 20 }).Count
+        $verdict = if ($loss -eq 0 -and $p95 -le $med + 10) { 'Clean line: steady ping and no loss. Lag you feel is not your connection.' }
+                   elseif ($loss -gt 1 -or $p95 -gt $med + 25) { 'Problem: ' + $(if ($loss -gt 1) { "$loss% of packets were lost. " } else { '' }) + $(if ($p95 -gt $med + 25) { 'Ping jumps a lot. ' } else { '' }) + 'Run Test the link to your router: if your home network is clean too, run Find where the lag starts to see whether it is your provider.' }
+                   else { 'Mostly fine, with some variation. If it gets worse in the evening, that is usually your provider''s busy hours.' }
+        $where = if ($script:FnBestName) { " ($($script:FnBestName))" } else { '' }
+        [void](Show-ZdDialog ("300 pings over one minute to $($res.Ip)$where`:`n`nTypical $med ms, 95% at $p95 ms or less, worst $max ms`nJitter $jit ms, spikes $spikes, packet loss $loss%`n`n$verdict") 'Jitter and loss test' 'OK' 'Information')
+    }
+}
+
+# pathping to the best Fortnite server: where does delay or loss start?
+$script:FnRouteBusy = $false
+function Start-FnRouteCheck {
+    if ($script:FnRouteBusy) { throw 'The route check is already running.' }
+    $hostName = ($PingHosts | Where-Object { $_.Name -eq (Get-PlayRegionName) } | Select-Object -First 1).Host
+    if (-not $hostName) { $hostName = $PingHosts[0].Host }
+    $script:FnRouteBusy = $true
+    Invoke-Worker @'
+param($ip, $hostName)
+if (-not $ip) { $ip = @(Resolve-DnsName $hostName -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) | Select-Object -First 1 }
+if (-not $ip) { return @{ Err = 'Could not find a Fortnite server to trace.' } }
+$raw = (& pathping.exe -n -q 25 -p 150 -w 800 $ip 2>&1 | Out-String)
+@{ Ip = $ip; Raw = $raw }
+'@ @($script:FnBestIp, $hostName) {
+        param($out, $errs)
+        $script:FnRouteBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable]) -or $res.Err) { Show-Toast $(if ($res.Err) { $res.Err } else { 'The route check could not run.' }) '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-RouteVerdict $res.Raw $res.Ip) 'Where the lag starts' 'OK' 'Information')
+    }
+}
+function Get-RouteVerdict([string]$Raw, [string]$Target) {
+    # hop lines of the statistics block: "  3   12ms     0/ 25 =  0%     0/ 25 =  0%  10.0.0.1" ("---" = that router ignores probes)
+    $hops = foreach ($m in [regex]::Matches($Raw, '(?m)^\s*(\d+)\s+(\d+ms|---)\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\S+)')) {
+        [pscustomobject]@{ Hop = [int]$m.Groups[1].Value; Rtt = $(if ($m.Groups[2].Value -eq '---') { $null } else { [int]($m.Groups[2].Value -replace 'ms') }); Loss = [int]$m.Groups[5].Value; Ip = $m.Groups[9].Value }
+    }
+    try { Set-Clipboard -Value $Raw } catch {}
+    if (-not $hops) { return "The route could not be measured (some networks block it). The full output was copied to your clipboard.`n`n$($Raw.Trim().Substring(0, [Math]::Min(700, $Raw.Trim().Length)))" }
+    $hops = @($hops | Sort-Object Hop); $final = $hops[-1]
+    $private = { param($ip) $ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)' }
+    $where = { param($h) if ($h.Hop -eq 1) { 'your router or Wi-Fi' } elseif ($h.Hop -le 3 -or (& $private $h.Ip)) { 'your internet provider' } else { 'beyond your provider (internet routes)' } }
+    # only the Fortnite server itself can show real loss; routers in between often just ignore probes
+    if ($Target -and $final.Ip -ne $Target) {
+        $s = "The trace stops after hop $($final.Hop) ($($final.Ip)): routers further along do not answer probes, which many providers do on purpose. So this check cannot see past your provider's network, and loss shown on the way is not real loss.`n`n"
+        $s += if ($hops | Where-Object { $_.Hop -eq 1 -and $_.Loss -gt 0 }) { "Your own router lost probes ($(($hops | Where-Object Hop -eq 1).Loss)%): check Wi-Fi or the cable first." } else { 'Your home network part is clean. The Jitter and loss test to the Fortnite server is the reliable measure for the rest of the path.' }
+        return $s + "`n`nThe full report was copied to your clipboard."
+    }
+    $s = "Route to $($final.Ip): $($final.Hop) hops, $($final.Rtt) ms at the end.`n`n"
+    if ($final.Loss -gt 0) {
+        $start = $final; for ($i = $hops.Count - 1; $i -ge 0; $i--) { if ($hops[$i].Loss -gt 0) { $start = $hops[$i] } else { break } }
+        $s += "Real packet loss ($($final.Loss)% at the end) starts at hop $($start.Hop) ($($start.Ip)): that is $(& $where $start).`n"
+    } else { $s += "No real packet loss: the server got every probe. Loss shown at middle hops only means those routers ignore ping, which is normal.`n" }
+    $timed = @($hops | Where-Object { $null -ne $_.Rtt })
+    $jump = $null; for ($i = 1; $i -lt $timed.Count; $i++) { if ($timed[$i].Rtt - $timed[$i - 1].Rtt -gt 15) { $jump = $timed[$i]; break } }
+    if ($jump) { $s += "The biggest delay is added at hop $($jump.Hop) ($($jump.Ip)): $(& $where $jump). Long jumps across borders or oceans are normal; a jump inside your own country is not.`n" }
+    $s + "`nThe full report was copied to your clipboard, ready to paste into a support ticket with your provider."
+}
+
+$script:EpicStatusBusy = $false
+function Start-EpicStatus {
+    if ($script:EpicStatusBusy) { throw 'Already checking.' }
+    $script:EpicStatusBusy = $true
+    Invoke-Worker @'
+try { $j = Invoke-RestMethod 'https://status.epicgames.com/api/v2/summary.json' -TimeoutSec 12 } catch { return @{ Err = $_.Exception.Message } }
+$fn = $j.components | Where-Object { $_.name -eq 'Fortnite' -and -not $_.group_id } | Select-Object -First 1
+$parts = @($j.components | Where-Object { $fn -and $_.group_id -eq $fn.id } | ForEach-Object { @{ Name = $_.name; Status = $_.status } })
+$inc = @($j.incidents | Where-Object { "$($_.name) $(@($_.components | ForEach-Object { $_.name }) -join ' ')" -match 'Fortnite' } | ForEach-Object { "$($_.name) ($($_.status))" })
+$mnt = @($j.scheduled_maintenances | Where-Object { "$($_.name)" -match 'Fortnite' } | ForEach-Object { "$($_.name)" })
+@{ Overall = "$($j.status.description)"; Parts = $parts; Inc = $inc; Mnt = $mnt }
+'@ @() {
+        param($out, $errs)
+        $script:EpicStatusBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or $r.Err) { Show-Toast 'Could not reach Epic''s status page.' '#FF9F0A'; return }
+        $bad = @($r.Parts | Where-Object { $_.Status -ne 'operational' })
+        $s = "Epic services: $($r.Overall)`n`nFortnite: " + $(if ($bad.Count) { ($bad | ForEach-Object { "$($_.Name): $($_.Status -replace '_', ' ')" }) -join ', ' } else { 'all parts working (matchmaking, game services, login, voice)' })
+        if (@($r.Inc).Count) { $s += "`n`nOngoing: $(@($r.Inc) -join '; ')" }
+        if (@($r.Mnt).Count) { $s += "`n`nMaintenance: $(@($r.Mnt) -join '; ')" }
+        $s += if ($bad.Count -or @($r.Inc).Count) { "`n`nEpic has a problem right now, so lag or errors may not be your PC or connection." } else { "`n`nEpic's side is fine, so look at your own connection: the Jitter and loss test shows it." }
+        [void](Show-ZdDialog $s 'Fortnite server status' 'OK' 'Information')
+    }
+}
+
+# --- Repairs
+function Get-BcdTimerValues {
+    $o = bcdedit /enum '{current}' 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $o) { return $null }
+    $h = @{}; foreach ($l in $o) { if ($l -match '^(useplatformclock|useplatformtick|disabledynamictick|tscsyncpolicy)\s+(\S+)') { $h[$Matches[1]] = $Matches[2] } }
+    $h
+}
+# NVIDIA overrides old guides leave on the Fortnite profile: a deeper frame queue, driver FXAA, shader cache off
+$NvBadOverrides = @(
+    @{ Id = [uint32]0x007BA09E; Bad = { param($v) $v -ge 2 }; Name = 'Maximum pre-rendered frames' }
+    @{ Id = [uint32]0x1074C972; Bad = { param($v) $v -eq 1 }; Name = 'Driver FXAA' }
+    @{ Id = [uint32]0x00198FFF; Bad = { param($v) $v -eq 0 }; Name = 'Shader cache off' }
+)
+function Get-NvBadOverrides { @(foreach ($o in $NvBadOverrides) { $e = Get-NvEff $NvProfile $o.Id; if ($e.Found -and $e.Own -and -not $e.Predefined -and (& $o.Bad $e.Value)) { [pscustomobject]@{ Id = $o.Id; Value = $e.Value; Name = $o.Name } } }) }
+# Balanced may have been deleted by another tool; recreate it from Windows' template so undo always has a plan to go back to
+function Get-FallbackPlan {
+    $list = powercfg /list
+    if ($list | Where-Object { $_ -match $BalancedGuid }) { return $BalancedGuid }
+    powercfg -duplicatescheme $BalancedGuid $BalancedGuid 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0 -and (powercfg /list | Where-Object { $_ -match $BalancedGuid })) { return $BalancedGuid }
+    $other = $list | Where-Object { $_ -match $GuidRx -and $_ -notmatch 'ZeroDelay' } | Select-Object -First 1
+    if ($other -and $other -match $GuidRx) { $Matches[0] } else { $null }
+}
+function Test-DualCcdX3D { (Get-CpuName) -match '(7900|7950|9900|9950)X3D' }
+
+function Get-InterferenceReport {
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
+    $has = { param($rx) [bool]($procs | Where-Object { $_ -match $rx }) }
+    $out = @()
+    if (& $has '^Discord$') { $out += 'Discord: its in-game overlay hooks into Fortnite. Turn it off in Discord > User Settings > Game Overlay if you do not use it.' }
+    if (& $has '^Overwolf') { $out += 'Overwolf: overlays and recording apps hook into the game. Turn its overlay off for Fortnite, or close it while you play.' }
+    if (& $has '^RTSS$') { $out += 'RivaTuner (RTSS): if it caps FPS, move the cap into Fortnite itself; Blur Busters measured RTSS caps up to about one frame slower than in-game caps.' }
+    if (& $has '^(Medal|MedalEncoder)') { $out += 'Medal: background clip recording costs GPU time and disk writes. Use manual clipping if you rarely watch them.' }
+    if (& $has '^RazerCortex') { $out += 'Razer Cortex: its booster switches power plans and closes processes on its own, which fights ZeroDelay''s plan.' }
+    if (& $has '^(ProcessLasso|ProcessGovernor)$') { $out += 'Process Lasso: it can force its own power plan (Bitsum Highest Performance) and keep it after the game closes; set its "Performance mode" to off or exclude Fortnite.' }
+    if (& $has '^(Hone|WiseGameBooster|GameBooster)') { $out += 'Another game booster is running: two tools changing the same settings undo each other. Use one.' }
+    $plans = @(powercfg /list | Where-Object { $_ -match 'Bitsum|Razer|ExitLag|Hone|Cortex' } | ForEach-Object { ($_ -replace '.*\(([^)]+)\).*', '$1').Trim() })
+    if ($plans.Count) { $out += "Power plans left by other tools: $($plans -join ', '). They can be switched on behind ZeroDelay's back; remove them in Control Panel > Power Options if you no longer use those tools." }
+    if (-not $out.Count) { return 'Nothing found: no overlays, recorders or other boosters running that interfere with Fortnite or ZeroDelay.' }
+    "Running now:`n`n$($out -join "`n`n")`n`nZeroDelay changes nothing here; overlays live inside the game process, which ZeroDelay never touches."
+}
+
+function Get-ControllerReport {
+    $dev = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'game controller|gamepad|Xbox|Wireless Controller|DualSense|DUALSHOCK|Pro Controller|8BitDo' -and $_.Class -in 'HIDClass', 'XnaComposite', 'XboxComposite', 'Bluetooth', 'USB' })
+    if (-not $dev.Count) { return 'No controller connected. (Plug it in or switch it on, then check again.)' }
+    $bt = @($dev | Where-Object { $_.InstanceId -match '^(BTHENUM|BTHLEDEVICE|BTHLE)\\' -or $_.Class -eq 'Bluetooth' })
+    $names = ($dev | ForEach-Object { $_.FriendlyName } | Select-Object -Unique) -join ', '
+    if ($bt.Count) {
+        "Controller found: $names`nConnected over: Bluetooth`n`nGamepadla measured an Xbox Series controller at about 12-13 ms on Bluetooth against 6.5-8.3 ms on a cable and 7-9 ms on the Xbox Wireless Adapter. A USB cable or the wireless adapter cuts that delay roughly in half. Bluetooth headphones on the same PC can make it worse."
+    } else { "Controller found: $names`nConnected over: cable or wireless adapter. That is the low-latency way; nothing to change." }
+}
+
 # --- Helpers for the research round 3 cards (1.11)
 $CopilotAppKey = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Microsoft.Copilot_8wekyb3d8bbwe'
 function Get-CopilotStartup { @(Get-ChildItem -LiteralPath $CopilotAppKey -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.GetValue('State') }) }
@@ -2253,8 +2622,10 @@ $Tweaks = @(
        }
        Off   = {
            $prev = $script:Backup.Custom['zdplan'].Prev
-           if (-not $prev -or -not (powercfg /list | Where-Object { $_ -match $prev })) { $prev = $BalancedGuid }
+           if (-not $prev -or -not (powercfg /list | Where-Object { $_ -match $prev })) { $prev = Get-FallbackPlan }
+           if (-not $prev) { throw 'No other power plan to switch back to.' }
            powercfg /setactive $prev
+           if ($LASTEXITCODE -ne 0) { throw 'Windows refused to switch back to your previous plan.' }
            # Remove our plan so it does not clutter the list.
            powercfg /list | Where-Object { $_ -match 'ZeroDelay' } | ForEach-Object { if ($_ -match $GuidRx) { powercfg -delete $Matches[0] 2>$null | Out-Null } }
            $script:Backup.Custom.Remove('zdplan')
@@ -2278,7 +2649,9 @@ $Tweaks = @(
            if ($LASTEXITCODE -ne 0) { throw 'Windows refused the plan (common on Modern Standby laptops).' }
        }
        Off   = {
-           $prev = $script:Backup.Custom['power']; if (-not $prev) { $prev = $BalancedGuid }
+           $prev = $script:Backup.Custom['power']
+           if (-not $prev -or -not (powercfg /list | Where-Object { $_ -match $prev })) { $prev = Get-FallbackPlan }
+           if (-not $prev) { throw 'No other power plan to switch back to.' }
            powercfg /setactive $prev 2>$null
            $script:Backup.Custom.Remove('power')
        } }
@@ -2289,21 +2662,18 @@ $Tweaks = @(
        Warn  = 'You stream or record with software that stutters when Game Mode is on (rare on current Windows).'
        Reg   = @( @{ P = 'HKCU:\Software\Microsoft\GameBar'; N = 'AutoGameModeEnabled'; V = 1; D = $null; M = 1 } ) }
 
-    @{ Id = 'prioSep'; Cat = 'System'; Icon = [char]0xE9D9; Rec = $true
-       Title = 'Foreground boost scheduling'
-       Desc  = 'Gives the active window shorter, boosted CPU time slices (Win32PrioritySeparation 0x26).'
-       Warn  = 'You run heavy background work (renders, compiles) while gaming. Those tasks will slow down.'
+    @{ Id = 'prioSep'; Cat = 'System'; Icon = [char]0xE9D9; Rec = $false
+       Title = 'Foreground priority: Programs'
+       Desc  = 'Sets Windows'' "Adjust for best performance of: Programs" scheduling (Win32PrioritySeparation 0x26). On desktop Windows that is the same as the default, so it only changes something when another tool switched it to background services or fixed time slices.'
+       Warn  = 'Never really: it puts the normal foreground boost back. It does not make Fortnite faster than a clean Windows.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl'; N = 'Win32PrioritySeparation'; V = 38; D = 2; M = 2 } ) }
 
-    @{ Id = 'mmcss'; Cat = 'System'; Icon = [char]0xE916; Rec = $true
-       Title = 'Maximum performance for games'
-       Desc  = 'Raises the Windows multimedia scheduler priority for games and reserves less CPU for background tasks.'
-       Warn  = 'You play music or voice chat through apps that crackle when games get more CPU time.'
+    @{ Id = 'mmcss'; Cat = 'System'; Icon = [char]0xE916; Rec = $false
+       Title = 'Reserve less CPU for background media'
+       Desc  = 'Lowers the share of CPU Windows'' multimedia scheduler keeps for low-priority work while audio or video streams play (SystemResponsiveness 20 to 10). The old "Games" task values are no longer set: no game registers with them and Microsoft documents them as unused.'
+       Warn  = 'Music or voice chat crackles afterwards. The effect on Fortnite itself is small.'
        Reg   = @(
            @{ P = $Mmcss; N = 'SystemResponsiveness'; V = 10; D = 20; M = 20 }
-           @{ P = "$Mmcss\Tasks\Games"; N = 'Priority'; V = 6; D = 2; M = 2 }
-           @{ P = "$Mmcss\Tasks\Games"; N = 'Scheduling Category'; V = 'High'; T = 'String'; D = 'Medium'; M = 'Medium' }
-           @{ P = "$Mmcss\Tasks\Games"; N = 'SFIO Priority'; V = 'High'; T = 'String'; D = 'Normal'; M = 'Normal' }
        ) }
 
     @{ Id = 'throttle'; Cat = 'Power'; Icon = [char]0xE7E8; Rec = $true
@@ -2318,10 +2688,10 @@ $Tweaks = @(
        Warn  = 'You rely on live notifications from Store apps such as Mail, Calendar or Phone Link.'
        Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications'; N = 'GlobalUserDisabled'; V = 1; D = $null; M = 0 } ) }
 
-    @{ Id = 'timer'; Cat = 'System'; Icon = [char]0xE823; Rec = $true; Badge = 'restart'
-       Title = 'Consistent timer resolution'
-       Desc  = 'Lets games keep their high-precision timer even when another window has focus (Windows 11).'
-       Warn  = 'You are on Windows 10, where this does nothing, or on battery where it costs a little power.'
+    @{ Id = 'timer'; Cat = 'System'; Icon = [char]0xE823; Rec = $false; Badge = 'restart'
+       Title = 'Global timer resolution requests'
+       Desc  = 'Brings back the old system-wide timer behaviour, so a separate timer tool can raise the timer for Fortnite. Fortnite on screen already gets its own timer; this only matters when it is minimized or fully covered.'
+       Warn  = 'You do not run a timer-resolution tool: then it only lets every background app''s timer request wake the whole PC, costing a little CPU and power.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; N = 'GlobalTimerResolutionRequests'; V = 1; D = $null; M = 0 } ) }
 
     @{ Id = 'usbsuspend'; Cat = 'Power'; Icon = [char]0xE88E; Rec = $true
@@ -2496,15 +2866,15 @@ $Tweaks = @(
     @{ Id = 'intmod'; Cat = 'Network'; Icon = [char]0xE81C; Rec = $false; Badge = 'advanced'
        Title = 'Turn off interrupt moderation'
        Desc  = 'The network card reports every packet immediately instead of batching them.'
-       Warn  = 'Your CPU is weak or you download a lot while playing. CPU usage rises; test with and without.'
+       Warn  = 'Your CPU is weak or you download a lot while playing. CPU usage rises; test with and without. Measured: Medium moderation is already about as fast for small game packets.'
        Test  = { Test-AdvProp '*InterruptModeration' 0 }
        On    = { Set-AdvProp 'intmod' '*InterruptModeration' 0 }
        Off   = { Reset-AdvProp 'intmod' '*InterruptModeration' 1 } }
 
-    @{ Id = 'netthrottle'; Cat = 'Network'; Icon = [char]0xEC4A; Rec = $true
+    @{ Id = 'netthrottle'; Cat = 'Network'; Icon = [char]0xEC4A; Rec = $false
        Title = 'Turn off network throttling'
-       Desc  = 'Stops Windows from limiting network processing while media is playing (NetworkThrottlingIndex).'
-       Warn  = 'You have audio dropouts afterwards. This trades a little CPU for network priority.'
+       Desc  = 'Stops Windows from limiting network processing while media is playing (NetworkThrottlingIndex). The limit only starts at about 15 Mbit/s of incoming traffic, far above what Fortnite uses.'
+       Warn  = 'One researcher measured slightly worse network-driver latency with throttling off, so test with the Ping check. Audio dropouts afterwards are another reason to switch it back.'
        Reg   = @( @{ P = $Mmcss; N = 'NetworkThrottlingIndex'; V = -1; D = 10; M = 10 } ) }
 
     @{ Id = 'wifipower'; Cat = 'Network'; Icon = [char]0xE701; Rec = $true
@@ -3329,7 +3699,7 @@ $Tweaks = @(
     @{ Id = 'preferipv4'; Cat = 'Network'; Icon = [char]0xE909; Rec = $false; Badge = 'restart'
        Live  = { $pp = @(Get-NetPrefixPolicy -ErrorAction Stop); $v4 = ($pp | Where-Object { $_.Prefix -eq '::ffff:0:0/96' }).Precedence; $v6 = ($pp | Where-Object { $_.Prefix -eq '::/0' }).Precedence; [bool]($v4 -gt $v6) }
        Title = 'Prefer IPv4 over IPv6'
-       Desc  = 'Microsoft''s supported way to favour IPv4 without disabling IPv6. Avoids slow IPv6 fallbacks.'
+       Desc  = 'Microsoft''s supported way to favour IPv4 without disabling IPv6. Avoids slow IPv6 fallbacks in launchers and browsers. Fortnite''s servers are IPv4-only, so it does not change Fortnite ping.'
        Warn  = 'Your provider gives you better routes over IPv6. Never disable IPv6 completely instead.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'; N = 'DisabledComponents'; V = 32; D = 0; M = 0 } ) }
 
@@ -3868,13 +4238,6 @@ $Tweaks = @(
        Warn  = ''
        Run   = { [void](Show-ZdDialog ("AMD Software > Gaming > Games > Fortnite:`n`nAMD Fluid Motion Frames: Off.`n`nThe per-game setting wins over the global one, so other games can keep it. HYPR-RX turns it on, so do not use HYPR-RX for Fortnite.`n`nCheck in a match: the AMD overlay (Alt+R) shows whether Fluid Motion Frames is active, and Alt+Shift+G toggles it.") ('AMD Fluid Motion Frames') ('OK') ('Information')); 'Shown.' } }
 
-    @{ Id = 'intel-lowlat'; Cat = 'Graphics'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
-       Requires = { [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_8086' -and $_ -match 'Arc' }) }
-       Title = 'Intel Arc: Low Latency Mode on (guided)'
-       Desc  = 'Intel''s driver Low Latency Mode stops the CPU queuing frames ahead of the GPU in DirectX 11 games, which includes Fortnite''s Performance mode.'
-       Warn  = ''
-       Run   = { [void](Show-ZdDialog ("Intel Graphics Software > Graphics > Frame Delivery (per game for FortniteClient-Win64-Shipping.exe, or global):`n`nLow Latency Mode: On.`n`nIf you see crashes with 'On + Boost', use plain 'On'.`n`nThe driver setting only applies to DirectX 11, which Fortnite uses in Performance mode. In DirectX 12 mode it does nothing.") ('Intel Low Latency Mode') ('OK') ('Information')); 'Shown.' } }
-
     @{ Id = 'nvapp-autoopt'; Cat = 'Graphics'; Icon = [char]0xE72E; Action = 'Show how'
        Requires = { Test-Path "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App" }
        Title = 'NVIDIA App: stop it auto-optimizing Fortnite (guided)'
@@ -4370,6 +4733,227 @@ $Tweaks = @(
        Desc  = 'A new graphics driver or CS2 update throws away the compiled shaders, so the first rounds can hitch while they rebuild. Play a few minutes of Deathmatch first.'
        Warn  = ''
        Run   = { [void](Show-ZdDialog ("After a graphics driver update or a big CS2 update:`n`n1. Start a Deathmatch or a practice map for 3 to 5 minutes and walk around.`n2. Then queue for Premier or Competitive.`n`nDo not clear the shader cache (Potato > Clear shader cache) right before you play: that causes the same rebuild.") ('Shader warm-up') ('OK') ('Information')); 'Shown.' } }
+
+    # ======================================================= research round 4 (1.13)
+    # ------------------------------------------------------------- Fortnite
+    @{ Id = 'fn-focussave'; Cat = 'Fortnite'; Icon = [char]0xE9D9; Rec = $false; Lat = $true
+       Title = 'Full FPS while another window has focus'
+       Desc  = 'Fortnite drops to about 30 FPS (or 15) whenever another window is active, even mid-match, to save power. This keeps full FPS for borderless players who click onto Discord or a browser on a second screen.'
+       Warn  = 'You play true fullscreen on one monitor: then nothing is visible while Fortnite is unfocused and the saving is free. Fortnite must be closed.'
+       Ini   = @{ bIsEnergySavingEnabledFocusLoss = @('False', 'True') } }
+
+    @{ Id = 'fn-showfps'; Cat = 'Fortnite'; Icon = [char]0xE9D9; Rec = $false
+       Title = 'Show FPS in game'
+       Desc  = 'Turns on Fortnite''s own FPS counter so you can see whether your FPS cap holds and judge every other change. It does not make the game faster.'
+       Warn  = 'You already use an overlay counter or dislike HUD clutter. Fortnite must be closed.'
+       Ini   = @{ bShowFPS = @('True', 'False') } }
+
+    @{ Id = 'fn-inireadonly'; Cat = 'Fortnite'; Icon = [char]0xE72E; Rec = $true
+       Title = 'Let Fortnite save its settings'
+       Desc  = 'Some optimizers make Fortnite''s settings file read-only. Fortnite then cannot save your in-game changes, so settings seem to reset. Epic''s own fix is to clear the read-only flag.'
+       Warn  = 'You made the file read-only on purpose to freeze your settings. Fortnite must be closed.'
+       Test  = { if (-not (Test-Path $IniPath)) { return $null }; -not (Get-Item $IniPath).IsReadOnly }
+       On    = {
+           Assert-IniWritable
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = [bool](Get-Item $IniPath).IsReadOnly }
+           Set-ItemProperty $IniPath IsReadOnly $false
+       }
+       Off   = { if ($script:Backup.Custom[$t.Id]) { Set-ItemProperty $IniPath IsReadOnly $true }; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'fn-renderercheck'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Action = 'Check'; Lat = $true
+       Title = 'Check what Fortnite really ran on'
+       Desc  = 'Reads Fortnite''s own log to confirm which graphics card it used, which renderer, whether Reflex really switched on, and whether it ran true fullscreen with tearing allowed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnRendererReport) 'What Fortnite ran on' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'fn-hitchreport'; Cat = 'Fortnite'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Title = 'Count real in-match stutters'
+       Desc  = 'Counts the freezes Fortnite''s own hitch detector logged during your last matches, leaving out loading screens and window switches, so you can tell whether stutter is real and whether a change helped.'
+       Warn  = ''
+       Run   = { Start-BackgroundReport 'Get-FnHitchReport'; 'Reading your last matches from Fortnite''s logs...' } }
+
+    @{ Id = 'fn-crashcheck'; Cat = 'Fortnite'; Icon = [char]0xE7BA; Action = 'Check'
+       Title = 'Check for recent Fortnite crashes'
+       Desc  = 'Looks for Fortnite crash reports from the last 14 days and tells you what kind of crash it was and what fixes it.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnCrashReport) 'Fortnite crashes' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'fn-engineini'; Cat = 'Fortnite'; Icon = [char]0xE9F9; Action = 'Check'
+       Title = 'Detect a tweak-pack Engine.ini'
+       Desc  = 'Warns when another optimizer has injected engine settings into Fortnite''s Engine.ini, an unsupported edit that can cause crashes or settings that behave oddly. ZeroDelay never edits that file.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnEngineIniReport) 'Fortnite Engine.ini' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'fn-replays'; Cat = 'Fortnite'; Icon = [char]0xE714; Action = 'Show how'
+       Title = 'Turn off automatic replay recording (guided)'
+       Desc  = 'Fortnite can record every match as a replay. If you never watch them, switching it off removes that background disk and CPU work. The setting lives in Fortnite''s cloud settings, so here is where to find it.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Fortnite: Settings > Game > Replays:`n`n- Record Replays: Off`n- Record Large Team Replays: Off`n- Record Creative Replays: Off`n`nKeep them on if you review your games, make montages or might need a replay for a tournament dispute.`n`n$(Get-FnReplayReport)") ('Fortnite replays') ('OK') ('Information')); 'Shown.' } }
+
+    # ---------------------------------------------------------------- Network
+    @{ Id = 'fn-subping'; Cat = 'Network'; Icon = [char]0xE909; Action = 'Test ping'; Lat = $true
+       Title = 'Fortnite subregion ping'
+       Desc  = 'Each Fortnite region has servers in several cities (Europe: Germany, France, UK). This pings every one, so you can set Fortnite''s Subregion Preference to the closest instead of a random one.'
+       Warn  = ''
+       Run   = { Start-FnSubPing; 'Pinging every Fortnite server city...' } }
+
+    @{ Id = 'fn-linetest'; Cat = 'Network'; Icon = [char]0xE9D9; Action = 'Run test'; Lat = $true
+       Title = 'Jitter and packet-loss test'
+       Desc  = 'Pings your best Fortnite server 300 times in one minute and reports jitter, spikes and packet loss, which matter more than average ping for hit registration and rubber-banding.'
+       Warn  = ''
+       Run   = { Start-FnLineTest; 'Testing your line to Fortnite for one minute...' } }
+
+    @{ Id = 'fn-routecheck'; Cat = 'Network'; Icon = [char]0xE8AB; Action = 'Run'; Lat = $true
+       Title = 'Find where the lag starts'
+       Desc  = 'Traces the route to your Fortnite server and shows where delay or real packet loss begins: your home, your provider, or beyond. Copies a report you can paste into a support ticket. Takes about two minutes.'
+       Warn  = ''
+       Run   = { Start-FnRouteCheck; 'Tracing the route to Fortnite (about two minutes)...' } }
+
+    @{ Id = 'fn-netreport'; Cat = 'Network'; Icon = [char]0xE839; Action = 'Check'; Lat = $true
+       Title = 'Network report from your last matches'
+       Desc  = 'Reads the ping, jitter and packet loss Fortnite itself recorded at the end of your recent matches, so you see what really happened in your games, not just an idle ping test.'
+       Warn  = ''
+       Run   = { Start-BackgroundReport 'Get-FnNetReport'; 'Reading your last matches from Fortnite''s logs...' } }
+
+    @{ Id = 'fn-epicstatus'; Cat = 'Network'; Icon = [char]0xE774; Action = 'Check'
+       Title = 'Is it Epic or is it you?'
+       Desc  = 'Checks Epic''s official status page for Fortnite matchmaking, game services, login and voice, so you do not chase PC tweaks while Epic''s servers have problems.'
+       Warn  = ''
+       Run   = { Start-EpicStatus; 'Checking Epic''s status page...' } }
+
+    @{ Id = 'fn-netdebug'; Cat = 'Network'; Icon = [char]0xE9D9; Action = 'Show how'
+       Title = 'Fortnite''s live network stats (guided)'
+       Desc  = 'Fortnite can show ping and packet loss live in a match, so you can spot lag spikes as they happen. It is stored in Fortnite''s cloud settings, so here is where to switch it on.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Fortnite: Settings > Game UI > Net Debug Stats: On (some seasons also have Latency Debug Stats).`n`nWhat to look for:`n- Ping: your real game ping, which beats any outside test.`n- Packet loss in or out above 0: the cause of rubber-banding. Run the Jitter and loss test and Find where the lag starts.") ('Net Debug Stats') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'sqmguide'; Cat = 'Network'; Icon = [char]0xE839; Action = 'Show how'; Lat = $true
+       Title = 'Fix bufferbloat on your router (guided)'
+       Desc  = 'If the Bufferbloat test gives you grade C or worse, your router lets downloads queue in front of your game packets. Turning on Smart Queue / SQM on the router fixes that at the source; here is where it lives.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Turn on the router's queue management and set it to about 90% of your measured speeds:`n`n- ASUS: Adaptive QoS > QoS > enable, type 'Adaptive QoS' or (Merlin) 'Cake'.`n- UniFi: Settings > Internet > Smart Queues: on.`n- OpenWrt: install luci-app-sqm, Network > SQM QoS, queue 'cake'.`n- Netgear Nighthawk Pro / DumaOS: QoS > Anti-Bufferbloat: Always.`n- FRITZ!Box: Internet > Filters > Prioritization: put Fortnite (or the PC) in Real-time applications.`n- TP-Link Deco/Archer: QoS > enable, set the bandwidth, high priority for this PC.`n`nThen run the Bufferbloat test again: grade A or B means it worked. Provider-supplied routers often lack this option; then a router that has it is the fix.") ('Router bufferbloat fix') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'nic-dmacoalesce'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Lat = $true
+       Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'DMACoalescing' }) }
+       Title = 'Intel: turn off DMA coalescing'
+       Desc  = 'Some Intel network cards hold incoming packets back for a moment to save power. Intel''s own guide says this may increase network latency.'
+       Warn  = 'You are on a laptop and battery life matters more than ping. Applying briefly reconnects the adapter.'
+       Test  = { Test-AdvProp 'DMACoalescing' 0 }
+       On    = { Set-AdvProp 'nic-dmacoalesce' 'DMACoalescing' 0 }
+       Off   = { Reset-AdvProp 'nic-dmacoalesce' 'DMACoalescing' 0 } }
+
+    # ------------------------------------------------------------- Input
+    @{ Id = 'in-accessoff'; Cat = 'Input'; Icon = [char]0xE8C9; Rec = $true; Badge = 'signout'
+       Title = 'Make sure Sticky, Filter and Mouse Keys are off'
+       Desc  = 'If Filter Keys got switched on (holding Shift for 8 seconds does it), Windows ignores quick key presses or delays repeats, so building and editing feel broken. This switches the features themselves off; the shortcut card only blocks their pop-up.'
+       Warn  = 'You use these accessibility features on purpose. Your other settings for them are kept.'
+       Test  = {
+           foreach ($k in 'StickyKeys', 'Keyboard Response', 'MouseKeys') { $v = Get-RegValue "HKCU:\Control Panel\Accessibility\$k" 'Flags'; if ($null -ne $v -and ([int]$v -band 1)) { return $false } }
+           $true
+       }
+       On    = { foreach ($k in 'StickyKeys', 'Keyboard Response', 'MouseKeys') { $p = "HKCU:\Control Panel\Accessibility\$k"; $v = Get-RegValue $p 'Flags'; if ($null -ne $v -and ([int]$v -band 1)) { Set-RegTracked $t.Id $p 'Flags' ([string]([int]$v -band -bnot 1)) 'String' } } }
+       Off   = { [void](Restore-RegTweak $t.Id) } }
+
+    @{ Id = 'ctrl-conn'; Cat = 'Input'; Icon = [char]0xE7FC; Action = 'Check'; Lat = $true
+       Title = 'Check how your controller is connected'
+       Desc  = 'Bluetooth roughly doubles controller delay compared with a cable or the Xbox Wireless Adapter (Gamepadla measured 12-13 ms against 6.5-8 ms). This tells you which one you use.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-ControllerReport) 'Controller connection' 'OK' 'Information'); 'Checked.' } }
+
+    # -------------------------------------------------------- Power / System
+    @{ Id = 'x3d-balanced'; Cat = 'Power'; Icon = [char]0xE945; Rec = $true; Lat = $true
+       Requires = { Test-DualCcdX3D }
+       Title = 'X3D: Balanced plan so AMD can park the slow die'
+       Desc  = 'On 7900X3D / 7950X3D / 9900X3D / 9950X3D, AMD''s driver only moves games onto the V-Cache die on the Balanced plan; high-performance plans keep both dies awake and Fortnite spreads across them. AMD''s own advice is Balanced.'
+       Warn  = 'Use this instead of the ZeroDelay or Ultimate Performance plan cards, not together with them. Set Windows'' Power mode to Best performance as well.'
+       Test  = { (Get-ActivePowerScheme).Guid -eq $BalancedGuid }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = (Get-ActivePowerScheme).Guid }
+           $b = Get-FallbackPlan; if ($b -ne $BalancedGuid) { throw 'Windows could not recreate the Balanced plan.' }
+           powercfg /setactive $BalancedGuid; if ($LASTEXITCODE -ne 0) { throw 'Windows refused to switch to Balanced.' }
+       }
+       Off   = { $p = $script:Backup.Custom[$t.Id]; if ($p -and (powercfg /list | Where-Object { $_ -match $p })) { powercfg /setactive $p }; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'interference'; Cat = 'System'; Icon = [char]0xE9F9; Action = 'Check'; Lat = $true
+       Title = 'Find overlays and boosters that interfere'
+       Desc  = 'Looks for running overlays (Discord, Overwolf, RivaTuner, Medal) that hook into Fortnite, and other boosters (Razer Cortex, Process Lasso) that switch power plans behind ZeroDelay''s back.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-InterferenceReport) 'Overlays and other boosters' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'wpbt-off'; Cat = 'Vendor'; Icon = [char]0xE7BA; Rec = $false; Badge = 'restart'
+       Requires = { Test-Path (Join-Path $env:windir 'System32\wpbbin.exe') }
+       Title = 'Stop the motherboard reinstalling vendor apps'
+       Desc  = 'Your motherboard hides an installer in its firmware that Windows runs at every boot (WPBT). That is how Armoury Crate and similar apps keep coming back after you remove them. This tells Windows not to run it.'
+       Warn  = 'Your laptop uses firmware-based anti-theft or company software (Absolute and similar), or you want the vendor app to install itself. It does not uninstall anything; also turn the option off in the BIOS.'
+       Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'; N = 'DisableWpbtExecution'; V = 1; D = $null; M = 0 } ) }
+
+    @{ Id = 'memcompress-on'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true
+       Requires = { ((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1GB) -le 17 }
+       Title = 'Turn memory compression back on'
+       Desc  = 'Some optimizers switch Windows'' memory compression off. With 16 GB of RAM or less that makes Windows page to disk sooner, which causes the stutter it claims to fix.'
+       Warn  = 'You turned it off yourself and measured a benefit.'
+       Test  = { try { [bool](Get-MMAgent -ErrorAction Stop).MemoryCompression } catch { $null } }   # needs administrator
+       On    = { if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = [bool](Get-MMAgent).MemoryCompression }; Enable-MMAgent -MemoryCompression -ErrorAction Stop }
+       Off   = { if ($script:Backup.Custom[$t.Id] -eq $false) { Disable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue }; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'memmgr-defaults'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true; Badge = 'restart'
+       Title = 'Undo memory-manager tweaks'
+       Desc  = 'Removes server-style memory settings other tools set (LargeSystemCache, DisablePagingExecutive, DisablePageCombining). On a gaming PC they take memory from games or have no measured benefit.'
+       Warn  = 'You set these yourself for a specific workload. Every value is backed up and comes back if you switch this off.'
+       Test  = {
+           $mm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+           "$(Get-RegValue $mm 'LargeSystemCache')" -in '', '0' -and "$(Get-RegValue $mm 'DisablePagingExecutive')" -in '', '0' -and $null -eq (Get-RegValue $mm 'DisablePageCombining')
+       }
+       On    = {
+           $mm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+           foreach ($n in 'LargeSystemCache', 'DisablePagingExecutive') { if ("$(Get-RegValue $mm $n)" -notin '', '0') { Set-RegTracked $t.Id $mm $n 0 'DWord' } }
+           if ($null -ne (Get-RegValue $mm 'DisablePageCombining')) { Remove-RegTracked $t.Id $mm 'DisablePageCombining' }
+       }
+       Off   = { [void](Restore-RegTweak $t.Id) } }
+
+    @{ Id = 'repair-spectre'; Cat = 'Repair'; Icon = [char]0xE72E; Rec = $false; Badge = 'restart'
+       Title = 'Turn Spectre / Meltdown protection back on'
+       Desc  = 'Removes the override some optimizers use to switch off Windows'' CPU security fixes (and the SEH overwrite protection). The speed gain on current CPUs is small, and it reopens real attacks through browsers.'
+       Warn  = 'You turned these off yourself on an old CPU and accept the risk. The values are backed up and come back if you switch this off.'
+       Remove = @(
+           @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'; N = 'FeatureSettingsOverride' }
+           @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'; N = 'FeatureSettingsOverrideMask' }
+           @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; N = 'DisableExceptionChainValidation' }
+       ) }
+
+    @{ Id = 'repair-platformclock'; Cat = 'Repair'; Icon = [char]0xE823; Rec = $true; Badge = 'restart'
+       Title = 'Stop forcing the slow HPET timer'
+       Desc  = 'Removes boot settings other tools add (useplatformclock, useplatformtick, disabledynamictick). Forcing the platform clock makes every high-precision time read cost about 1 µs plus a system call instead of about 30 ns.'
+       Warn  = 'You set these for a specific reason and measured it. The values are backed up and come back if you switch this off.'
+       Test  = { $v = Get-BcdTimerValues; if ($null -eq $v) { return $null }; $v.Count -eq 0 }
+       On    = {
+           $v = Get-BcdTimerValues; if ($null -eq $v) { throw 'Could not read the boot settings (needs administrator).' }
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = $v }
+           foreach ($n in @($v.Keys)) { bcdedit /deletevalue '{current}' $n | Out-Null }
+       }
+       Off   = {
+           $b = $script:Backup.Custom[$t.Id]
+           if ($b) { foreach ($p in $(if ($b -is [System.Collections.IDictionary]) { $b.GetEnumerator() } else { $b.PSObject.Properties })) { $val = if ("$($p.Value)" -match '^(Yes|Ja|Oui|Sí|Si|Sim|Tak|Evet)$') { 'yes' } elseif ("$($p.Value)" -match '^(No|Nein|Non|Nie|Hayır|Não|Nee)$') { 'no' } else { "$($p.Value)" }; bcdedit /set '{current}' $p.Name $val | Out-Null } }
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    @{ Id = 'nv-overrides'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true; Lat = $true
+       Title = 'NVIDIA: remove leftover overrides that hurt Fortnite'
+       Desc  = 'Old guides and tools leave driver settings on the Fortnite profile that queue more frames (pre-rendered frames 2 or more), add a driver FXAA pass, or switch the shader cache off. This puts those back to the driver default.'
+       Warn  = 'You set one of these on purpose. The values are backed up and come back if you switch this off. Restart Fortnite afterwards.'
+       Test  = { if (-not (Test-NvAvailable)) { return $null }; -not @(Get-NvBadOverrides).Count }
+       On    = {
+           $bad = @(Get-NvBadOverrides)
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @($bad | ForEach-Object { @{ Id = [int64]$_.Id; Value = [int64]$_.Value } }) }
+           foreach ($b in $bad) { [void][NvDrs]::Delete($NvProfile, [uint32]$b.Id) }
+       }
+       Off   = { foreach ($b in @($script:Backup.Custom[$t.Id] | Where-Object { $_ })) { [void][NvDrs]::Set($NvProfile, [uint32]$b.Id, [uint32]$b.Value) }; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'fn-idlesave'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $false
+       Title = 'Restore Fortnite''s lobby power saving'
+       Desc  = 'Many tweak packs switch off Fortnite''s idle energy saving. It only lowers FPS after about 30 seconds without input in the lobby, never in a match, so switching it off just heats your PC between games.'
+       Warn  = 'You leave the lobby running as a stream background and want full FPS while away. Fortnite must be closed.'
+       Ini   = @{ bIsEnergySavingEnabledIdle = @('True', 'False') } }
 
     # ======================================================= Creator tab (1.7)
     @{ Id = 'cr-autosave'; Cat = 'Creator'; Icon = [char]0xE74E; Rec = $true; Requires = { [bool](Get-PrPrefsFile) }
@@ -8575,6 +9159,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.13.0' = @(
+        @{ T = '27 new cards from 8 research passes'; D = 'Researched what Atlas, ReviOS, WinUtil, Hone, Process Lasso, Razer Cortex, ExitLag and the measured tuning guides change, and kept only what has evidence. Nothing is switched on for you.' }
+        @{ T = 'Fortnite subregion ping'; D = 'Europe alone has servers in Germany, France and the UK, often 15 ms apart. ZeroDelay pings every one and tells you which Subregion Preference to pick in Fortnite.' }
+        @{ T = 'Your real matches'; D = 'Reads Fortnite''s own log: ping, jitter and packet loss per match, real in-match stutters, which graphics card and renderer it used, recent crashes. Plus a jitter and loss test, a route check that shows where lag starts, and Epic''s server status.' }
+        @{ T = 'Honest corrections'; D = 'Two independent research passes showed four of our recommended cards (priority separation, MMCSS game priority, global timer, network throttling) do little or nothing measurable. They are no longer recommended and now say what they really do. The Intel Arc card was removed: Fortnite''s Performance mode is DirectX 12 now.' }
+        @{ T = 'Repairs'; D = 'Undo other tools'' HPET boot settings, memory-manager tweaks, disabled memory compression and Spectre overrides, NVIDIA overrides that queue frames or turn the shader cache off, and a read-only Fortnite settings file.' }
+    )
     '1.12.1' = @(
         @{ T = 'No more sudden closing'; D = 'An error in a button or a background timer used to close ZeroDelay without a word. Now it shows a short message, keeps running and writes the details to crash.log in ZeroDelay''s data folder.' }
         @{ T = 'Updates take over'; D = 'If an older ZeroDelay was still running in the tray when you updated, opening ZeroDelay showed the old version. It now restarts into the new one.' }
