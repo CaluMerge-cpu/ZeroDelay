@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.13.0'
+$AppVersion = '1.13.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -5481,6 +5481,13 @@ foreach ($t in $Tweaks) { if ($PotatoIds -contains $t.Id) { $t.Potato = $true } 
 # Cards shown on the GTX 1080 Ti tab (alongside the ones made for it)
 $Gtx1080Ids = @('perfmode', 'meshquality', 'nanite', 'reflex', 'vsync', 'fullscreen', 'fpscap', 'vrrcap', 'motionblur', 'grass', 'nvpower', 'hags', 'gpu-msi', 'shadercache')
 foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
+
+# Cards added in the latest research round, shown together in the "New tweaks" tab (they stay in their own tabs too)
+$NewIds = @('fn-focussave', 'fn-showfps', 'fn-inireadonly', 'fn-renderercheck', 'fn-hitchreport', 'fn-crashcheck', 'fn-engineini', 'fn-replays',
+            'fn-subping', 'fn-linetest', 'fn-routecheck', 'fn-netreport', 'fn-epicstatus', 'fn-netdebug', 'sqmguide', 'nic-dmacoalesce',
+            'in-accessoff', 'ctrl-conn', 'x3d-balanced', 'interference', 'wpbt-off',
+            'memcompress-on', 'memmgr-defaults', 'repair-spectre', 'repair-platformclock', 'nv-overrides', 'fn-idlesave')
+foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
 # ==================================================================== UI ===
@@ -7199,6 +7206,8 @@ $Categories = @(
     @{ Name = 'Active';     Icon = [char]0xE73E; Title = 'Active tweaks'; Page = 'Active' }
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
        Note = 'Only the tweaks that change input delay, frame time or ping. Green icons mark them in every tab.' }
+    @{ Name = 'New';        Icon = [char]0xE735; Title = 'New tweaks'
+       Note = 'The cards added in 1.13: subregion ping, reports from your real Fortnite matches, network tests and repairs. Each one also stays in its usual tab. Nothing here is switched on for you.' }
     @{ Name = 'GameMode';   Icon = [char]0xE768; Title = 'Game Mode'; Page = 'GameMode' }
     @{ Name = 'Events';     Icon = [char]0xE7C1; Title = 'Tournaments'; Page = 'Events' }
     @{ Name = 'Potato';     Icon = [char]0xE7F4; Title = 'Potato graphics'
@@ -9159,6 +9168,14 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.13.1' = @(
+        @{ T = 'New tweaks tab'; D = 'Every card added in 1.13 is now together in its own tab under Tweaks, so you can find them in one place. Each card also stays in its usual tab.' }
+        @{ T = '27 new cards from 8 research passes'; D = 'Researched what Atlas, ReviOS, WinUtil, Hone, Process Lasso, Razer Cortex, ExitLag and the measured tuning guides change, and kept only what has evidence. Nothing is switched on for you.' }
+        @{ T = 'Fortnite subregion ping'; D = 'Europe alone has servers in Germany, France and the UK, often 15 ms apart. ZeroDelay pings every one and tells you which Subregion Preference to pick in Fortnite.' }
+        @{ T = 'Your real matches'; D = 'Reads Fortnite''s own log: ping, jitter and packet loss per match, real in-match stutters, which graphics card and renderer it used, recent crashes. Plus a jitter and loss test, a route check that shows where lag starts, and Epic''s server status.' }
+        @{ T = 'Honest corrections'; D = 'Two independent research passes showed four of our recommended cards (priority separation, MMCSS game priority, global timer, network throttling) do little or nothing measurable. They are no longer recommended and now say what they really do. The Intel Arc card was removed: Fortnite''s Performance mode is DirectX 12 now.' }
+        @{ T = 'Repairs'; D = 'Undo other tools'' HPET boot settings, memory-manager tweaks, disabled memory compression and Spectre overrides, NVIDIA overrides that queue frames or turn the shader cache off, and a read-only Fortnite settings file.' }
+    )
     '1.13.0' = @(
         @{ T = '27 new cards from 8 research passes'; D = 'Researched what Atlas, ReviOS, WinUtil, Hone, Process Lasso, Razer Cortex, ExitLag and the measured tuning guides change, and kept only what has evidence. Nothing is switched on for you.' }
         @{ T = 'Fortnite subregion ping'; D = 'Europe alone has servers in Germany, France and the UK, often 15 ms apart. ZeroDelay pings every one and tells you which Subregion Preference to pick in Fortnite.' }
@@ -13173,6 +13190,7 @@ function Update-Filter {
         $show = if ($q) { -not $t.Header -and ($t.Title -like "*$q*" -or $t.Desc -like "*$q*") }
                 elseif ($script:CurrentCat.Name -eq 'Latency') { [bool]$t.Lat }
                 elseif ($script:CurrentCat.Name -eq 'Potato') { [bool]$t.Potato }
+                elseif ($script:CurrentCat.Name -eq 'New') { [bool]$t.New }
                 elseif ($script:CurrentCat.Name -eq 'Gtx1080Ti') { [bool]$t.Gtx }
                 else { $script:CurrentCat.Name -eq 'All' -or $t.Cat -eq $script:CurrentCat.Name }
         $t.Card.Visibility = if ($show -and -not $t.Hidden) { 'Visible' } else { 'Collapsed' }

@@ -17,6 +17,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 
 - **240+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
+  A **New tweaks** tab collects the cards added in the latest version.
 - **Network checks**: your cable's link speed and errors, Wi-Fi signal and band, a 20-second test of the link to your router
   (home network or internet line?), VPN routing, traffic shapers such as Killer or cFosSpeed, and the Intel 2.5G driver bug.
 - **Guided cards** for settings no program can change safely: AMD Anti-Lag and Fluid Motion Frames, Intel Arc Low Latency
