@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.14.0'
+$AppVersion = '1.15.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -268,6 +268,7 @@ public class MatchFrames {
     public int Frames; public double AvgFps; public double Low1Fps; public double TotalMs;
     public int StutterCount; public double[] StutterAtMs; public double[] StutterMs;
     public double LatAvg; public string LatKind;   // input-to-display latency (PC latency with Reflex), 0 when not recorded
+    public double P5Fps, MedFps;   // FPS held 95% of the time and the median FPS, gameplay frames only
 }
 public static class FrameStats {
     public static System.Threading.Tasks.Task<MatchFrames> AnalyzeAsync(string path) {
@@ -298,7 +299,7 @@ public static class FrameStats {
                     lat.Add(latCol >= 0 && f.Length > latCol && double.TryParse(f[latCol], System.Globalization.NumberStyles.Float, inv, out l) && l > 0 && l < 500 ? l : double.NaN);
                 }
             }
-            if (latName != null) latKind = latName.Contains("PC") ? "PC latency" : (latName.Contains("Photon") ? "input latency" : "display latency");
+            if (latName != null) latKind = latName.Contains("PC") ? "PC latency" : (latName.Contains("Photon") ? "input-to-frame estimate" : "display latency");
         }
         int n = ft.Count;
         if (n < 300) return null;
@@ -326,6 +327,8 @@ public static class FrameStats {
         m.TotalMs = total;
         m.AvgFps = play.Count > 0 ? 1000.0 * play.Count / playSum : 0;
         play.Sort();
+        m.MedFps = 1000.0 / play[play.Count / 2];
+        m.P5Fps = 1000.0 / play[Math.Min(play.Count - 1, (int)(play.Count * 0.95))];
         int k = Math.Max(1, (int)Math.Ceiling(play.Count * 0.01));
         double slow = 0;
         for (int i = play.Count - k; i < play.Count; i++) slow += play[i];
@@ -1026,8 +1029,12 @@ function Get-ActivePowerScheme {
 }
 
 function Get-RefreshRate {
+    $d = @(Get-Displays)
+    $hz = ($d | Where-Object Discrete | Measure-Object Hz -Maximum).Maximum
+    if (-not $hz) { $hz = ($d | Measure-Object Hz -Maximum).Maximum }
+    if ($hz) { return [int]$hz }
     $r = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-          Where-Object { $_.CurrentRefreshRate -gt 1 } | Select-Object -First 1).CurrentRefreshRate
+          Where-Object { $_.CurrentRefreshRate -gt 1 } | Sort-Object CurrentRefreshRate -Descending | Select-Object -First 1).CurrentRefreshRate
     if ($r) { [int]$r } else { 0 }
 }
 
@@ -2249,7 +2256,7 @@ function Read-SharedText([string]$Path) {
     try { $sr = New-Object IO.StreamReader $fs; $sr.ReadToEnd() } finally { $fs.Close() }
 }
 function Get-FnLogs([int]$Count = 5) { @(Get-ChildItem (Join-Path $FnSaved 'Logs') -Filter 'FortniteGame*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $Count) }
-function ConvertFrom-FnStamp([string]$s) { try { [datetime]::ParseExact($s, 'yyyy.MM.dd-HH.mm.ss:fff', [Globalization.CultureInfo]::InvariantCulture) } catch { $null } }
+function ConvertFrom-FnStamp([string]$s) { try { [datetime]::ParseExact($s, 'yyyy.MM.dd-HH.mm.ss:fff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal) } catch { $null } }   # Fortnite logs in UTC; this returns local time
 
 # per-match network numbers Fortnite itself logs at the end of each game phase
 function Get-FnNetReport {
@@ -2353,7 +2360,7 @@ function Get-FnHitchReport {
 
 # big Fortnite logs take seconds to read: build the report in the background worker, then show it
 $script:ReportBusy = @{}
-$script:ReportTitles = @{ 'Get-FnHitchReport' = 'Stutters in your matches'; 'Get-FnNetReport' = 'Your matches, measured by Fortnite'; 'Get-WinUpdateReport' = 'Windows build check'; 'Get-KernelDriverToolsReport' = 'Kernel-driver sensor tools' }
+$script:ReportTitles = @{ 'Get-FnHitchReport' = 'Stutters in your matches'; 'Get-FnNetReport' = 'Your matches, measured by Fortnite'; 'Get-WinUpdateReport' = 'Windows build check'; 'Get-KernelDriverToolsReport' = 'Kernel-driver sensor tools'; 'Get-FnInputPoolReport' = 'Controllers and Fortnite input'; 'Get-WinActivationReport' = 'Windows activation' }
 function Start-BackgroundReport([string]$Fn) {
     if ($script:ReportBusy[$Fn]) { throw 'Already reading Fortnite''s logs.' }
     $script:ReportBusy[$Fn] = $true
@@ -2411,40 +2418,13 @@ $script:FnSubBusy = $false
 function Start-FnSubPing {
     if ($script:FnSubBusy) { throw 'The subregion ping is already running.' }
     $script:FnSubBusy = $true
-    Invoke-Worker @'
-param($hosts, $city)
-$ips = @()
-foreach ($h in $hosts) {
-    foreach ($a in @(Resolve-DnsName $h.Host -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' })) {
-        $name = try { (Resolve-DnsName $a.IPAddress -Type PTR -QuickTimeout -ErrorAction Stop | Select-Object -First 1).NameHost } catch { '' }
-        $sub = if ($name -match '\.compute-1\.') { 'us-east-1' } elseif ($name -match '\.([a-z]{2}-[a-z]+-\d)\.') { $Matches[1] } else { '' }
-        $ips += [pscustomobject]@{ Region = $h.Name; Ip = $a.IPAddress; Sub = $(if ($sub -and $city[$sub]) { $city[$sub] } elseif ($sub) { $sub } else { $h.Name }) }
-    }
-}
-$ips = @($ips | Sort-Object Ip -Unique)
-$rtt = @{}
-for ($round = 0; $round -lt 8; $round++) {
-    $jobs = foreach ($x in $ips) { [pscustomobject]@{ Ip = $x.Ip; T = (New-Object System.Net.NetworkInformation.Ping).SendPingAsync($x.Ip, 1000) } }
-    try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($jobs | ForEach-Object { $_.T }), 3000) | Out-Null } catch {}
-    foreach ($j in $jobs) { if (-not $rtt[$j.Ip]) { $rtt[$j.Ip] = @() }; $rtt[$j.Ip] += $(if ($j.T.Status -eq 'RanToCompletion' -and $j.T.Result.Status -eq 'Success') { [int]$j.T.Result.RoundtripTime } else { -1 }) }
-    Start-Sleep -Milliseconds 200
-}
-@{ Rows = @($ips | ForEach-Object { $ok = @($rtt[$_.Ip] | Where-Object { $_ -ge 0 } | Sort-Object); [pscustomobject]@{ Region = $_.Region; Sub = $_.Sub; Ip = $_.Ip; Med = $(if ($ok.Count) { $ok[[int][math]::Floor(($ok.Count - 1) / 2)] } else { -1 }); Loss = [int](100 * (8 - $ok.Count) / 8) } }) }
-'@ @(, @($PingHosts | ForEach-Object { @{ Name = $_.Name; Host = $_.Host } })) + @(, $AwsCity) {
+    $targets = try { @(Get-FnPingTargets) } catch { @() }
+    Invoke-Worker $FnDcPingCode @($targets, @($PingHosts | ForEach-Object { @{ Name = $_.Name; Host = $_.Host } }), $AwsCity) {
         param($out, $errs)
         $script:FnSubBusy = $false
         $res = Get-WorkerResult $out
         if (-not ($res -is [hashtable]) -or -not @($res.Rows).Count) { Show-Toast 'Could not reach Epic''s ping servers. Check your connection.' '#FF9F0A'; return }
-        $rows = @($res.Rows | Where-Object { $_.Med -ge 0 })
-        $mine = Get-PlayRegionName
-        $best = $rows | Where-Object { $_.Region -eq $mine } | Sort-Object { $_.Med } | Select-Object -First 1
-        if ($best) { $script:FnBestIp = $best.Ip; $script:FnBestName = "$($best.Sub) ($($best.Region))" }
-        $lines = foreach ($g in $rows | Group-Object { $_.Region } | Sort-Object { ($_.Group | Measure-Object Med -Minimum).Minimum }) {
-            $subs = foreach ($sg in $g.Group | Group-Object { $_.Sub } | Sort-Object { ($_.Group | Measure-Object Med -Minimum).Minimum }) { "$($sg.Name) $(($sg.Group | Measure-Object Med -Minimum).Minimum) ms" }
-            "$(if ($g.Name -eq $mine) { '> ' })$($g.Name): $($subs -join '  ·  ')"
-        }
-        $tip = if ($best) { "`n`nYour best server in $mine is $($best.Sub) at $($best.Med) ms. In Fortnite: Settings > Game > Matchmaking Region: $mine (not Auto, which also leaves the subregion on Auto), then Subregion Preference: $($best.Sub)." } else { '' }
-        [void](Show-ZdDialog ("Ping to every Fortnite server city (lowest per city):`n`n$($lines -join "`n")$tip`n`nICMP ping approximates the game ping; Fortnite's Net Debug Stats show the exact in-game number. Results are wrong while a ping booster or VPN is running.") 'Fortnite subregion ping' 'OK' 'Information')
+        [void](Show-ZdDialog (Get-FnSubPingText $res) 'Fortnite subregion ping' 'OK' 'Information')
     }
 }
 
@@ -2609,6 +2589,1901 @@ function Get-ControllerReport {
     if ($bt.Count) {
         "Controller found: $names`nConnected over: Bluetooth`n`nGamepadla measured an Xbox Series controller at about 12-13 ms on Bluetooth against 6.5-8.3 ms on a cable and 7-9 ms on the Xbox Wireless Adapter. A USB cable or the wireless adapter cuts that delay roughly in half. Bluetooth headphones on the same PC can make it worse."
     } else { "Controller found: $names`nConnected over: cable or wireless adapter. That is the low-latency way; nothing to change." }
+}
+
+# --- Helpers for research round 6 (1.15)
+
+# --- Research round 7 (1.15): Fortnite log reports (fnlog): match bottleneck, audio path, Epic Quality Assets
+# Performance mode = PreferredFeatureLevel=es31 under [D3DRHIPreference] in GameUserSettings.ini ($null = no settings file yet)
+function Test-FnPerformanceMode {
+    if (-not (Test-Path $IniPath)) { return $null }
+    $lines = try { [IO.File]::ReadAllLines($IniPath) } catch { return $null }
+    $sec = ''
+    foreach ($l in $lines) {
+        if ($l -match '^\s*\[(.+)\]\s*$') { $sec = $Matches[1]; continue }
+        if ($sec -eq 'D3DRHIPreference' -and $l -match '^\s*PreferredFeatureLevel\s*=\s*(\S*)') { return $Matches[1] -eq 'es31' }
+    }
+    $false
+}
+# one key from a given [section] of GameUserSettings.ini (Get-IniValue ignores sections)
+function Get-FnIniSectionValue([string]$Section, [string]$Key) {
+    if (-not (Test-Path $IniPath)) { return $null }
+    $lines = try { [IO.File]::ReadAllLines($IniPath) } catch { return $null }
+    $sec = ''
+    foreach ($l in $lines) {
+        if ($l -match '^\s*\[(.+)\]\s*$') { $sec = $Matches[1]; continue }
+        if ($sec -eq $Section -and $l -match "^\s*$([regex]::Escape($Key))=(.*)$") { return $Matches[1].Trim() }
+    }
+    $null
+}
+
+# --- Match bottleneck: Fortnite's end-of-match LogHealthSnapshot (worker: 3-6 logs of 10-40 MB)
+$script:FnBottleneckBusy = $false
+function Start-FnBottleneckCheck {
+    if ($script:FnBottleneckBusy) { throw 'The bottleneck check is already running.' }
+    $logs = @(Get-FnLogs 6 | ForEach-Object { $_.FullName })
+    if (-not $logs.Count) { [void](Show-ZdDialog 'No Fortnite logs found. Play a match first.' 'What limits your FPS' 'OK' 'Information'); return }
+    $script:FnBottleneckBusy = $true
+    Invoke-Worker @'
+param($paths)
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$rows = New-Object System.Collections.ArrayList
+foreach ($p in $paths) {
+    $t = try { $fs = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite'); try { (New-Object IO.StreamReader $fs).ReadToEnd() } finally { $fs.Close() } } catch { continue }
+    $prof = [regex]::Match($t, 'Selected Device Profile: \[(\w+)\]').Groups[1].Value
+    foreach ($m in [regex]::Matches($t, '(?m)^\[([\d.\-:]+)\]\[\s*\d+\]LogHealthSnapshot: =+ Snapshot: End of Match \((\w+)')) {
+        if ($m.Groups[2].Value -like 'FrontEnd*') { continue }
+        $e = $t.IndexOf('LogHealthSnapshot: =====', $m.Index + $m.Length)
+        $len = if ($e -gt $m.Index) { $e - $m.Index } else { [Math]::Min(4000, $t.Length - $m.Index) }
+        $b = $t.Substring($m.Index, [Math]::Min($len, 6000))
+        $n = { param($rx) $x = [regex]::Match($b, $rx); if ($x.Success) { [double]::Parse($x.Groups[1].Value, $inv) } else { -1 } }
+        [void]$rows.Add([pscustomobject]@{
+            Stamp = $m.Groups[1].Value; State = $m.Groups[2].Value; Profile = $prof
+            Secs = & $n 'MeasuredPerfTime: ([\d.]+)'; Fps = & $n 'AvgFPS:\s*([\d.]+)'; HitchPm = & $n 'HitchesPerMinute: ([\d.]+)'; AvgHitch = & $n 'Avg Hitch ([\d.]+)ms'
+            Dyn = & $n 'DynRes: Avg: ([\d.]+)%'; FT = & $n 'FT: Avg: ([\d.]+)ms'
+            GT = & $n 'GT:\s+Avg ([\d.]+)ms'; GTb = & $n 'GT:[^\r\n]*Bound Frames: ([\d.]+)%'
+            RT = & $n 'RT:\s+Avg ([\d.]+)ms'; RTb = & $n 'RT:[^\r\n]*Bound Frames: ([\d.]+)%'
+            RHIT = & $n 'RHIT:\s+Avg ([\d.]+)ms'; RHITb = & $n 'RHIT:[^\r\n]*Bound Frames: ([\d.]+)%'
+            GPU = & $n 'GPU:\s+Avg ([\d.]+)ms'; GPUb = & $n 'GPU:[^\r\n]*Bound Frames: ([\d.]+)%'
+        })
+    }
+}
+@{ Rows = @($rows) }
+'@ @(, $logs) {
+        param($out, $errs)
+        $script:FnBottleneckBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'Could not read Fortnite''s logs.' '#FF9F0A'; return }
+        $lim = Get-FnIniSectionValue $IniSection.Trim('[', ']') 'FrameRateLimit'
+        [void](Show-ZdDialog (Format-FnBottleneckReport @($r.Rows) $lim (Test-FnPerformanceMode)) 'What limits your FPS' 'OK' 'Information')
+    }
+}
+# what set the frame time of one match: 'cap', 'gpu', 'game', 'render' or 'mixed'
+function Get-FnBottleneckKind($r) {
+    $units = [ordered]@{ game = $r.GT; render = [Math]::Max($r.RT, $r.RHIT); gpu = $r.GPU }
+    $max = ($units.Values | Measure-Object -Maximum).Maximum
+    if ($max -le 0 -or $r.FT -le 0) { return 'mixed' }
+    # every unit finishes well before the frame ends: something waits (FPS cap, V-Sync, driver limiter)
+    if ($r.FT -ge 1.25 * $max -and ($r.FT - $max) -ge 0.4) { return 'cap' }
+    $bound = [ordered]@{ gpu = $r.GPUb; game = $r.GTb; render = [Math]::Max($r.RTb, $r.RHITb) }
+    $top = $bound.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+    if ($top.Value -ge 20) { return $top.Key }
+    $lead = $units.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+    if ($lead.Value -ge 0.8 * $r.FT) { return $lead.Key }
+    'mixed'
+}
+# turns the snapshot rows into per-match verdicts and the settings that help in the current rendering mode
+function Format-FnBottleneckReport($Rows, $FrameRateLimit, $PerfNow) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $rows = @($Rows | Where-Object { $_ -and $_.Secs -ge 120 -and $_.FT -gt 0 -and $_.Fps -gt 0 } | Sort-Object Stamp -Descending | Select-Object -First 5)
+    if (-not $rows.Count) { return 'Fortnite has not logged a finished match of two minutes or more in its recent logs (or the log format changed after an update). Play a match, return to the lobby, then check again.' }
+    $f1 = { param($v) ([double]$v).ToString('0.0#', $inv) }
+    $kindTxt = @{ cap = 'held by a frame cap'; gpu = 'graphics card limited'; game = 'processor (game thread) limited'; render = 'render threads (draw calls) limited'; mixed = 'no single limit' }
+    $kinds = @(); $lines = @()
+    foreach ($r in $rows) {
+        $k = Get-FnBottleneckKind $r; $kinds += $k
+        $when = try { [datetime]::ParseExact($r.Stamp, 'yyyy.MM.dd-HH.mm.ss:fff', $inv).ToString('d MMM HH:mm') } catch { $r.Stamp }
+        $what = switch -Wildcard ($r.State) { 'Athena*' { 'match' } 'Playspace*' { 'island' } default { $r.State -replace '_GameState_C$', '' } }
+        $mode = if ($r.Profile -match 'ES31') { 'Performance mode' } elseif ($r.Profile) { 'DirectX 12' } else { 'mode unknown' }
+        $verdict = $kindTxt[$k] + $(if ($k -eq 'cap') { " at about $([int][Math]::Round($r.Fps)) FPS" } else { '' })
+        $lines += "{0}, {1}, {2} min, {3}: {4} FPS. Frame {5} ms: game thread {6}, render {7}, RHI {8}, GPU {9} ms -> {10}. {11} hitches/min." -f $when, $what, [int]($r.Secs / 60), $mode, [int][Math]::Round($r.Fps), (& $f1 $r.FT), (& $f1 $r.GT), (& $f1 $r.RT), (& $f1 $r.RHIT), (& $f1 $r.GPU), $verdict, (& $f1 $r.HitchPm)
+    }
+    $main = ($kinds | Group-Object | Sort-Object Count -Descending | Select-Object -First 1).Name
+    $lastPerf = $rows[0].Profile -match 'ES31'
+    $perf = if ($null -ne $PerfNow) { [bool]$PerfNow } else { $lastPerf }
+    $modeName = if ($perf) { 'Performance mode' } else { 'DirectX 12' }
+    $adv = @()
+    switch ($main) {
+        'cap' {
+            $capped = @($rows | Where-Object { (Get-FnBottleneckKind $_) -eq 'cap' })
+            $capFps = [int][Math]::Round(($capped | Measure-Object Fps -Average).Average)
+            $lim = 0.0; [void][double]::TryParse("$FrameRateLimit", [Globalization.NumberStyles]::Float, $inv, [ref]$lim)
+            $src = if ($lim -gt 0) { "Fortnite's own Frame Rate Limit is $([int]$lim) FPS." } else { "Fortnite's Frame Rate Limit is Unlimited, so the cap comes from outside Fortnite: the graphics driver's Max Frame Rate, RivaTuner, V-Sync, or Reflex's automatic cap when G-SYNC/FreeSync and V-Sync are both on." }
+            $adv += "Held by a frame cap at about $capFps FPS: the processor and graphics card finish each frame early and wait. $src If the cap is far below your monitor's refresh rate, see Stable FPS cap and G-SYNC / FreeSync FPS cap. Graphics settings cost nothing here until the GPU time gets close to the frame time."
+        }
+        'gpu' {
+            if ($perf) { $adv += 'Graphics card limited, in Performance mode. The settings that still work in this mode: Lower 3D resolution (the biggest lever), then Medium view distance and Performance mode: low mesh quality. Most other graphics options are pinned off by Epic''s device profile in this mode and change nothing.' }
+            else { $adv += 'Graphics card limited, in DirectX 12. Measured costs (pcoptimizedsettings, RTX 4090, 2024; treat as relative weights): Nanite over 20% (Turn off Nanite), shadows 14-28%, Lumen global illumination 16-22% (use Ambient Occlusion), Lumen reflections 6-13% (use SSR), Effects on Epic about 10% (High or lower; Competitive graphics covers these four). Then DLSS or TSR upscaling, or Lower 3D resolution. Performance rendering mode is lighter still.' }
+        }
+        'game' {
+            if ($perf) { $adv += 'Processor (game thread) limited, in Performance mode: the graphics card waits for the CPU. What helps: Medium view distance and Performance mode: low mesh quality (less to process), closing overlays and background apps (Find overlays and boosters that interfere), and on dual-die Ryzen the Balanced-plan card. Lowering 3D resolution does not help here and only costs clarity.' }
+            else { $adv += 'Processor (game thread) limited, in DirectX 12: the graphics card waits for the CPU. What helps: Performance rendering mode (much lower CPU load), Medium view distance (about 6-7%), closing overlays and background apps. Lowering 3D resolution or upscaling does not help here and only costs clarity.' }
+        }
+        'render' { $adv += "Render or RHI thread limited (too many draw calls for the CPU). What helps: $(if ($perf) { 'Performance mode: low mesh quality and Medium view distance.' } else { 'Performance rendering mode, Medium view distance.' })" }
+        default { $adv += 'No single part sets the frame time: game thread, render threads and GPU are close to each other. Small gains only; check the per-match lines for a pattern.' }
+    }
+    if ($lastPerf -ne $perf) { $adv += "Your settings file now selects $modeName, but these matches ran in the other mode: play a match before trusting the advice." }
+    if (@($rows | Where-Object { $_.HitchPm -gt 2 -or $_.AvgHitch -gt 100 }).Count) { $adv += 'Some matches had more than 2 hitches a minute or long average hitches: that is stutter rather than low FPS. Count real in-match stutters shows where they happened.' }
+    if (@($rows | Where-Object { $_.Dyn -ge 0 -and $_.Dyn -lt 99.5 }).Count) { $adv += 'Dynamic resolution lowered the resolution in some matches (Turn off dynamic resolution).' }
+    "From Fortnite's own end-of-match performance summary (average times per frame; the slowest part sets the FPS):`n`n$($lines -join "`n`n")`n`n$($adv -join "`n`n")"
+}
+
+# --- Fortnite audio path and real dropouts from the last log (worker: the log is 10-40 MB)
+$script:FnAudioBusy = $false
+function Start-FnAudioCheck {
+    if ($script:FnAudioBusy) { throw 'The audio check is already running.' }
+    $log = @(Get-FnLogs 1)
+    if (-not $log.Count) { [void](Show-ZdDialog 'No Fortnite log found. Start Fortnite once first.' 'Fortnite audio' 'OK' 'Information'); return }
+    $script:FnAudioBusy = $true
+    Invoke-Worker @'
+param($path)
+$t = try { $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite'); try { (New-Object IO.StreamReader $fs).ReadToEnd() } finally { $fs.Close() } } catch { return @{ Err = $_.Exception.Message } }
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$ts = { param($s) try { [datetime]::ParseExact($s, 'yyyy.MM.dd-HH.mm.ss:fff', $inv) } catch { $null } }
+$one = { param($rx) $x = [regex]::Match($t, $rx); if ($x.Success) { $x.Groups[1].Value } else { '' } }
+# literal search plus the line's own time stamp: line-anchored regexes take ~0.7 s each on a 30 MB log
+$at = { param($needle) $i = 0; while (($i = $t.IndexOf($needle, $i, [StringComparison]::Ordinal)) -ge 0) { $ls = $t.LastIndexOf("`n", $i) + 1; [pscustomobject]@{ Index = $i; Stamp = $(if ($t[$ls] -eq '[' -and $ls + 24 -le $t.Length) { $t.Substring($ls + 1, 23) } else { '' }) }; $i += $needle.Length } }
+$starts = @(& $at 'Starting AudioMixerPlatformInterface::RunInternal()' | ForEach-Object { & $ts $_.Stamp } | Where-Object { $_ })
+$real = @(); $startup = 0
+foreach ($u in @(& $at 'Audio Buffer Underrun (starvation) detected')) {
+    $w = & $ts $u.Stamp
+    if ($w -and ($starts | Where-Object { ($w - $_).TotalMilliseconds -ge 0 -and ($w - $_).TotalMilliseconds -le 1000 })) { $startup++ } else { $real += $u.Stamp }
+}
+$used = @(@([regex]::Matches($t, 'Using Audio Hardware Device ([^\r\n]+)')) + @([regex]::Matches($t, 'resuming audio on new device: ''([^''\r\n]+)''')) | Sort-Object Index | ForEach-Object { $_.Groups[1].Value.Trim() })
+$swaps = 0
+if ($starts.Count) { foreach ($s in @(& $at 'Attempt to swap audio render device')) { $w = & $ts $s.Stamp; if ($w -and ($w - $starts[0]).TotalSeconds -gt 60) { $swaps++ } } }
+$devs = @([regex]::Matches($t, '(?m)LogAudio: Display:\s{2,}(.+?) \(\{[\d.]+\}\.\{') | ForEach-Object { $_.Groups[1].Value.Trim() } | Select-Object -Unique)
+$first = [regex]::Match($t, '(?m)^\[([\d.\-:]+)\]'); $lastM = [regex]::Match($t, '(?m)^\[([\d.\-:]+)\]', 'RightToLeft')
+@{ Device = $(if ($used.Count) { $used[-1] } else { '' }); Rate = & $one 'Sample Rate:\s+(\d+)'; Frames = & $one 'Callback Buffer Frame Size To Use:\s+(\d+)'; Queue = & $one 'Number of buffers to queue:\s+(\d+)'
+   Channels = & $one 'FAudioMixerWasapi initialized: SampleRate=\d+ NumChannels=(\d+)'; HwRate = & $one 'InitializeHardware succeeded with sample rate: (\d+)'; Api = & $one 'Initializing audio mixer using platform API: ''(\w+)'''
+   Spatial = & $one 'Audio Spatialization Plugin: ([^\r\n]+?)(?: is external send|\r|\n)'; Devices = $devs; Real = $real; Startup = $startup; Swaps = $swaps
+   First = $(if ($first.Success) { $first.Groups[1].Value } else { '' }); Last = $(if ($lastM.Success) { $lastM.Groups[1].Value } else { '' }) }
+'@ @($log[0].FullName) {
+        param($out, $errs)
+        $script:FnAudioBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or $r.Err) { Show-Toast 'Could not read Fortnite''s log.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-FnAudioReport $r (Get-FnIniSectionValue $IniSection.Trim('[', ']') 'bUseHeadphoneMode') (Get-FnIniSectionValue $IniSection.Trim('[', ']') 'AudioOutputDeviceId')) 'Fortnite audio' 'OK' 'Information')
+    }
+}
+function Format-FnAudioReport($r, $HeadphoneMode, $OutputId) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    if (-not $r.Device -and -not $r.Rate) { return 'Fortnite''s last log has no audio start-up lines (the session may have ended early, or the log format changed after an update).' }
+    $when = try { [datetime]::ParseExact($r.First, 'yyyy.MM.dd-HH.mm.ss:fff', $inv).ToString('d MMM HH:mm') } catch { '?' }
+    $mins = try { [int]([datetime]::ParseExact($r.Last, 'yyyy.MM.dd-HH.mm.ss:fff', $inv) - [datetime]::ParseExact($r.First, 'yyyy.MM.dd-HH.mm.ss:fff', $inv)).TotalMinutes } catch { 0 }
+    $out = @("Fortnite session from $when ($mins min):")
+    $out += "Output device used: $(if ($r.Device) { $r.Device } else { 'unknown' })$(if ("$OutputId".Trim()) { ' (picked in Fortnite''s audio settings)' } else { ' (follows the Windows default)' })"
+    if ($r.Rate) {
+        $ms = if ([int]$r.Frames -gt 0) { ([double]$r.Frames * 1000 / [double]$r.Rate).ToString('0.0', $inv) } else { '?' }
+        $out += "Mixer: $($r.Rate) Hz, $($r.Frames)-sample buffers ($ms ms each), $($r.Queue) queued, $(if ($r.Channels) { "$($r.Channels) channels, " })Windows shared mode ($(if ($r.Api) { $r.Api } else { 'WASAPI' }))"
+    }
+    $hp = "$HeadphoneMode" -eq 'True'
+    $out += "3D Headphones (HRTF, $(if ($r.Spatial) { $r.Spatial } else { 'Resonance Audio' })): $(if ($hp) { 'on' } elseif ("$HeadphoneMode") { 'off' } else { 'unknown' })"
+    $real = @($r.Real)
+    $out += "Audio dropouts (buffer underruns): $($real.Count)$(if ($r.Startup) { " (plus $($r.Startup) at mixer start-up, which happens in every session and is harmless)" })"
+    $adv = @()
+    if ($real.Count) { $adv += "Each dropout is an audible gap or crackle: the mixer did not get CPU time within its $(if ($r.Frames -and $r.Rate) { ([double]$r.Frames * 1000 / [double]$r.Rate).ToString('0', $inv) } else { 'few' }) ms window. Usual causes: driver DPC spikes (run the Idle spike test), a wireless or USB headset dongle on a hub or front-panel port, or audio enhancement and virtual-surround software. First one at $(try { [datetime]::ParseExact($real[0], 'yyyy.MM.dd-HH.mm.ss:fff', $inv).ToString('HH:mm:ss') } catch { $real[0] })." }
+    else { $adv += 'No real audio dropouts in this session.' }
+    if ([int]$r.Swaps -gt 0) { $adv += "The audio device changed $($r.Swaps) times mid-session (a headset dongle reconnecting, or Windows switching its default device): each change is a short silence." }
+    if ($r.Rate -and $r.Rate -ne '48000') { $adv += "The mixer runs at $($r.Rate) Hz instead of the usual 48000 Hz; Check your default playback device shows the Windows format." }
+    if ($r.Device -match 'THX') { $adv += 'Razer THX Spatial is the output device. Since a July 2026 Fortnite update it has been reported to distort Fortnite audio at 48 kHz (Razer Insider). Reported fixes: set the THX Spatial device to 16-bit, 44100 Hz in Windows Sound settings, or pick the headset itself as Fortnite''s output device (Settings > Audio).' }
+    elseif (@($r.Devices) -match 'THX') { $adv += 'Razer THX Spatial is installed but Fortnite did not use it. If you switch to it and hear distortion, set it to 16-bit, 44100 Hz (reported fix, Razer Insider, July 2026).' }
+    elseif ($r.Device -match 'Sonar|Nahimic|Dolby|DTS|Voicemeeter|Virtual') { $adv += 'The output device is a virtual audio device: it adds a processing layer. If you hear crackle or delay, try the headset itself as the output device.' }
+    if ($r.Device -match 'Hands-Free|Bluetooth|AirPods|Buds|WH-1000|WF-1000') { $adv += 'This looks like a Bluetooth device, which runs far behind the game; Check your default playback device explains it.' }
+    if ($hp -and $r.Device -match 'THX|Sonar|Dolby|DTS|Sonic|Nahimic') { $adv += '3D Headphones is on while a virtual-surround device is used: the sound is processed twice. Use one of them.' }
+    elseif (-not $hp -and "$HeadphoneMode") { $adv += 'With a stereo headset, 3D Headphones (Settings > Audio) can make above, below and behind easier to place. That is Epic''s claim; no independent measurement exists, so try it and keep what you hear better with.' }
+    ($out -join "`n") + "`n`n" + ($adv -join "`n`n")
+}
+
+# --- Epic Quality Assets (launcher option since v42.30): what the manifest says is installed, and whether it fits the rendering mode
+function Get-FnEpicQualityReport {
+    $j = $null
+    foreach ($m in Get-ChildItem "$env:ProgramData\Epic\EpicGamesLauncher\Data\Manifests" -Filter *.item -ErrorAction SilentlyContinue) {
+        try { $x = Get-Content $m.FullName -Raw | ConvertFrom-Json; if ($x.AppName -eq 'Fortnite' -or $x.DisplayName -eq 'Fortnite') { $j = $x; break } } catch {}
+    }
+    $perf = Test-FnPerformanceMode
+    $sg = @(foreach ($k in 'sg.ShadowQuality', 'sg.TextureQuality', 'sg.EffectsQuality', 'sg.ViewDistanceQuality', 'sg.GlobalIlluminationQuality') { $v = Get-FnIniSectionValue 'ScalabilityGroups' $k; if ("$v" -match '^\d+$') { [int]$v } })
+    $avg = if ($sg.Count) { ($sg | Measure-Object -Average).Average } else { $null }
+    $high = (-not $perf) -and $null -ne $avg -and $avg -ge 2
+    $s = 'Fortnite rendering: ' + $(if ($null -eq $perf) { 'unknown (no settings file yet)' } elseif ($perf) { 'Performance mode' } else { "DirectX 12$(if ($null -ne $avg) { ", quality around $(@('Low', 'Medium', 'High', 'Epic', 'Epic')[[int][Math]::Round($avg)])" })" })
+    if ($j) {
+        $tags = @($j.InstallTags | Where-Object { "$_".Trim() })
+        $comp = @($j.InstallComponents | Where-Object { "$_".Trim() })
+        $s += "`nLauncher install: $([Math]::Round([double]$j.InstallSize / 1GB, 1)) GB at $($j.InstallLocation)"
+        $s += "`nOptional content tags: $(if ($tags.Count) { $tags -join ', ' } else { 'none (base game only)' })$(if ($comp.Count) { "; components: $($comp -join ', ')" })"
+        $s += "`n(Epic has not published which tag the Epic Quality Assets option uses, so ZeroDelay shows the list as it is: no tags means it is not installed.)"
+    } else { $s += "`nThe Epic launcher's Fortnite manifest was not found, so ZeroDelay cannot tell what is installed." }
+    $s += "`n`n" + $(if ($perf) { 'Advice: leave Epic Quality Assets off. Performance mode never uses them, so they only take disk space.' }
+        elseif ($high) { 'Advice: tick Epic Quality Assets. On High or Epic in DirectX 12 the game otherwise streams Epic-quality terrain and objects over your connection during the match, a source of hitches and bandwidth use. Epic says it is not an FPS setting.' }
+        elseif ($null -ne $perf) { 'Advice: on Low or Medium settings the gain is small; leave it off unless you have spare disk space and stutter when new areas load.' }
+        else { 'Advice: tick it for DirectX 12 on High or Epic, leave it off for Performance mode or Low.' })
+    $s + "`n`nWhere: Epic Games Launcher > Library > Fortnite > ... (three dots) > Options > Epic Quality Assets: tick or untick, then Apply. The launcher downloads or removes the files; ZeroDelay never edits the launcher's files. Not on a hard drive or a nearly full SSD (Check Fortnite's drive)."
+}
+
+
+# --- Research round 7 (1.15): Fortnite's own datacenter list, its region test, match servers, Starlink
+
+# Fortnite datacenter ids from the hotfix cache: city, cloud, cloud region, game region (checked 2026-10-31 against AWS ip-ranges.json and Google cloud.json)
+$FnDcInfo = @{
+    VA   = @{ City = 'Virginia'; Prov = 'AWS'; Cloud = 'us-east-1'; Rid = 'NA' }
+    OH   = @{ City = 'Ohio'; Prov = 'AWS'; Cloud = 'us-east-2'; Rid = 'NA' }
+    NCAL = @{ City = 'N. California'; Prov = 'AWS'; Cloud = 'us-west-1'; Rid = 'NA' }
+    OR   = @{ City = 'Oregon'; Prov = 'AWS'; Cloud = 'us-west-2'; Rid = 'NA' }
+    TX   = @{ City = 'Dallas'; Prov = 'AWS'; Cloud = 'us-east-1-dfw-2'; Rid = 'NA' }
+    IA   = @{ City = 'Iowa'; Prov = 'Google Cloud'; Cloud = 'us-central1'; Rid = 'NA' }
+    MX   = @{ City = 'Mexico'; Prov = 'AWS'; Cloud = 'mx-central-1'; Rid = 'NA' }
+    DE   = @{ City = 'Frankfurt'; Prov = 'AWS'; Cloud = 'eu-central-1'; Rid = 'EU' }
+    GB   = @{ City = 'London'; Prov = 'AWS'; Cloud = 'eu-west-2'; Rid = 'EU' }
+    FR   = @{ City = 'Paris'; Prov = 'AWS'; Cloud = 'eu-west-3'; Rid = 'EU' }
+    SYD  = @{ City = 'Sydney'; Prov = 'AWS'; Cloud = 'ap-southeast-2'; Rid = 'OCE' }
+    SAO  = @{ City = 'Sao Paulo'; Prov = 'AWS'; Cloud = 'sa-east-1'; Rid = 'BR' }
+    TOK  = @{ City = 'Tokyo'; Prov = 'AWS'; Cloud = 'ap-northeast-1'; Rid = 'ASIA' }
+    BAH  = @{ City = 'Doha'; Prov = 'Google Cloud'; Cloud = 'me-central1'; Rid = 'ME' }
+    MUM  = @{ City = 'Mumbai'; Prov = 'AWS'; Cloud = 'ap-south-1'; Rid = 'ME' }
+    IL   = @{ City = 'Tel Aviv'; Prov = 'AWS'; Cloud = 'il-central-1'; Rid = 'ME' }
+    ZA   = @{ City = 'Cape Town'; Prov = 'AWS'; Cloud = 'af-south-1'; Rid = 'UND' }
+    SG   = @{ City = 'Singapore'; Prov = 'AWS'; Cloud = 'ap-southeast-1'; Rid = 'UND' }
+    MY   = @{ City = 'Malaysia'; Prov = 'AWS'; Cloud = 'ap-southeast-5'; Rid = 'UND' }
+    TW   = @{ City = 'Taiwan'; Prov = 'AWS'; Cloud = 'ap-east-2'; Rid = 'UND' }
+    SE   = @{ City = 'Stockholm'; Prov = 'AWS'; Cloud = 'eu-north-1'; Rid = 'UND' }
+    IT   = @{ City = 'Spain'; Prov = 'AWS'; Cloud = 'eu-south-2'; Rid = 'UND' }
+    CL   = @{ City = 'Santiago'; Prov = 'Google Cloud'; Cloud = 'southamerica-west1'; Rid = 'UND' }
+    BE   = @{ City = 'Belgium'; Prov = 'Google Cloud'; Cloud = 'europe-west1'; Rid = 'UND' }
+    SE2  = @{ City = 'Stockholm'; Prov = 'Google Cloud'; Cloud = 'europe-north2'; Rid = 'UND' }
+}
+# the selectable ids, for the DNS fallback (ping-<id>.ds.on.epicgames.com) when Fortnite has never downloaded its list
+$FnSubIds = 'VA', 'OH', 'NCAL', 'OR', 'TX', 'IA', 'MX', 'DE', 'GB', 'FR', 'SYD', 'SAO', 'TOK', 'BAH', 'MUM', 'IL'
+# Fortnite has one North America region; ZeroDelay's ping regions (and tournaments) keep NA East / Central / West
+$FnNaSplit = @{ VA = 'NA East'; OH = 'NA East'; TX = 'NA Central'; IA = 'NA Central'; MX = 'NA Central'; NCAL = 'NA West'; OR = 'NA West' }
+$FnRegionGame = @{ NA = 'North America'; EU = 'Europe'; OCE = 'Oceania'; BR = 'Brazil'; ASIA = 'Asia'; ME = 'Middle East'; UND = 'not selectable' }
+# cloud region -> city; both clouds use the same name for the same metro so they can be compared
+$CloudCity = @{
+    'AWS|us-east-1' = 'Virginia'; 'AWS|us-east-2' = 'Ohio'; 'AWS|us-west-1' = 'N. California'; 'AWS|us-west-2' = 'Oregon'; 'AWS|ca-central-1' = 'Montreal'; 'AWS|ca-west-1' = 'Calgary'
+    'AWS|mx-central-1' = 'Mexico'; 'AWS|sa-east-1' = 'Sao Paulo'; 'AWS|eu-central-1' = 'Frankfurt'; 'AWS|eu-central-2' = 'Zurich'; 'AWS|eu-west-1' = 'Ireland'; 'AWS|eu-west-2' = 'London'
+    'AWS|eu-west-3' = 'Paris'; 'AWS|eu-north-1' = 'Stockholm'; 'AWS|eu-south-1' = 'Milan'; 'AWS|eu-south-2' = 'Spain'; 'AWS|me-south-1' = 'Bahrain'; 'AWS|me-central-1' = 'UAE'
+    'AWS|il-central-1' = 'Tel Aviv'; 'AWS|af-south-1' = 'Cape Town'; 'AWS|ap-south-1' = 'Mumbai'; 'AWS|ap-south-2' = 'Hyderabad'; 'AWS|ap-northeast-1' = 'Tokyo'; 'AWS|ap-northeast-2' = 'Seoul'
+    'AWS|ap-northeast-3' = 'Osaka'; 'AWS|ap-southeast-1' = 'Singapore'; 'AWS|ap-southeast-2' = 'Sydney'; 'AWS|ap-southeast-3' = 'Jakarta'; 'AWS|ap-southeast-4' = 'Melbourne'; 'AWS|ap-southeast-5' = 'Malaysia'
+    'AWS|ap-east-1' = 'Hong Kong'; 'AWS|ap-east-2' = 'Taiwan'
+    'Google Cloud|us-central1' = 'Iowa'; 'Google Cloud|us-east1' = 'South Carolina'; 'Google Cloud|us-east4' = 'Virginia'; 'Google Cloud|us-east5' = 'Ohio'; 'Google Cloud|us-south1' = 'Dallas'
+    'Google Cloud|us-west1' = 'Oregon'; 'Google Cloud|us-west2' = 'Los Angeles'; 'Google Cloud|us-west3' = 'Salt Lake City'; 'Google Cloud|us-west4' = 'Las Vegas'
+    'Google Cloud|northamerica-northeast1' = 'Montreal'; 'Google Cloud|northamerica-northeast2' = 'Toronto'; 'Google Cloud|northamerica-south1' = 'Mexico'
+    'Google Cloud|southamerica-east1' = 'Sao Paulo'; 'Google Cloud|southamerica-west1' = 'Santiago'; 'Google Cloud|europe-west1' = 'Belgium'; 'Google Cloud|europe-west2' = 'London'
+    'Google Cloud|europe-west3' = 'Frankfurt'; 'Google Cloud|europe-west4' = 'Netherlands'; 'Google Cloud|europe-west6' = 'Zurich'; 'Google Cloud|europe-west8' = 'Milan'; 'Google Cloud|europe-west9' = 'Paris'
+    'Google Cloud|europe-west10' = 'Berlin'; 'Google Cloud|europe-west12' = 'Turin'; 'Google Cloud|europe-north1' = 'Finland'; 'Google Cloud|europe-north2' = 'Stockholm'; 'Google Cloud|europe-central2' = 'Warsaw'
+    'Google Cloud|europe-southwest1' = 'Madrid'; 'Google Cloud|me-central1' = 'Doha'; 'Google Cloud|me-central2' = 'Dammam'; 'Google Cloud|me-west1' = 'Tel Aviv'; 'Google Cloud|africa-south1' = 'Johannesburg'
+    'Google Cloud|asia-south1' = 'Mumbai'; 'Google Cloud|asia-south2' = 'Delhi'; 'Google Cloud|asia-northeast1' = 'Tokyo'; 'Google Cloud|asia-northeast2' = 'Osaka'; 'Google Cloud|asia-northeast3' = 'Seoul'
+    'Google Cloud|asia-east1' = 'Taiwan'; 'Google Cloud|asia-east2' = 'Hong Kong'; 'Google Cloud|asia-southeast1' = 'Singapore'; 'Google Cloud|asia-southeast2' = 'Jakarta'
+    'Google Cloud|australia-southeast1' = 'Sydney'; 'Google Cloud|australia-southeast2' = 'Melbourne'
+}
+# AWS Local Zone metro codes (network border group us-east-1-dfw-2 = Dallas)
+$AwsMetro = @{ dfw = 'Dallas'; iah = 'Houston'; atl = 'Atlanta'; chi = 'Chicago'; mia = 'Miami'; lax = 'Los Angeles'; den = 'Denver'; phx = 'Phoenix'; sea = 'Seattle'; bos = 'Boston'; nyc = 'New York'; mci = 'Kansas City'; msp = 'Minneapolis'; las = 'Las Vegas'; pdx = 'Portland'; phl = 'Philadelphia'; qro = 'Mexico'; bue = 'Buenos Aires'; scl = 'Santiago'; lim = 'Lima'; akl = 'Auckland'; per = 'Perth'; tpe = 'Taiwan'; ham = 'Hamburg'; waw = 'Warsaw'; cph = 'Copenhagen'; hel = 'Finland'; lag = 'Lagos'; ccu = 'Kolkata'; del = 'Delhi'; bkk = 'Bangkok'; mnl = 'Manila' }
+
+# city of a cloud location (AWS network border group or Google scope)
+function Get-CloudCity([string]$Prov, [string]$Loc) {
+    if (-not $Loc) { return '' }
+    $c = $CloudCity["$Prov|$Loc"]; if ($c) { return $c }
+    if ($Prov -eq 'AWS' -and $Loc -match '-([a-z]{3})-\d+[a-z]?$' -and $AwsMetro[$Matches[1]]) { return $AwsMetro[$Matches[1]] }
+    $parent = $CloudCity["$Prov|$($Loc -replace '-(wl\d-)?[a-z]{3}-.*$', '')"]
+    if ($parent) { "$parent (edge zone)" } else { $Loc }
+}
+# ZeroDelay's ping region name for a datacenter id
+function Get-FnAppRegion([string]$Id, [string]$Rid) {
+    if ($Rid -eq 'NA') { if ($FnNaSplit[$Id]) { return $FnNaSplit[$Id] }; return 'NA Central' }
+    $n = $FnRegionGame[$Rid]; if ($n) { $n } else { $Rid }
+}
+# the game region ('North America', 'Europe', ...) that ZeroDelay's chosen region belongs to
+function Get-FnGameRegionOf([string]$AppRegion) { if ($AppRegion -like 'NA *') { 'North America' } else { $AppRegion } }
+
+# small EMS hotfix files (name is a hash, so found by content): the one with the datacenter list, plus every net.* cvar; cached until a file changes
+function Get-FnEmsInfo {
+    $dir = Join-Path $FnSaved 'PersistentDownloadDir\EMS'
+    $files = @(Get-ChildItem $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 0 -and $_.Length -lt 262144 } | Sort-Object LastWriteTime -Descending)
+    $key = ($files | ForEach-Object { "$($_.Name)$($_.LastWriteTimeUtc.Ticks)" }) -join ';'
+    if ($script:FnEmsCache -and $script:FnEmsCache.Key -eq $key) { return $script:FnEmsCache }
+    $hit = $null; $cv = @{}
+    foreach ($f in $files) {
+        $t = try { Read-SharedText $f.FullName } catch { continue }
+        if (-not $hit -and $t.Contains('+DatacenterDefinitions=')) { $hit = @{ Path = $f.FullName; Time = $f.LastWriteTime; Text = $t } }
+        foreach ($m in [regex]::Matches($t, '(?m)^(net\.\w+)=([^\r\n]*)')) { if (-not $cv.ContainsKey($m.Groups[1].Value)) { $cv[$m.Groups[1].Value] = $m.Groups[2].Value.Trim().Trim('"') } }
+    }
+    $script:FnEmsCache = @{ Key = $key; Hit = $hit; Cvars = $cv }
+    $script:FnEmsCache
+}
+# Fortnite's datacenter list (+DatacenterDefinitions in [/Script/Qos.QosRegionManager]): one row per datacenter; empty when Fortnite never downloaded it
+function Get-FnDatacenters {
+    $e = Get-FnEmsInfo; if (-not $e.Hit) { return @() }
+    $vis = @{}
+    foreach ($m in [regex]::Matches($e.Hit.Text, '(?m)^\+RegionDefinitions=\(DisplayName=NSLOCTEXT\("[^"]*", *"[^"]*", *"([^"]*)"\), *RegionId="(\w+)"[^\r\n]*?bVisible=(true|false)')) { $vis[$m.Groups[2].Value] = @{ Name = $m.Groups[1].Value; Visible = $m.Groups[3].Value -eq 'true' } }
+    @(foreach ($m in [regex]::Matches($e.Hit.Text, '(?m)^\+DatacenterDefinitions=\(Id="(\w+)", *RegionId="(\w+)", *bEnabled=(true|false)([^\r\n]*)')) {
+        $id = $m.Groups[1].Value; $rid = $m.Groups[2].Value; $info = $FnDcInfo[$id]
+        $show = if ($vis.ContainsKey($rid)) { $vis[$rid].Visible } else { $rid -ne 'UND' }
+        [pscustomobject]@{
+            Id = $id; RegionId = $rid; Region = (Get-FnAppRegion $id $rid)
+            GameRegion = $(if ($vis[$rid] -and $vis[$rid].Name -and $rid -ne 'UND') { $vis[$rid].Name } elseif ($FnRegionGame[$rid]) { $FnRegionGame[$rid] } else { $rid })
+            Visible = ($show -and $m.Groups[3].Value -eq 'true')
+            City = $(if ($info) { $info.City } else { $id }); Prov = $(if ($info) { $info.Prov } else { '' })
+            Ips = @([regex]::Matches($m.Groups[4].Value, 'Address="([\d.]+)"') | ForEach-Object { $_.Groups[1].Value })
+        }
+    })
+}
+# what the subregion ping measures: every IP of every selectable datacenter, or (no list yet) Epic's per-city ping names
+function Get-FnPingTargets {
+    $dc = @(Get-FnDatacenters | Where-Object { $_.Visible -and $_.Ips.Count })
+    if ($dc.Count) { return @(foreach ($d in $dc) { foreach ($ip in $d.Ips) { @{ Region = $d.Region; Game = $d.GameRegion; Sub = $d.City; Id = $d.Id; Prov = $d.Prov; Ip = $ip } } }) }
+    @(foreach ($id in $FnSubIds) { $i = $FnDcInfo[$id]; @{ Region = (Get-FnAppRegion $id $i.Rid); Game = $FnRegionGame[$i.Rid]; Sub = $i.City; Id = $id; Prov = $i.Prov; Host = "ping-$($id.ToLower()).ds.on.epicgames.com" } })
+}
+# worker: resolves (fallback only) and pings every target 8 times; without any target it falls back to the old regional DNS + reverse-DNS split
+$FnDcPingCode = @'
+param($targets, $hosts, $city)
+$src = 'ems'; $ips = @()
+foreach ($t in @($targets)) {
+    if ($t.Ip) { $ips += [pscustomobject]@{ Region = $t.Region; Game = $t.Game; Sub = $t.Sub; Id = $t.Id; Prov = $t.Prov; Ip = $t.Ip }; continue }
+    if (-not $t.Host) { continue }
+    $src = 'dns-sub'
+    foreach ($a in @(Resolve-DnsName $t.Host -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' } | Select-Object -First 4)) { $ips += [pscustomobject]@{ Region = $t.Region; Game = $t.Game; Sub = $t.Sub; Id = $t.Id; Prov = $t.Prov; Ip = $a.IPAddress } }
+}
+if (-not $ips.Count) {
+    $src = 'dns'
+    foreach ($h in @($hosts)) {
+        foreach ($a in @(Resolve-DnsName $h.Host -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' })) {
+            $name = try { (Resolve-DnsName $a.IPAddress -Type PTR -QuickTimeout -ErrorAction Stop | Select-Object -First 1).NameHost } catch { '' }
+            $sub = if ($name -match '\.compute-1\.') { 'us-east-1' } elseif ($name -match '\.([a-z]{2}-[a-z]+-\d)\.') { $Matches[1] } else { '' }
+            $ips += [pscustomobject]@{ Region = $h.Name; Game = $h.Name; Sub = $(if ($sub -and $city[$sub]) { $city[$sub] } elseif ($sub) { $sub } else { $h.Name }); Id = ''; Prov = ''; Ip = $a.IPAddress }
+        }
+    }
+}
+$ips = @($ips | Sort-Object Ip -Unique)
+$rtt = @{}
+for ($round = 0; $round -lt 8; $round++) {
+    $jobs = foreach ($x in $ips) { [pscustomobject]@{ Ip = $x.Ip; T = (New-Object System.Net.NetworkInformation.Ping).SendPingAsync($x.Ip, 1000) } }
+    try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($jobs | ForEach-Object { $_.T }), 3000) | Out-Null } catch {}
+    foreach ($j in $jobs) { if (-not $rtt[$j.Ip]) { $rtt[$j.Ip] = @() }; $rtt[$j.Ip] += $(if ($j.T.Status -eq 'RanToCompletion' -and $j.T.Result.Status -eq 'Success') { [int]$j.T.Result.RoundtripTime } else { -1 }) }
+    Start-Sleep -Milliseconds 200
+}
+@{ Source = $src; Rows = @($ips | ForEach-Object { $ok = @($rtt[$_.Ip] | Where-Object { $_ -ge 0 } | Sort-Object); [pscustomobject]@{ Region = $_.Region; Game = $_.Game; Sub = $_.Sub; Id = $_.Id; Prov = $_.Prov; Ip = $_.Ip; Med = $(if ($ok.Count) { $ok[[int][math]::Floor(($ok.Count - 1) / 2)] } else { -1 }); Loss = [int](100 * (8 - $ok.Count) / 8) } }) }
+'@
+# per-datacenter result of the subregion ping: median over its IPs, the fastest IP for the follow-up tests
+function Get-FnSubDcRows($Rows) {
+    @(foreach ($g in @($Rows) | Group-Object { "$($_.Game)|$($_.Sub)|$($_.Prov)" }) {
+        $ok = @($g.Group | Where-Object { $_.Med -ge 0 } | Sort-Object { $_.Med }); $f = $g.Group[0]
+        [pscustomobject]@{ Region = $f.Region; Game = $f.Game; Sub = $f.Sub; Id = $f.Id; Prov = $f.Prov
+                           Med = $(if ($ok.Count) { [int]$ok[[int][math]::Floor(($ok.Count - 1) / 2)].Med } else { -1 })
+                           BestIp = $(if ($ok.Count) { $ok[0].Ip } else { '' }); BestRegion = $(if ($ok.Count) { $ok[0].Region } else { $f.Region }) }
+    })
+}
+# dialog text of Fortnite subregion ping; sets $script:FnBestIp / FnBestName (line test, route check) and $script:FnSubLast (region test comparison)
+function Get-FnSubPingText($Res) {
+    $dcs = @(Get-FnSubDcRows $Res.Rows)
+    $mine = Get-PlayRegionName; $mineGame = Get-FnGameRegionOf $mine
+    $best = $dcs | Where-Object { $_.Med -ge 0 -and ($_.Game -eq $mineGame -or $_.Game -eq $mine) } | Sort-Object { $_.Med } | Select-Object -First 1
+    if ($best) { $script:FnBestIp = $best.BestIp; $script:FnBestName = "$($best.Sub) ($($best.BestRegion))" }
+    $script:FnSubLast = @{ Time = Get-Date; Source = "$($Res.Source)"; Dcs = $dcs }
+    $lines = foreach ($g in $dcs | Group-Object { $_.Game } | Sort-Object { $m = @($_.Group | Where-Object { $_.Med -ge 0 } | ForEach-Object { $_.Med }); if ($m.Count) { ($m | Measure-Object -Minimum).Minimum } else { 99999 } }) {
+        $subs = foreach ($d in $g.Group | Sort-Object { if ($_.Med -ge 0) { $_.Med } else { 99999 } }) {
+            $tag = if ($d.Prov -eq 'Google Cloud') { ' (Google Cloud)' } else { '' }
+            if ($d.Med -ge 0) { "$($d.Sub) $($d.Med) ms$tag" } else { "$($d.Sub) no reply$tag" }
+        }
+        "$(if ($g.Name -eq $mineGame -or $g.Name -eq $mine) { '> ' })$($g.Name): $($subs -join '  ·  ')"
+    }
+    $s = "Ping to every Fortnite server city (median per city):`n`n$($lines -join "`n")"
+    if ($dcs | Where-Object { $_.Med -lt 0 }) { $s += "`n`nNo reply means that server ignores ping (its cloud or your network filters it). That says nothing about the game connection, which uses UDP." }
+    if ($dcs | Where-Object { $_.Id -eq 'BAH' }) { $s += "`n`nFortnite's Middle East 'BAH' server has run in Google Cloud's Doha datacenter, not AWS Bahrain, since March 2026." }
+    if ($best) { $s += "`n`nYour best server in $mineGame is $($best.Sub) at $($best.Med) ms. In Fortnite: Settings > Game > Matchmaking Region: $mineGame (not Auto, which also leaves the subregion on Auto), then Subregion Preference: $($best.Sub)." }
+    $src = switch ("$($Res.Source)") {
+        'ems' { $e = Get-FnEmsInfo; "Server list: Fortnite's own datacenter list$(if ($e.Hit) { ", downloaded $($e.Hit.Time.ToString('d MMM'))" }), the same addresses the game tests." }
+        'dns-sub' { "Fortnite's own server list was not found (start Fortnite once and it downloads it), so Epic's per-city ping names were used." }
+        default { "Fortnite's own server list was not found, so Epic's regional ping names were used; they no longer cover every city." }
+    }
+    "$s`n`n$src ICMP ping is usually 3-10 ms below the game's own number, which Your region ping as Fortnite measured it shows. Results are wrong while a ping booster or VPN is running."
+}
+
+# Fortnite server ping card: ZeroDelay's ping regions with the datacenters of each (empty Subs = old single DNS name)
+function Get-FnRegionPingList {
+    $dc = @(try { Get-FnDatacenters | Where-Object { $_.Visible -and $_.Ips.Count } } catch { })
+    @(foreach ($h in $PingHosts) { @{ Name = $h.Name; Host = $h.Host; Subs = @($dc | Where-Object { $_.Region -eq $h.Name } | ForEach-Object { @{ Id = $_.Id; Ips = @($_.Ips) } }) } })
+}
+# background job of the Fortnite server ping card: 4 pings to every datacenter IP, region = its fastest datacenter (median over that datacenter's IPs)
+$FnRegionPingJob = {
+    param($list)
+    $all = @(foreach ($h in $list) { foreach ($s in @($h.Subs)) { foreach ($ip in @($s.Ips)) { "$ip" } } }) | Select-Object -Unique
+    $rtt = @{}
+    if (@($all).Count) {
+        for ($r = 0; $r -lt 4; $r++) {
+            $jobs = foreach ($ip in $all) { [pscustomobject]@{ Ip = $ip; T = (New-Object System.Net.NetworkInformation.Ping).SendPingAsync($ip, 1000) } }
+            try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($jobs | ForEach-Object { $_.T }), 3000) | Out-Null } catch {}
+            foreach ($j in $jobs) { if ($j.T.Status -eq 'RanToCompletion' -and $j.T.Result.Status -eq 'Success') { if (-not $rtt.ContainsKey($j.Ip)) { $rtt[$j.Ip] = New-Object System.Collections.ArrayList }; [void]$rtt[$j.Ip].Add([int]$j.T.Result.RoundtripTime) } }
+            Start-Sleep -Milliseconds 150
+        }
+    }
+    foreach ($h in $list) {
+        $best = $null; $bestId = ''
+        if (@($h.Subs).Count) {
+            foreach ($s in @($h.Subs)) {
+                $v = @(foreach ($ip in @($s.Ips)) { if ($rtt.ContainsKey("$ip")) { $rtt["$ip"] } }) | Sort-Object
+                if (@($v).Count) { $m = @($v)[[int][math]::Floor((@($v).Count - 1) / 2)]; if ($null -eq $best -or $m -lt $best) { $best = $m; $bestId = "$($s.Id)" } }
+            }
+        } else {
+            $p = New-Object System.Net.NetworkInformation.Ping; $times = @()
+            1..4 | ForEach-Object { try { $x = $p.Send($h.Host, 1000); if ($x.Status -eq 'Success') { $times += $x.RoundtripTime } } catch {} }
+            if ($times.Count) { $best = [int](($times | Measure-Object -Average).Average) }
+        }
+        [pscustomobject]@{ Name = $h.Name; Ms = $best; Sub = $bestId }
+    }
+}
+
+# --- worker-side code shared by the log cards (pasted into the worker scripts: the worker has no app functions)
+$FnLogWorkerCode = @'
+function Read-ZdLog([string]$Path) { try { $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite'); try { (New-Object IO.StreamReader $fs).ReadToEnd() } finally { $fs.Close() } } catch { '' } }
+function ConvertFrom-ZdStamp([string]$s) { try { [datetime]::ParseExact($s, 'yyyy.MM.dd-HH.mm.ss:fff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal) } catch { $null } }
+function Get-ZdQos([string]$t) {
+    $rows = New-Object Collections.ArrayList; $best = New-Object Collections.ArrayList
+    foreach ($m in [regex]::Matches($t, "(?m)^\[([\d.\-:]+)\]\[[\s\d]+\]LogQos: (?:Verbose: \t(\w+) \((\w+)\): (\d+)/(\d+) queries succeeded, average ping: (\d+)ms|[^\r\n]*?Best region is '(\w*)', recommended subregion is '(\w*)')")) {
+        $ts = ConvertFrom-ZdStamp $m.Groups[1].Value
+        if ($m.Groups[2].Success) { [void]$rows.Add([pscustomobject]@{ Time = $ts; Id = $m.Groups[2].Value; Rid = $m.Groups[3].Value; Ok = [int]$m.Groups[4].Value; Of = [int]$m.Groups[5].Value; Ms = [int]$m.Groups[6].Value }) }
+        else { [void]$best.Add([pscustomobject]@{ Time = $ts; Region = $m.Groups[7].Value; Sub = $m.Groups[8].Value }) }
+    }
+    @{ Rows = @($rows); Best = @($best) }
+}
+function Get-ZdMatches([string]$t) {
+    $out = New-Object Collections.ArrayList; $level = ''; $cur = $null; $inv = [Globalization.CultureInfo]::InvariantCulture
+    foreach ($m in [regex]::Matches($t, '(?m)^\[([\d.\-:]+)\]\[[\s\d]+\](?:LogNet: Welcomed by server \(Level: ([^\s?,)]+)|LogNet: ServerSetPingAddress: EPingType::UDPQoS PingAddress: ([\d.]+)|[^\r\n]*?EndGamePhase_ClientMetrics General Stats:([^\r\n]*))')) {
+        if ($m.Groups[2].Success) { $level = $m.Groups[2].Value; continue }
+        if ($m.Groups[3].Success) { $cur = @{ Time = (ConvertFrom-ZdStamp $m.Groups[1].Value); Ip = $m.Groups[3].Value; Level = $level; Pings = (New-Object Collections.ArrayList); Loss = 0.0 }; [void]$out.Add($cur); continue }
+        if (-not $cur) { continue }
+        $f = @{}; foreach ($kv in [regex]::Matches($m.Groups[4].Value, '(\w+): (-?[\d.]+)')) { $f[$kv.Groups[1].Value] = [double]::Parse($kv.Groups[2].Value, $inv) }
+        if ($f['DurationSec'] -ge 60 -and $f.ContainsKey('PingRTT')) { [void]$cur.Pings.Add([int]$f['PingRTT']); $cur.Loss = [math]::Max($cur.Loss, [math]::Max([double]$f['InPacketsLostPercentage'], [double]$f['OutPacketsLostPercentage'])) }
+    }
+    @($out | ForEach-Object { [pscustomobject]@{ Time = $_.Time; Ip = $_.Ip; Level = $_.Level; Pings = @($_.Pings); Loss = $_.Loss } })
+}
+function Get-ZdPings([string[]]$Ips, [int]$Rounds) {
+    $rtt = @{}; foreach ($ip in $Ips) { $rtt[$ip] = New-Object Collections.ArrayList }
+    for ($r = 0; $r -lt $Rounds; $r++) {
+        $jobs = foreach ($ip in $Ips) { [pscustomobject]@{ Ip = $ip; T = (New-Object System.Net.NetworkInformation.Ping).SendPingAsync($ip, 1000) } }
+        try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($jobs | ForEach-Object { $_.T }), 3000) | Out-Null } catch {}
+        foreach ($j in $jobs) { if ($j.T.Status -eq 'RanToCompletion' -and $j.T.Result.Status -eq 'Success') { [void]$rtt[$j.Ip].Add([int]$j.T.Result.RoundtripTime) } }
+        Start-Sleep -Milliseconds 200
+    }
+    @(foreach ($ip in $Ips) { $ok = @($rtt[$ip] | Sort-Object); [pscustomobject]@{ Ip = $ip; Med = $(if ($ok.Count) { $ok[[int][math]::Floor(($ok.Count - 1) / 2)] } else { -1 }); N = $ok.Count } })
+}
+'@
+# AWS ip-ranges.json + Google cloud.json, reduced to "prefix|location" strings and cached as json in $DataDir for 7 days; longest-prefix lookup
+$CloudRangeWorkerCode = @'
+function ConvertTo-ZdIpNum([string]$Ip) { $b = ([Net.IPAddress]::Parse($Ip)).GetAddressBytes(); ([long]$b[0] -shl 24) + ([long]$b[1] -shl 16) + ([long]$b[2] -shl 8) + [long]$b[3] }
+function Get-ZdCloudRanges([string]$Path, [bool]$Fetch) {
+    $c = $null; $age = 999
+    if ($Path -and (Test-Path $Path)) { try { $c = [IO.File]::ReadAllText($Path) | ConvertFrom-Json } catch { $c = $null } }
+    if ($c -and $c.Fetched) { try { $age = ((Get-Date).ToUniversalTime() - [datetime]::Parse("$($c.Fetched)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()).TotalDays } catch {} }
+    if ($Fetch -and $age -ge 7) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $a = Invoke-RestMethod 'https://ip-ranges.amazonaws.com/ip-ranges.json' -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
+            $g = Invoke-RestMethod 'https://www.gstatic.com/ipranges/cloud.json' -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
+            $aws = @{}
+            foreach ($p in $a.prefixes) { if ($p.service -eq 'EC2' -or ($p.service -eq 'AMAZON' -and -not $aws.ContainsKey($p.ip_prefix))) { $aws[$p.ip_prefix] = "$($p.ip_prefix)|$($p.network_border_group)" } }
+            $gcp = @($g.prefixes | Where-Object { $_.ipv4Prefix } | ForEach-Object { "$($_.ipv4Prefix)|$($_.scope)" })
+            if ($aws.Count -lt 100 -or $gcp.Count -lt 50) { throw 'short list' }
+            $c = [pscustomobject]@{ Fetched = (Get-Date).ToUniversalTime().ToString('o'); Aws = @($aws.Values); Gcp = $gcp }
+            $dir = Split-Path $Path; if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
+            [IO.File]::WriteAllText($Path, ($c | ConvertTo-Json -Compress))
+        } catch {}
+    }
+    $c
+}
+function New-ZdRangeIndex($c) {
+    $idx = @{}; $masks = @{}
+    foreach ($prov in 'AWS', 'Google Cloud') {
+        $list = if ($prov -eq 'AWS') { @($c.Aws) } else { @($c.Gcp) }
+        foreach ($e in $list) {
+            $p, $loc = "$e" -split '\|', 2; $net, $len = $p -split '/'
+            $n = [int]$len; $mask = ([long]4294967295 -shl (32 - $n)) -band [long]4294967295
+            $k = "$n|$((ConvertTo-ZdIpNum $net) -band $mask)"; if (-not $idx.ContainsKey($k)) { $idx[$k] = "$prov|$loc" }; $masks[$n] = $mask
+        }
+    }
+    @{ Idx = $idx; Masks = $masks; Bits = @($masks.Keys | Sort-Object -Descending) }
+}
+function Find-ZdRange($Ix, [string]$Ip) {
+    $v = ConvertTo-ZdIpNum $Ip
+    foreach ($n in $Ix.Bits) { $k = "$n|$($v -band $Ix.Masks[$n])"; if ($Ix.Idx.ContainsKey($k)) { $p, $loc = $Ix.Idx[$k] -split '\|', 2; return @{ Prov = $p; Loc = $loc } } }
+    $null
+}
+'@
+# worker script with the shared code pasted in after the param line
+function Join-WorkerCode([string]$Param, [string]$Body, [string[]]$Parts) { "$Param`n" + ($Parts -join "`n") + "`n" + $Body }
+function Get-FnLogPaths([int]$Count) { @(Get-FnLogs $Count | ForEach-Object { $_.FullName }) }
+function Get-CloudRangesPath { Join-Path $DataDir 'cloud-ranges.json' }
+function Get-FnCity([string]$Id) { if ($FnDcInfo[$Id]) { $FnDcInfo[$Id].City } else { $Id } }
+function Get-MedianInt($Values) { $v = @($Values | Where-Object { $null -ne $_ } | Sort-Object); if (-not $v.Count) { return $null }; [int]$v[[int][math]::Floor(($v.Count - 1) / 2)] }
+
+# --- fn-qoslog: the region test Fortnite runs at every start, from its own log
+$script:FnQosBusy = $false
+function Start-FnQosLog {
+    if ($script:FnQosBusy) { throw 'Already reading Fortnite''s log.' }
+    $paths = Get-FnLogPaths 4
+    if (-not $paths.Count) { throw 'No Fortnite log found. Start Fortnite once first.' }
+    $script:FnQosBusy = $true
+    $code = Join-WorkerCode 'param($paths)' @'
+$rows = @(); $best = @()
+foreach ($p in $paths) { $q = Get-ZdQos (Read-ZdLog $p); $rows += $q.Rows; $best += $q.Best; if ($best.Count -ge 10) { break } }
+@{ Rows = $rows; Best = $best }
+'@ @($FnLogWorkerCode)
+    Invoke-Worker $code @(, [string[]]$paths) {
+        param($out, $errs)
+        $script:FnQosBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable])) { Show-Toast 'Could not read Fortnite''s log.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-FnQosText $res) 'Your region, measured by Fortnite' 'OK' 'Information')
+    }
+}
+# dialog text: latest block per region, median over recent launches, failed echoes, Auto's pick, ZeroDelay's own ping next to it
+function Get-FnQosText($Res) {
+    $rows = @($Res.Rows | Where-Object { $_.Time })
+    if (-not $rows.Count) { return 'Fortnite has not logged a region test yet (start Fortnite once), or the log format changed after an update. Fortnite subregion ping measures the same servers with ZeroDelay''s own ping.' }
+    $last = ($rows | Sort-Object Time -Descending | Select-Object -First 1).Time
+    $cur = @($rows | Where-Object { $_.Time -eq $last })
+    $times = @($rows | ForEach-Object { $_.Time } | Sort-Object -Unique -Descending | Select-Object -First 10)
+    $recent = @($rows | Where-Object { $times -contains $_.Time })
+    $zd = @{}; if ($script:FnSubLast) { foreach ($d in @($script:FnSubLast.Dcs)) { if ($d.Id -and $d.Med -ge 0) { $zd[$d.Id] = $d.Med } } }
+    $mineGame = Get-FnGameRegionOf (Get-PlayRegionName)
+    $lines = @(); $loss = @(); $diffs = @()
+    foreach ($g in $cur | Where-Object { $_.Rid -ne 'UND' } | Group-Object Rid | Sort-Object { ($_.Group | Measure-Object Ms -Minimum).Minimum }) {
+        $name = if ($FnRegionGame[$g.Name]) { $FnRegionGame[$g.Name] } else { $g.Name }
+        $parts = foreach ($r in $g.Group | Sort-Object Ms) {
+            $med = Get-MedianInt @($recent | Where-Object { $_.Id -eq $r.Id } | ForEach-Object { $_.Ms })
+            $x = "$(Get-FnCity $r.Id) $($r.Ms) ms"
+            if ($times.Count -gt 1 -and $null -ne $med -and [math]::Abs($med - $r.Ms) -ge 3) { $x += " (usually $med)" }
+            if ($zd.ContainsKey($r.Id)) { $diffs += $r.Ms - $zd[$r.Id]; if ($name -eq $mineGame) { $x += ", ZeroDelay $($zd[$r.Id])" } }
+            $x
+        }
+        $lines += "$(if ($name -eq $mineGame) { '> ' })$name`: $($parts -join '  ·  ')"
+    }
+    foreach ($r in $recent | Where-Object { $_.Ok -lt $_.Of }) { $loss += "$(Get-FnCity $r.Id) $($r.Ok)/$($r.Of) at $($r.Time.ToString('d MMM HH:mm'))" }
+    $hidden = @($cur | Where-Object { $_.Rid -eq 'UND' } | Sort-Object Ms | ForEach-Object { "$(Get-FnCity $_.Id) $($_.Ms) ms$(if ($FnDcInfo[$_.Id] -and $FnDcInfo[$_.Id].Prov -eq 'Google Cloud') { ' (Google Cloud)' })" })
+    $b = @($Res.Best | Where-Object { $_.Time } | Sort-Object Time -Descending | Select-Object -First 1)
+    $s = "Fortnite's own region test from $($last.ToString('d MMM HH:mm')) (4 UDP echoes to each datacenter$(if ($times.Count -gt 1) { "; 'usually' = median of the last $($times.Count) tests" })):`n`n$($lines -join "`n")"
+    if ($hidden.Count) { $s += "`n`nAlso measured, but not selectable in the menu: $($hidden -join ', ')." }
+    if ($b.Count -and $b[0].Region) { $s += "`n`nOn Auto, Fortnite picks region $(if ($FnRegionGame[$b[0].Region]) { $FnRegionGame[$b[0].Region] } else { $b[0].Region })$(if ($b[0].Sub) { ", subregion $(Get-FnCity $b[0].Sub) ($($b[0].Sub))" })." }
+    if ($loss.Count) { $s += "`n`nEchoes lost: $($loss -join '; '). A lost echo at launch is packet loss towards that datacenter; if it repeats, run the Jitter and loss test." }
+    if (((Get-Date) - $last).TotalDays -gt 7) { $s += "`n`nThese numbers are more than a week old: start Fortnite to refresh them." }
+    if ($zd.Count) {
+        $avg = if ($diffs.Count) { [int](($diffs | Measure-Object -Average).Average) } else { 0 }
+        $s += "`n`nZeroDelay's ping is from Fortnite subregion ping at $($script:FnSubLast.Time.ToString('HH:mm')). The game's number is on average $avg ms $(if ($avg -ge 0) { 'higher' } else { 'lower' }); up to about 10 ms is normal (UDP echo versus ICMP, and the tests ran at different times)."
+        if ($avg -ge 15) { $s += ' A gap of 15 ms or more means the game''s packets take a slower path: see Why your in-game ping differs.' }
+    } else { $s += "`n`nRun Fortnite subregion ping to see ZeroDelay's own ping next to these numbers." }
+    $s
+}
+
+# --- fn-matchdc: where the last matches ran (server IP per match -> cloud and city), joined with Fortnite's end-of-match ping
+$script:FnMatchDcBusy = $false
+function Start-FnMatchDc {
+    if ($script:FnMatchDcBusy) { throw 'Already looking up your match servers.' }
+    $paths = Get-FnLogPaths 10
+    if (-not $paths.Count) { throw 'No Fortnite log found. Play a match first.' }
+    $beacons = @{}; foreach ($d in @(try { Get-FnDatacenters } catch { })) { foreach ($ip in $d.Ips) { $beacons[$ip] = $d.Id } }
+    $script:FnMatchDcBusy = $true
+    $code = Join-WorkerCode 'param($paths, $cache, $beacons, $max)' @'
+$all = @()
+foreach ($p in $paths) { $all += @(Get-ZdMatches (Read-ZdLog $p)); if ($all.Count -ge $max) { break } }
+$c = Get-ZdCloudRanges $cache $true
+$ix = if ($c -and @($c.Aws).Count) { New-ZdRangeIndex $c } else { $null }
+$rows = @(foreach ($x in $all) {
+    $prov = ''; $loc = ''
+    if ($ix) { $r = Find-ZdRange $ix $x.Ip; if ($r) { $prov = $r.Prov; $loc = $r.Loc } }
+    [pscustomobject]@{ Time = $x.Time; Ip = $x.Ip; Level = $x.Level; Pings = $x.Pings; Loss = $x.Loss; Prov = $prov; Loc = $loc; Dc = $(if ($beacons.ContainsKey($x.Ip)) { $beacons[$x.Ip] } else { '' }) }
+})
+@{ Rows = $rows; Fetched = $(if ($c) { "$($c.Fetched)" } else { '' }) }
+'@ @($FnLogWorkerCode, $CloudRangeWorkerCode)
+    Invoke-Worker $code @([string[]]$paths, (Get-CloudRangesPath), $beacons, 40) {
+        param($out, $errs)
+        $script:FnMatchDcBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable])) { Show-Toast 'Could not read Fortnite''s log.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-FnMatchDcText $res 20) 'Where your matches ran' 'OK' 'Information')
+    }
+}
+# per match: city, cloud and Fortnite's own ping (median over its phases); EMS datacenter list first, then the published ranges
+function Get-FnMatchRows($Res) {
+    @(foreach ($r in @($Res.Rows) | Where-Object { $_.Time }) {
+        $prov = "$($r.Prov)"; $city = ''
+        if ($r.Dc -and $FnDcInfo[$r.Dc]) { $city = $FnDcInfo[$r.Dc].City; $prov = $FnDcInfo[$r.Dc].Prov }
+        elseif ($prov) { $city = Get-CloudCity $prov "$($r.Loc)" }
+        [pscustomobject]@{ Time = $r.Time; Ip = $r.Ip; City = $(if ($city) { $city } else { 'unknown' }); Prov = $(if ($prov) { $prov } else { 'unknown cloud' }); Ping = (Get-MedianInt @($r.Pings)); Loss = [double]$r.Loss; Island = ("$($r.Level)" -match '^/VKPlay/|Creative|Playground') }
+    }) | Sort-Object Time -Descending
+}
+# AWS against Google Cloud in the same city: medians of Fortnite's own match ping, flagged at 10 ms or more with 3+ matches each
+function Get-FnCloudSplit($Rows) {
+    @(foreach ($g in @($Rows | Where-Object { $null -ne $_.Ping -and $_.Prov -in 'AWS', 'Google Cloud' }) | Group-Object City) {
+        $a = @($g.Group | Where-Object { $_.Prov -eq 'AWS' }); $o = @($g.Group | Where-Object { $_.Prov -eq 'Google Cloud' })
+        if (-not $a.Count -or -not $o.Count) { continue }
+        $ma = Get-MedianInt @($a | ForEach-Object { $_.Ping }); $mo = Get-MedianInt @($o | ForEach-Object { $_.Ping })
+        [pscustomobject]@{ City = $g.Name; Aws = $ma; AwsN = $a.Count; Gcp = $mo; GcpN = $o.Count; Gap = [math]::Abs($ma - $mo); Worse = $(if ($ma -gt $mo) { 'AWS' } else { 'Google Cloud' }); Sure = ($a.Count -ge 3 -and $o.Count -ge 3) }
+    })
+}
+function Get-FnMatchDcText($Res, [int]$N = 20) {
+    $all = @(Get-FnMatchRows $Res)
+    if (-not $all.Count) { return 'No match servers in Fortnite''s recent logs yet (play a match first), or the log format changed after an update.' }
+    $rows = @($all | Select-Object -First $N)
+    $cities = ($rows | Group-Object City | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', '
+    $provs = ($rows | Group-Object Prov | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) on $($_.Name)" }) -join ', '
+    $s = "Your last $($rows.Count) matches ran in: $cities ($provs).`n`n"
+    $s += (($rows | Select-Object -First 10 | ForEach-Object { "$($_.Time.ToString('d MMM HH:mm'))  $($_.City), $($_.Prov)$(if ($null -ne $_.Ping) { ", ping $($_.Ping) ms" } else { ' (no full phase logged yet)' })$(if ($_.Loss -gt 0.5) { ", loss $([math]::Round($_.Loss, 1))%" })$(if ($_.Island) { ' (island)' })" }) -join "`n")
+    if ($rows.Count -gt 10) { $s += "`n..." }
+    if ($rows | Where-Object { $_.Island }) { $s += "`n`nIsland (Creative / UEFN) matches can run in other cities and clouds than Battle Royale; for the ping comparison below that does not matter." }
+    $s += "`n`nSubregion Preference is a priority, not a lock: if most matches ran in another city than the one you picked, there were not enough players there at the time."
+    $split = @(Get-FnCloudSplit $all)
+    $bad = @($split | Where-Object { $_.Sure -and $_.Gap -ge 10 })
+    if ($bad.Count) {
+        foreach ($b in $bad) {
+            $good = if ($b.Worse -eq 'AWS') { 'Google Cloud' } else { 'AWS' }
+            $s += "`n`nYour provider routes badly to $($b.Worse) in $($b.City): Fortnite measured $(if ($b.Worse -eq 'AWS') { $b.Aws } else { $b.Gcp }) ms there against $(if ($b.Worse -eq 'AWS') { $b.Gcp } else { $b.Aws }) ms on $good in the same city ($($b.AwsN) AWS and $($b.GcpN) Google Cloud matches). Both datacenters sit in the same metro, so the gap is the route your provider takes, not distance."
+        }
+        $s += "`n`nWhat to do: run Find where the lag starts during or right after a match on the slow cloud and send the report to your provider (ask them to check their peering with that cloud). Subregion Preference cannot choose the cloud. This is the one case where a ping booster's different route can genuinely help; try it with its free trial and compare in Network report from your last matches."
+    } elseif ($split.Count) {
+        $s += "`n`n" + (($split | ForEach-Object { "$($_.City): AWS $($_.Aws) ms ($($_.AwsN) match$(if ($_.AwsN -ne 1) { 'es' })), Google Cloud $($_.Gcp) ms ($($_.GcpN))" }) -join "`n")
+        $s += if (@($split | Where-Object { $_.Sure }).Count) { "`nNo routing gap: your provider reaches both clouds equally well." } else { "`nToo few matches on one of the clouds yet (3 each are needed) to judge your provider's routes." }
+    }
+    if (-not $Res.Fetched) { $s += "`n`nThe AWS and Google address lists could not be downloaded, so some servers show as unknown. ZeroDelay fetches them at most once a week." }
+    $s
+}
+
+# --- fn-pingtruth: what the in-game ping is, and whether the game's UDP numbers sit far above ZeroDelay's ping to the same servers
+$script:FnPingTruthBusy = $false
+function Start-FnPingTruth {
+    if ($script:FnPingTruthBusy) { throw 'Already comparing.' }
+    $paths = Get-FnLogPaths 3
+    $dcs = @{}; foreach ($d in @(try { Get-FnDatacenters } catch { }) | Where-Object { $_.Visible }) { $dcs[$d.Id] = @($d.Ips) }
+    $script:FnPingTruthBusy = $true
+    $code = Join-WorkerCode 'param($paths, $dcs)' @'
+$qos = @(); $best = $null; $mlist = @(); $cv = @{}
+foreach ($p in $paths) {
+    $t = Read-ZdLog $p
+    foreach ($m in [regex]::Matches($t, 'Set CVar \[\[(net\.(?:PlayerFacingPingType|NetPingUDPInterval|PingExcludeFrameTime|NetPingTypes)):([^\]]*)\]\]')) { if (-not $cv.ContainsKey($m.Groups[1].Value)) { $cv[$m.Groups[1].Value] = $m.Groups[2].Value.Trim('"') } }
+    if (-not $qos.Count) { $q = Get-ZdQos $t; if (@($q.Rows).Count) { $last = (@($q.Rows) | Sort-Object Time -Descending | Select-Object -First 1).Time; $qos = @($q.Rows | Where-Object { $_.Time -eq $last }); $best = @($q.Best) | Sort-Object Time -Descending | Select-Object -First 1 } }
+    if ($mlist.Count -lt 3) { $mlist += @(Get-ZdMatches $t | Where-Object { @($_.Pings).Count } | Sort-Object Time -Descending | Select-Object -First (3 - $mlist.Count)) }
+    if ($qos.Count -and $mlist.Count -ge 3) { break }
+}
+$ips = @(); foreach ($r in $qos) { if ($dcs.ContainsKey($r.Id)) { $ips += $dcs[$r.Id] } }
+$ips += @($mlist | ForEach-Object { $_.Ip })
+$icmp = if ($ips.Count) { Get-ZdPings ([string[]]@($ips | Select-Object -Unique)) 6 } else { @() }
+@{ Qos = $qos; Best = $best; Matches = $mlist; Icmp = $icmp; Cvars = $cv }
+'@ @($FnLogWorkerCode)
+    Invoke-Worker $code @([string[]]$paths, $dcs) {
+        param($out, $errs)
+        $script:FnPingTruthBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable])) { Show-Toast 'The ping comparison could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-FnPingTruthText $res) 'Your in-game ping' 'OK' 'Information')
+    }
+}
+function Get-FnPingTruthText($Res) {
+    $cv = @{}; try { foreach ($k in (Get-FnEmsInfo).Cvars.Keys) { $cv[$k] = (Get-FnEmsInfo).Cvars[$k] } } catch {}
+    if ($Res.Cvars) { foreach ($k in @($Res.Cvars.Keys)) { if (-not $cv.ContainsKey($k)) { $cv[$k] = $Res.Cvars[$k] } } }
+    $type = "$($cv['net.PlayerFacingPingType'])"; $int = "$($cv['net.NetPingUDPInterval'])"; $ex = "$($cv['net.PingExcludeFrameTime'])"
+    $s = if ($type -eq '8' -or -not $type) {
+        "What Fortnite's ping number is: a UDP echo to your match server's QoS port$(if ($int) { ", sent every $int s" } else { ' every few seconds' }) and shown as a moving average$(if ($ex -eq '1' -or -not $ex) { ', with frame time left out' }). " + $(if ($type) { "(Read from Fortnite's own settings: PlayerFacingPingType=$type$(if ($int) { ", NetPingUDPInterval=$int" })$(if ($ex) { ", PingExcludeFrameTime=$ex" }).) " } else { "(Fortnite's settings file was not found; this is how it worked in October 2026.) " }) + "So FPS, Reflex, the server's tick rate and PC tweaks cannot raise or lower it; only the network path between you and the server can."
+    } else { "Fortnite now reports ping type $type (it was 8, a UDP echo to the match server, in October 2026), so the explanation below may be out of date." }
+    $icmp = @{}; foreach ($i in @($Res.Icmp)) { $icmp["$($i.Ip)"] = [int]$i.Med }
+    $dcs = @{}; foreach ($d in @(try { Get-FnDatacenters } catch { })) { $dcs[$d.Id] = $d }
+    $cmp = @(foreach ($r in @($Res.Qos)) {
+        if (-not $dcs.ContainsKey($r.Id)) { continue }
+        $z = Get-MedianInt @($dcs[$r.Id].Ips | ForEach-Object { if ($icmp.ContainsKey($_) -and $icmp[$_] -ge 0) { $icmp[$_] } })
+        if ($null -ne $z) { [pscustomobject]@{ Id = $r.Id; Game = $r.Ms; Zd = $z; Gap = $r.Ms - $z } }
+    }) | Sort-Object Game
+    $out = @($s)
+    if ($cmp.Count) {
+        $when = (@($Res.Qos)[0]).Time
+        $out += "Fortnite's own UDP test at its last start$(if ($when) { " ($($when.ToString('d MMM HH:mm')))" }) against ZeroDelay's ping now, same server addresses:`n" + (($cmp | Select-Object -First 6 | ForEach-Object { "$(Get-FnCity $_.Id): game $($_.Game) ms, ZeroDelay $($_.Zd) ms ($(if ($_.Gap -ge 0) { '+' })$($_.Gap))" }) -join "`n")
+    }
+    $mt = @(foreach ($m in @($Res.Matches)) {
+        $g = Get-MedianInt @($m.Pings); $z = if ($icmp.ContainsKey("$($m.Ip)")) { $icmp["$($m.Ip)"] } else { -1 }
+        [pscustomobject]@{ Time = $m.Time; Game = $g; Zd = $z; Gap = $(if ($z -ge 0 -and $null -ne $g) { $g - $z } else { $null }) }
+    })
+    if ($mt.Count) {
+        $out += "Your last match servers, Fortnite's end-of-match ping against ZeroDelay's ping now:`n" + (($mt | ForEach-Object { "$(if ($_.Time) { $_.Time.ToString('d MMM HH:mm') })  game $($_.Game) ms, $(if ($_.Zd -ge 0) { "ZeroDelay $($_.Zd) ms" } else { 'no reply to ping (most Google Cloud match servers ignore ping; the server may also be gone)' })" }) -join "`n")
+    }
+    # the in-match number against ping to that very server is the direct comparison; the launch test is the fallback
+    $mg = @($mt | Where-Object { $null -ne $_.Gap } | ForEach-Object { $_.Gap })
+    $gaps = if ($mg.Count) { $mg } else { @($cmp | ForEach-Object { $_.Gap }) }
+    $what = if ($mg.Count) { 'in-match ping' } else { 'launch test' }
+    if (-not @($gaps).Count) { $out += 'There was nothing to compare: start Fortnite once (it tests every datacenter at launch) and play a match, then check again.' }
+    else {
+        $g = Get-MedianInt $gaps
+        if ($g -ge 15) { $out += "The game's $what is typically $g ms above ZeroDelay's ping to the same servers. Ping and game packets take different paths: usually a ping booster or VPN (see Check Fortnite is not going through a VPN), a traffic shaper or filter driver on the adapter (Find traffic shapers on your network adapter), or a router 'game accelerator' or QoS rule that treats UDP differently. Switch them off one at a time and check again." }
+        else { $out += "The game's $what is $(if ($g -ge 0) { "$g ms above" } else { "$(-$g) ms below" }) ZeroDelay's ping to the same servers, so nothing on your PC or router treats game packets worse. On the test PC the in-match number matched ping within 2 ms and the launch test read up to about 12 ms higher. If the game still feels laggy, look at jitter and loss in Network report from your last matches." }
+    }
+    $out -join "`n`n"
+}
+
+# --- starlink-check: Starlink detection (public address -> reverse DNS *.starlinkisp.net), ground station, 15-second spike test
+function Get-StarlinkCachePath { Join-Path $DataDir 'starlink.json' }
+# Requires of starlink-check: the cached answer (under 1 ms). No network at startup: the card shows until it has been
+# checked once (the click saves the answer), then only on Starlink connections
+function Test-StarlinkCached {
+    try {
+        $p = Get-StarlinkCachePath; $t = if ([IO.File]::Exists($p)) { [IO.File]::ReadAllText($p) } else { '' }
+        if (-not $t) { return $true }
+        $t -match '"Starlink":true'
+    } catch { $false }
+}
+# worker: public IPv4 from one STUN binding request, its reverse DNS, result cached in $DataDir\starlink.json (no address stored)
+$StarlinkDetectCode = @'
+param($servers, $cache)
+$ip = ''
+foreach ($s in $servers) {
+    $h, $p = $s -split ':'
+    try {
+        $u = New-Object System.Net.Sockets.UdpClient 0; $u.Client.ReceiveTimeout = 2500
+        $req = New-Object byte[] 20; $req[1] = 1; $req[4] = 0x21; $req[5] = 0x12; $req[6] = 0xA4; $req[7] = 0x42
+        $tid = New-Object byte[] 12; (New-Object System.Random).NextBytes($tid); [Array]::Copy($tid, 0, $req, 8, 12)
+        [void]$u.Send($req, 20, $h, [int]$p)
+        $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any), 0
+        $r = $u.Receive([ref]$ep); $u.Close()
+        $i = 20
+        while ($i + 8 -le $r.Length) {
+            $type = ($r[$i] -shl 8) -bor $r[$i + 1]; $len = ($r[$i + 2] -shl 8) -bor $r[$i + 3]; $v = $i + 4
+            if ($type -eq 0x20 -and $r[$v + 1] -eq 1) { $ip = "$($r[$v + 4] -bxor 0x21).$($r[$v + 5] -bxor 0x12).$($r[$v + 6] -bxor 0xA4).$($r[$v + 7] -bxor 0x42)"; break }
+            if ($type -eq 0x01 -and $r[$v + 1] -eq 1) { $ip = "$($r[$v + 4]).$($r[$v + 5]).$($r[$v + 6]).$($r[$v + 7])" }
+            $i = $v + $len + ((4 - ($len % 4)) % 4)
+        }
+    } catch { try { $u.Close() } catch {} }
+    if ($ip) { break }
+}
+if (-not $ip) { return @{ Err = 'Could not find your public address (STUN blocked or offline).' } }
+$ptr = try { "$((Resolve-DnsName $ip -Type PTR -QuickTimeout -ErrorAction Stop | Where-Object { $_.NameHost } | Select-Object -First 1).NameHost)" } catch { '' }
+$is = $ptr -match '\.(starlinkisp\.net|starlink\.com)\.?$'
+$o = [pscustomobject]@{ Checked = (Get-Date).ToUniversalTime().ToString('o'); Starlink = $is; Ptr = $(if ($is) { $ptr } else { '' }) }
+try { $dir = Split-Path $cache; if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }; [IO.File]::WriteAllText($cache, ($o | ConvertTo-Json -Compress)) } catch {}
+@{ Starlink = $is; Ptr = $o.Ptr; PtrSeen = [bool]$ptr }
+'@
+# $Then (scriptblock taking the result hashtable) runs on the UI thread; $null = quiet background refresh
+function Start-StarlinkDetect([scriptblock]$Then) {
+    $script:StarlinkThen = $Then
+    Invoke-Worker $StarlinkDetectCode @(@('stun.cloudflare.com:3478', 'stun.l.google.com:19302'), (Get-StarlinkCachePath)) {
+        param($out, $errs)
+        $script:StarlinkLast = Get-WorkerResult $out
+        if ($script:StarlinkThen) { $f = $script:StarlinkThen; $script:StarlinkThen = $null; & $f $script:StarlinkLast }
+    }
+}
+# Starlink PoP code (customer.frntdeu1.pop.starlinkisp.net -> frntdeu1): city where known, country or US state, nearest Fortnite datacenter
+$StarlinkCountry = @{
+    deu = 'Germany|DE'; aut = 'Austria|DE'; che = 'Switzerland|DE'; pol = 'Poland|DE'; cze = 'Czechia|DE'; nld = 'Netherlands|DE'; dnk = 'Denmark|DE'; swe = 'Sweden|DE'; nor = 'Norway|DE'; fin = 'Finland|DE'
+    ltu = 'Lithuania|DE'; lva = 'Latvia|DE'; est = 'Estonia|DE'; hun = 'Hungary|DE'; svk = 'Slovakia|DE'; svn = 'Slovenia|DE'; hrv = 'Croatia|DE'; srb = 'Serbia|DE'; bgr = 'Bulgaria|DE'; rou = 'Romania|DE'
+    grc = 'Greece|DE'; ita = 'Italy|DE'; lux = 'Luxembourg|DE'; tur = 'Turkey|DE'; gbr = 'United Kingdom|GB'; irl = 'Ireland|GB'; fra = 'France|FR'; esp = 'Spain|FR'; prt = 'Portugal|FR'; bel = 'Belgium|FR'
+    isr = 'Israel|IL'; cyp = 'Cyprus|IL'; jor = 'Jordan|IL'; sau = 'Saudi Arabia|BAH'; are = 'United Arab Emirates|BAH'; qat = 'Qatar|BAH'; bhr = 'Bahrain|BAH'; kwt = 'Kuwait|BAH'; omn = 'Oman|BAH'; ind = 'India|MUM'
+    jpn = 'Japan|TOK'; kor = 'South Korea|TOK'; phl = 'Philippines|TOK'; twn = 'Taiwan|TOK'; mys = 'Malaysia|TOK'; sgp = 'Singapore|TOK'; idn = 'Indonesia|TOK'; aus = 'Australia|SYD'; nzl = 'New Zealand|SYD'
+    bra = 'Brazil|SAO'; arg = 'Argentina|SAO'; chl = 'Chile|SAO'; ury = 'Uruguay|SAO'; pry = 'Paraguay|SAO'; per = 'Peru|SAO'; col = 'Colombia|VA'; ecu = 'Ecuador|VA'; pri = 'Puerto Rico|VA'; mex = 'Mexico|MX'
+}
+$StarlinkState = @{
+    va = 'VA'; ny = 'VA'; nj = 'VA'; ga = 'VA'; fl = 'VA'; nc = 'VA'; sc = 'VA'; md = 'VA'; pa = 'VA'; ma = 'VA'; ct = 'VA'; de = 'VA'; dc = 'VA'; me = 'VA'; nh = 'VA'; vt = 'VA'; ri = 'VA'; al = 'VA'
+    oh = 'OH'; mi = 'OH'; in = 'OH'; ky = 'OH'; wv = 'OH'; tn = 'OH'; il = 'OH'; wi = 'IA'; ia = 'IA'; mn = 'IA'; mo = 'IA'; ne = 'IA'; ks = 'IA'; sd = 'IA'; nd = 'IA'; co = 'IA'
+    tx = 'TX'; ok = 'TX'; la = 'TX'; ar = 'TX'; nm = 'TX'; ms = 'TX'; ca = 'NCAL'; nv = 'NCAL'; az = 'NCAL'; ut = 'NCAL'; hi = 'NCAL'; wa = 'OR'; or = 'OR'; id = 'OR'; mt = 'OR'; wy = 'OR'; ak = 'OR'
+}
+$StarlinkCity = @{ frnt = 'Frankfurt'; lndn = 'London'; mdrd = 'Madrid'; mlan = 'Milan'; wrsw = 'Warsaw'; sfia = 'Sofia'; dlls = 'Dallas'; sttl = 'Seattle'; lsan = 'Los Angeles'; chcg = 'Chicago'; nwyy = 'New York'; ashn = 'Ashburn'; atln = 'Atlanta'; dnvr = 'Denver'; mmmi = 'Miami'; sydy = 'Sydney'; tkyo = 'Tokyo'; sngp = 'Singapore'; lgos = 'Lagos' }
+function Get-StarlinkPop([string]$Ptr) {
+    if ($Ptr -notmatch '(?:^|\.)([a-z0-9]+)\.(?:pop\.starlinkisp\.net|isp\.starlink\.com)\.?$') { return $null }
+    $code = $Matches[1]; $city = ''; $area = ''; $dc = ''
+    if ($code -match '^([a-z]{4})([a-z]{3})\d*$') {
+        $city = "$($StarlinkCity[$Matches[1]])"; $loc = $Matches[2]
+        if ($StarlinkCountry[$loc]) { $area, $dc = $StarlinkCountry[$loc] -split '\|' }
+        elseif ($loc -match '^([a-z]{2})x$' -and $StarlinkState[$Matches[1]]) { $area = "US state $($Matches[1].ToUpper())"; $dc = $StarlinkState[$Matches[1]] }
+    }
+    [pscustomobject]@{ Code = $code; City = $city; Area = $area; Dc = $dc }
+}
+# card action: fresh detection, then the PoP advice and the offer of the 60-second spike test
+function Start-StarlinkCheck {
+    Start-StarlinkDetect {
+        param($r)
+        if (-not ($r -is [hashtable]) -or $r.Err) { Show-Toast $(if ($r -is [hashtable] -and $r.Err) { $r.Err } else { 'The Starlink check could not run.' }) '#FF9F0A'; return }
+        $text = Get-StarlinkText $r
+        if (-not $r.Starlink) { [void](Show-ZdDialog $text 'Starlink' 'OK' 'Information'); return }
+        if ((Show-ZdDialog "$text`n`nRun the 60-second spike test now? It pings a Fortnite server 20 times a second." 'Starlink' 'YesNo' 'Information') -eq 'Yes') { Start-StarlinkSpikeTest (Get-StarlinkPop $r.Ptr) }
+    }
+}
+function Get-StarlinkText($R) {
+    if (-not $R.Starlink) { return "Your connection does not look like Starlink right now$(if (-not $R.PtrSeen) { ' (your public address has no reverse DNS name, so this cannot be fully ruled out)' }). Nothing to do here." }
+    $pop = Get-StarlinkPop $R.Ptr
+    $s = "You are on Starlink. Your traffic leaves the satellite network at ground station (PoP) $(if ($pop) { "'$($pop.Code)'$(if ($pop.City -or $pop.Area) { " ($((@($pop.City, $pop.Area) | Where-Object { $_ }) -join ', '))" })" } else { "'$($R.Ptr)'" }), and every match starts from there, not from your home."
+    if ($pop -and $pop.Dc -and $FnDcInfo[$pop.Dc]) {
+        $i = $FnDcInfo[$pop.Dc]
+        $s += "`n`nThe Fortnite datacenter nearest that PoP is $($i.City): Matchmaking Region $($FnRegionGame[$i.Rid]), Subregion Preference $($i.City). Confirm it with Fortnite subregion ping; if the PoP changes (Starlink moves users between PoPs), check again."
+    } else { $s += "`n`nRun Fortnite subregion ping: the lowest city there is the one nearest your PoP." }
+    $s + "`n`nWhat helps on Starlink: a cable from the PC to the Starlink router (or its Ethernet adapter) instead of Wi-Fi, and Smart Queue / SQM if you use your own router (see Fix bufferbloat on your router). Every 15 seconds Starlink reassigns satellites, which causes short spikes no setting can remove."
+}
+$script:StarlinkSpikeBusy = $false
+function Start-StarlinkSpikeTest($Pop) {
+    if ($script:StarlinkSpikeBusy) { throw 'The spike test is already running.' }
+    $ip = $null
+    if ($Pop -and $Pop.Dc) { $d = @(try { Get-FnDatacenters } catch { }) | Where-Object { $_.Id -eq $Pop.Dc } | Select-Object -First 1; if ($d -and $d.Ips.Count) { $ip = $d.Ips[0] } }
+    if (-not $ip) { $ip = $script:FnBestIp }
+    $hostName = if ($Pop -and $Pop.Dc) { "ping-$($Pop.Dc.ToLower()).ds.on.epicgames.com" } else { ($PingHosts | Where-Object { $_.Name -eq (Get-PlayRegionName) } | Select-Object -First 1).Host }
+    $script:StarlinkSpikeBusy = $true
+    Show-Toast 'Testing for Starlink spikes for 60 seconds...' '#30D158'
+    Invoke-Worker @'
+param($ip, $hostName)
+if (-not $ip) { $ip = @(Resolve-DnsName $hostName -Type A -QuickTimeout -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) | Select-Object -First 1 }
+if (-not $ip) { return @{ Err = 'Could not find a Fortnite server to test.' } }
+$p = New-Object System.Net.NetworkInformation.Ping; $ph = New-Object Collections.ArrayList; $rt = New-Object Collections.ArrayList
+$sw = [Diagnostics.Stopwatch]::StartNew(); $k = 0
+while ($sw.ElapsedMilliseconds -lt 60000) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $v = try { $x = $p.Send($ip, 1000); if ($x.Status -eq 'Success') { [int]$x.RoundtripTime } else { -1 } } catch { -1 }
+    [void]$ph.Add([int]($now % 15000)); [void]$rt.Add($v)
+    $k++; $wait = $k * 50 - $sw.ElapsedMilliseconds; if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+}
+@{ Ip = $ip; Phase = @($ph); R = @($rt) }
+'@ @($ip, $hostName) {
+        param($out, $errs)
+        $script:StarlinkSpikeBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable]) -or $res.Err) { Show-Toast $(if ($res -is [hashtable] -and $res.Err) { $res.Err } else { 'The spike test could not run.' }) '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-StarlinkSpikeText $res) 'Starlink spike test' 'OK' 'Information')
+    }
+}
+# folds the samples onto the 15-second Starlink schedule (wall clock): p95 per one-second slot against the overall median
+function Get-StarlinkSpikeText($Res) {
+    $r = @($Res.R); $ph = @($Res.Phase)
+    $ok = @($r | Where-Object { $_ -ge 0 } | Sort-Object)
+    if (-not $ok.Count) { return 'The Fortnite server did not answer any ping, so the spike test could not judge your line. Run it again, or use the Jitter and loss test.' }
+    $med = $ok[[int][math]::Floor(($ok.Count - 1) / 2)]; $loss = [math]::Round(100 * ($r.Count - $ok.Count) / $r.Count, 1)
+    $slots = @(for ($b = 0; $b -lt 15; $b++) {
+        $v = @(for ($i = 0; $i -lt $r.Count; $i++) { if ($r[$i] -ge 0 -and [math]::Floor($ph[$i] / 1000) -eq $b) { $r[$i] } }) | Sort-Object
+        $lost = @(for ($i = 0; $i -lt $r.Count; $i++) { if ($r[$i] -lt 0 -and [math]::Floor($ph[$i] / 1000) -eq $b) { 1 } }).Count
+        if (@($v).Count -ge 5) { [pscustomobject]@{ Slot = $b; P95 = @($v)[[int][math]::Floor(0.95 * (@($v).Count - 1))]; Lost = $lost } }
+    })
+    $worst = $slots | Sort-Object P95 -Descending | Select-Object -First 1
+    $s = "$($r.Count) pings in 60 seconds to $($Res.Ip): typical $med ms, $loss% lost.`n`n"
+    if ($worst -and $worst.P95 - $med -ge 30) {
+        $secs = (0..3 | ForEach-Object { ':{0:00}' -f ($worst.Slot + 15 * $_) }) -join ', '
+        $s += "Regular spikes: in the same second of every 15-second period (at $secs past each minute) ping reaches $($worst.P95) ms. That is Starlink's satellite reassignment every 15 seconds. Nothing on your PC can remove it; a cable to the router and a nearby PoP keep the rest of the line clean."
+    } else { $s += "No regular 15-second spikes this time (worst one-second slot $(if ($worst) { "$($worst.P95) ms" } else { 'n/a' }) at 95%). Starlink's spikes come and go with satellite position and load, so test again in the evening if matches feel uneven." }
+    $s
+}
+
+
+# --- Research round 7 (1.15, frame): PresentMon presentation and latency checks, GPU-limit check, measured FPS cap, outside frame limiters
+# Intel PresentMon 2.6.0 console, pinned: the SHA-256 GitHub publishes for release asset PresentMon-2.6.0-x64.exe (980,320 bytes, 21 Sep 2026)
+$PresentMonSha256 = 'B2A706BC6AD475749E3B7E3409263AA1E6906D45BDCF993F6DBC0F660188F1AF'
+$PresentMonBytes  = 980320
+# NVIDIA driver V-Sync modes (VSYNCMODE 0x00A879CF, NvApiDriverSettings.h)
+$FrameVSyncModes = @{ 0x60925292 = 'application decides (default)'; 0x47814940 = 'forced on'; 0x08416747 = 'forced off'; 0x18888888 = 'Fast Sync'; 0x32610244 = '1/2 refresh'; 0x71271021 = '1/3 refresh'; 0x13245256 = '1/4 refresh' }
+
+# ZeroDelay runs elevated (PresentMon's event-tracing session needs it)
+function Test-ZdElevated { try { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { $false } }
+# process id of the running Fortnite client, or $null
+function Get-FnGamePid { $p = Get-Process ($FortniteExeName -replace '\.exe$') -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { $p.Id } else { $null } }
+# 'Title' of an existing card in quotes, or the fallback text when the card is not in this build
+function Get-FrameCardRef([string]$Id, [string]$Fallback) { $t = $null; try { $t = Find-Tweak $Id } catch {}; if ($t -and $t.Title) { "'$($t.Title)'" } else { $Fallback } }
+# refresh rate of the display Fortnite most likely runs on (fastest one on the graphics card)
+function Get-FrameHz {
+    $d = @(try { Get-Displays } catch { @() })
+    $hz = ($d | Where-Object Discrete | Measure-Object Hz -Maximum).Maximum
+    if (-not $hz) { $hz = ($d | Measure-Object Hz -Maximum).Maximum }
+    if ($hz) { [int]$hz } else { 0 }
+}
+
+# true when the file is exactly Intel's PresentMon 2.6.0 release
+function Test-PresentMonFile([string]$Path) { (Test-Path -LiteralPath $Path) -and (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $PresentMonSha256 }
+# downloads the pinned release to a temporary name, checks size and SHA-256, and only then moves it into the tools folder
+function Save-PresentMon {
+    New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+    $tmp = Join-Path $ToolsDir 'PresentMon.download'
+    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $PresentMonUrl -OutFile $tmp -UseBasicParsing -TimeoutSec 90
+    } catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; throw "Download failed: $($_.Exception.Message)" }
+    finally { $ProgressPreference = $pp }
+    $h = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+    if ($h -ne $PresentMonSha256) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw "The download does not match Intel's published PresentMon 2.6.0 (SHA-256 $h). It was deleted and nothing was run."
+    }
+    Move-Item -LiteralPath $tmp -Destination $PresentMonExe -Force
+}
+# path of the verified PresentMon console exe; downloads it only after the user agrees, $null when they decline
+function Get-PresentMon {
+    if (Test-PresentMonFile $PresentMonExe) { return $PresentMonExe }
+    $why = if (Test-Path -LiteralPath $PresentMonExe) { "The PresentMon.exe in ZeroDelay's tools folder is not Intel's PresentMon 2.6.0 release, so ZeroDelay will not run it. Downloading replaces it.`n`n" } else { '' }
+    $msg = "${why}Download Intel PresentMon 2.6.0 from Intel's official GitHub releases?`n`nFile: PresentMon-2.6.0-x64.exe ($([Math]::Round($PresentMonBytes / 1KB)) KB)`nFrom: $PresentMonUrl`n`nIt is Intel's free frame-time recorder (MIT licence). ZeroDelay checks its SHA-256 fingerprint against the published release, saves it to $ToolsDir and runs it only while you measure."
+    if ((Show-ZdDialog $msg 'Download PresentMon' 'YesNo' 'Question') -ne 'Yes') { return $null }
+    Save-PresentMon
+    $PresentMonExe
+}
+
+# PresentMon CSV reader. Runs in the worker (dot-sourced from this text) and in tests: present modes, tearing, dropped frames,
+# frame times, PC latency and animation error, optionally split into blocks of $BlockMs for run-to-run spread.
+$FramePmParse = @'
+function Read-PmCsv([string]$Path, [double]$BlockMs = 0) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture; $ns = [Globalization.NumberStyles]::Float
+    $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite'); $sr = New-Object IO.StreamReader $fs
+    try {
+        $head = $sr.ReadLine(); if (-not $head) { return @{ Err = 'PresentMon wrote an empty file: no frames from Fortnite reached it.' } }
+        $cols = $head.Split(','); $ix = @{}; for ($i = 0; $i -lt $cols.Count; $i++) { $ix[$cols[$i].Trim()] = $i }
+        $col = { param([string[]]$names) foreach ($n in $names) { if ($ix.ContainsKey($n)) { return $ix[$n] } }; -1 }
+        $cMode = & $col 'PresentMode'; $cTear = & $col 'AllowsTearing'; $cFt = & $col 'MsBetweenPresents', 'FrameTime'
+        $cShown = & $col 'MsUntilDisplayed', 'DisplayedTime'; $cDrop = & $col 'Dropped'
+        $cT = & $col 'TimeInMs', 'CPUStartTimeInMs', 'CPUStartTime'; $cTs = & $col 'TimeInSeconds'
+        $cPcl = & $col 'MsPCLatency', 'PCLatency'; $cIn = & $col 'MsAllInputToPhotonLatency', 'AllInputToPhotonLatency'; $cAnim = & $col 'MsAnimationError', 'AnimationError'
+        if ($cFt -lt 0) { return @{ Err = 'Unexpected PresentMon output (no frame-time column).' } }
+        $modes = @{}; $tear = 0; $drop = 0; $n = 0
+        $ft = New-Object Collections.Generic.List[double]; $pcl = New-Object Collections.Generic.List[double]
+        $inp = New-Object Collections.Generic.List[double]; $anim = New-Object Collections.Generic.List[double]
+        $blk = @{}; $t0 = $null
+        while ($null -ne ($line = $sr.ReadLine())) {
+            $f = $line.Split(','); $v = 0.0
+            if ($f.Count -lt $cols.Count -or -not [double]::TryParse($f[$cFt], $ns, $inv, [ref]$v) -or $v -le 0) { continue }
+            $n++; $ft.Add($v)
+            if ($cMode -ge 0) { $m = $f[$cMode]; if ($modes.ContainsKey($m)) { $modes[$m]++ } else { $modes[$m] = 1 } }
+            if ($cTear -ge 0 -and $f[$cTear] -eq '1') { $tear++ }
+            if (($cDrop -ge 0 -and $f[$cDrop] -eq '1') -or ($cDrop -lt 0 -and $cShown -ge 0 -and $f[$cShown] -eq 'NA')) { $drop++ }
+            $lat = $null; $x = 0.0
+            if ($cPcl -ge 0 -and [double]::TryParse($f[$cPcl], $ns, $inv, [ref]$x) -and $x -gt 0 -and $x -lt 500) { $pcl.Add($x); $lat = $x }
+            if ($cIn -ge 0 -and [double]::TryParse($f[$cIn], $ns, $inv, [ref]$x) -and $x -gt 0 -and $x -lt 500) { $inp.Add($x); if ($null -eq $lat) { $lat = -$x } }
+            if ($cAnim -ge 0 -and [double]::TryParse($f[$cAnim], $ns, $inv, [ref]$x)) { $anim.Add([Math]::Abs($x)) }
+            if ($BlockMs -gt 0) {
+                $t = 0.0
+                if ($cT -ge 0 -and [double]::TryParse($f[$cT], $ns, $inv, [ref]$t)) { } elseif ($cTs -ge 0 -and [double]::TryParse($f[$cTs], $ns, $inv, [ref]$t)) { $t *= 1000 } else { continue }
+                if ($null -eq $t0) { $t0 = $t }
+                $b = [int][Math]::Floor(($t - $t0) / $BlockMs)
+                if (-not $blk.ContainsKey($b)) { $blk[$b] = @{ Ft = (New-Object Collections.Generic.List[double]); Pcl = (New-Object Collections.Generic.List[double]); In = (New-Object Collections.Generic.List[double]) } }
+                $blk[$b].Ft.Add($v); if ($null -ne $lat) { if ($lat -gt 0) { $blk[$b].Pcl.Add($lat) } else { $blk[$b].In.Add(-$lat) } }
+            }
+        }
+    } finally { $sr.Close() }
+    if ($n -lt 30) { return @{ Err = "PresentMon saw only $n frames from Fortnite. Was it minimised, or in a loading screen?" } }
+    $q = { param($l, [double]$p) $a = [double[]]@($l); if (-not $a.Count) { return $null }; [Array]::Sort($a); $a[[int][Math]::Floor($p * ($a.Count - 1))] }
+    $useIn = $pcl.Count -lt 100 -and $inp.Count -ge 100
+    $kind = if ($pcl.Count -ge 100) { 'PC latency' } elseif ($useIn) { 'input-to-photon latency' } else { $null }
+    $latList = @($pcl, $inp)[[int]$useIn]
+    $ftMed = & $q $ft 0.5; $ft95 = & $q $ft 0.95; $ft99 = & $q $ft 0.99
+    $full = [double](@($blk.Values | ForEach-Object { $_.Ft.Count }) | Measure-Object -Maximum).Maximum
+    $rows = @(foreach ($k in @($blk.Keys | Sort-Object)) {
+        $b = $blk[$k]; if ($b.Ft.Count -lt 200 -or $b.Ft.Count -lt 0.5 * $full) { continue }   # also drops the short tail block
+        $bl = @($b.Pcl, $b.In)[[int]$useIn]
+        [pscustomobject]@{ Block = $k + 1; Frames = $b.Ft.Count; FpsMed = [Math]::Round(1000 / (& $q $b.Ft 0.5), 1); LatMed = $(if ($bl.Count -ge 100) { [Math]::Round((& $q $bl 0.5), 2) } else { $null }) }
+    })
+    @{
+        Frames = $n; Cols = $cols.Count
+        Modes = @($modes.Keys | Sort-Object { -$modes[$_] } | ForEach-Object { [pscustomobject]@{ Mode = $_; Count = $modes[$_]; Share = [Math]::Round(100.0 * $modes[$_] / $n, 2) } })
+        TearShare = [Math]::Round(100.0 * $tear / $n, 2); DropShare = [Math]::Round(100.0 * $drop / $n, 2); HasTear = ($cTear -ge 0)
+        FtMed = [Math]::Round($ftMed, 2); FtP95 = [Math]::Round($ft95, 2); FtP99 = [Math]::Round($ft99, 2)
+        FpsMed = [Math]::Round(1000 / $ftMed, 1); FpsP5 = [Math]::Round(1000 / $ft95, 1)
+        LatKind = $kind; LatN = $latList.Count; HasPclCol = ($cPcl -ge 0)
+        LatMed = $(if ($kind) { [Math]::Round((& $q $latList 0.5), 2) } else { $null }); LatP95 = $(if ($kind) { [Math]::Round((& $q $latList 0.95), 2) } else { $null })
+        AnimN = $anim.Count; AnimMed = $(if ($anim.Count -ge 100) { [Math]::Round((& $q $anim 0.5), 2) } else { $null }); AnimP99 = $(if ($anim.Count -ge 100) { [Math]::Round((& $q $anim 0.99), 2) } else { $null })
+        Blocks = $rows
+    }
+}
+'@
+
+# worker: runs PresentMon for $seconds on Fortnite as a hidden background process, waits for it, parses and deletes the CSV
+$FramePmWorker = @'
+param($exe, $csv, $seconds, $pcl, $session, $parse, $blockMs)
+. ([scriptblock]::Create($parse))
+$a = @('--process_name', 'FortniteClient-Win64-Shipping.exe', '--output_file', "`"$csv`"", '--timed', "$seconds", '--terminate_after_timed', '--no_console_stats', '--stop_existing_session', '--session_name', $session)
+if ($pcl) { $a += '--track_pc_latency' }
+$errFile = "$csv.err.txt"
+try { $p = Start-Process -FilePath $exe -ArgumentList $a -WindowStyle Hidden -PassThru -RedirectStandardError $errFile } catch { return @{ Err = "PresentMon did not start: $($_.Exception.Message)" } }
+$null = $p.Handle
+if (-not $p.WaitForExit(([int]$seconds + 30) * 1000)) { try { $p.Kill() } catch {}; Remove-Item -LiteralPath $csv, $errFile -Force -ErrorAction SilentlyContinue; return @{ Err = 'PresentMon did not finish in time and was stopped.' } }
+$msg = "$(Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)"
+Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+if ($msg -match 'access denied') { Remove-Item -LiteralPath $csv -Force -ErrorAction SilentlyContinue; return @{ Err = 'admin' } }
+if (-not (Test-Path -LiteralPath $csv)) { return @{ Err = "PresentMon recorded nothing (exit code $($p.ExitCode)). $(($msg -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -First 1))".Trim() } }
+try { $r = Read-PmCsv $csv $blockMs } catch { $r = @{ Err = "Could not read PresentMon's output: $($_.Exception.Message)" } }
+finally { Remove-Item -LiteralPath $csv -Force -ErrorAction SilentlyContinue }
+$r.Exit = $p.ExitCode
+$r
+'@
+
+# the shared checks before a PresentMon run: throws with the reason the user sees
+function Assert-FramePmReady {
+    if ($script:FramePmBusy) { throw 'A PresentMon measurement is already running. Wait for its result.' }
+    if (-not (Get-FnGamePid)) { throw 'Fortnite is not running: start a match or the Creative hub first, then click again.' }
+    if (-not (Test-ZdElevated)) { throw 'This needs ZeroDelay to run as administrator: PresentMon reads Windows'' event tracing, which Windows only allows administrators. Restart ZeroDelay and accept the Windows prompt.' }
+}
+# checks, then the verified exe path; $null when the user declined the download
+function Initialize-FramePm { Assert-FramePmReady; Get-PresentMon }
+function New-FramePmCsvPath([string]$Kind) { Join-Path $ToolsDir "$Kind-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv" }
+# turns a worker error into the message the user sees
+function Get-FramePmErrorText($r) {
+    if (-not ($r -is [hashtable])) { return 'The measurement could not run (the background worker returned nothing).' }
+    if ($r.Err -eq 'admin') { return 'Windows refused PresentMon''s trace session: ZeroDelay is not running as administrator. Restart it and accept the Windows prompt.' }
+    "$($r.Err)"
+}
+
+# fn-presentmode: 20 s of PresentMon on Fortnite in the worker, then the present-mode report
+function Start-FnPresentModeTest {
+    $exe = Initialize-FramePm
+    if (-not $exe) { return $false }
+    $script:FramePmBusy = $true
+    Invoke-Worker $FramePmWorker @($exe, (New-FramePmCsvPath 'present'), 20, $false, 'ZeroDelayPresent', $FramePmParse, 0) {
+        param($out, $errs)
+        $script:FramePmBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or $r.Err) { Show-Toast (Get-FramePmErrorText $r) '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-FnPresentModeReport $r) 'How Fortnite reaches your screen' 'OK' 'Information')
+    }
+    $true
+}
+# what usually pushes a game into composition, with the ZeroDelay card that deals with each
+function Get-FnCompositionCauses {
+    $l = if (Test-Path $IniPath) { @(Get-Content $IniPath -ErrorAction SilentlyContinue) } else { @() }
+    $out = @()
+    if ("$(Get-IniValue $l 'FullscreenMode')" -in '1', '2') { $out += "Fortnite runs in a window or windowed fullscreen: anything drawn on top (notifications, the volume pop-up, a window from the other screen) makes Windows compose. $(Get-FrameCardRef 'fullscreen' 'True fullscreen') avoids most of it." }
+    if ("$(Get-IniValue $l 'bUseVSync')" -eq 'True') { $out += "V-Sync is on in Fortnite; in windowed fullscreen that keeps frames waiting for the compositor. $(Get-FrameCardRef 'vsync' 'Turning V-Sync off') fixes it unless you use G-SYNC." }
+    $mpo = $null; try { $mpo = Find-Tweak 'mpo-off' } catch {}
+    if ($mpo -and $mpo.State -eq $true) { $out += "$(Get-FrameCardRef 'mpo-off' 'MPO off') is on. Without overlay planes nothing on top of the game can stay on its own plane, so Windows composes every frame while it is visible. Switch it off unless it fixed flicker for you." }
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
+    $ov = @(@{ Rx = '^Discord$'; N = 'Discord' }, @{ Rx = '^Overwolf'; N = 'Overwolf' }, @{ Rx = '^(Medal|MedalEncoder)$'; N = 'Medal' }, @{ Rx = '^GameBar$'; N = 'Xbox Game Bar' }, @{ Rx = '^RTSS$'; N = 'RivaTuner (users report PresentMon 2.x showing composition while RTSS hooks a game)' } |
+           Where-Object { $rx = $_.Rx; $procs | Where-Object { $_ -match $rx } } | ForEach-Object { $_.N })
+    $out += "Overlays drawn over the game$(if ($ov.Count) { " (running now: $($ov -join ', '))" }): $(Get-FrameCardRef 'interference' 'the overlay check') and $(Get-FrameCardRef 'gamebaroverlay' 'the Game Bar overlay card')."
+    $out += "HDR: Windows HDR or Auto HDR converting Fortnite's picture can stop direct flips on some screens: $(Get-FrameCardRef 'autohdr' 'Auto HDR off') and $(Get-FrameCardRef 'fnhdr' 'Fortnite HDR off')."
+    $out += "Two monitors at different refresh rates: $(Get-FrameCardRef 'mixed-refresh' 'the mixed refresh-rate check')."
+    $out += "The ""Activate Windows"" watermark is drawn above every window and keeps borderless games composed: $(Get-FrameCardRef 'win-activation' 'activate Windows with your licence (Settings > System > Activation)')."
+    $out
+}
+# report text for one PresentMon capture: present modes, tearing, dropped frames and frame times, with a verdict
+function Format-FnPresentModeReport($r) {
+    $share = { param($rx) [double](@($r.Modes | Where-Object { $_.Mode -match $rx } | ForEach-Object { $_.Share }) | Measure-Object -Sum).Sum }
+    $hw = & $share '^Hardware'; $flip = & $share '^Composed: Flip$'; $comp = & $share '^Composed'
+    $modes = ($r.Modes | Select-Object -First 5 | ForEach-Object { "- $($_.Mode): $($_.Share)% ($($_.Count) frames)" }) -join "`n"
+    $s = "PresentMon watched Fortnite for 20 s: $($r.Frames) frames, median $($r.FpsMed) FPS (frame time $($r.FtMed) ms, slowest 1% above $($r.FtP99) ms).`n`nHow the frames reached the screen:`n$modes`n`n"
+    if ($r.HasTear) { $s += "Tearing allowed: $($r.TearShare)% of frames. " }
+    $s += "Dropped (never shown): $($r.DropShare)%.`n`n"
+    if ($hw -ge 95) { $s += "Good: $hw% of frames went straight to the screen (independent flip). That has the same delay as exclusive fullscreen; Windows' compositor is out of the way." }
+    elseif ($comp -gt 50) { $s += "Problem: Windows' compositor handled $comp% of the frames. Each one waits for the next composition, about one refresh of extra delay (4.2 ms at 240 Hz, 6.9 ms at 144 Hz), and tearing is impossible even with V-Sync off." }
+    elseif ($flip -gt 5) { $s += "Partly composed: $flip% of frames went through the compositor (Composed: Flip). Something drew over the game for part of the capture; those frames had about one refresh of extra delay." }
+    else { $s += "Mixed result: $hw% direct flips. Run it again in the middle of a match with nothing else on screen." }
+    if ($comp -gt 5) { $s += "`n`nUsual causes, with the ZeroDelay card for each:`n- $((Get-FnCompositionCauses) -join "`n- ")" }
+    $l = if (Test-Path $IniPath) { @(Get-Content $IniPath -ErrorAction SilentlyContinue) } else { @() }
+    if ($r.HasTear -and $r.TearShare -lt 50 -and $hw -ge 50 -and "$(Get-IniValue $l 'bUseVSync')" -ne 'True' -and (Test-VrrActive) -ne $true) {
+        $s += "`n`nTearing was not allowed for most frames although V-Sync is off in Fortnite and G-SYNC is not active: something outside the game forces sync. $(Get-FrameCardRef 'fn-extlimiters' 'The outside-limiter check') shows driver V-Sync and caps."
+    }
+    if ($comp -gt 5 -and $r.DropShare -gt 1) { $s += "`n`n$($r.DropShare)% of frames were never shown, which fits composition." }
+    $s + "`n`nPresentMon only reads Windows' own event tracing; it does not touch Fortnite or Easy Anti-Cheat. Measured, nothing changed."
+}
+
+# Fortnite and ZeroDelay settings that matter for a latency comparison, in one line
+function Get-FrameSettingsSummary {
+    $l = if (Test-Path $IniPath) { @(Get-Content $IniPath -ErrorAction SilentlyContinue) } else { @() }
+    $rf = switch ("$(Get-IniValue $l 'LatencyTweak2')") { '0' { 'Reflex off' } '1' { 'Reflex on' } '2' { 'Reflex On+Boost' } default { 'Reflex unknown' } }
+    $cap = [double]("0$(Get-IniValue $l 'FrameRateLimit')" -replace '^0(?=\d)', '')
+    $win = switch ("$(Get-IniValue $l 'FullscreenMode')") { '0' { 'fullscreen' } '1' { 'windowed fullscreen' } '2' { 'windowed' } default { 'window mode unknown' } }
+    $setup = try { Get-SetupSummary } catch { '' }
+    "$rf, $(if ($cap -gt 0) { "cap $([int]$cap) FPS" } else { 'uncapped' }), V-Sync $(if ("$(Get-IniValue $l 'bUseVSync')" -eq 'True') { 'on' } else { 'off' }), $win$(if ($setup) { ", $setup" })"
+}
+# one capture's latency numbers in the shape saved as baseline: median, p95, spread of the three 30 s blocks
+function ConvertTo-FrameLatencySummary($r) {
+    $b = @($r.Blocks | Where-Object { $null -ne $_.LatMed })
+    $spread = if ($b.Count -ge 2) { [Math]::Round(($b | Measure-Object LatMed -Maximum).Maximum - ($b | Measure-Object LatMed -Minimum).Minimum, 2) } else { $null }
+    [pscustomobject]@{ Kind = $r.LatKind; Med = $r.LatMed; P95 = $r.LatP95; Spread = $spread; Blocks = @($b | ForEach-Object { $_.LatMed }); Fps = $r.FpsMed; AnimP99 = $r.AnimP99 }
+}
+# report text for the latency capture (90 s, three 30 s blocks)
+function Format-FnLatencyReport($r) {
+    $l = if (Test-Path $IniPath) { @(Get-Content $IniPath -ErrorAction SilentlyContinue) } else { @() }
+    $s = "90 s of Fortnite measured by PresentMon: $($r.Frames) frames, median $($r.FpsMed) FPS, slowest 1% of frames above $($r.FtP99) ms, $($r.DropShare)% never shown.`n`n"
+    if ($r.LatKind) {
+        $blk = @($r.Blocks | Where-Object { $null -ne $_.LatMed } | ForEach-Object { "$($_.LatMed)" })
+        $what = if ($r.LatKind -eq 'PC latency') { 'PC latency (from the moment the PC takes your input to the frame going to the display; NVIDIA''s markers, sent by Fortnite)' } else { 'input-to-photon latency (PresentMon''s own estimate without Fortnite''s markers: it counts only from the last mouse or keyboard event Windows saw before each frame, so it reads far lower than real end-to-end delay; use it only to compare two runs)' }
+        $s += "$($what):`nmedian $($r.LatMed) ms, 95% of frames at $($r.LatP95) ms or less$(if ($blk.Count -ge 2) { "`nper 30 s block: $($blk -join ' / ') ms" }).`n"
+        if ($r.LatKind -eq 'PC latency' -and $r.LatMed -gt 35 -and "$(Get-IniValue $l 'LatencyTweak2')" -in '1', '2') { $s += "`nAbove 35 ms with Reflex on is high for a fast PC: check $(Get-FrameCardRef 'fn-gpubound' 'the GPU-limit check'), $(Get-FrameCardRef 'fn-presentmode' 'the presentation check') and that frame generation is off.`n" }
+        if ($r.LatKind -eq 'PC latency') { $s += "`nFor scale (GameGPU, Fortnite, RTX 5090, PC latency): 1440p native about 41 ms with Reflex off and 21 ms with Reflex on; 1080p 32 ms and 19 ms. Your own before/after difference matters more than these.`n" }
+    }
+    if ($r.LatKind -ne 'PC latency') {
+        $s += "$(if ($r.LatKind) { "`n" } else { 'No latency numbers: ' })Fortnite sent no NVIDIA PC Latency markers$(if ($r.HasPclCol) { ' (the column stayed empty)' }). Fortnite sends them through NVIDIA Reflex: in Fortnite open Settings > Graphics and set NVIDIA Reflex Low Latency to On or On + Boost (the $(Get-FrameCardRef 'reflex' 'Reflex') card does the same), restart Fortnite, then measure in a match, not the lobby. NVIDIA's FrameView guide has a section on enabling latency markers in Fortnite. AMD and Intel cards get no markers, so only frame times are measured.`n"
+    }
+    if ($null -ne $r.AnimP99) {
+        $s += "`nAnimation error (how far on-screen motion is from even timing): median $($r.AnimMed) ms, 99th percentile $($r.AnimP99) ms. "
+        $s += if ($r.AnimP99 -gt [Math]::Max(4, 2 * $r.AnimMed)) { 'That is uneven: motion looks less smooth than the FPS suggests. A cap you can always hold usually evens it out.' } else { 'Even enough.' }
+    }
+    $s
+}
+# compares a new latency summary with the saved baseline: real only when bigger than max(1 ms, 5%) and than the block-to-block spread
+function Compare-FnLatency($Base, $Now) {
+    if (-not $Now.Med) { return 'No comparison: this run has no latency numbers.' }
+    if ("$($Base.Kind)" -ne "$($Now.Kind)") { return "No comparison: the baseline measured $($Base.Kind) and this run $($Now.Kind)." }
+    $diff = [Math]::Round([double]$Now.Med - [double]$Base.Med, 2)
+    $thr = [Math]::Max(1.0, 0.05 * [double]$Base.Med)
+    $noise = [double](@($Base.Spread, $Now.Spread | Where-Object { $null -ne $_ }) | Measure-Object -Maximum).Maximum
+    $when = try { ([datetime]$Base.Time).ToString('d MMM HH:mm') } catch { 'earlier' }
+    $s = "Baseline ($when, $($Base.Summary)): median $($Base.Med) ms, 95% at $($Base.P95) ms$(if ($null -ne $Base.Spread) { ", blocks within $($Base.Spread) ms" }).`nNow ($(Get-FrameSettingsSummary)): median $($Now.Med) ms, 95% at $($Now.P95) ms$(if ($null -ne $Now.Spread) { ", blocks within $($Now.Spread) ms" }).`n`n"
+    $s += if ([Math]::Abs($diff) -le $thr -or [Math]::Abs($diff) -le $noise) { "No measurable effect: the difference ($('{0:+0.0#;-0.0#;0}' -f $diff) ms) is not bigger than both the 1 ms / 5% threshold ($([Math]::Round($thr, 1)) ms) and the spread between 30 s blocks ($noise ms)." }
+          elseif ($diff -lt 0) { "Lower by $(-$diff) ms: bigger than the 1 ms / 5% threshold and the spread between blocks ($noise ms), so it is a real improvement on your PC." }
+          else { "Higher by $diff ms: bigger than the threshold and the spread between blocks ($noise ms), so the change made latency worse here. Consider switching it back." }
+    if ($Base.Fps -and $Now.Fps) { $s += "`nMedian FPS: $($Base.Fps) then, $($Now.Fps) now." }
+    try { if (((Get-Date) - [datetime]$Base.Time).TotalHours -gt 24) { $s += "`n`nThe baseline is more than a day old; a Fortnite or driver update in between makes the comparison unreliable." } } catch {}
+    $s + "`n`nOnly compare runs in the same mode and similar spots; a busy fight and an empty field differ more than most settings."
+}
+# fn-latencytest: 90 s capture with PC latency markers, split into three 30 s blocks; compares with or saves the baseline
+function Start-FnLatencyTest {
+    Assert-FramePmReady
+    $base = $script:Backup.Custom['latency-baseline']
+    $script:FrameLatCompare = $false
+    if ($base -and $base.Med) {
+        $when = try { ([datetime]$base.Time).ToString('d MMM HH:mm') } catch { 'earlier' }
+        $a = Show-ZdDialog ("You have a latency baseline from $when ($($base.Summary)): median $($base.Med) ms.`n`nYes: measure now and compare with it. Change only one thing since then (for example one ZeroDelay card) and play the same mode.`n`nNo: measure a new baseline instead.") 'Latency before and after' 'YesNo' 'Question'
+        $script:FrameLatCompare = ($a -eq 'Yes')
+    }
+    $exe = Get-PresentMon
+    if (-not $exe) { return $false }
+    $script:FramePmBusy = $true
+    Invoke-Worker $FramePmWorker @($exe, (New-FramePmCsvPath 'latency'), 92, $true, 'ZeroDelayLatency', $FramePmParse, 30000) {
+        param($out, $errs)
+        $script:FramePmBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or $r.Err) { Show-Toast (Get-FramePmErrorText $r) '#FF9F0A'; return }
+        $now = ConvertTo-FrameLatencySummary $r
+        $s = Format-FnLatencyReport $r
+        $base = $script:Backup.Custom['latency-baseline']
+        if ($script:FrameLatCompare -and $base) { $s += "`n`n--- Before and after`n$(Compare-FnLatency $base $now)" }
+        elseif ($now.Med) {
+            $script:Backup.Custom['latency-baseline'] = @{ Time = (Get-Date).ToString('o'); Summary = (Get-FrameSettingsSummary); Kind = $now.Kind; Med = $now.Med; P95 = $now.P95; Spread = $now.Spread; Fps = $now.Fps }
+            Save-Backup
+            $s += "`n`nSaved as your baseline. To test one change: switch one ZeroDelay card (or one Fortnite setting), play the same mode, click this card again and answer Yes. ZeroDelay measures again and tells you whether the difference is bigger than the noise."
+        }
+        [void](Show-ZdDialog $s 'Measured latency' 'OK' 'Information')
+    }
+    $true
+}
+
+# per-process GPU load with English counter names (works on every Windows language), like the Home page's LiveStats
+$FrameGpuSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+public static class ZdGpuPid {
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)] static extern int PdhOpenQuery(string src, IntPtr user, out IntPtr q);
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)] static extern int PdhAddEnglishCounter(IntPtr q, string path, IntPtr user, out IntPtr c);
+    [DllImport("pdh.dll")] static extern int PdhCollectQueryData(IntPtr q);
+    [DllImport("pdh.dll")] static extern int PdhCloseQuery(IntPtr q);
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)] static extern int PdhGetFormattedCounterArray(IntPtr c, uint fmt, ref uint size, out uint count, IntPtr buf);
+    // one value per second: the 3D-engine load of this process on its busiest GPU (0-100), -1 when a sample failed; null when PDH is unavailable
+    public static double[] Sample(int pid, int seconds) {
+        IntPtr q, c;
+        if (PdhOpenQuery(null, IntPtr.Zero, out q) != 0) return null;
+        try {
+            if (PdhAddEnglishCounter(q, @"\GPU Engine(*)\Utilization Percentage", IntPtr.Zero, out c) != 0) return null;
+            PdhCollectQueryData(q);
+            string tag = "pid_" + pid + "_";
+            var res = new List<double>();
+            for (int s = 0; s < seconds; s++) {
+                Thread.Sleep(1000);
+                if (PdhCollectQueryData(q) != 0) { res.Add(-1); continue; }
+                var perGpu = new Dictionary<string, double>();
+                foreach (var kv in Arr(c)) {
+                    if (!kv.Key.StartsWith(tag) || !kv.Key.EndsWith("engtype_3D")) continue;
+                    int a = kv.Key.IndexOf("luid_"), b = kv.Key.IndexOf("_phys");
+                    string gpu = a >= 0 && b > a ? kv.Key.Substring(a, b - a) : "";
+                    double cur; perGpu.TryGetValue(gpu, out cur); perGpu[gpu] = cur + kv.Value;
+                }
+                double best = perGpu.Count == 0 ? -1 : 0; foreach (var v in perGpu.Values) if (v > best) best = v;
+                res.Add(best < 0 ? -1 : Math.Min(100, best));
+            }
+            return res.ToArray();
+        } finally { PdhCloseQuery(q); }
+    }
+    static List<KeyValuePair<string, double>> Arr(IntPtr c) {
+        var list = new List<KeyValuePair<string, double>>();
+        uint size = 0, count;
+        PdhGetFormattedCounterArray(c, 0x200 | 0x8000, ref size, out count, IntPtr.Zero);
+        if (size == 0) return list;
+        IntPtr buf = Marshal.AllocHGlobal((int)size);
+        try {
+            if (PdhGetFormattedCounterArray(c, 0x200 | 0x8000, ref size, out count, buf) != 0) return list;
+            int stride = IntPtr.Size + 16;   // PDH_FMT_COUNTERVALUE_ITEM_W: name pointer, then the 16-byte value
+            for (int i = 0; i < count; i++) {
+                IntPtr item = new IntPtr(buf.ToInt64() + i * stride);
+                string name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(item));
+                uint status = (uint)Marshal.ReadInt32(item, IntPtr.Size);
+                double v = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, IntPtr.Size + 8));
+                if (status <= 1 && name != null) list.Add(new KeyValuePair<string, double>(name, v));
+            }
+        } finally { Marshal.FreeHGlobal(buf); }
+        return list;
+    }
+}
+'@
+# worker: compiles the sampler once per process if needed, samples Fortnite's GPU load for $seconds
+$FrameGpuWorker = @'
+param($fpid, $seconds, $src)
+if (-not ('ZdGpuPid' -as [type])) { try { Add-Type -TypeDefinition $src -ErrorAction Stop } catch { return @{ Err = "The GPU sampler could not start: $($_.Exception.Message)" } } }
+$v = [ZdGpuPid]::Sample([int]$fpid, [int]$seconds)
+if ($null -eq $v) { return @{ Err = 'Windows'' GPU performance counters could not be read on this PC.' } }
+@{ Samples = @($v | ForEach-Object { [double]$_ }); Alive = [bool](Get-Process -Id $fpid -ErrorAction SilentlyContinue) }
+'@
+# fn-gpubound: 20 s of Fortnite's 3D-engine load in the worker, no admin needed
+function Start-FnGpuBoundTest {
+    if ($script:FrameGpuBusy) { throw 'The GPU check is already running.' }
+    $fpid = Get-FnGamePid
+    if (-not $fpid) { throw 'Fortnite is not running: start a match or the Creative hub first, then click again.' }
+    $script:FrameGpuBusy = $true
+    Invoke-Worker $FrameGpuWorker @($fpid, 20, $FrameGpuSource) {
+        param($out, $errs)
+        $script:FrameGpuBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or $r.Err) { Show-Toast $(if ($r -is [hashtable] -and $r.Err) { $r.Err } else { 'The GPU check could not run.' }) '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-FnGpuBoundReport $r) 'Is the graphics card the limit?' 'OK' 'Information')
+    }
+}
+# verdict for the GPU samples: GPU-bound when 95%+ for more than half the time; advice depends on Reflex (LatencyTweak2)
+function Format-FnGpuBoundReport($r) {
+    $ok = @($r.Samples | Where-Object { $_ -ge 0 })
+    if ($ok.Count -lt 10) { return "Windows reported Fortnite's GPU load for only $($ok.Count) of 20 seconds$(if (-not $r.Alive) { ' (Fortnite closed during the check)' }). Try again in a match." }
+    $avg = [Math]::Round(($ok | Measure-Object -Average).Average); $hi = [Math]::Round(100.0 * @($ok | Where-Object { $_ -ge 95 }).Count / $ok.Count)
+    $l = if (Test-Path $IniPath) { @(Get-Content $IniPath -ErrorAction SilentlyContinue) } else { @() }
+    $lt = "$(Get-IniValue $l 'LatencyTweak2')"; $nv = [bool](Test-NvAvailable)
+    $reflexOn = $nv -and $lt -in '1', '2'
+    $cap = [double]("0$(Get-IniValue $l 'FrameRateLimit')" -replace '^0(?=\d)', '')
+    $s = "Fortnite's load on the graphics card's 3D engine over 20 s: average $avg%, at 95% or more for $hi% of the time.`nNVIDIA Reflex: $(if (-not $nv) { 'not available (NVIDIA only)' } elseif ($lt -eq '2') { 'On + Boost' } elseif ($lt -eq '1') { 'On' } else { 'Off' }). Fortnite FPS cap: $(if ($cap -gt 0) { [int]$cap } else { 'none' }).`n`n"
+    if ("$(Get-IniValue $l 'bEnableDLSSFrameGeneration')" -eq 'True') { $s += "Frame generation is on, which keeps the graphics card busy by design, so this reading says little about queued frames.`n`n" }
+    if ($avg -lt 40) { $s += 'Low load: you were probably in the lobby or a menu (Fortnite caps those at its menu frame rate), or the CPU is the limit. Measure again in the middle of a match.' }
+    elseif ($hi -gt 50) {
+        if ($reflexOn) { $s += 'The graphics card is the limit, but Reflex is on, so it already keeps frames from queueing in front of it; a cap would not lower your delay. For more FPS, lower the 3D resolution or use DLSS or Performance mode settings.' }
+        else {
+            $mc = try { Get-MeasuredFpsCap } catch { $null }
+            $s += "The graphics card is the limit and Reflex is off, so frames queue in front of it, which adds delay (GameGPU measured Fortnite at about 32 ms with Reflex off and 19 ms with it on; Battle(non)sense found that keeping GPU load under about 95% alone cut input lag clearly). "
+            $s += if ($cap -gt 0) { "Your cap of $([int]$cap) FPS is above what the card holds here: lower it until the load stays under 95%" } else { 'Set an FPS cap a little under what you usually get in fights' }
+            $s += " with $(Get-FrameCardRef 'fpscap' 'the FPS cap card')$(if ($mc -and $mc.Cap) { " (your recent matches suggest $($mc.Cap) FPS)" })."
+            if ($nv) { $s += " Better still, turn on $(Get-FrameCardRef 'reflex' 'Reflex'), which removes the queue without costing FPS." }
+        }
+    } else { $s += "Not limited by the graphics card: it had headroom most of the time ($hi% at 95% or more), so no frames queue in front of it. If FPS is lower than you want, the CPU or the game itself is the limit." }
+    $s + "`n`nRead from Windows' own GPU counters (no admin, nothing changed). Lobby and menus are capped by Fortnite, so only an in-match reading counts."
+}
+
+# measured FPS cap from the last matches' frame data (match reports with P5/Med): floor of the FPS held 95% of the time,
+# at most Hz*3600/(Hz+3600) with VRR; Cap stays $null when there is no data or the frame rate was not steady (P5 under 85% of the median)
+function Get-MeasuredFpsCap([int]$Hz = 0, $Vrr = $null) {
+    if (-not (Test-Path $MatchDir)) { return $null }
+    $reps = @(Get-ChildItem $MatchDir -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 10 |
+              ForEach-Object { try { Get-Content $_.FullName -Raw | ConvertFrom-Json } catch {} } |
+              Where-Object { $_.Fps -and [double]$_.Fps.P5 -gt 0 -and [double]$_.Fps.Med -gt 0 -and [int]$_.Minutes -ge 5 } | Select-Object -First 5)
+    if (-not $reps.Count) { return $null }
+    $mid = { param($v) $a = @($v | Sort-Object); if ($a.Count % 2) { $a[[int](($a.Count - 1) / 2)] } else { ($a[$a.Count / 2 - 1] + $a[$a.Count / 2]) / 2 } }
+    $p5 = [double](& $mid @($reps | ForEach-Object { [double]$_.Fps.P5 })); $med = [double](& $mid @($reps | ForEach-Object { [double]$_.Fps.Med }))
+    if (-not $Hz) { $Hz = Get-FrameHz }
+    if ($null -eq $Vrr) { $Vrr = try { Test-VrrActive } catch { $null } }
+    $limit = if ($Vrr -eq $true -and $Hz -gt 0) { [int][Math]::Floor($Hz * 3600.0 / ($Hz + 3600)) } else { $null }
+    $steady = $p5 -ge 0.85 * $med
+    $cap = [int][Math]::Floor($p5); if ($limit -and $cap -gt $limit) { $cap = $limit }
+    [pscustomobject]@{ Cap = $(if ($steady -and $cap -ge 30) { $cap } else { $null }); P5 = [Math]::Round($p5, 1); Med = [Math]::Round($med, 1); Matches = $reps.Count; Steady = $steady; VrrLimit = $limit }
+}
+
+# RivaTuner Statistics Server folder, or $null when not installed (cheap)
+function Get-RtssDir {
+    $d = Get-RegValue 'HKLM:\SOFTWARE\WOW6432Node\Unwinder\RTSS' 'InstallDir'
+    if ($d -and (Test-Path -LiteralPath $d)) { return $d }
+    foreach ($p in ${env:ProgramFiles(x86)}, $env:ProgramFiles) { if ($p -and (Test-Path -LiteralPath (Join-Path $p 'RivaTuner Statistics Server'))) { return (Join-Path $p 'RivaTuner Statistics Server') } }
+    $null
+}
+# RTSS frame limits, read-only: [Framerate] Limit= (and LimitDenominator=) in the Fortnite profile and in Global
+function Get-RtssFpsLimits {
+    $dir = Get-RtssDir; if (-not $dir) { return $null }
+    $read = {
+        param($file)
+        if (-not (Test-Path -LiteralPath $file)) { return $null }
+        $sec = ''; $lim = $null; $den = 1
+        foreach ($line in Get-Content -LiteralPath $file -ErrorAction SilentlyContinue) {
+            if ($line -match '^\s*\[(.+)\]') { $sec = $Matches[1].Trim(); continue }
+            if ($sec -ne 'Framerate') { continue }
+            if ($line -match '^\s*Limit\s*=\s*(\d+)') { $lim = [int]$Matches[1] } elseif ($line -match '^\s*LimitDenominator\s*=\s*(\d+)') { $den = [Math]::Max(1, [int]$Matches[1]) }
+        }
+        if ($null -eq $lim) { return $null }
+        [Math]::Round($lim / $den, 1)
+    }
+    $fn = & $read (Join-Path $dir "Profiles\$FortniteExeName.cfg"); $gl = & $read (Join-Path $dir 'Profiles\Global')
+    [pscustomobject]@{ Dir = $dir; Running = [bool](Get-Process RTSS -ErrorAction SilentlyContinue); Fortnite = $fn; Global = $gl; Effective = $(if ($null -ne $fn) { $fn } else { $gl }); From = $(if ($null -ne $fn) { 'Fortnite profile' } else { 'Global profile' }) }
+}
+# one NVIDIA setting as Fortnite gets it: effective value and where it comes from
+function Get-FrameNvSetting([uint32]$Id) {
+    $e = Get-NvEff 'Fortnite' $Id; $b = Get-NvEff 'Base Profile' $Id
+    $from = if ($e.Found -and $e.Own -and -not $e.Predefined) { 'Fortnite profile' } elseif ($e.Found -and $e.Own) { 'NVIDIA''s own Fortnite profile' } elseif ($b.Found -and $b.Own) { 'global settings' } elseif ($e.Found) { 'driver default' } else { $null }
+    [pscustomobject]@{ Found = $e.Found; Value = $(if ($e.Found) { [int64]$e.Value } else { $null }); From = $from }
+}
+# fn-extlimiters: every frame cap and sync setting outside Fortnite (NVIDIA profile, RTSS) next to Fortnite's own, and which one holds the FPS
+function Get-FnLimiterReport {
+    $l = if (Test-Path $IniPath) { @(Get-Content $IniPath -ErrorAction SilentlyContinue) } else { @() }
+    $cap = [double]("0$(Get-IniValue $l 'FrameRateLimit')" -replace '^0(?=\d)', ''); $gvs = "$(Get-IniValue $l 'bUseVSync')" -eq 'True'; $lt = "$(Get-IniValue $l 'LatencyTweak2')"
+    $hz = Get-FrameHz; $nv = [bool](Test-NvAvailable); $vrr = if ($nv) { Test-VrrActive } else { $null }
+    $caps = @(); $notes = @(); $lines = @()
+    $lines += "Fortnite: FPS cap $(if ($cap -gt 0) { [int]$cap } else { 'unlimited' }), V-Sync $(if ($gvs) { 'on' } else { 'off' }), Reflex $(switch ($lt) { '2' { 'On + Boost' } '1' { 'On' } '0' { 'Off' } default { 'unknown' } }). Menus: $(Get-IniValue $l 'FrontendFrameRateLimit') FPS."
+    if ($cap -gt 0) { $caps += [pscustomobject]@{ Fps = $cap; Name = 'Fortnite''s own FPS cap'; Ext = $false } }
+    if ($gvs -and $vrr -ne $true -and $hz) { $caps += [pscustomobject]@{ Fps = $hz; Name = 'V-Sync in Fortnite (your refresh rate)'; Ext = $false } }
+    $drvForce = $false
+    if ($nv) {
+        $frl = Get-FrameNvSetting 0x10835002; $vs = Get-FrameNvSetting 0x00A879CF; $ov = Get-FrameNvSetting 0x10A879CF; $bg = Get-FrameNvSetting 0x10835016
+        $flags = [NvDrs]::VrrFlags(); $gsyncDisplay = $flags -ge 0 -and ($flags -band 1)
+        $vsVal = if ($vs.Found) { $vs.Value } else { 0x60925292 }
+        $vsName = if ($FrameVSyncModes.ContainsKey([int]$vsVal)) { $FrameVSyncModes[[int]$vsVal] } else { '0x{0:X8}' -f $vsVal }
+        $lines += "NVIDIA driver for Fortnite: Max Frame Rate $(if ($frl.Found -and $frl.Value -gt 0) { "$($frl.Value) FPS (from $($frl.From))" } else { 'off' }); V-Sync $vsName$(if ($vs.From -and $vsVal -ne 0x60925292) { " (from $($vs.From))" }); G-SYNC $(if ($vrr -eq $true) { 'active for Fortnite' } elseif ($gsyncDisplay) { 'on for the display but blocked for Fortnite' } else { 'off' })$(if ($bg.Found -and $bg.Value -gt 0) { "; background cap $($bg.Value) FPS while Fortnite is not focused" })."
+        if ($frl.Found -and $frl.Value -gt 0) { $caps += [pscustomobject]@{ Fps = [double]$frl.Value; Name = "NVIDIA Max Frame Rate ($($frl.From))"; Ext = $true } }
+        switch ([int]$vsVal) {
+            0x47814940 { $drvForce = $true; if ($vrr -ne $true -and $hz) { $caps += [pscustomobject]@{ Fps = $hz; Name = 'NVIDIA V-Sync forced on (your refresh rate)'; Ext = $true }; $notes += 'Driver V-Sync is forced on without G-SYNC: that adds the same delay as V-Sync in the game. Set it to "Use the 3D application setting" or Off in the NVIDIA App (or the lowest-latency preset on the NVIDIA page).' } }
+            0x18888888 { $notes += 'Fast Sync is set for Fortnite: it drops frames and paces them unevenly. Set V-Sync back to "Use the 3D application setting".' }
+            0x32610244 { if ($hz) { $caps += [pscustomobject]@{ Fps = $hz / 2; Name = 'NVIDIA V-Sync 1/2 refresh'; Ext = $true } }; $notes += 'Half-refresh V-Sync halves your frame rate. Remove it.' }
+            0x71271021 { if ($hz) { $caps += [pscustomobject]@{ Fps = $hz / 3; Name = 'NVIDIA V-Sync 1/3 refresh'; Ext = $true } }; $notes += 'One-third-refresh V-Sync cuts your frame rate to a third. Remove it.' }
+            0x13245256 { if ($hz) { $caps += [pscustomobject]@{ Fps = $hz / 4; Name = 'NVIDIA V-Sync 1/4 refresh'; Ext = $true } }; $notes += 'Quarter-refresh V-Sync cuts your frame rate to a quarter. Remove it.' }
+        }
+        if ($ov.Found -and $ov.Value -ne 0 -and $gsyncDisplay) { $notes += "G-SYNC is switched off for Fortnite alone (VRR override $($ov.Value) $(switch ($ov.Value) { 1 { '= force off' } 2 { '= not allowed' } 4 { '= fixed refresh' } default { '' } }), from $($ov.From)). $(Get-FrameCardRef 'nv-gsyncwindowed' 'The windowed G-SYNC card') clears it." }
+        if ($vrr -eq $true -and $lt -in '1', '2' -and ($gvs -or $drvForce) -and $hz) { $caps += [pscustomobject]@{ Fps = [Math]::Floor($hz * 3600.0 / ($hz + 3600)); Name = 'Reflex''s automatic cap with G-SYNC and V-Sync'; Ext = $false } }
+    } else { $lines += 'NVIDIA driver: no NVIDIA card, nothing to read.' }
+    $rt = Get-RtssFpsLimits
+    if ($rt) {
+        $lines += "RivaTuner (RTSS): $(if ($rt.Running) { 'running' } else { 'installed, not running' }); limit for Fortnite $(if ($rt.Effective -gt 0) { "$($rt.Effective) FPS (from the $($rt.From))" } else { 'off' })$(if ($null -ne $rt.Fortnite -and $null -ne $rt.Global -and $rt.Global -ne $rt.Fortnite) { "; global limit $($rt.Global)" })."
+        if ($rt.Effective -gt 0 -and $rt.Running) { $caps += [pscustomobject]@{ Fps = [double]$rt.Effective; Name = "RivaTuner limit ($($rt.From))"; Ext = $true } }
+        elseif ($rt.Effective -gt 0) { $notes += 'The RivaTuner limit only applies while RTSS runs (it often starts with MSI Afterburner).' }
+    } else { $lines += 'RivaTuner (RTSS): not installed.' }
+    $s = ($lines -join "`n") + "`n`n"
+    $win = $caps | Sort-Object Fps | Select-Object -First 1
+    if ($win) {
+        $s += "What holds your FPS: $($win.Name) at $([Math]::Round($win.Fps, 1)) FPS$(if (@($caps).Count -gt 1) { " (the lowest of: $((@($caps) | Sort-Object Fps | ForEach-Object { "$($_.Name) $([Math]::Round($_.Fps, 1))" }) -join '; '))" }). The lowest cap always wins; the others do nothing while it holds."
+        if ($win.Ext -and $win.Name -notmatch 'V-Sync') {
+            $s += "`n`nThat cap sits outside the game. Blur Busters measured outside limiters up to one frame slower than a good in-game cap. Move it into Fortnite: set the same number with $(Get-FrameCardRef 'fpscap' 'the FPS cap card') and switch the outside one off (NVIDIA App > Graphics > Fortnite > Max Frame Rate: Off, or the RTSS profile). Exception: with G-SYNC some players keep the driver cap together with Reflex on purpose; that measured about the same."
+        }
+    } else {
+        $s += 'What holds your FPS: no cap at all, in Fortnite or outside it. If your FPS still sits at one number, the graphics card or CPU is the limit, or Fortnite''s energy saving while another window has focus.'
+    }
+    if ($notes.Count) { $s += "`n`n$($notes -join "`n`n")" }
+    $s + "`n`nRead-only: ZeroDelay changed nothing here and never edits RivaTuner's files."
+}
+
+
+# --- Research round 7 (1.15), area repair: Fortnite aim readout, stray controllers, tournament input rules,
+#     tweak-pack damage repairs (boot flags, UAC, TDR, VSS, Windows Update, Defender, IFEO junk, game services),
+#     Windows activation, and the leftover scan
+
+# ---- Fortnite cloud settings (ClientSettings.Sav), read-only: Epic's cloud copy overwrites any local edit
+# Newest ClientSettings.Sav under Saved\Cloud\<account id>, or $null
+function Get-FnCloudSettingsPath {
+    $f = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'FortniteGame\Saved\Cloud') -Recurse -Filter 'ClientSettings.Sav' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($f) { $f.FullName } else { $null }
+}
+# Decompresses the save ("ECFD", version, flags, size, then zlib) and reads the property tags we show; $null if the format is not recognised
+function Read-FnCloudSettings([string]$Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try { $raw = New-Object byte[] $fs.Length; [void]$fs.Read($raw, 0, $raw.Length) } finally { $fs.Close() }
+        if ($raw.Length -lt 20 -or [Text.Encoding]::ASCII.GetString($raw, 0, 4) -ne 'ECFD' -or $raw[16] -ne 0x78) { return $null }
+        # skip the 16-byte header and the 2-byte zlib header: DeflateStream reads the raw deflate data (.NET 4.x has no ZLibStream)
+        $ms = [IO.MemoryStream]::new($raw, 18, $raw.Length - 18)
+        $ds = [IO.Compression.DeflateStream]::new($ms, [IO.Compression.CompressionMode]::Decompress)
+        $outS = [IO.MemoryStream]::new(); $ds.CopyTo($outS); $ds.Close()
+        $d = $outS.ToArray()
+    } catch { return $null }
+    $txt = [Text.Encoding]::GetEncoding(28591).GetString($d)   # Latin-1: one char per byte, so string offsets are byte offsets
+    $r = @{ Path = $Path; Time = (Get-Item -LiteralPath $Path).LastWriteTime }
+    foreach ($n in 'MouseSensitivityX', 'MouseSensitivityY', 'MotionTargetingSlow', 'MotionScopedSlow', 'EditingMultiplier', 'MouseZoomScaling',
+                   'bIgnoreGamepadInput', 'bLockPrimaryInputMethodToMouse', 'bCustomKeyboardDiagonals', 'KeyboardForwardDiagonal', 'KeyboardStrafeDiagonal') {
+        # an FString: int32 length (with the terminator), the name, \0; matching the length too skips longer names that end the same way
+        $len = $n.Length + 1
+        $needle = [string][char]($len -band 0xFF) + [char](($len -shr 8) -band 0xFF) + [char]0 + [char]0 + $n + [char]0
+        $i = $txt.IndexOf($needle, [StringComparison]::Ordinal); if ($i -lt 0) { continue }
+        $p = $i + $needle.Length
+        if ($p + 4 -gt $d.Length) { continue }
+        $tl = [BitConverter]::ToInt32($d, $p); if ($tl -lt 2 -or $tl -gt 64) { continue }
+        $type = $txt.Substring($p + 4, $tl - 1); $p += 4 + $tl
+        # UE 5.5+: int32 type-parameter count, int32 size, flags byte, value. UE4: int32 size, int32 array index, guid byte, value. Same offsets for floats.
+        if ($type -eq 'FloatProperty' -and $p + 13 -le $d.Length -and [BitConverter]::ToInt32($d, $p + 4) -eq 4) { $r[$n] = [double][BitConverter]::ToSingle($d, $p + 9) }
+        elseif ($type -eq 'DoubleProperty' -and $p + 17 -le $d.Length) { $r[$n] = [BitConverter]::ToDouble($d, $p + 9) }
+        elseif ($type -eq 'BoolProperty' -and $p + 9 -le $d.Length) { $b = $d[$p + 8]; $r[$n] = [bool](($b -band 0x10) -or $b -eq 1) }   # 0x10 = BoolTrue tag flag (UE 5.5+), 1 = UE4 bool byte
+        elseif ($type -eq 'EnumProperty') { $m = [regex]::Match($txt.Substring($p, [Math]::Min(300, $txt.Length - $p)), '::(\w+)\x00'); if ($m.Success) { $r[$n] = $m.Groups[1].Value } }
+    }
+    if (-not $r.ContainsKey('MouseSensitivityX')) { return $null }
+    $r
+}
+
+# Fortnite aim settings with eDPI and cm per 360 (the DPI comes from ZeroDelay's Sensitivity page if it was used)
+function Get-FnAimReport {
+    $p = Get-FnCloudSettingsPath
+    if (-not $p) { return 'No Fortnite settings file found. Start Fortnite once and open its settings, then check again.' }
+    $s = Read-FnCloudSettings $p
+    if (-not $s) { return 'Could not read Fortnite''s settings file. Its format probably changed after a Fortnite update; nothing was changed.' }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $yaw = 0.5555; if ($FortniteYaw) { $yaw = [double]$FortniteYaw }
+    $pc = { param($v) if ($null -eq $v) { 'not stored (default)' } else { ([double]$v * 100).ToString('0.###', $inv) + '%' } }
+    $x = [double]$s.MouseSensitivityX; $y = $s.MouseSensitivityY
+    $l = @("X sensitivity: $(& $pc $x)   Y sensitivity: $(& $pc $y)")
+    $l += "Targeting (aiming down sights): $(& $pc $s.MotionTargetingSlow)   Scope: $(& $pc $s.MotionScopedSlow)"
+    $l += "Edit-mode multiplier: $(if ($null -ne $s.EditingMultiplier) { ([double]$s.EditingMultiplier).ToString('0.##', $inv) + 'x' } else { 'not stored (default)' })"
+    $l += "Zoom scaling: $(if ($s.MouseZoomScaling) { $s.MouseZoomScaling } else { 'not stored (default)' })"
+    $l += "Use Custom Diagonals: $(if ($s.bCustomKeyboardDiagonals) { "on (forward $(([double]$s.KeyboardForwardDiagonal).ToString('0', $inv)), strafe $(([double]$s.KeyboardStrafeDiagonal).ToString('0', $inv)))" } else { 'off' })"
+    $l += "Ignore Gamepad Input: $(if ($s.bIgnoreGamepadInput) { 'on' } else { 'off' })   Lock Input Method as Mouse: $(if ($s.bLockPrimaryInputMethodToMouse) { 'on' } else { 'off' })"
+    $out = "From Fortnite's settings file (saved $($s.Time.ToString('d MMM HH:mm'))):`n`n$($l -join "`n")`n`n"
+    $saved = $null; if ($script:Backup -and $script:Backup.Custom) { $saved = $script:Backup.Custom['sens'] }
+    $dpi = 0.0; if ($saved) { [void][double]::TryParse("$($saved.Dpi)", [Globalization.NumberStyles]::Float, $inv, [ref]$dpi) }
+    if ($x -gt 0 -and $dpi -gt 0) {
+        $cm = 914.4 / ($dpi * $x * $yaw)
+        $out += "At $dpi DPI (the value on ZeroDelay's Sensitivity page; change it there if your mouse uses another): eDPI $(($dpi * $x).ToString('0.#', $inv)), $($cm.ToString('0.0', $inv)) cm per 360 turn (hip fire).`n"
+        $sp = 0.0; if ([double]::TryParse("$($saved.Sens)", [Globalization.NumberStyles]::Float, $inv, [ref]$sp) -and $sp -gt 0 -and [math]::Abs($sp - $x * 100) -gt 0.01) { $out += "The Sensitivity page holds $($sp.ToString('0.###', $inv))%, but Fortnite uses $(($x * 100).ToString('0.###', $inv))%: type the Fortnite value there to use its converter.`n" }
+    } elseif ($x -gt 0) {
+        foreach ($d in 400, 800, 1600, 3200) { $out += "At $d DPI: eDPI $(($d * $x).ToString('0.#', $inv)), $((914.4 / ($d * $x * $yaw)).ToString('0.0', $inv)) cm per 360`n" }
+        $out += "(Enter your mouse DPI on ZeroDelay's Sensitivity page and this check uses it.)`n"
+    }
+    $notes = @()
+    if ($null -ne $y -and [math]::Abs([double]$y - $x) -gt 0.00001) { $notes += 'X and Y differ. That is fine if you chose it; otherwise vertical aim feels different from horizontal.' }
+    $notes += 'For reference, 2026 pro settings lists mostly show 400-800 DPI at 40-80 eDPI and targeting/scope at 30-50%. That is typical, not correct: consistency matters more than the number.'
+    $notes += 'cm per 360 uses 0.5555 degrees per count at 100%, which matches published converters within about 1%.'
+    $out + "`n" + ($notes -join "`n") + "`n`nRead-only: Fortnite uploads this file to Epic's cloud and the cloud copy wins, so editing it would be undone. Change these in Fortnite: Settings > Mouse & Keyboard."
+}
+
+# ---- Stray or virtual controllers for keyboard-and-mouse players
+# Report of virtual pad drivers, present gamepads, remappers and Fortnite's two input flags (runs in the worker: Get-PnpDevice takes ~0.5 s)
+function Get-FnInputPoolReport {
+    $svcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    $virt = @()
+    if (Test-Path "$svcRoot\ViGEmBus") { $virt += 'ViGEmBus (Nefarius Virtual Gamepad Emulation Bus: DS4Windows, DSX, reWASD-style remappers and old double-movement tools create virtual Xbox pads through it)' }
+    if (Test-Path "$svcRoot\vjoy") { $virt += 'vJoy (virtual joystick driver)' }
+    if (Test-Path "$svcRoot\HidHide") { $virt += 'HidHide (hides a real controller so only the virtual copy is seen)' }
+    $dev = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue)
+    $pads = @($dev | Where-Object { ($_.Class -in 'XnaComposite', 'XboxComposite' -or $_.FriendlyName -match 'game controller|gamepad|Xbox .*Controller|Wireless Controller|DualSense|DUALSHOCK|Pro Controller|8BitDo|vJoy Device|Virtual Gamepad' -or $_.InstanceId -match '&IG_\d') -and $_.FriendlyName -notmatch 'system controller|Emulation Bus|HidHide' } | ForEach-Object { "$($_.FriendlyName)" } | Select-Object -Unique)
+    $remap = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(DS4Windows|DSX|DualSenseX|reWASDEngine|reWASDTray|x360ce|JoyToKey|vJoyConf)$' } | ForEach-Object { $_.ProcessName } | Select-Object -Unique)
+    $s = Read-FnCloudSettings (Get-FnCloudSettingsPath)
+    $out = @()
+    $out += "Virtual controller drivers: $(if ($virt.Count) { "`n- " + ($virt -join "`n- ") } else { 'none' })"
+    $out += "Controllers connected now: $(if ($pads.Count) { $pads -join ', ' } else { 'none' })"
+    if ($remap.Count) { $out += "Remapper running now: $($remap -join ', ')" }
+    $flags = if ($s) { "Fortnite: Ignore Gamepad Input $(if ($s.bIgnoreGamepadInput) { 'ON' } else { 'off' }), Lock Input Method as Mouse $(if ($s.bLockPrimaryInputMethodToMouse) { 'ON' } else { 'off' }), Use Custom Diagonals $(if ($s.bCustomKeyboardDiagonals) { 'ON' } else { 'off' })" } else { 'Fortnite''s settings file could not be read, so its input options are unknown.' }
+    $out += $flags
+    $txt = ($out -join "`n") + "`n`n"
+    if (-not $virt.Count -and -not $pads.Count -and -not $remap.Count) { return $txt + 'No controller and no virtual controller driver: Fortnite cannot be switched to controller input by a stray device. Nothing to do.' }
+    $adv = @()
+    if ($s -and -not $s.bIgnoreGamepadInput -and -not $s.bLockPrimaryInputMethodToMouse) {
+        $adv += 'Fortnite switches its active input to controller as soon as any pad sends a signal (a drifting stick, a virtual pad from a remapper), which changes prompts and aim behaviour mid-fight. If you play keyboard and mouse only: Settings > Game > Input > Ignore Gamepad Input: On. If you sometimes pick up the pad: Lock Input Method as Mouse: On instead.'
+    } elseif ($s) { $adv += 'Fortnite already ignores or locks out controller input, so a stray or virtual pad cannot switch it. Nothing to change in Fortnite.' }
+    if ($virt -match 'ViGEm' -or $remap.Count) {
+        $adv += "If the virtual pad was for double movement (keys mapped to a virtual controller), Fortnite has its own: Use Custom Diagonals in the Game settings (on this PC: $(if ($s -and $s.bCustomKeyboardDiagonals) { 'already on' } else { 'off' })). Wooting withdrew its ViGEm Double Movement tool after Epic added it."
+        $adv += 'Tournaments: FNCS 2026 rules ban macros, automation and input-manipulation devices. Do not run keyboard-to-controller remappers in Epic events.'
+        $adv += 'If no app of yours still uses ViGEm, uninstall "ViGEm Bus Driver" (and HidHide) in Settings > Apps. ZeroDelay does not remove drivers.'
+    }
+    $txt + ($adv -join "`n`n") + "`n`nReports only. These options live in Fortnite's cloud settings, so ZeroDelay cannot switch them for you."
+}
+
+# ---- Tournament: keyboard rules, appended to Get-TournamentReport
+# Wooting (USB VID 31E3) present or seen before, plus Snap Tap / SOCD advice and boot flags that stop Easy Anti-Cheat
+function Get-TournamentInputNote {
+    $now = $false; $ever = $false
+    foreach ($svc in 'HidUsb', 'kbdhid', 'usbccgp') {
+        $k = Get-Item -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$svc\Enum" -ErrorAction SilentlyContinue
+        if ($k) { foreach ($n in $k.GetValueNames()) { if ("$($k.GetValue($n))" -match 'VID_31E3') { $now = $true } } }
+    }
+    if (-not $now) { $ever = [bool](@(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB' -Name -ErrorAction SilentlyContinue) -like 'VID_31E3*') }
+    $l = @()
+    if ($now -or $ever) { $l += "Wooting keyboard $(if ($now) { 'connected' } else { 'used on this PC before' }): Wooting said in April 2026 that Epic does not allow Wooting keyboards at Fortnite pro-circuit events, because of its old Double Movement tool. That matters at LAN events, where admins approve your peripherals; online cups on your own PC are not affected. Plan another keyboard for LAN finals." }
+    $l += 'Snap Tap / SOCD (Razer Snap Tap, Wooting Rappy Snappy and similar): Epic has no explicit ruling. FNCS 2026 rules ban macros, automation and input-manipulation devices, and Valve and ESL banned SOCD in CS2, so switch it off for Epic-sanctioned events. Rapid Trigger only changes when a key release counts and is not known to be restricted. ZeroDelay cannot read keyboard firmware.'
+    $b = $null; try { $b = Get-BcdCurrent } catch {}
+    if ($b -and (@($script:BcdAntiCheat | Where-Object { Test-BcdYes $b[$_.N] }).Count)) { $l += 'Test signing, disabled driver checks or kernel debugging is on: Easy Anti-Cheat refuses to start. Turn on the card Boot flags that stop Easy Anti-Cheat (Repair).' }
+    "`n`nInput rules for events:`n- " + ($l -join "`n- ")
+}
+
+# ---- Repair engine: every value a repair card changes is saved in $script:Backup.Custom[<card id>] first
+# A hashtable copy: after a restart the backup file hands nested hashtables back as PSCustomObjects
+function ConvertTo-ZdHash($o) {
+    $h = @{}
+    if ($null -eq $o) { return $h }
+    if ($o -is [System.Collections.IDictionary]) { foreach ($k in @($o.Keys)) { $h[$k] = $o[$k] } }
+    else { foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value } }
+    $h
+}
+# Name/Value pairs of a hashtable or PSCustomObject
+function Get-ZdPairs($o) {
+    if ($null -eq $o) { return }
+    if ($o -is [System.Collections.IDictionary]) { foreach ($k in @($o.Keys)) { [pscustomobject]@{ Name = $k; Value = $o[$k] } } }
+    else { foreach ($p in $o.PSObject.Properties) { [pscustomobject]@{ Name = $p.Name; Value = $p.Value } } }
+}
+# The backup record of a repair card as live hashtables: @{ Reg = @{ 'path|name' = @{ P; N; E; V; T } }; Layers = @{}; Tasks = @{}; Bcd = @{} }
+function Get-RepairBackup([string]$Id) {
+    $b = ConvertTo-ZdHash $script:Backup.Custom[$Id]
+    foreach ($s in 'Reg', 'Layers', 'Tasks', 'Bcd') { $b[$s] = ConvertTo-ZdHash $b[$s] }
+    $script:Backup.Custom[$Id] = $b
+    $b
+}
+# Saves a value's original state once per card (binary as base64, multi-string joined with NUL so the JSON backup stays flat)
+function Save-RepairOriginal([string]$Id, [string]$P, [string]$N) {
+    $b = Get-RepairBackup $Id; $key = "$P|$N"
+    if ($b.Reg.ContainsKey($key)) { return }
+    $k = Get-Item -LiteralPath $P -ErrorAction SilentlyContinue
+    $e = [bool]($k -and ($k.GetValueNames() -contains $N)); $v = $null; $ty = $null
+    if ($e) {
+        $v = $k.GetValue($N, $null, 'DoNotExpandEnvironmentNames'); $ty = $k.GetValueKind($N).ToString()
+        if ($v -is [byte[]]) { $v = [Convert]::ToBase64String($v) } elseif ($v -is [string[]]) { $v = $v -join [char]0 }
+    }
+    $b.Reg[$key] = @{ P = $P; N = $N; E = $e; V = $v; T = $ty }
+}
+# Writes a value after saving the original; $true when it reads back as written (protected keys refuse silently)
+function Set-RepairValue([string]$Id, [string]$P, [string]$N, $V, [string]$T = 'DWord') {
+    if (-not (Test-Path -LiteralPath $P)) { return $false }
+    Save-RepairOriginal $Id $P $N
+    try { New-ItemProperty -LiteralPath $P -Name $N -Value $V -PropertyType $T -Force -ErrorAction Stop | Out-Null } catch {}
+    "$(Get-RegValue $P $N)" -eq "$V"
+}
+# Deletes a value after saving it; $true when it is gone
+function Remove-RepairValue([string]$Id, [string]$P, [string]$N) {
+    if ($null -eq (Get-RegValue $P $N)) { return $true }
+    Save-RepairOriginal $Id $P $N
+    try { Remove-ItemProperty -LiteralPath $P -Name $N -ErrorAction Stop } catch {}
+    $null -eq (Get-RegValue $P $N)
+}
+# Tells the service manager about a Start value written to the registry, so it takes effect without a restart (never starts or stops anything)
+function Sync-SvcStartType([string]$Name, $Start) {
+    $type = switch ("$Start") { '2' { 'Automatic' } '3' { 'Manual' } '4' { 'Disabled' } default { $null } }
+    if ($type) { try { Set-Service -Name $Name -StartupType $type -ErrorAction Stop } catch {} }
+}
+# Puts back everything a repair card changed (registry values, Fortnite compatibility layers, scheduled tasks). Returns what Windows refused;
+# the backup is only dropped when everything came back.
+function Restore-RepairValues([string]$Id) {
+    $fail = @()
+    $b = $script:Backup.Custom[$Id]
+    if ($null -eq $b) { return }
+    $get = { param($n) if ($b -is [System.Collections.IDictionary]) { $b[$n] } else { $b.$n } }
+    foreach ($e in @(Get-ZdPairs (& $get 'Reg') | ForEach-Object { $_.Value })) {
+        $cur = Get-RegValue $e.P $e.N
+        if (-not $e.E) {
+            if ($null -ne $cur) { try { Remove-ItemProperty -LiteralPath $e.P -Name $e.N -ErrorAction Stop } catch {}; if ($null -ne (Get-RegValue $e.P $e.N)) { $fail += "$($e.N) in $($e.P)" } }
+            continue
+        }
+        $want = switch ("$($e.T)") { 'Binary' { , [Convert]::FromBase64String("$($e.V)") } 'MultiString' { , [string[]]("$($e.V)" -split [char]0) } 'DWord' { [int]$e.V } 'QWord' { [long]$e.V } default { "$($e.V)" } }
+        $curText = if ($cur -is [byte[]]) { [Convert]::ToBase64String($cur) } elseif ($cur -is [string[]]) { $cur -join [char]0 } else { "$cur" }
+        if ($null -ne $cur -and $curText -eq "$($e.V)") { continue }
+        try { New-ItemProperty -LiteralPath $e.P -Name $e.N -Value $want -PropertyType $e.T -Force -ErrorAction Stop | Out-Null } catch { $fail += "$($e.N) in $($e.P)"; continue }
+        if ($e.N -eq 'Start' -and $e.P -match '\\Services\\([^\\]+)$') { Sync-SvcStartType $Matches[1] $e.V }
+    }
+    foreach ($l in @(Get-ZdPairs (& $get 'Layers'))) {
+        $kp, $vn = $l.Name -split '\|', 2
+        $cur = Get-RegValue $kp $vn
+        if ("$cur" -match '(^|\s)RUNASADMIN(\s|$)') { continue }
+        $new = if (-not "$cur".Trim()) { "$($l.Value)" } elseif ("$cur" -match '^~\s*(.*)$') { "~ RUNASADMIN $($Matches[1])".Trim() } else { "RUNASADMIN $cur".Trim() }
+        try { New-ItemProperty -LiteralPath $kp -Name $vn -Value $new -PropertyType String -Force -ErrorAction Stop | Out-Null } catch { $fail += "the compatibility layer on $vn" }
+    }
+    foreach ($tk in @(Get-ZdPairs (& $get 'Tasks'))) {
+        $i = $tk.Name.LastIndexOf('\')
+        try { Disable-ScheduledTask -TaskPath $tk.Name.Substring(0, $i + 1) -TaskName $tk.Name.Substring($i + 1) -ErrorAction Stop | Out-Null } catch { $fail += "the task $($tk.Name)" }
+    }
+    if (-not $fail.Count) { $script:Backup.Custom.Remove($Id) }
+    $fail
+}
+
+# ---- What each registry repair looks for. Rules: Is = bad values, Not = the only good values, Any = bad when present, Gt = bad above.
+#      Fix = value to write ('delayed' = 2 if the service kept its DelayedAutostart flag, else 3); no Fix = delete the value (absent = Windows default).
+$script:RepairSpecs = @{
+    'repair-uac' = @(
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; N = 'EnableLUA'; Is = @(0); Fix = 1; What = 'User Account Control fully off (EnableLUA = 0)' }
+    )
+    'repair-tdr' = @(
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; N = 'TdrLevel'; Is = @(0, 1, 2); What = 'GPU hang recovery off or changed (TdrLevel)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; N = 'TdrDebugMode'; Is = @(0, 1); What = 'GPU timeouts ignored or sent to a debugger (TdrDebugMode)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; N = 'TdrDelay'; Gt = 60; What = 'GPU hang timeout over a minute (TdrDelay)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; N = 'TdrDdiDelay'; Gt = 60; What = 'GPU driver-call timeout over a minute (TdrDdiDelay)' }
+    )
+    'repair-vss' = @(
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\VSS'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'VSS'; What = 'Volume Shadow Copy service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\swprv'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'swprv'; What = 'Microsoft Software Shadow Copy Provider disabled' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore'; N = 'DisableSR'; Not = @(0); What = 'System Restore turned off by policy (DisableSR)' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore'; N = 'DisableConfig'; Not = @(0); What = 'System Restore settings locked by policy (DisableConfig)' }
+    )
+    'repair-wu-services' = @(
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'wuauserv'; What = 'Windows Update service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\UsoSvc'; N = 'Start'; Is = @(4); Fix = 2; Svc = 'UsoSvc'; What = 'Update Orchestrator service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'WaaSMedicSvc'; Protected = $true; What = 'Windows Update Medic service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\BITS'; N = 'Start'; Is = @(4); Fix = 'delayed'; Svc = 'BITS'; What = 'Background Intelligent Transfer Service disabled' }
+    )
+    'repair-defender' = @(
+        foreach ($n in 'DisableAntiSpyware', 'DisableAntiVirus', 'DisableRoutinelyTakingAction') { @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; N = $n; Not = @(0); What = "Defender switched off by policy ($n)" } }
+        foreach ($n in 'DisableRealtimeMonitoring', 'DisableBehaviorMonitoring', 'DisableOnAccessProtection', 'DisableScanOnRealtimeEnable', 'DisableIOAVProtection') { @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection'; N = $n; Not = @(0); What = "Real-time protection switched off by policy ($n)" } }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; N = 'EnableSmartScreen'; Is = @(0); What = 'SmartScreen for apps and files off by policy' }
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer'; N = 'SmartScreenEnabled'; Is = @('Off'); What = 'SmartScreen for downloaded files set to Off' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'SmartScreenEnabled'; Is = @(0); What = 'Microsoft Edge SmartScreen off by policy' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend'; N = 'Start'; Is = @(4); Fix = 2; Protected = $true; What = 'Microsoft Defender Antivirus service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\WdNisSvc'; N = 'Start'; Is = @(4); Fix = 3; Protected = $true; What = 'Defender network inspection service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\WdFilter'; N = 'Start'; Is = @(4); Fix = 0; Protected = $true; What = 'Defender file-scanning driver disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\WdBoot'; N = 'Start'; Is = @(4); Fix = 0; Protected = $true; What = 'Defender boot driver disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\SecurityHealthService'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'SecurityHealthService'; Protected = $true; What = 'Windows Security service disabled' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\wscsvc'; N = 'Start'; Is = @(4); Fix = 2; Svc = 'wscsvc'; Protected = $true; What = 'Security Center service disabled' }
+    )
+    # ZeroDelay's own entries are not listed: cpuprio (PerfOptions CpuPriorityClass = 3), ioprio (IoPriority), fnfso (layer token), fn-mitigations (MitigationOptions)
+    'repair-ifeo-junk' = @(
+        foreach ($n in 'CpuUtilization', 'GpuSpeed', 'InputBoosted', 'ProcOptimize', 'throttlinginsensitive', 'DisableHeapValidation', 'DisableExceptionChainValidation', 'DisableSEHValidation', 'DisableBreakpoint') {
+            @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FortniteClient-Win64-Shipping.exe'; N = $n; Any = $true; What = "made-up Fortnite 'performance' value $n (not a Windows setting)" }
+        }
+        foreach ($n in 'DisableHeapValidation', 'DisableExceptionChainValidation', 'DisableSEHValidation', 'DisableBreakpoint') {
+            @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FortniteClient-Win64-Shipping.exe\PerfOptions'; N = $n; Any = $true; What = "made-up Fortnite value PerfOptions\$n (not a Windows setting)" }
+        }
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FortniteClient-Win64-Shipping.exe\PerfOptions'; N = 'CpuPriorityClass'; Is = @(4); What = 'Fortnite forced to Realtime CPU priority' }
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\csrss.exe\PerfOptions'; N = 'CpuPriorityClass'; Any = $true; What = 'priority override on csrss.exe (a protected system process)' }
+        @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\csrss.exe\PerfOptions'; N = 'IoPriority'; Any = $true; What = 'disk priority override on csrss.exe' }
+    )
+    'repair-gamesvcs' = @(
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\XboxGipSvc'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'XboxGipSvc'; What = 'Xbox Accessory Management service disabled (Xbox controllers and headsets)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\GameInputSvc'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'GameInputSvc'; Skip = 'GameInputDup'; What = 'GameInput service disabled (controller input in Fortnite)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\EasyAntiCheat_EOS'; N = 'Start'; Is = @(4); Fix = 3; Svc = 'EasyAntiCheat_EOS'; What = 'Easy Anti-Cheat service set to Disabled (Fortnite cannot start)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\MMCSS'; N = 'Start'; Is = @(4); Fix = 2; Svc = 'MMCSS'; What = 'Multimedia Class Scheduler service disabled (audio thread priority)' }
+        @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'; N = 'DisabledComponents'; Not = @(0, 32); Fix = 32; What = 'IPv6 fully disabled (DisabledComponents)' }
+    )
+}
+# Compatibility-layer keys checked for RUNASADMIN on the Fortnite exe
+$script:RepairLayerKeys = @('HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers', 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers')
+# Windows Update tasks packs disable; all enabled on a clean Windows 10/11 (Reboot and wake tasks are left alone)
+$script:RepairWuTasks = @('\Microsoft\Windows\UpdateOrchestrator\Schedule Scan', '\Microsoft\Windows\UpdateOrchestrator\Schedule Scan Static Task', '\Microsoft\Windows\UpdateOrchestrator\USO_UxBroker', '\Microsoft\Windows\WindowsUpdate\Scheduled Start')
+
+# Fast registry read for the repair checks (Requires runs at startup): .NET directly, because the provider's Get-Item costs up to 40 ms on a missing key
+function Get-RepairRegValue([string]$P, [string]$N) {
+    $root = if ($P -like 'HKLM:\*') { [Microsoft.Win32.Registry]::LocalMachine } elseif ($P -like 'HKCU:\*') { [Microsoft.Win32.Registry]::CurrentUser } else { return (Get-RegValue $P $N) }
+    $k = $null
+    try { $k = $root.OpenSubKey($P.Substring(6)); if ($k) { $k.GetValue($N, $null, 'DoNotExpandEnvironmentNames') } } catch { $null } finally { if ($k) { $k.Close() } }
+}
+# Value names and data of a key through .NET ($null when missing)
+function Get-RepairRegKey([string]$P) {
+    $root = if ($P -like 'HKLM:\*') { [Microsoft.Win32.Registry]::LocalMachine } elseif ($P -like 'HKCU:\*') { [Microsoft.Win32.Registry]::CurrentUser } else { return $null }
+    $k = $null
+    try { $k = $root.OpenSubKey($P.Substring(6)); if ($k) { $h = @{}; foreach ($n in $k.GetValueNames()) { $h[$n] = $k.GetValue($n) }; $h } } catch { $null } finally { if ($k) { $k.Close() } }
+}
+# $true when a registry value breaks a repair rule
+function Test-RepairRule($Spec, $Value) {
+    if ($null -eq $Value) { return $false }
+    $s = "$Value"
+    if ($Spec.Any) { return $true }
+    if ($null -ne $Spec.Is) { return [bool](@($Spec.Is | Where-Object { "$_" -eq $s }).Count) }
+    if ($null -ne $Spec.Not) { return -not @($Spec.Not | Where-Object { "$_" -eq $s }).Count }
+    if ($null -ne $Spec.Gt) { $n = 0.0; return ([double]::TryParse($s, [ref]$n) -and $n -gt $Spec.Gt) }
+    $false
+}
+# Two or more Microsoft GameInput installs: then a disabled GameInput service may be the user's own workaround (see gameinput-dup)
+function Test-GameInputDuplicate {
+    $n = 0
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
+        foreach ($e in @(Get-ChildItem $k -ErrorAction SilentlyContinue)) { if ("$($e.GetValue('DisplayName'))" -like 'Microsoft GameInput*') { $n++ } }
+    }
+    $n -ge 2
+}
+# Another antivirus with real-time protection on (Defender is then passive on purpose); cached 30 s
+function Test-ThirdPartyAvActive {
+    Get-Cached 'avthirdparty' {
+        $av = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue)
+        [bool](@($av | Where-Object { "$($_.displayName)" -notmatch 'Windows Defender|Microsoft Defender' -and (([int]$_.productState -band 0x1000) -ne 0) }).Count)
+    } 30
+}
+# The Fortnite exe set to run as administrator in a compatibility-layer key
+function Get-RunAsAdminLayers {
+    foreach ($k in $script:RepairLayerKeys) {
+        $vals = Get-RepairRegKey $k; if (-not $vals) { continue }
+        foreach ($n in @($vals.Keys)) {
+            if ($n -notmatch '\\FortniteClient-Win64-Shipping\.exe$') { continue }
+            $v = "$($vals[$n])"
+            if ($v -match '(^|\s)RUNASADMIN(\s|$)') { [pscustomobject]@{ Spec = $null; Layer = $k; Name = $n; Value = $v; What = "Fortnite always runs as administrator (RUNASADMIN compatibility layer, $(if ($k -like 'HKCU*') { 'your profile' } else { 'all users' }))" } }
+        }
+    }
+}
+# Windows Update tasks that exist and are disabled, read from the task files (about 1 ms each, unlike enumerating every task);
+# missing or unreadable files count as unknown: deleted tasks cannot be told apart from builds that never had them
+$script:RepairTaskDir = Join-Path $env:windir 'System32\Tasks'
+function Get-DisabledWuTasks {
+    foreach ($p in $script:RepairWuTasks) {
+        $x = $null; try { $x = [IO.File]::ReadAllText((Join-Path $script:RepairTaskDir $p.TrimStart('\'))) } catch { continue }
+        if ($x -match '<Settings>[\s\S]*?<Enabled>false</Enabled>[\s\S]*?</Settings>') { [pscustomobject]@{ Spec = $null; Task = $p; What = "Windows Update task disabled: $($p -replace '^.*\\', '')" } }
+    }
+}
+# Every leftover a registry repair card finds (callers wrap it in @(); nothing when clean)
+function Get-RepairFindings([string]$Id) {
+    $out = @()
+    foreach ($s in @($script:RepairSpecs[$Id])) {
+        if (-not $s) { continue }
+        $v = Get-RepairRegValue $s.P $s.N
+        if (-not (Test-RepairRule $s $v)) { continue }
+        if ($s.Skip -eq 'GameInputDup' -and (Test-GameInputDuplicate)) { continue }
+        $out += [pscustomobject]@{ Spec = $s; Value = $v; What = $s.What }
+    }
+    if ($Id -eq 'repair-ifeo-junk') { $out += @(Get-RunAsAdminLayers) }
+    if ($Id -eq 'repair-wu-services') { $out += @(Get-DisabledWuTasks) }
+    # another active antivirus: Defender is passive on purpose and its settings are that product's business
+    if ($Id -eq 'repair-defender' -and $out.Count -and (Test-ThirdPartyAvActive)) { $out = @() }
+    $out
+}
+# Card Test: $true = no leftovers (the repair is "on")
+function Test-RepairClean([string]$Id) { -not @(Get-RepairFindings $Id).Count }
+# Card Requires: shown only when a leftover exists or this card has a backup to undo
+function Test-RepairShown([string]$Id) { (Test-TweakHasBackup $Id) -or [bool]@(Get-RepairFindings $Id).Count }
+
+# Applies a registry repair card: Windows defaults back, every previous value saved; protected values get guided text instead of an error
+function Invoke-RepairCardOn([string]$Id) {
+    $fail = @()
+    foreach ($f in @(Get-RepairFindings $Id)) {
+        $s = $f.Spec
+        if ($s) {
+            $ok = if ($null -ne $s.Fix) {
+                $val = if ("$($s.Fix)" -eq 'delayed') { if ("$(Get-RegValue $s.P 'DelayedAutostart')" -eq '1') { 2 } else { 3 } } else { $s.Fix }
+                Set-RepairValue $Id $s.P $s.N $val $(if ($s.T) { $s.T } else { 'DWord' })
+            } else { Remove-RepairValue $Id $s.P $s.N }
+            if ($ok -and $s.Svc) { Sync-SvcStartType $s.Svc (Get-RegValue $s.P $s.N) }
+            if (-not $ok) { $fail += $f }
+        } elseif ($f.Layer) {
+            $b = Get-RepairBackup $Id; $key = "$($f.Layer)|$($f.Name)"
+            if (-not $b.Layers.ContainsKey($key)) { $b.Layers[$key] = $f.Value }
+            $new = (($f.Value -replace '(^|\s)RUNASADMIN(?=\s|$)', ' ') -replace '\s+', ' ').Trim()
+            try {
+                if ($new -in '', '~') { Remove-ItemProperty -LiteralPath $f.Layer -Name $f.Name -ErrorAction Stop } else { New-ItemProperty -LiteralPath $f.Layer -Name $f.Name -Value $new -PropertyType String -Force -ErrorAction Stop | Out-Null }
+            } catch { $fail += $f }
+        } elseif ($f.Task) {
+            $i = $f.Task.LastIndexOf('\')
+            try { Enable-ScheduledTask -TaskPath $f.Task.Substring(0, $i + 1) -TaskName $f.Task.Substring($i + 1) -ErrorAction Stop | Out-Null; $b = Get-RepairBackup $Id; $b.Tasks[$f.Task] = $true } catch { $fail += $f }
+        }
+    }
+    if ($fail.Count) { [void](Show-ZdDialog (Get-RepairFailText $Id $fail) 'Some settings could not be changed' 'OK' 'Warning') }
+}
+# Undo of a registry repair card; throws (keeping the backup) when Windows refuses
+function Invoke-RepairCardOff([string]$Id) {
+    $f = @(Restore-RepairValues $Id)
+    if ($f.Count) { throw "Windows refused to put back: $($f -join ', '). Run ZeroDelay as administrator and try again." }
+}
+# Guided text for what Windows refused, per card
+function Get-RepairFailText([string]$Id, $Fail) {
+    $list = ($Fail | ForEach-Object { "- $($_.What)" }) -join "`n"
+    $s = "Windows refused these changes:`n$list`n`n"
+    $prot = @($Fail | Where-Object { $_.Spec -and $_.Spec.Protected })
+    if ($Id -eq 'repair-wu-services' -and $prot.Count) { $s += "Windows protects the Update Medic service even from administrators. If a blocker tool (Windows Update Blocker, a 'disable updates' script) switched it off, open that tool and choose Enable. Otherwise Settings > System > Recovery > Fix problems using Windows Update reinstalls the current Windows version and keeps your files and apps.`n`n" }
+    if ($Id -eq 'repair-wu-services' -and @($Fail | Where-Object { $_.Task }).Count) { $s += "Only the system account may switch the Update Orchestrator tasks on. Fix problems using Windows Update (Settings > System > Recovery) restores them; the services fixed here already let Windows Update scan when you check for updates.`n`n" }
+    if ($Id -eq 'repair-defender' -and $prot.Count) { $s += "Windows protects Defender's services and drivers even from administrators. To turn them back on: 1. Windows Security > Virus & threat protection: use Turn on or Restart now if offered. 2. If a tool such as Defender Control or a 'disable Defender' script did it, use its Enable option. 3. Otherwise Settings > System > Recovery > Fix problems using Windows Update reinstalls Windows and keeps your files and apps. ZeroDelay never installs anything.`n`n" }
+    $s + 'Anything else on the list needs ZeroDelay to run as administrator. What could be changed was changed and backed up.'
+}
+# Leftover descriptions for the scan (strings)
+function Get-RepairFindingText([string]$Id) {
+    if ($Id -eq 'repair-bcd-anticheat') { return @(Get-BcdFindings $script:BcdAntiCheat | ForEach-Object { "$($_.What) [$($_.N) $($_.Value)]" }) }
+    if ($Id -eq 'repair-bcd-limits') { return @(Get-BcdFindings $script:BcdLimits | ForEach-Object { "$($_.What) [$($_.N) $($_.Value)]" }) }
+    @(Get-RepairFindings $Id | ForEach-Object { if ($_.Spec) { "$($_.What) [$($_.Spec.N) = $($_.Value)]" } else { $_.What } })
+}
+
+# ---- Boot configuration (bcdedit /enum {current}, ~50-100 ms, needs administrator): read once and cached 30 s; repairs clear the cache
+function Get-BcdCurrent {
+    Get-Cached 'bcdcurrent' {
+        $o = $null; try { $o = bcdedit /enum '{current}' 2>$null } catch {}
+        if ($LASTEXITCODE -ne 0 -or -not $o) { return $null }
+        $h = @{}
+        foreach ($l in $o) { if ("$l" -match '^([a-z][a-z0-9]*)\s+(\S.*)$') { $n = $Matches[1].ToLower(); if (-not $h.ContainsKey($n)) { $h[$n] = $Matches[2].Trim() } } }
+        $h
+    } 30
+}
+# A bcdedit Yes in the languages Windows ships most
+function Test-BcdYes($v) { "$v" -match '^(Yes|Ja|Oui|Sí|Si|Sì|Sim|Tak|Evet|Ano|Igen|Kyllä)$' }
+# Boot values that stop Easy Anti-Cheat
+$script:BcdAntiCheat = @(
+    @{ N = 'testsigning'; Rule = 'yes'; What = 'test signing on: unsigned test drivers may load, and Easy Anti-Cheat refuses to start' }
+    @{ N = 'nointegritychecks'; Rule = 'yes'; What = 'driver signature checks off (Easy Anti-Cheat error 30007)' }
+    @{ N = 'debug'; Rule = 'yes'; What = 'kernel debugging on: Easy Anti-Cheat refuses to start' }
+)
+# Core/RAM limits and debug-only boot values (the timer ones belong to repair-platformclock)
+$script:BcdLimits = @(
+    @{ N = 'numproc'; Rule = 'any'; What = 'number of processors limited (msconfig > Boot > Advanced options)' }
+    @{ N = 'onecpu'; Rule = 'yes'; What = 'Windows uses only one CPU core' }
+    @{ N = 'truncatememory'; Rule = 'any'; What = 'memory above an address ignored' }
+    @{ N = 'removememory'; Rule = 'any'; What = 'part of the RAM hidden from Windows' }
+    @{ N = 'groupsize'; Rule = 'any'; What = 'processor group size forced (testing only)' }
+    @{ N = 'maxgroup'; Rule = 'yes'; What = 'processor groups maximised (testing only)' }
+    @{ N = 'groupaware'; Rule = 'yes'; What = 'processor group testing mode' }
+    @{ N = 'disableelamdrivers'; Rule = 'yes'; What = 'early-launch anti-malware driver off (debugging only)' }
+    @{ N = 'msi'; Rule = 'ForceDisable'; What = 'MSI interrupts off for every device' }
+    @{ N = 'x2apicpolicy'; Rule = 'any'; What = 'x2APIC mode forced instead of chosen by Windows' }
+    @{ N = 'uselegacyapicmode'; Rule = 'yes'; What = 'legacy APIC mode forced (debugging only)' }
+    @{ N = 'usephysicaldestination'; Rule = 'yes'; What = 'APIC physical destination mode forced (debugging only)' }
+    @{ N = 'usefirmwarepcisettings'; Rule = 'yes'; What = 'PCI resources taken from the firmware (debugging only)' }
+    @{ N = 'configaccesspolicy'; Rule = 'DisallowMmConfig'; What = 'PCI Express extended config space blocked' }
+    @{ N = 'pciexpress'; Rule = 'ForceDisable'; What = 'PCI Express native features off' }
+    @{ N = 'xsavedisable'; Rule = 'notzero'; What = 'XSAVE (AVX state saving) disabled' }
+    @{ N = 'forcelegacyplatform'; Rule = 'yes'; What = 'legacy platform forced' }
+    @{ N = 'nolowmem'; Rule = 'yes'; What = '32-bit-only value, ignored on 64-bit Windows (leftover)' }
+    @{ N = 'avoidlowmemory'; Rule = 'any'; What = '32-bit-era value, no effect on 64-bit Windows (leftover)' }
+    @{ N = 'firstmegabytepolicy'; Rule = 'any'; What = 'legacy first-megabyte policy (leftover)' }
+    @{ N = 'increaseuserva'; Rule = 'any'; What = '32-bit-only value, ignored on 64-bit Windows (leftover)' }
+    @{ N = 'pae'; Rule = 'any'; What = '32-bit-only value, ignored on 64-bit Windows (leftover)' }
+    @{ N = 'linearaddress57'; Rule = 'any'; What = '5-level paging forced (leftover)' }
+)
+# Boot values breaking a rule list: @{ N; Value; What }, from the cached enumeration
+function Get-BcdFindings($Rules, $Bcd = $null) {
+    if ($null -eq $Bcd) { $Bcd = Get-BcdCurrent }
+    if ($null -eq $Bcd) { return }
+    foreach ($r in $Rules) {
+        $v = $Bcd[$r.N]; if ($null -eq $v) { continue }
+        $bad = switch ($r.Rule) { 'yes' { Test-BcdYes $v } 'any' { $true } 'notzero' { "$v" -notmatch '^(0|0x0|No|Nein|Non)$' } default { "$v" -eq $r.Rule } }
+        if ($bad) { [pscustomobject]@{ N = $r.N; Value = $v; What = $r.What } }
+    }
+}
+# Card Test for a boot repair: $null when the boot settings cannot be read (not administrator)
+function Test-BcdRepairClean($Rules) { $b = Get-BcdCurrent; if ($null -eq $b) { return $null }; -not @(Get-BcdFindings $Rules $b).Count }
+# Card Requires for a boot repair
+function Test-BcdRepairShown([string]$Id, $Rules) { (Test-TweakHasBackup $Id) -or [bool]@(Get-BcdFindings $Rules).Count }
+# Deletes the bad boot values (absent = Windows default) after saving them
+function Invoke-BcdRepairOn([string]$Id, $Rules) {
+    $cur = Get-BcdCurrent; if ($null -eq $cur) { throw 'Could not read the boot settings (needs administrator).' }
+    $bad = @(Get-BcdFindings $Rules $cur)
+    $b = Get-RepairBackup $Id
+    foreach ($f in $bad) { if (-not $b.Bcd.ContainsKey($f.N)) { $b.Bcd[$f.N] = $f.Value } }
+    $fail = @()
+    foreach ($f in $bad) { bcdedit /deletevalue '{current}' $f.N | Out-Null; if ($LASTEXITCODE -ne 0) { $fail += $f.N } }
+    Clear-ReadCache
+    if ($fail.Count) { throw "Windows refused to remove: $($fail -join ', ')." }
+}
+# Puts the saved boot values back (Yes/No in any language written as yes/no)
+function Invoke-BcdRepairOff([string]$Id) {
+    $b = $script:Backup.Custom[$Id]
+    $bcd = if ($b -is [System.Collections.IDictionary]) { $b['Bcd'] } elseif ($b) { $b.Bcd } else { $null }
+    $fail = @()
+    foreach ($e in @(Get-ZdPairs $bcd)) {
+        $val = if (Test-BcdYes $e.Value) { 'yes' } elseif ("$($e.Value)" -match '^(No|Nein|Non|Não|Nie|Hayır|Nee|Ne|Nem|Ei)$') { 'no' } else { "$($e.Value)" }
+        bcdedit /set '{current}' $e.Name $val | Out-Null; if ($LASTEXITCODE -ne 0) { $fail += $e.Name }
+    }
+    Clear-ReadCache
+    if ($fail.Count) { throw "Windows refused to put back: $($fail -join ', ')." }
+    $script:Backup.Custom.Remove($Id)
+}
+
+# ---- Restore point: why Windows cannot make one (VSS / System Restore switched off); '' when nothing is wrong
+function Get-RestorePointHint {
+    $bad = @(Get-RepairFindings 'repair-vss')
+    if (-not $bad.Count) { return '' }
+    " Another tool switched off what restore points need ($(($bad | ForEach-Object { $_.What }) -join '; ')). Turn on 'Turn System Restore and shadow copies back on' in the Repair tab, then try again."
+}
+
+# ---- Windows activation (SoftwareLicensingProduct takes ~0.7 s: runs in the worker)
+function Get-WinActivationReport {
+    $p = $null
+    try { $p = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop) } catch { return "Could not read the licence state: $($_.Exception.Message)" }
+    if (-not $p.Count) { return 'Windows reports no installed product key. Settings > System > Activation shows the state and how to fix it.' }
+    $names = @{ 0 = 'not activated'; 1 = 'activated'; 2 = 'not activated (initial grace period)'; 3 = 'not activated (grace period after a hardware change)'; 4 = 'not activated (non-genuine grace period)'; 5 = 'not activated (notification mode)'; 6 = 'not activated (extended grace period)' }
+    $lic = @($p | Where-Object { [int]$_.LicenseStatus -eq 1 })
+    $main = if ($lic.Count) { $lic[0] } else { $p[0] }
+    $st = [int]$main.LicenseStatus
+    $s = "$($main.Name)`nLicence: $($names[$st])$(if ($main.ProductKeyChannel) { ", $($main.ProductKeyChannel) channel" })"
+    if ($st -eq 1) { return "$s`n`nWindows is activated, so no 'Activate Windows' watermark is drawn. Nothing to do." }
+    "$s`n`nWhile Windows is not activated it draws the 'Activate Windows' watermark above every window, games included. The watermark is a window the desktop compositor must draw on top, and a Blur Busters user reports it keeps borderless and windowed games composed (Composed: Flip: about one refresh of extra delay and no tearing) unless the graphics card can put it on its own overlay plane. True fullscreen avoids the compositor.`n`nThe fix is a legitimate licence: Settings > System > Activation. A digital licence tied to your Microsoft account comes back after a hardware change through the Activation troubleshooter there.`n`nDo not use watermark removers or KMS activators: they patch system files or run unofficial activation services, and Defender flags many of them as hack tools. ZeroDelay only reads the licence state."
+}
+
+# ---- Leftover scan: runs every Repair card's Test in the worker and lists what other optimizers left behind
+$script:PackScanBusy = $false
+function Start-PackScan {
+    if ($script:PackScanBusy) { throw 'The scan is already running.' }
+    $script:PackScanBusy = $true
+    $specs = @($Tweaks | Where-Object { $_.Cat -eq 'Repair' -and -not $_.Action -and -not $_.Header -and -not $_.Picker } | ForEach-Object { ConvertTo-WorkerSpec $_ })
+    $ids = @('repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services', 'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs')
+    Invoke-Worker @'
+param($specs, $ids)
+$rows = @()
+foreach ($s in $specs) {
+    $t = @{}
+    foreach ($k in $s.PSBase.Keys) { $v = $s[$k]; $t[$k] = if ($v -is [hashtable] -and $v.ContainsKey('__sb')) { [scriptblock]::Create($v.__sb) } else { $v } }
+    if (-not $t.Id) { continue }
+    $st = Invoke-TweakTest $t
+    $det = @(); if ($st -eq $false -and $ids -contains $t.Id) { $det = @(Get-RepairFindingText $t.Id) }
+    $rows += [pscustomobject]@{ Id = $t.Id; Title = "$($t.Title)"; State = $st; Detail = $det }
+}
+$extra = @()
+$vd = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'VerifyDrivers'
+if ("$vd".Trim()) { $extra += "Driver Verifier is active (drivers: $("$vd".Trim())). Easy Anti-Cheat refuses to run with it. In an administrator prompt run: verifier /reset, then restart." }
+if (-not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend')) { $extra += 'The Microsoft Defender service is missing entirely, not just disabled: this looks like a stripped custom Windows image (Tiny11, Ghost Spectre and similar). That cannot be repaired from inside Windows; a clean or in-place reinstall from Microsoft''s media brings Defender, Windows Update and the Store back.' }
+elseif (-not (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv')) { $extra += 'The Windows Update service is missing entirely: this looks like a stripped custom Windows image. Only an in-place reinstall from Microsoft''s media brings it back.' }
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# a hashtable envelope: Get-WorkerResult unwraps the top-level object, which strips a pscustomobject's properties
+@{ Rows = $rows; Extra = $extra; Admin = $admin }
+'@ (@(, $specs) + @(, $ids)) {
+        param($out, $errs)
+        $script:PackScanBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'Could not run the leftover scan.' '#FF9F0A'; return }
+        $bad = @($r.Rows | Where-Object { $_.State -eq $false })
+        $s = if ($bad.Count) {
+            "Leftovers found by $($bad.Count) Repair card$(if ($bad.Count -ne 1) { 's' }):`n`n" + (($bad | ForEach-Object { "- $($_.Title)$(if (@($_.Detail).Count) { ":`n    " + (@($_.Detail) -join "`n    ") })" }) -join "`n") + "`n`nTurn each card on in Tweaks > Repair to put the Windows default back. Every value is backed up and comes back if you switch the card off. Read each card's warning first: some leftovers may be your own choice."
+        } else { "No leftovers from other optimizers: all $(@($r.Rows).Count) Repair checks are clean or do not apply to this PC." }
+        if (@($r.Extra).Count) { $s += "`n`nAlso found (guided, nothing to switch):`n- " + (@($r.Extra) -join "`n- ") }
+        if (-not $r.Admin) { $s += "`n`nZeroDelay is not running as administrator, so the boot settings could not be read and those checks were skipped." }
+        [void](Show-ZdDialog $s 'Leftovers from other optimizers' 'OK' 'Information')
+    }
 }
 
 # --- Helpers for research round 5 (1.14)
@@ -4353,9 +6228,13 @@ function Get-RouterTestText([int[]]$R, [bool]$Wifi) {
     $ms = { param($v) if ($v -lt 1) { 'under 1 ms' } else { "$v ms" } }
     $s = "Over $how, $($R.Count) pings to your router: typical $(& $ms $med), 95% at $(& $ms $p95) or less, worst $(& $ms $max), $spikes over 20 ms, $loss% lost.`n`n"
     $good = if ($Wifi) { $med -le 5 -and $p95 -le 15 -and $loss -lt 1 } else { $med -le 2 -and $p95 -le 5 -and $loss -lt 1 }
-    if ($good) { $s += 'Your home network is clean. If your Fortnite ping still spikes, the cause is your internet line or the route to the server, not your PC, cable or Wi-Fi. Run the Bufferbloat test to check the line.' }
+    # Ethernet but slow or uneven to the router: a powerline adapter, mesh satellite or extender sits in the path
+    $notDirect = -not $Wifi -and ($med -gt 1.5 -or $p95 -gt 4)
+    $directHint = "A real cable straight to the router answers in under 1 ms, steadily. Typical $(& $ms $med) with 95% at $(& $ms $p95) means something else is in the path: a powerline adapter, a mesh satellite or a Wi-Fi extender with a LAN port. Those add a few ms and spikes; a direct cable to the router removes them. Some provider routers answer ping slowly, so run the test again with nothing else busy before you buy anything."
+    if ($notDirect -and $loss -lt 1 -and $p95 -le 15) { $s += $directHint }
+    elseif ($good) { $s += 'Your home network is clean. If your Fortnite ping still spikes, the cause is your internet line or the route to the server, not your PC, cable or Wi-Fi. Run the Bufferbloat test to check the line.' }
     elseif ($Wifi) { $s += 'Your Wi-Fi adds the spikes. Move closer to the router, use its 5 GHz network (see Prefer 5 GHz), run Check your Wi-Fi signal, or best of all use a cable. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.' }
-    else { $s += 'There are spikes even on the cable. Run Check your cable connection, make sure nobody is downloading or streaming heavily (see the Bufferbloat test), and check Find traffic shapers. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.' }
+    else { $s += 'There are spikes even on the cable. Run Check your cable connection, make sure nobody is downloading or streaming heavily (see the Bufferbloat test), and check Find traffic shapers. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.'; if ($notDirect) { $s += "`n`n$directHint" } }
     $s
 }
 
@@ -4638,7 +6517,7 @@ $Tweaks = @(
     # ----------------------------------------------------------------- Input
     @{ Id = 'mouse'; Cat = 'Input'; Icon = [char]0xE962; Rec = $true
        Title = 'Turn off mouse acceleration'
-       Desc  = 'Disables "Enhance pointer precision" so the same hand movement always gives the same aim.'
+       Desc  = 'Disables "Enhance pointer precision" so the same hand movement always moves the cursor the same distance: desktop, menus and games that use the Windows cursor. Fortnite matches read the mouse raw, so in-match aim does not change; the Fortnite mouse acceleration card covers that.'
        Warn  = 'You are used to acceleration on desktop. Your cursor will feel slower until you adjust DPI.'
        Reg   = @(
            @{ P = 'HKCU:\Control Panel\Mouse'; N = 'MouseSpeed'; V = '0'; T = 'String'; D = '1'; M = '1' }
@@ -4649,7 +6528,7 @@ $Tweaks = @(
 
     @{ Id = 'keyrepeat'; Cat = 'Input'; Icon = [char]0xE765; Rec = $false
        Title = 'Reduce keyboard repeat delay'
-       Desc  = 'Shortest delay before a held key starts repeating, at the fastest repeat rate.'
+       Desc  = 'Shortest delay before a held key starts repeating, at the fastest repeat rate. For typing and the desktop: Fortnite reads keys raw in matches, so building and editing do not get faster.'
        Warn  = 'You type a lot outside games. Held keys will repeat almost instantly. Does not change in-game input latency.'
        Reg   = @(
            @{ P = 'HKCU:\Control Panel\Keyboard'; N = 'KeyboardDelay'; V = '0'; T = 'String'; D = '1'; M = '1' }
@@ -4692,7 +6571,7 @@ $Tweaks = @(
 
     @{ Id = 'windowed'; Cat = 'Graphics'; Icon = [char]0xE740; Rec = $true
        Title = 'Optimizations for windowed games'
-       Desc  = 'Uses the low-latency flip model for borderless/windowed games, close to true fullscreen latency.'
+       Desc  = 'Uses the low-latency flip model for borderless/windowed games, close to true fullscreen latency. Helps DirectX 10/11 games; Fortnite now runs DirectX 12 in both rendering modes, which always uses the flip model, so Fortnite itself does not change.'
        Warn  = 'You are on Windows 10 (not available) or an old game breaks in windowed mode.'
        Dx    = @{ K = 'SwapEffectUpgradeEnable'; V = '1'; D = '0'; M = '0' } }
 
@@ -4804,7 +6683,7 @@ $Tweaks = @(
 
     @{ Id = 'ping'; Cat = 'Network'; Icon = [char]0xE909; Action = 'Test ping'
        Title = 'Fortnite server ping'
-       Desc  = 'Measures your ping to every Fortnite region so you can pick the lowest in matchmaking settings.'
+       Desc  = 'Measures your ping to every Fortnite region, using the server list Fortnite itself downloads, and shows the closest city of each, so you can pick the lowest in matchmaking settings.'
        Warn  = 'Never. This only measures, it changes nothing.' }
 
     @{ Id = 'dns'; Cat = 'Network'; Icon = [char]0xE72C; Action = 'Flush now'
@@ -4853,7 +6732,7 @@ $Tweaks = @(
 
     @{ Id = 'fpscap'; Cat = 'Fortnite'; Icon = [char]0xE9D9; Rec = $true; Extra = 'fps'
        Title = 'Stable FPS cap'
-       Desc  = 'A cap your PC can always hit keeps GPU load under 100%, which avoids queued frames.'
+       Desc  = 'A cap your PC can always hit keeps GPU load under 100%, which avoids queued frames. With frame data from your recent matches, the box starts at the FPS you held 95% of the time (kept under the G-SYNC limit), but only when your frame rate was steady.'
        Warn  = 'You prefer completely uncapped FPS. Fortnite must be closed.'
        Ini   = @{ FrameRateLimit = @({ '{0}.000000' -f [int]$script:FpsBox.Text }, '0.000000') }
        Test  = {
@@ -4870,7 +6749,7 @@ $Tweaks = @(
 
     @{ Id = 'fnmouse'; Cat = 'Fortnite'; Icon = [char]0xE962; Rec = $true
        Title = 'Turn off Fortnite mouse acceleration'
-       Desc  = 'Fortnite has its own mouse acceleration separate from Windows. This turns it off for raw aim.'
+       Desc  = 'Fortnite reads the mouse raw in matches, so Windows pointer settings do not change your aim, but its own mouse acceleration setting does. This turns it off for consistent aim.'
        Warn  = 'You play on controller only. Fortnite must be closed.'
        Ini   = @{ bDisableMouseAcceleration = @('True', 'False') } }
 
@@ -4894,7 +6773,7 @@ $Tweaks = @(
 
     @{ Id = 'compgfx'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Rec = $true
        Title = 'Competitive graphics'
-       Desc  = 'Shadows, effects, post-processing, lighting, reflections and foliage to Low. Textures untouched.'
+       Desc  = 'Shadows, effects, post-processing, lighting, reflections and foliage to Low. Textures untouched. In Performance mode Epic''s device profile already pins effects, reflections, ambient occlusion and foliage to off, so the gain there is small; in DirectX 12 these are the biggest GPU costs.'
        Warn  = 'You want the game to look its best. Low shadows also make enemies easier to see. Fortnite must be closed.'
        Ini   = @{
            'sg.ShadowQuality'             = @('0', '3', 'ScalabilityGroups')
@@ -5116,7 +6995,7 @@ $Tweaks = @(
 
     @{ Id = 'shadinglow'; Cat = 'Potato'; Icon = [char]0xE790; Rec = $false
        Title = 'Low shading quality'
-       Desc  = 'Simplest material shading. Less GPU work on every surface.'
+       Desc  = 'Simplest material shading. Less GPU work on every surface. DirectX 12 only: in Performance mode Epic''s device profile pins material quality to its lowest and ignores this setting.'
        Warn  = 'You want materials to look detailed. Fortnite must be closed.'
        Ini   = @{ 'sg.ShadingQuality' = @('0', '3', 'ScalabilityGroups') } }
 
@@ -5158,11 +7037,13 @@ $Tweaks = @(
            if ((Test-VrrActive) -eq $false) { throw 'G-SYNC is off on your PC, so a cap just below the refresh rate does not help. See the NVIDIA page.' }
            $cap = Get-VrrCap
            if (-not $cap) { throw 'Could not read your refresh rate.' }
+           $mc = try { Get-MeasuredFpsCap } catch { $null }
+           $why = if ($mc -and $mc.Cap -and $mc.Cap -lt $cap) { $cap = $mc.Cap; " (your last $($mc.Matches) matches held $cap FPS or more 95% of the time)" } else { '' }
            $script:FpsBox.Text = "$cap"
            $fps = $Tweaks | Where-Object { $_.Id -eq 'fpscap' }
            Invoke-TweakOn $fps
            Update-Card $fps; Update-Summary
-           "Fortnite FPS cap set to $cap."
+           "Fortnite FPS cap set to $cap$why."
        } }
 
     @{ Id = 'ccdpin'; Cat = 'Fortnite'; Icon = [char]0xE964; Action = 'Pin now'; Lat = $true
@@ -5334,19 +7215,23 @@ $Tweaks = @(
 
     @{ Id = 'kernelsched'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $false; Badge = 'restart'
        Title = 'Remove unproven scheduler tweaks'
-       Desc  = 'Deletes undocumented kernel scheduler values written by other tools. None has evidence; wrong values can cause stutter.'
+       Desc  = 'Deletes undocumented kernel scheduler and DPC values written by other tools, including a zeroed DPC watchdog, which turns a driver fault into a hard freeze instead of a crash report. None has evidence; wrong values can cause stutter.'
        Warn  = 'You set these yourself and measured an improvement. Every value is backed up and comes back if you switch this off.'
        Remove = @(
            foreach ($n in 'ReadyTimeTicks', 'ScanLatencyTicks', 'ThreadReadyCount', 'BoostingPeriodMultiplier', 'ForceForegroundBoostDecay',
-                          'SerializeTimerExpiration', 'ThreadDpcEnable', 'TimerCheckFlags', 'EnableTickAccumulationFromAccountingPeriods', 'EnablePerCpuClockTickScheduling') {
+                          'SerializeTimerExpiration', 'ThreadDpcEnable', 'TimerCheckFlags', 'EnableTickAccumulationFromAccountingPeriods', 'EnablePerCpuClockTickScheduling',
+                          'DpcTimeout', 'DpcWatchdogPeriod', 'MaximumDpcQueueDepth', 'MinimumDpcRate', 'IdealDpcRate', 'UnlimitDpcQueue') {
                @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; N = $n }
+           }
+           foreach ($n in 'IRQ0Priority', 'IRQ8Priority', 'ThreadBoostType', 'ThreadSchedulingModel', 'AdjustDpcThreshold', 'DeepIoCoalescingEnabled', 'IdealDpcRate', 'SchedulerAssistThreadFlagOverride', 'ForegroundBoost') {
+               @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl'; N = $n }
            }
        ) }
 
     # ---------------------------------------------- network + Fortnite (research round 2)
     @{ Id = 'framegen'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
        Title = 'Turn off frame generation'
-       Desc  = 'DLSS Frame Generation inserts fake frames and adds input delay, even with Reflex on.'
+       Desc  = 'DLSS Frame Generation inserts fake frames and adds input delay, even with Reflex on. DirectX 12 only: in Performance mode Epic''s device profile switches DLSS off, so frame generation cannot run there anyway.'
        Warn  = 'You play casually on a weak GPU and prefer smoothness over responsiveness. Fortnite must be closed.'
        Ini   = @{ bEnableDLSSFrameGeneration = @('False', 'False') } }
 
@@ -5370,7 +7255,7 @@ $Tweaks = @(
 
     @{ Id = 'texturelow'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Rec = $false
        Title = 'Low textures (under 8 GB VRAM)'
-       Desc  = 'Stops hitching when textures overflow your graphics memory. No benefit on 8 GB+ cards.'
+       Desc  = 'Stops hitching when textures overflow your graphics memory. No benefit on 8 GB+ cards. The memory saving is DirectX 12 only: in Performance mode Epic''s device profile fixes the texture pool at 600 MB whatever the card, so there it only makes textures blurrier.'
        Warn  = 'Your GPU has 8 GB or more of video memory. Textures just look worse then. Fortnite must be closed.'
        Ini   = @{ 'sg.TextureQuality' = @('0', '2', 'ScalabilityGroups') } }
 
@@ -6135,7 +8020,7 @@ $Tweaks = @(
     @{ Id = 'fn-dlss'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
        Requires = { [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' -and $_ -match 'RTX' }) -and -not ((Test-Path $IniPath) -and (Get-IniValue (Get-Content $IniPath) 'PreferredFeatureLevel') -eq 'es31') }
        Title = 'Use DLSS upscaling (RTX, DirectX 12)'
-       Desc  = 'In DirectX 12, DLSS renders fewer pixels and upscales them cleanly, which gives more FPS and lower latency than native resolution or Epic''s TSR when your graphics card is the limit.'
+       Desc  = 'In DirectX 12, DLSS renders fewer pixels and upscales them cleanly, which gives more FPS and lower latency than native resolution or Epic''s TSR when your graphics card is the limit. No effect in Performance mode: Epic''s device profile switches DLSS off there.'
        Warn  = 'You play in Performance mode (no DLSS there), or your GPU usage is well under 90% (CPU-limited, so no gain). Your DLSS quality choice is kept. Fortnite must be closed.'
        Ini   = @{ FortAntiAliasingMethod = @('DLSS', $null) } }
 
@@ -6679,7 +8564,7 @@ $Tweaks = @(
     # ---------------------------------------------------------------- Network
     @{ Id = 'fn-subping'; Cat = 'Network'; Icon = [char]0xE909; Action = 'Test ping'; Lat = $true
        Title = 'Fortnite subregion ping'
-       Desc  = 'Each Fortnite region has servers in several cities (Europe: Germany, France, UK). This pings every one, so you can set Fortnite''s Subregion Preference to the closest instead of a random one.'
+       Desc  = 'Each Fortnite region has servers in several cities (Europe: Frankfurt, Paris, London; some run on Google Cloud). This pings every address in Fortnite''s own server list, so you can set Subregion Preference to the closest instead of a random one.'
        Warn  = ''
        Run   = { Start-FnSubPing; 'Pinging every Fortnite server city...' } }
 
@@ -6840,6 +8725,190 @@ $Tweaks = @(
        Desc  = 'Many tweak packs switch off Fortnite''s idle energy saving. It only lowers FPS after about 30 seconds without input in the lobby, never in a match, so switching it off just heats your PC between games.'
        Warn  = 'You leave the lobby running as a stream background and want full FPS while away. Fortnite must be closed.'
        Ini   = @{ bIsEnergySavingEnabledIdle = @('True', 'False') } }
+
+    # ======================================================= research round 6 (1.15)
+    # ---- fnlog (1.15)
+    # ------------------------------------------------------------- Fortnite
+    @{ Id = 'fn-bottleneck'; Cat = 'Fortnite'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Title = 'What limits your FPS in matches'
+       Desc  = 'Reads the performance summary Fortnite writes at the end of each match (frame time, game thread, render threads, GPU) and says per match whether the graphics card, the processor or a frame cap set your FPS, with the settings that help in your rendering mode.'
+       Warn  = ''
+       Run   = { Start-FnBottleneckCheck; 'Reading your last matches...' } }
+
+    @{ Id = 'fn-epicquality'; Cat = 'Fortnite'; Icon = [char]0xE896; Action = 'Show how'
+       Title = 'Epic Quality Assets: on or off (guided)'
+       Desc  = 'Since v42.30 the launcher option High Resolution Textures is called Epic Quality Assets: map terrain and objects are stored on disk instead of streamed mid-match. Worth it in DirectX 12 on High or Epic; only disk space in Performance mode or on Low. Shows what is installed and where to switch it.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnEpicQualityReport) 'Epic Quality Assets' 'OK' 'Information'); 'Shown.' } }
+
+    # ---------------------------------------------------------------- Input
+    @{ Id = 'fn-audiocheck'; Cat = 'Input'; Icon = [char]0xE767; Action = 'Check'
+       Title = 'Check Fortnite''s audio and dropouts'
+       Desc  = 'Reads Fortnite''s last log: the audio device it really used, the mixer rate and buffer, whether 3D Headphones is on, and how many real audio dropouts (buffer underruns) happened, leaving out the harmless one at start-up. Includes the reported fix for Razer THX Spatial distortion.'
+       Warn  = ''
+       Run   = { Start-FnAudioCheck; 'Reading Fortnite''s audio log...' } }
+
+    # ---- fnnet (1.15)
+
+    @{ Id = 'fn-qoslog'; Cat = 'Network'; Icon = [char]0xE909; Action = 'Check'; Lat = $true
+       Title = 'Your region ping as Fortnite measured it'
+       Desc  = 'At every start Fortnite sends 4 UDP echoes to each of its datacenters and logs the result. This reads that log: the game''s own ping per city, lost echoes, and which region and subregion Auto picks, next to ZeroDelay''s own ping if you ran Fortnite subregion ping.'
+       Warn  = ''
+       Run   = { Start-FnQosLog; 'Reading Fortnite''s region test...' } }
+
+    @{ Id = 'fn-matchdc'; Cat = 'Network'; Icon = [char]0xE774; Action = 'Check'; Lat = $true
+       Title = 'Where your last matches really ran'
+       Desc  = 'Reads each recent match server from Fortnite''s log and looks up its city and cloud (AWS or Google Cloud) in Epic''s server list and the published AWS and Google address lists (downloaded at most once a week). Shows whether Subregion Preference holds and whether your provider reaches one cloud worse.'
+       Warn  = ''
+       Run   = { Start-FnMatchDc; 'Looking up your recent match servers...' } }
+
+    @{ Id = 'fn-pingtruth'; Cat = 'Network'; Icon = [char]0xE9D9; Action = 'Check'
+       Title = 'Why your in-game ping differs'
+       Desc  = 'Explains Fortnite''s ping number (a UDP echo to the match server every 2 seconds with frame time left out, so FPS cannot raise it) and compares the game''s own numbers with ZeroDelay''s ping to the same servers. 15 ms or more above points at a booster, VPN or traffic shaper on the game''s path.'
+       Warn  = ''
+       Run   = { Start-FnPingTruth; 'Comparing the game''s ping with ZeroDelay''s...' } }
+
+    @{ Id = 'starlink-check'; Cat = 'Network'; Icon = [char]0xE753; Action = 'Check'
+       Requires = { Test-StarlinkCached }
+       Title = 'Starlink: pick the region by your ground station'
+       Desc  = 'Starlink traffic leaves the satellite network at a ground station (PoP) that can be far from home, so the right Fortnite region follows the PoP. This shows yours and the nearest Fortnite datacenter, and can run a 60-second test for the short spikes Starlink''s 15-second satellite reassignment causes.'
+       Warn  = ''
+       Run   = { Start-StarlinkCheck; 'Checking your Starlink ground station...' } }
+
+    # ---- frame (1.15)
+
+    @{ Id = 'fn-presentmode'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Action = 'Test'; Lat = $true
+       Title = 'Check how Fortnite reaches the screen'
+       Desc  = 'Watches Fortnite for 20 s with Intel PresentMon and shows how its frames reach the screen: directly (independent flip, as fast as exclusive fullscreen) or through Windows'' compositor, which adds about one refresh of delay. Also shows tearing, dropped frames and frame times.'
+       Warn  = 'Needs Fortnite running in a match and ZeroDelay as administrator. Downloads PresentMon from Intel (about 1 MB) once, after asking.'
+       Run   = { if (Start-FnPresentModeTest) { 'Measuring for 20 s: keep playing.' } else { 'Cancelled.' } } }
+
+    @{ Id = 'fn-latencytest'; Cat = 'Fortnite'; Icon = [char]0xE916; Action = 'Test'; Lat = $true
+       Title = 'Measure your PC latency, before and after'
+       Desc  = 'Records 90 s with PresentMon and Fortnite''s own NVIDIA latency markers: PC latency (median and 95%), frame times and animation error. Saves it as a baseline; change one card, measure again, and it tells you whether the difference is bigger than the run-to-run noise.'
+       Warn  = 'Needs Fortnite in a match, ZeroDelay as administrator and Reflex on (no markers on AMD or Intel cards). Compare only the same mode and similar spots.'
+       Run   = { if (Start-FnLatencyTest) { 'Measuring for 90 s: keep playing the same way.' } else { 'Cancelled.' } } }
+
+    @{ Id = 'fn-gpubound'; Cat = 'Fortnite'; Icon = [char]0xE9D9; Action = 'Test'; Lat = $true
+       Title = 'Is the graphics card the limit?'
+       Desc  = 'Samples Fortnite''s load on the graphics card for 20 s from Windows'' own counters. When it sits at 95% or more and Reflex is off, frames queue in front of the card and add delay; then a cap or Reflex fixes it. With Reflex on, it says so and leaves it.'
+       Warn  = 'Run it in a match: the lobby is capped by Fortnite and reads low. Frame generation makes the reading meaningless.'
+       Run   = { [void](Start-FnGpuBoundTest); 'Sampling the graphics card for 20 s: keep playing.' } }
+
+    @{ Id = 'fn-extlimiters'; Cat = 'Graphics'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Requires = { (Test-NvAvailable) -or [bool](Get-RtssDir) }
+       Title = 'Find FPS caps and V-Sync set outside Fortnite'
+       Desc  = 'Reads the NVIDIA driver profile for Fortnite and your global settings (Max Frame Rate, forced V-Sync, Fast Sync, half refresh, G-SYNC blocked for Fortnite) and RivaTuner''s limit, next to Fortnite''s own cap, and tells you which one really holds your FPS. Changes nothing.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnLimiterReport) 'Frame caps and V-Sync' 'OK' 'Information'); 'Checked.' } }
+
+    # ---- repair (1.15)
+
+    @{ Id = 'fn-aimreadout'; Cat = 'Input'; Icon = [char]0xE962; Action = 'Check'
+       Requires = { [bool](Get-FnCloudSettingsPath) }
+       Title = 'Read your Fortnite aim settings'
+       Desc  = 'Reads Fortnite''s own settings file and shows X/Y sensitivity, targeting and scope multipliers, edit multiplier, zoom scaling, Custom Diagonals and the controller lock-outs, with eDPI and cm per 360 at the DPI from the Sensitivity page. Read-only.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnAimReport) 'Your Fortnite aim settings' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'fn-inputpool'; Cat = 'Input'; Icon = [char]0xE7FC; Action = 'Check'
+       Title = 'Stray or virtual controller in Fortnite?'
+       Desc  = 'Finds virtual controller drivers (ViGEm, vJoy, HidHide), connected gamepads and remappers that can flip Fortnite from mouse to controller input mid-fight, and reads whether Fortnite''s Ignore Gamepad Input and Lock Input Method as Mouse are on. Reports only.'
+       Warn  = ''
+       Run   = { Start-BackgroundReport 'Get-FnInputPoolReport'; 'Looking for controllers...' } }
+
+    @{ Id = 'repair-bcd-anticheat'; Cat = 'Repair'; Icon = [char]0xE72E; Rec = $false; Badge = 'restart'
+       Requires = { Test-BcdRepairShown 'repair-bcd-anticheat' $script:BcdAntiCheat }
+       Title = 'Boot flags that stop Easy Anti-Cheat'
+       Desc  = 'Removes test signing, disabled driver-signature checks and kernel debugging from the boot settings. Easy Anti-Cheat refuses to start with any of them (error 30007), and unlock guides and unsigned driver mods leave them on.'
+       Warn  = 'An unsigned driver you rely on (some RGB, fan or controller-overclock tools) stops loading. If BitLocker is on, keep your recovery key at hand. The old values are backed up.'
+       Test  = { Test-BcdRepairClean $script:BcdAntiCheat }
+       On    = { Invoke-BcdRepairOn $t.Id $script:BcdAntiCheat }
+       Off   = { Invoke-BcdRepairOff $t.Id } }
+
+    @{ Id = 'repair-bcd-limits'; Cat = 'Repair'; Icon = [char]0xE964; Rec = $false; Badge = 'restart'
+       Requires = { Test-BcdRepairShown 'repair-bcd-limits' $script:BcdLimits }
+       Title = 'Remove core, RAM and debug boot limits'
+       Desc  = 'Removes boot settings that cap the CPU cores or RAM Windows uses (msconfig''s processor and memory limits), switch off early-launch anti-malware or MSI interrupts, or force debug-only APIC and PCI modes. Windows chooses these itself when they are absent.'
+       Warn  = 'You set one of these to work around a specific hardware fault. The old values are backed up and come back if you switch this off. If BitLocker is on, keep your recovery key at hand.'
+       Test  = { Test-BcdRepairClean $script:BcdLimits }
+       On    = { Invoke-BcdRepairOn $t.Id $script:BcdLimits }
+       Off   = { Invoke-BcdRepairOff $t.Id } }
+
+    @{ Id = 'repair-uac'; Cat = 'Repair'; Icon = [char]0xE72E; Rec = $false; Badge = 'restart'
+       Requires = { Test-RepairShown 'repair-uac' }
+       Title = 'Turn User Account Control back on'
+       Desc  = 'Another tool switched UAC fully off (EnableLUA = 0). Then Store apps, the Xbox app and Game Bar refuse to open, and every program runs with full administrator rights. It gains no FPS. Sets it back to the Windows default.'
+       Warn  = 'You turned UAC off yourself and accept the risk. To only stop the prompts, lower the slider in Control Panel instead. Needs a restart.'
+       Test  = { Test-RepairClean 'repair-uac' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'repair-tdr'; Cat = 'Repair'; Icon = [char]0xE7F4; Rec = $true; Badge = 'restart'
+       Requires = { Test-RepairShown 'repair-tdr' }
+       Title = 'Turn GPU hang recovery back on'
+       Desc  = 'Removes TdrLevel and TdrDebugMode values that switch off Windows'' graphics timeout recovery, and timeouts over a minute. Without it a driver hang freezes the whole PC until you hold the power button, instead of a 2-second reset. Microsoft says users should not change these.'
+       Warn  = 'A driver developer told you to set these for debugging. The values are backed up and come back if you switch this off.'
+       Test  = { Test-RepairClean 'repair-tdr' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'repair-vss'; Cat = 'Repair'; Icon = [char]0xE777; Rec = $true
+       Requires = { Test-RepairShown 'repair-vss' }
+       Title = 'Turn System Restore and shadow copies back on'
+       Desc  = 'Another tool disabled the Volume Shadow Copy service or turned System Restore off by policy. Then no restore point can be made, including ZeroDelay''s own, and Windows Backup and File History fail. The service only runs on demand, so it costs nothing while you play.'
+       Warn  = 'You turned System Restore off on purpose to save disk space. The values are backed up and come back if you switch this off.'
+       Test  = { Test-RepairClean 'repair-vss' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'repair-wu-services'; Cat = 'Repair'; Icon = [char]0xE777; Rec = $false
+       Requires = { Test-RepairShown 'repair-wu-services' }
+       Title = 'Turn Windows Update services back on'
+       Desc  = 'Another tool disabled the Windows Update, Update Orchestrator, Update Medic or BITS service, or their scan tasks. Microsoft ships game fixes through them (the 2025 Easy Anti-Cheat crash fix on 24H2, the 2026 mouse-stutter fix) and Defender stops getting updates. Restores the Windows defaults.'
+       Warn  = 'You block updates on purpose. To keep updates from interrupting games, use the Windows Update cards (no restarts while signed in, active hours) instead. Some parts are protected; ZeroDelay then shows the steps.'
+       Test  = { Test-RepairClean 'repair-wu-services' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'repair-defender'; Cat = 'Repair'; Icon = [char]0xE83D; Rec = $false; Badge = 'restart'
+       Requires = { Test-RepairShown 'repair-defender' }
+       Title = 'Turn Microsoft Defender back on'
+       Desc  = 'Shown only when no other antivirus is active and a tool switched Defender, real-time protection or SmartScreen off by policy or service. That gains no measured FPS and leaves the PC unprotected; the Defender cards on the Background tab cut its game impact instead.'
+       Warn  = 'You use another protection setup Windows does not report. Defender''s services are protected by Windows; if they cannot be switched back, ZeroDelay shows the steps. Every value is backed up.'
+       Test  = { Test-RepairClean 'repair-defender' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'repair-ifeo-junk'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $false
+       Requires = { Test-RepairShown 'repair-ifeo-junk' }
+       Title = 'Remove fake Fortnite and csrss priority values'
+       Desc  = 'Removes made-up values tweak packs write for Fortnite (CpuUtilization, GpuSpeed, InputBoosted, Disable...Validation), a Realtime priority, the run-as-administrator layer that stops overlays hooking in, and priority overrides on csrss.exe. ZeroDelay''s own priority and fullscreen settings stay.'
+       Warn  = 'You set Fortnite to run as administrator on purpose. The values are backed up and come back if you switch this off. Restart Fortnite afterwards.'
+       Test  = { Test-RepairClean 'repair-ifeo-junk' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'repair-gamesvcs'; Cat = 'Repair'; Icon = [char]0xE7FC; Rec = $false; Badge = 'restart'
+       Requires = { Test-RepairShown 'repair-gamesvcs' }
+       Title = 'Turn game services and IPv6 back on'
+       Desc  = 'Sets the Xbox Accessory, GameInput, Easy Anti-Cheat and Multimedia Class Scheduler services back from Disabled to their Windows defaults, and IPv6 from fully off to prefer-IPv4. Disabled, they break controllers, Fortnite''s launch or audio priority, and gain nothing.'
+       Warn  = 'You disabled GameInput yourself as a workaround (it is skipped when two GameInput versions are installed). Only the start type is changed; nothing is started or touched in Easy Anti-Cheat.'
+       Test  = { Test-RepairClean 'repair-gamesvcs' }
+       On    = { Invoke-RepairCardOn $t.Id }
+       Off   = { Invoke-RepairCardOff $t.Id } }
+
+    @{ Id = 'pack-scan'; Cat = 'Repair'; Icon = [char]0xE9F9; Action = 'Check'
+       Title = 'Scan for other optimizers'' leftovers'
+       Desc  = 'Runs every Repair card''s check at once and lists what tweak packs left behind: boot flags that stop Easy Anti-Cheat, disabled UAC, GPU recovery, restore points, Windows Update or Defender, fake Fortnite values, disabled game services. Nothing is changed.'
+       Warn  = ''
+       Run   = { Start-PackScan; 'Checking for leftovers...' } }
+
+    @{ Id = 'win-activation'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'; Lat = $true
+       Title = 'Is Windows activated?'
+       Desc  = 'Reads the Windows licence state. Unactivated Windows draws the Activate Windows watermark over every window, which a Blur Busters report links to borderless games staying composed (about one refresh of extra delay). Reports only; advises legitimate activation.'
+       Warn  = ''
+       Run   = { Start-BackgroundReport 'Get-WinActivationReport'; 'Reading the licence state...' } }
 
     # ======================================================= research round 5 (1.14)
     # ---- fngpu (1.14)
@@ -7080,9 +9149,9 @@ $Tweaks = @(
     # ------------------------------------------------------------ Fortnite
     @{ Id = 'tournament-ready'; Cat = 'Fortnite'; Icon = [char]0xE72E; Action = 'Check'
        Title = 'Check Fortnite tournament readiness'
-       Desc  = 'Since 19 February 2026 Epic requires Secure Boot, TPM 2.0 and IOMMU for every PC tournament. Checks all three and gives the BIOS steps for any that is off. Normal matches do not need them, and none of the three costs FPS on its own.'
+       Desc  = 'Since 19 February 2026 Epic requires Secure Boot, TPM 2.0 and IOMMU for every PC tournament. Checks all three and gives the BIOS steps for any that is off, plus the keyboard rules for events (Wooting at LAN, Snap Tap / SOCD). None of the three costs FPS on its own.'
        Warn  = ''
-       Run   = { [void](Show-ZdDialog (Get-TournamentReport) 'Tournament readiness' 'OK' 'Information'); 'Checked.' } }
+       Run   = { [void](Show-ZdDialog ((Get-TournamentReport) + (Get-TournamentInputNote)) 'Tournament readiness' 'OK' 'Information'); 'Checked.' } }
 
     # ---- sys (1.14)
 
@@ -7456,7 +9525,7 @@ $Tweaks = @(
     # ============================================================== Fortnite
     @{ Id = 'grass'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Rec = $true
        Title = 'Hide grass'
-       Desc  = 'Grass costs GPU time and can hide players lying in it.'
+       Desc  = 'Grass costs GPU time and can hide players lying in it. DirectX 12 only: in Performance mode Epic''s device profile already sets grass density to 0 and ignores this setting.'
        Warn  = 'You want the full look of the map. Fortnite must be closed.'
        Ini   = @{ bShowGrass = @('False', 'True') } }
 
@@ -7468,8 +9537,8 @@ $Tweaks = @(
 
     @{ Id = 'gpucrashdbg'; Cat = 'Fortnite'; Icon = [char]0xE7BA; Rec = $true
        Title = 'GPU crash debugging off'
-       Desc  = 'If left on after a crash it adds heavy GPU overhead every frame. This makes sure it is off.'
-       Warn  = 'Epic support asked you to turn it on to diagnose crashes. Fortnite must be closed.'
+       Desc  = 'Fortnite''s GPU Crash Debugging option exists in every rendering mode since v42.20, Performance mode included. It turns on driver validation that Epic''s engineers say adds a non-negligible performance cost, so it is not meant for normal play. This makes sure it is off.'
+       Warn  = 'Epic support asked you to turn it on to diagnose crashes. NVIDIA Aftermath crash reports stay on either way (Epic''s default). Fortnite must be closed.'
        Ini   = @{ bUseGPUCrashDebugging = @('False', 'False') } }
 
     @{ Id = 'fnhdr'; Cat = 'Fortnite'; Icon = [char]0xE790; Rec = $false
@@ -7496,7 +9565,7 @@ $Tweaks = @(
 
     @{ Id = 'fnfso'; Cat = 'Fortnite'; Icon = [char]0xE740; Rec = $false; Badge = 'advanced'
        Title = 'Disable fullscreen optimizations'
-       Desc  = 'Forces legacy exclusive fullscreen for Fortnite only. Some PCs get lower latency, others none.'
+       Desc  = 'Turns off fullscreen optimizations for Fortnite only. In DirectX 11 that forced legacy exclusive fullscreen; Fortnite now runs DirectX 12 in both rendering modes, which has no legacy exclusive mode, so expect no difference.'
        Warn  = 'Alt-tab becomes slow, or you see no difference. Test with and without.'
        Test  = { if (-not $script:FortniteExe) { return $null }; "$(Get-RegValue $LayersKey $script:FortniteExe)" -match 'DISABLEDXMAXIMIZEDWINDOWEDMODE' }
        On    = {
@@ -7693,12 +9762,10 @@ $Gtx1080Ids = @('perfmode', 'meshquality', 'nanite', 'reflex', 'vsync', 'fullscr
 foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
 
 # Cards added in the latest research round, shown together in the "New tweaks" tab (they stay in their own tabs too)
-$NewIds = @('epic-autostart', 'fn-displaycheck', 'fn-argaudit', 'fn-ecoqos', 'fn-mitigations', 'fn-drive', 'fn-streamcache', 'tournament-ready',
-            'nv-drivercheck', 'nv-gsyncwindowed', 'nv-bgfps', 'rebar-check', 'pcie-link', 'mixed-refresh',
-            'wifi-mtk-lowpower', 'wifi-mtk-roam', 'wifi-intel-bgscan', 'vnic-metric', 'repair-tcpleftovers', 'nat-check', 'nic-msi', 'rtl-gigalite-off',
-            'ccd-balanced', 'ccd-parking', 'amd-chipset', 'ftpm-stutter', 'ram-xmp', 'ram-channels', 'whea-scan', 'amd-uep-off', 'amd-uep-task',
-            'ssd-health', 'thirdparty-av', 'bios-age', 'win-updatecheck', 'gameinput-dup', 'audio-default', 'admin-protection',
-            'kerneldriver-tools', 'inpoutx64-off', 'idle-spikes', 'task-audit', 'hyperv-check')
+$NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn-matchdc', 'fn-pingtruth', 'starlink-check',
+            'fn-presentmode', 'fn-latencytest', 'fn-gpubound', 'fn-extlimiters', 'fn-aimreadout', 'fn-inputpool',
+            'pack-scan', 'repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services',
+            'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
@@ -8813,7 +10880,9 @@ function New-Card($t) {
 "@)
         $script:FpsBox = $panel.Children[0]
         $cur = if (Test-Path $IniPath) { Get-IniValue (Get-Content $IniPath) 'FrameRateLimit' } else { $null }
-        $script:FpsBox.Text = if ($cur -and [double]$cur -gt 0) { [int][double]$cur } else { Get-RefreshRate }
+        $mc = if (-not ($cur -and [double]$cur -gt 0)) { try { Get-MeasuredFpsCap } catch { $null } }
+        $script:FpsBox.Text = if ($cur -and [double]$cur -gt 0) { [int][double]$cur } elseif ($mc -and $mc.Cap) { $mc.Cap } else { Get-RefreshRate }
+        if ($mc -and $mc.Cap) { $script:FpsBox.ToolTip = "Measured: your last $($mc.Matches) matches held $($mc.Cap) FPS or more 95% of the time (median $([int]$mc.Med))." }
         $extra.Content = $panel
     }
     if ($t.Extra -eq 'res') {
@@ -9385,12 +11454,12 @@ $script:PingTimer.Add_Tick({
     $best = $res | Where-Object { $_.Ms } | Sort-Object Ms | Select-Object -First 1
     $lines = foreach ($r in $res) {
         $ms = if ($r.Ms) { "$($r.Ms) ms" } else { 'no reply' }
-        $mark = if ($best -and $r.Name -eq $best.Name) { '  < best' } else { '' }
-        '{0,-12}{1,9}{2}' -f $r.Name, $ms, $mark
+        $mark = if ($best -and $r.Name -eq $best.Name) { ' < best' } else { '' }
+        '{0,-12}{1,8} {2,-4}{3}' -f $r.Name, $ms, "$($r.Sub)", $mark
     }
     # two columns to fit the card
     $half = [Math]::Ceiling($lines.Count / 2)
-    $rows = for ($i = 0; $i -lt $half; $i++) { '{0,-30}{1}' -f $lines[$i], $(if ($i + $half -lt $lines.Count) { $lines[$i + $half] } else { '' }) }
+    $rows = for ($i = 0; $i -lt $half; $i++) { '{0,-33}{1}' -f $lines[$i], $(if ($i + $half -lt $lines.Count) { $lines[$i + $half] } else { '' }) }
     $script:PingText.Text = $rows -join "`n"
     $script:PingBtn.IsEnabled = $true
     $script:PingBtn.Content = 'Test ping'
@@ -9399,15 +11468,7 @@ function Start-PingTest($btn) {
     $script:PingBtn = $btn
     $btn.IsEnabled = $false; $btn.Content = 'Testing...'
     $script:PingText.Text = 'Pinging Fortnite regions...'
-    $script:PingJob = Start-Job -ArgumentList (, $PingHosts) -ScriptBlock {
-        param($list)
-        foreach ($h in $list) {
-            $p = New-Object System.Net.NetworkInformation.Ping
-            $times = @()
-            1..4 | ForEach-Object { try { $r = $p.Send($h.Host, 1000); if ($r.Status -eq 'Success') { $times += $r.RoundtripTime } } catch {} }
-            [pscustomobject]@{ Name = $h.Name; Ms = $(if ($times.Count) { [int](($times | Measure-Object -Average).Average) } else { $null }) }
-        }
-    }
+    $script:PingJob = Start-Job -ArgumentList (, @(Get-FnRegionPingList)) -ScriptBlock $FnRegionPingJob
     $script:PingTimer.Start()
 }
 
@@ -9419,7 +11480,7 @@ $Categories = @(
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
        Note = 'Only the tweaks that change input delay, frame time or ping. Green icons mark them in every tab.' }
     @{ Name = 'New';        Icon = [char]0xE735; Title = 'New tweaks'
-       Note = 'The cards added in 1.14: hardware checks (RAM, PCIe, Resizable BAR, drives), G-SYNC in borderless, Windows bug checks, Wi-Fi and network fixes. Each one also stays in its usual tab. Nothing here is switched on for you.' }
+       Note = 'New and reworked in 1.15: what limits your FPS in real matches, where your matches really ran, present-mode and latency tests, your Fortnite sensitivity, and repairs for tweak-pack leftovers. Each card also stays in its usual tab. Nothing here is switched on for you.' }
     @{ Name = 'GameMode';   Icon = [char]0xE768; Title = 'Game Mode'; Page = 'GameMode' }
     @{ Name = 'Events';     Icon = [char]0xE7C1; Title = 'Tournaments'; Page = 'Events' }
     @{ Name = 'Potato';     Icon = [char]0xE7F4; Title = 'Potato graphics'
@@ -9543,8 +11604,8 @@ function Get-HealthIssues {
 
     $lines = if (Test-Path $IniPath) { Get-Content $IniPath } else { @() }
     # --- aim
-    if ((St 'mouse') -eq $false) { Add-Issue 3 'Windows mouse acceleration is on' 'The same hand movement gives different aim depending on speed. Every pro turns this off.' 'mouse' }
-    if ((St 'fnmouse') -eq $false) { Add-Issue 3 'Fortnite mouse acceleration is on' 'Fortnite has its own acceleration on top of Windows. Needs Fortnite closed to fix.' 'fnmouse' }
+    if ((St 'mouse') -eq $false) { Add-Issue 3 'Windows mouse acceleration is on' 'The cursor moves further on fast movements: desktop, menus and games that use the Windows cursor. Fortnite matches read the mouse raw, so in-match aim is not affected.' 'mouse' }
+    if ((St 'fnmouse') -eq $false) { Add-Issue 3 'Fortnite mouse acceleration is on' 'Fortnite has its own acceleration setting, and it is the one that affects in-match aim (matches read the mouse raw). Needs Fortnite closed to fix.' 'fnmouse' }
     # --- frames
     $cap = [double](Get-IniValue $lines 'FrameRateLimit'); $vrr = Get-VrrCap
     $hz = (Get-Displays | Where-Object Discrete | Measure-Object Hz -Maximum).Maximum
@@ -9559,7 +11620,7 @@ function Get-HealthIssues {
     }
     if ((St 'vsync') -eq $false) { Add-Issue 3 'V-Sync is on in Fortnite' 'V-Sync holds every frame for the next refresh and adds a lot of delay.' 'vsync' }
     if ((Get-IniValue $lines 'LatencyTweak2') -ne '2' -and (Test-NvAvailable)) { Add-Issue 3 'NVIDIA Reflex is not on "On + Boost"' 'Reflex is the biggest single latency setting for NVIDIA cards.' 'reflex' }
-    if ((Get-IniValue $lines 'bEnableDLSSFrameGeneration') -eq 'True') { Add-Issue 2 'Frame generation is on' 'Generated frames look smoother but add input delay.' 'framegen' }
+    if ((Get-IniValue $lines 'bEnableDLSSFrameGeneration') -eq 'True' -and -not (Test-FnPerformanceMode)) { Add-Issue 2 'Frame generation is on' 'Generated frames look smoother but add input delay.' 'framegen' }
     if ((St 'refreshrate') -eq $false) { Add-Issue 3 'Your main monitor is below its highest refresh rate' 'Windows often leaves high-Hz monitors at 60 Hz.' 'refreshrate' }
     $d = Get-Displays
     $igpu = @($d | Where-Object { -not $_.Discrete }); $dgpu = @($d | Where-Object Discrete)
@@ -10163,13 +12224,12 @@ function New-BenchmarkPage {
         $b[$n].Add_Click({ param($s, $e) $script:BenchSeconds = $s.Tag; Update-BenchDurationButtons })
     }
     $b.Get.Add_Click({
-        $r = (Show-ZdDialog ("Download PresentMon 2.6.0 from Intel's official GitHub page?`n`n$PresentMonUrl`n`nIt is Intel's free frame-time recorder. ZeroDelay saves it to its own folder and only runs it when you start a benchmark.") ('Download PresentMon') ('YesNo') ('Question'))
+        $r = (Show-ZdDialog ("Download PresentMon 2.6.0 (PresentMon-2.6.0-x64.exe, $([Math]::Round($PresentMonBytes / 1KB)) KB) from Intel's official GitHub page?`n`n$PresentMonUrl`n`nIt is Intel's free frame-time recorder. ZeroDelay checks its SHA-256 against Intel's release, saves it to its own folder and only runs it when you start a benchmark.") ('Download PresentMon') ('YesNo') ('Question'))
         if ($r -ne 'Yes') { return }
         try {
             $window.Cursor = [Windows.Input.Cursors]::Wait
             New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $PresentMonUrl -OutFile $PresentMonExe -UseBasicParsing
+            Save-PresentMon
             Show-Toast 'PresentMon downloaded. You can benchmark now.' '#30D158'
         } catch { Show-Toast "Download failed: $($_.Exception.Message)" '#FF9F0A' }
         finally { $window.Cursor = $null; Update-BenchmarkPage }
@@ -10444,7 +12504,7 @@ function Update-BenchmarkPage {
         $w1 = [int](260 * $r.AvgFps / $maxFps); $w2 = [int](260 * $r.Low1 / $maxFps)
         $when = try { ([datetime]$r.Time).ToString('dd MMM HH:mm') } catch { '' }
         $tag = if ($r -eq $best -and $runs.Count -gt 1) { "<Border Background='#2D4635' CornerRadius='5' Padding='7,2' Margin='10,0,0,0'><TextBlock Text='Best 1% low' FontSize='11' Foreground='#30D158' FontWeight='SemiBold'/></Border>" } else { '' }
-        $lat = if ($r.Latency) { "$($r.Latency) ms $($r.LatencyKind)" } else { 'latency n/a' }
+        $lat = if ($r.Latency) { "$($r.Latency) ms $("$($r.LatencyKind)" -replace '^input latency$', 'input-to-frame estimate')" } else { 'latency n/a' }
         $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='18,14' Margin='0,0,0,10'>
@@ -11071,7 +13131,7 @@ function Invoke-Wizard {
     Save-Backup; Update-All
     Add-History 'Setup wizard finished' 'wizard' $null
     $ui.Wizard.Visibility = 'Collapsed'
-    Show-Toast ("All set: $($msg -join ', '). " + $(if ($rp -like 'Restore point created*') { 'A restore point was made first.' } else { '' })) '#30D158'
+    Show-Toast ("All set: $($msg -join ', '). " + $(if ($rp -like 'Restore point created*') { 'A restore point was made first.' } elseif ($rp -like 'Could not*') { "No restore point was made. $rp" } else { '' })) $(if ($rp -like 'Could not*') { '#FF9F0A' } else { '#30D158' })
     $script:NavButtons['Health'].IsChecked = $true
 }
 
@@ -11380,6 +13440,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.15.0' = @(
+        @{ T = 'What limits your FPS'; D = 'Reads the summary Fortnite writes after every match and says whether your processor, your graphics card or a frame cap held you back, with the settings that help in your rendering mode.' }
+        @{ T = 'Where your matches really ran'; D = 'Fortnite''s own server list and region test, the server of every match (Amazon or Google Cloud), and whether your provider routes worse to one of them. The subregion ping card works again and uses the game''s real servers.' }
+        @{ T = 'Present mode and latency tests'; D = 'Intel PresentMon (downloaded only when you allow it, hash-checked) shows whether Fortnite gets the direct-to-screen mode and measures your PC latency, with a before/after comparison.' }
+        @{ T = 'Repairs for tweak-pack leftovers'; D = 'Finds boot settings that stop Easy Anti-Cheat, processor and memory limits, UAC off, GPU crash recovery off, broken restore points, Windows Update or Defender off and fake boost values on Fortnite. Each card shows only when the problem exists.' }
+        @{ T = 'Honest corrections'; D = 'Grass, shading, textures, DLSS and frame generation do nothing in Performance mode (Epic''s profile overrides them), and Windows pointer precision and key repeat do not reach Fortnite in a match. Those cards now say so.' }
+    )
     '1.14.0' = @(
         @{ T = 'Live view on Home'; D = 'CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a one-minute graph, plus the apps using the most CPU right now. It only measures while Home is open.' }
         @{ T = '43 new cards from 8 research passes'; D = 'All in the New tweaks tab, and each also in its usual tab. Nothing is switched on for you.' }
@@ -11594,7 +13661,7 @@ function Get-MouseVerdict($r) {
     if ($rate -le 250) { return @("$rate Hz is slow for gaming: up to $([Math]::Round(1000 / $rate)) ms between mouse updates. Almost every gaming mouse can do 1000 Hz; set it in your mouse software (Logitech G HUB, Razer Synapse, SteelSeries GG, ...) or with the button under the mouse.", '#FF453A') }
     if ($rate -eq 500) { return @('500 Hz works, but 1000 Hz halves the gap between mouse updates (2 ms to 1 ms). Set 1000 Hz in your mouse software if it offers it.', '#FF9F0A') }
     if ($rate -eq 1000) { return @('1000 Hz and steady: the competitive standard. Nothing to change.', '#30D158') }
-    @("$rate Hz and steady: very smooth. If Fortnite ever stutters while you flick, try 1000 Hz, because high rates need more CPU time.", '#30D158')
+    @("$rate Hz and steady: very smooth. Fortnite reads the mouse on its own input thread, so this rate is fine for it; if your FPS or 1% lows drop when you flick fast, try 2000 or 1000 Hz (Windows still spends a little CPU time per report).", '#30D158')
 }
 function New-MousePage {
     $root = [ZdTheme]::Parse(@"
@@ -11629,7 +13696,7 @@ function New-MousePage {
     <StackPanel>
       <TextBlock Text='Good to know' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
       <TextBlock Foreground='#A1A1A6' FontSize='12.5' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'
-        Text='&#x2022;  1000 Hz is the competitive standard: a new mouse position every 1 ms. 500 Hz waits up to 2 ms, 125 Hz up to 8 ms.&#x0a;&#x2022;  2000 to 8000 Hz feels even smoother but costs CPU time; if Fortnite stutters when you flick, go back to 1000 Hz.&#x0a;&#x2022;  Change the rate in your mouse software (Logitech G HUB, Razer Synapse, SteelSeries GG, ...) or with the button under the mouse.&#x0a;&#x2022;  Plug the mouse or its wireless receiver straight into the PC, not into a hub, keyboard or front-panel port.'/>
+        Text='&#x2022;  1000 Hz is the competitive standard: a new mouse position every 1 ms. 500 Hz waits up to 2 ms, 125 Hz up to 8 ms.&#x0a;&#x2022;  2000 to 8000 Hz feels even smoother. Fortnite reads the mouse on its own input thread (Unreal Engine 5.7 moved it off the game thread for 8000 Hz mice), so high rates no longer slow the game itself; Windows still spends a little CPU time per report. If FPS or 1% lows drop when you flick fast, try 2000 or 1000 Hz.&#x0a;&#x2022;  Change the rate in your mouse software (Logitech G HUB, Razer Synapse, SteelSeries GG, ...) or with the button under the mouse.&#x0a;&#x2022;  Plug the mouse or its wireless receiver straight into the PC, not into a hub, keyboard or front-panel port.'/>
     </StackPanel>
   </Border>
 </StackPanel>
@@ -11884,7 +13951,7 @@ function New-MatchReport($Start, $End, $Frames, $Samples) {
     # frames
     $stutters = @(); $fps = $null
     if ($Frames -and $Frames.Frames -gt 0) {
-        $fps = [pscustomobject]@{ Avg = [Math]::Round($Frames.AvgFps); Low1 = [Math]::Round($Frames.Low1Fps); Frames = $Frames.Frames }
+        $fps = [pscustomobject]@{ Avg = [Math]::Round($Frames.AvgFps); Low1 = [Math]::Round($Frames.Low1Fps); Frames = $Frames.Frames; P5 = [Math]::Round($Frames.P5Fps, 1); Med = [Math]::Round($Frames.MedFps, 1) }
         for ($i = 0; $i -lt $Frames.StutterAtMs.Length; $i++) {
             # PresentMon stops with Fortnite, so frame times are counted back from the end of the session
             $at = $End.AddMilliseconds(-($Frames.TotalMs - $Frames.StutterAtMs[$i]))
@@ -12127,7 +14194,7 @@ function Update-MatchesPage {
             if ($more -gt 0) { $stX += "<TextBlock Text='and $more more' FontSize='12' Foreground='#98989D' Margin='0,4,0,0'/>" }
         }
         $gpuX = if ($r.GpuMaxTemp) { "  ·  GPU up to $($r.GpuMaxTemp) °C" } else { '' }
-        if ($r.Latency) { $gpuX = "  ·  $($r.Latency) ms $($r.LatencyKind)" + $gpuX }
+        if ($r.Latency) { $gpuX = "  ·  $($r.Latency) ms $("$($r.LatencyKind)" -replace '^input latency$', 'input-to-frame estimate')" + $gpuX }
         $netX = if ($null -ne $r.PingAvg) { "Connection to Epic's $($r.PingRegion) servers: $($r.PingAvg) ms ping, $($r.Jitter) ms jitter, $($r.LossPct)% lost$(if ($r.Boosted) { '   (a ping booster was running: it routes the game''s own traffic, so this shows your normal connection)' })" } else { '' }
         $warmX = if ($r.AfterUpdate) { "<TextBlock Text='$(Esc "First match after an update ($($r.AfterUpdate)): some stutter while shaders compile is normal.")' FontSize='12' Foreground='#0A84FF' Margin='0,6,0,0' TextWrapping='Wrap'/>" } else { '' }
         $fixes = @(Get-MatchFixes $r)
@@ -15203,7 +17270,7 @@ function Update-TrendsPage {
     # small multiples, one measure each
     if (@($avg | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'FPS' @(@{ Name = 'Average'; Values = $avg; Color = $col.S1 }, @{ Name = '1% low'; Values = $low; Color = $col.S2 }) 'FPS' $reps $marks $false)) }
     if (@($stu | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'Stutters per match' @(@{ Name = 'Stutters'; Values = $stu; Color = $col.S1 }) '' $reps $marks $true)) }
-    if (@($lat | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart "Input latency ($(@($reps | Where-Object { $_.LatencyKind } | Select-Object -Last 1).LatencyKind))" @(@{ Name = 'Latency'; Values = $lat; Color = $col.S1 }) 'ms' $reps $marks $true)) }
+    if (@($lat | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart "Latency ($("$(@($reps | Where-Object { $_.LatencyKind } | Select-Object -Last 1).LatencyKind)" -replace '^input latency$', 'input-to-frame estimate'))" @(@{ Name = 'Latency'; Values = $lat; Color = $col.S1 }) 'ms' $reps $marks $true)) }
     if (@($png | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'Ping to Epic''s servers' @(@{ Name = 'Ping'; Values = $png; Color = $col.S1 }) 'ms' $reps $marks $true)) }
     if (-not $g.Charts.Children.Count) { [void]$g.Charts.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='These matches have no frame or ping data yet. Download PresentMon on the Benchmark page for FPS, stutters and latency.' Foreground='#A1A1A6' TextWrapping='Wrap'/>")) }
     # the same numbers as a table
@@ -15660,9 +17727,10 @@ function New-ZeroDelayRestorePoint {
     try { Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop } catch {}
     $before = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue).Count
     try { Checkpoint-Computer -Description 'ZeroDelay - before tweaks' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningAction SilentlyContinue }
-    catch { return "Could not create a restore point: $($_.Exception.Message)" }
+    catch { return "Could not create a restore point: $($_.Exception.Message)$(Get-RestorePointHint)" }
     $after = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue).Count
     if ($after -gt $before) { $script:Backup.Custom['restorepoint'] = (Get-Date).ToString('o'); Save-Backup; return 'Restore point created. You can roll back from Control Panel > Recovery.' }
+    $hint = Get-RestorePointHint; if ($hint) { return "Could not create a restore point.$hint" }
     'Windows skipped it: it only allows one restore point every 24 hours, and one already exists from today.'
 }
 $ui.RestorePoint.Add_Click({
@@ -15735,7 +17803,7 @@ function Invoke-ApplyTweaks($pick) {
     if (-not $script:Backup.Custom.ContainsKey('restorepoint')) {
         $r = (Show-ZdDialog ("Create a Windows restore point first? It takes a few seconds and lets you roll everything back.") ('Restore point') ('YesNoCancel') ('Question'))
         if ($r -eq 'Cancel') { return }
-        if ($r -eq 'Yes') { $window.Cursor = [Windows.Input.Cursors]::Wait; Show-Toast (New-ZeroDelayRestorePoint) '#A1A1A6'; $window.Cursor = $null }
+        if ($r -eq 'Yes') { $window.Cursor = [Windows.Input.Cursors]::Wait; $rpm = New-ZeroDelayRestorePoint; Show-Toast $rpm $(if ($rpm -like 'Could not*') { '#FF9F0A' } else { '#A1A1A6' }); $window.Cursor = $null }
         else { $script:Backup.Custom['restorepoint'] = 'declined'; Save-Backup }
     }
     $window.Cursor = [Windows.Input.Cursors]::Wait

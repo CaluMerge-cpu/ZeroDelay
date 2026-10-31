@@ -17,7 +17,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
   advice for undervolting and cooling an older card.
 
-- **280+ tweaks and checks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
+- **300+ tweaks and checks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
   A **New tweaks** tab collects the cards added in the latest version.
 - **Hardware checks**: EXPO/XMP off, single-channel memory, a graphics card on fewer PCIe lanes, Resizable BAR,
@@ -33,10 +33,15 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   VAC-blocking `-insecure`), Steam overlay/downloads/recording, CS2 version and drive, and sensitivity in cm/360. VAC-safe:
   nothing touches the game files or anti-cheat.
 - **Your real matches**: reads Fortnite's own log for ping, jitter and packet loss per match, real in-match stutters (loading
-  screens left out), which graphics card and renderer Fortnite used, whether Reflex was on, and recent crashes.
-- **Fortnite subregion ping**: Epic's regions have servers in several cities (Europe: Germany, France, UK); ZeroDelay pings
-  each one so you can set Fortnite's Subregion Preference, plus a one-minute jitter and loss test, a route check that shows
-  where lag starts, and Epic's live server status.
+  screens left out), which graphics card and renderer Fortnite used, whether Reflex was on, recent crashes, and whether
+  your processor, graphics card or a frame cap limited your FPS in each match.
+- **Fortnite subregion ping**: pings the servers in Fortnite's own datacenter list (Amazon and Google Cloud) so you can set
+  Fortnite's Subregion Preference, shows the game's own region test and where every match really ran, plus a one-minute
+  jitter and loss test, a route check that shows where lag starts, and Epic's live server status.
+- **Present mode and latency tests** with Intel PresentMon (downloaded only when you allow it, hash-checked): whether
+  Fortnite gets the direct-to-screen mode, and PC latency with a before/after comparison.
+- **Repairs for tweak-pack leftovers**: boot settings that stop Easy Anti-Cheat, processor and memory limits, UAC off,
+  GPU crash recovery off, broken restore points, Windows Update or Defender off. Each card shows only when the problem exists.
 - **Game Mode**: a booster-style dashboard with a Start Game button (turns Game Mode on and launches Fortnite), a
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses
