@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.17.0'
+$AppVersion = '1.18.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -8876,6 +8876,1046 @@ $Tweaks = @(
        Warn  = 'You leave the lobby running as a stream background and want full FPS while away. Fortnite must be closed.'
        Ini   = @{ bIsEnergySavingEnabledIdle = @('True', 'False') } }
 
+    # ======================================================= more games (1.18)
+    # ---- cs2stats (1.18)
+
+    @{ Id = 'cs-gsi'; Cat = 'CS2'; Icon = [char]0xE9D2; Rec = $false
+       Requires = { Test-Cs2Installed }
+       Title = 'CS2 match stats'
+       Desc  = 'Adds a Valve Game State Integration file to CS2''s cfg folder, so CS2 sends your own scoreboard to ZeroDelay on this PC (127.0.0.1 only) while you play. ZeroDelay saves kills, deaths, headshots, damage and the result of each match. Restart CS2 after switching it on.'
+       Warn  = 'Official Valve feature: it does not touch game files or VAC, and nothing leaves your PC. Only records while ZeroDelay is open. Do not want stats kept: leave it off.'
+       Test  = { $f = Get-Cs2GsiCfgPath; if (-not $f) { return $null }; Test-Path -LiteralPath $f }
+       On    = { Enable-Cs2Gsi; Update-Cs2GsiListener }
+       Off   = { Disable-Cs2Gsi; Update-Cs2GsiListener } }
+
+    # ---- fps games (1.18): VALORANT, Overwatch 2, Rainbow Six Siege X
+    # ======================================================= VALORANT
+    # Vanguard: only GameUserSettings.ini (per-PC video file), the NVIDIA 'Valorant' profile and Windows' GPU choice.
+    @{ Id = 'val-latency-guide'; Cat = 'Valorant'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'valorant' }
+       Title = 'VALORANT: lowest-latency video settings (guided)'
+       Desc  = 'Reflex, the frame limit, multithreaded rendering and the raw input buffer live in your Riot account settings, which Riot syncs from its servers and can overwrite in the file, so set them in the game. VALORANT was one of NVIDIA''s first Reflex games.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In VALORANT: Settings > Video.`n`nGeneral:`n1. Display Mode: Fullscreen.`n2. Limit FPS Always: Off with Reflex, or a cap your PC holds in every fight (a few FPS below your refresh rate with G-SYNC/FreeSync).`n`nGraphics Quality:`n3. Multithreaded Rendering: On (spreads the CPU work over more cores).`n4. NVIDIA Reflex Low Latency: On + Boost (NVIDIA cards).`n5. VSync: Off.`n6. Material, Texture, Detail quality: Low gives the most FPS; Anti-Aliasing and Anisotropic Filtering cost little.`n`nSettings > General > Mouse:`n7. Raw Input Buffer: On (reads a high-polling-rate mouse more efficiently).`n`nThese save to your Riot account, so they follow you to any PC. ZeroDelay does not edit them: Riot overwrites the local copy when you sign in.") ('VALORANT latency settings') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'val-vsync-off'; Cat = 'Valorant'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'valorant' }
+       Title = 'VALORANT: turn off V-Sync'
+       Desc  = 'V-Sync holds each frame until the next screen refresh, which queues frames and adds input delay. This sets bUseVSync=False in VALORANT''s per-PC GameUserSettings.ini for the account that played last.'
+       Warn  = 'You hate tearing and have no G-SYNC/FreeSync. If it turns back on, Riot restored it from your account: switch it off in the game. VALORANT must be closed.'
+       GameIni = @(@{ Game = 'valorant'; Section = '/Script/ShooterGame.ShooterGameUserSettings'; Key = 'bUseVSync'; V = 'False' })
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'val-fullscreen'; Cat = 'Valorant'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'valorant' }
+       Title = 'VALORANT: exclusive fullscreen'
+       Desc  = 'Fullscreen lets VALORANT present frames straight to the display instead of through the desktop compositor, the lowest-latency path. Sets the Unreal fullscreen mode values (0 = fullscreen) in GameUserSettings.ini.'
+       Warn  = 'You alt-tab a lot or use a second monitor while playing. If Riot resets it, pick Fullscreen in Settings > Video. VALORANT must be closed.'
+       GameIni = @(@{ Game = 'valorant'; Section = '/Script/ShooterGame.ShooterGameUserSettings'; Key = 'FullscreenMode'; V = '0' },
+                   @{ Game = 'valorant'; Section = '/Script/ShooterGame.ShooterGameUserSettings'; Key = 'LastConfirmedFullscreenMode'; V = '0' },
+                   @{ Game = 'valorant'; Section = '/Script/ShooterGame.ShooterGameUserSettings'; Key = 'PreferredFullscreenMode'; V = '0' })
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'val-nv-smoothmotion'; Cat = 'Valorant'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'valorant') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for VALORANT'
+       Desc  = 'Smooth Motion is NVIDIA''s driver frame generation: if it is switched on globally it inserts generated frames, which add input delay. This pins it off in the driver''s own Valorant profile. Driver setting only; Vanguard and the game are not touched.'
+       Warn  = 'You want generated frames in VALORANT. It does nothing on graphics cards before RTX 40. Restart VALORANT after changing it.'
+       Nv    = @{ Profile = 'Valorant'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'val-nv-power'; Cat = 'Valorant'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'valorant') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for VALORANT'
+       Desc  = 'VALORANT is light on the graphics card, so at high FPS the driver often drops its clocks and each frame takes longer to render. This keeps clocks up while VALORANT runs (driver Valorant profile only).'
+       Warn  = 'You already use Reflex On + Boost (it does the same), you are on a laptop on battery, or you care about power and heat. Restart VALORANT after changing it.'
+       Nv    = @{ Profile = 'Valorant'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'val-gpupref'; Cat = 'Valorant'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'valorant') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run VALORANT on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning VALORANT-Win64-Shipping.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting; the game is not touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart VALORANT after changing it.'
+       Test  = { $e = Get-GameExePath 'valorant'; if (-not $e) { return $null }; "$(Get-RegValue $GpuPrefKey $e)" -match 'GpuPreference=2;' }
+       On    = {
+           $e = Get-GameExePath 'valorant'; $cur = "$(Get-RegValue $GpuPrefKey $e)"
+           $new = if ($cur -match 'GpuPreference=\d;') { $cur -replace 'GpuPreference=\d;', 'GpuPreference=2;' } else { "GpuPreference=2;$cur" }
+           Set-RegTracked $t.Id $GpuPrefKey $e $new 'String'
+       }
+       Off   = { if (-not (Restore-RegTweak $t.Id)) { $e = Get-GameExePath 'valorant'; $v = "$(Get-RegValue $GpuPrefKey $e)" -replace 'GpuPreference=2;', ''; if ($v) { Set-RegValue $GpuPrefKey $e $v 'String' } else { Remove-RegValue $GpuPrefKey $e } } } }
+
+    # ======================================================= Overwatch 2
+    # Settings_v0.ini writes Key = "value" (quoted, spaced) and leaves out keys at their default.
+    @{ Id = 'ow-latency-guide'; Cat = 'Overwatch'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'overwatch' }
+       Title = 'Overwatch 2: Reflex, Reduce Buffering, FPS cap'
+       Desc  = 'NVIDIA Reflex, Reduce Buffering and the frame-rate limit are the settings that decide Overwatch 2''s input delay. Their names in Settings_v0.ini are not documented anywhere reliable, so ZeroDelay shows where to set them instead of guessing.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Overwatch 2: Options > Video.`n`n1. Display Mode: Fullscreen.`n2. NVIDIA Reflex: Enabled + Boost (NVIDIA cards). Reflex keeps the frame queue empty.`n3. Reduce Buffering: On. It lowers the frames the game buffers ahead; turn it off only if your FPS drops well below your refresh rate.`n4. Triple Buffering: Off. V-Sync: Off.`n5. Frame Rate: Custom, set to a cap your PC holds in team fights (a few FPS below your refresh rate with G-SYNC/FreeSync), or high with Reflex on.`n6. Dynamic Render Scale: Off, so the picture does not change sharpness mid-fight.`n`nClose Overwatch 2 normally afterwards so it saves the file.") ('Overwatch 2 latency settings') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'ow-vsync-off'; Cat = 'Overwatch'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'overwatch' }
+       Title = 'Overwatch 2: turn off V-Sync'
+       Desc  = 'V-Sync waits for the screen refresh before showing each frame, which adds input delay. Sets VerticalSyncEnabled = "0" in [Render.13] of Settings_v0.ini, where the game keeps it.'
+       Warn  = 'You hate tearing and have no G-SYNC/FreeSync monitor. Overwatch 2 must be closed.'
+       GameIni = @(@{ Game = 'overwatch'; Section = 'Render.13'; Key = 'VerticalSyncEnabled'; V = '"0"' })
+       Test  = { $p = Get-GameCfgPath 'overwatch'; if (-not $p) { return $null }; $v = Get-GameIniValue 'overwatch' 'Render.13' 'VerticalSyncEnabled'; ($null -eq $v) -or ($v -eq '"0"') }
+       On    = {
+           Enable-GameIni $t
+           # Overwatch writes 'Key = "value"': keep its spacing on a line ZeroDelay added
+           $p = Get-GameCfgPath 'overwatch'; $c = Read-GameCfg $p
+           for ($i = 0; $i -lt $c.Lines.Count; $i++) { if ("$($c.Lines[$i])" -match '^(VerticalSyncEnabled)="') { $c.Lines[$i] = "$($c.Lines[$i])" -replace '^(\w+)="', '$1 = "' } }
+           Write-GameCfg $p $c
+       }
+       Off   = { Disable-GameIni $t } }
+
+    @{ Id = 'ow-triplebuffer-off'; Cat = 'Overwatch'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'overwatch' }
+       Title = 'Overwatch 2: turn off Triple Buffering'
+       Desc  = 'Triple Buffering only matters with V-Sync and adds a frame of queue. Sets TripleBufferingEnabled = "0" in [Render.13] of Settings_v0.ini, the key shared configs show for this setting.'
+       Warn  = 'You play with V-Sync on and want smoother frame pacing more than lower delay. Overwatch 2 must be closed.'
+       GameIni = @(@{ Game = 'overwatch'; Section = 'Render.13'; Key = 'TripleBufferingEnabled'; V = '"0"' })
+       Test  = { $p = Get-GameCfgPath 'overwatch'; if (-not $p) { return $null }; $v = Get-GameIniValue 'overwatch' 'Render.13' 'TripleBufferingEnabled'; ($null -eq $v) -or ($v -eq '"0"') }
+       On    = {
+           Enable-GameIni $t
+           $p = Get-GameCfgPath 'overwatch'; $c = Read-GameCfg $p
+           for ($i = 0; $i -lt $c.Lines.Count; $i++) { if ("$($c.Lines[$i])" -match '^(TripleBufferingEnabled)="') { $c.Lines[$i] = "$($c.Lines[$i])" -replace '^(\w+)="', '$1 = "' } }
+           Write-GameCfg $p $c
+       }
+       Off   = { Disable-GameIni $t } }
+
+    @{ Id = 'ow-nv-smoothmotion'; Cat = 'Overwatch'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'overwatch') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Overwatch 2'
+       Desc  = 'Smooth Motion is NVIDIA''s driver frame generation: if it is switched on globally it inserts generated frames, which add input delay. This pins it off in the driver''s own Overwatch 2 profile.'
+       Warn  = 'You want generated frames in Overwatch 2. It does nothing on graphics cards before RTX 40. Restart the game after changing it.'
+       Nv    = @{ Profile = 'Overwatch 2'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'ow-gpupref'; Cat = 'Overwatch'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'overwatch') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Overwatch 2 on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning Overwatch.exe to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Overwatch 2 after changing it.'
+       Test  = { $e = Get-GameExePath 'overwatch'; if (-not $e) { return $null }; "$(Get-RegValue $GpuPrefKey $e)" -match 'GpuPreference=2;' }
+       On    = {
+           $e = Get-GameExePath 'overwatch'; $cur = "$(Get-RegValue $GpuPrefKey $e)"
+           $new = if ($cur -match 'GpuPreference=\d;') { $cur -replace 'GpuPreference=\d;', 'GpuPreference=2;' } else { "GpuPreference=2;$cur" }
+           Set-RegTracked $t.Id $GpuPrefKey $e $new 'String'
+       }
+       Off   = { if (-not (Restore-RegTweak $t.Id)) { $e = Get-GameExePath 'overwatch'; $v = "$(Get-RegValue $GpuPrefKey $e)" -replace 'GpuPreference=2;', ''; if ($v) { Set-RegValue $GpuPrefKey $e $v 'String' } else { Remove-RegValue $GpuPrefKey $e } } } }
+
+    # ======================================================= Rainbow Six Siege X
+    # GameSettings.ini documents its own values in comments: VSync 0 = off; WindowMode 0 = fullscreen; NVReflex 0/1/2.
+    @{ Id = 'r6-vsync-off'; Cat = 'R6Siege'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'r6siege' }
+       Title = 'Siege: turn off V-Sync'
+       Desc  = 'V-Sync makes Siege wait one or two screen refreshes per frame (the file''s own notes: 1 = one frame, 2 = two frames), which adds input delay. Sets VSync=0 in [DISPLAY_SETTINGS] of GameSettings.ini.'
+       Warn  = 'You hate tearing and have no G-SYNC/FreeSync monitor. Siege must be closed.'
+       GameIni = @(@{ Game = 'r6siege'; Section = 'DISPLAY_SETTINGS'; Key = 'VSync'; V = '0' })
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'r6-reflex'; Cat = 'R6Siege'; Icon = [char]0xE945; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'r6siege') -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' }) }
+       Title = 'Siege: NVIDIA Reflex on'
+       Desc  = 'Reflex stops the CPU queuing frames ahead of the graphics card, so your aim reaches the screen sooner; NVIDIA lists Siege as a Reflex game. Sets NVReflex=1 (the file''s notes: 1 = On, 2 = On + Boost) in [DISPLAY].'
+       Warn  = 'Your graphics card is not NVIDIA (GTX 900 or newer). On + Boost chosen in the game also counts as on and is kept. Siege must be closed.'
+       GameIni = @(@{ Game = 'r6siege'; Section = 'DISPLAY'; Key = 'NVReflex'; V = '1' })
+       Test  = { if (-not (Get-GameCfgPath 'r6siege')) { return $null }; (Get-GameIniValue 'r6siege' 'DISPLAY' 'NVReflex') -in '1', '2' }
+       On    = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'r6-buffered'; Cat = 'R6Siege'; Icon = [char]0xE9D9; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'r6siege' }
+       Title = 'Siege: at most 1 frame buffered by the GPU'
+       Desc  = 'MaxGPUBufferedFrame sets how many frames Siege lets queue for the graphics card. 1 keeps the queue short, which lowers input delay when the GPU is the limit. Sets MaxGPUBufferedFrame=1 in [DISPLAY_SETTINGS].'
+       Warn  = 'Your FPS drops or stutters afterwards (weak CPU): turn it off. With Reflex on, Reflex already keeps the queue empty, so this changes little. Not every value is documented by Ubisoft. Siege must be closed.'
+       GameIni = @(@{ Game = 'r6siege'; Section = 'DISPLAY_SETTINGS'; Key = 'MaxGPUBufferedFrame'; V = '1' })
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'r6-fullscreen'; Cat = 'R6Siege'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'r6siege' }
+       Title = 'Siege: exclusive fullscreen'
+       Desc  = 'Fullscreen lets Siege present frames straight to the display instead of through the desktop compositor, the lowest-latency path. Sets WindowMode=0 (the file''s notes: 0 = fullscreen, 1 = windowed, 2 = borderless).'
+       Warn  = 'You alt-tab a lot or use a second monitor while playing. Siege must be closed.'
+       GameIni = @(@{ Game = 'r6siege'; Section = 'DISPLAY_SETTINGS'; Key = 'WindowMode'; V = '0' })
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'r6-nv-smoothmotion'; Cat = 'R6Siege'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'r6siege') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Siege'
+       Desc  = 'Smooth Motion is NVIDIA''s driver frame generation: if it is switched on globally it inserts generated frames, which add input delay. This pins it off in the driver''s own Rainbow Six Siege profile.'
+       Warn  = 'You want generated frames in Siege. It does nothing on graphics cards before RTX 40. Restart Siege after changing it.'
+       Nv    = @{ Profile = 'Tom Clancy''s Rainbow Six: Siege'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'r6-gpupref'; Cat = 'R6Siege'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'r6siege') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Siege on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning Siege''s game exes (RainbowSix.exe, and RainbowSix_Vulkan.exe when present) to the high-performance one in Windows stops them ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Siege after changing it.'
+       Test  = {
+           $d = Get-GameInstallDir 'r6siege'; if (-not $d) { return $null }
+           $ex = @('RainbowSix.exe', 'RainbowSix_Vulkan.exe' | ForEach-Object { Join-Path $d $_ } | Where-Object { Test-Path $_ })
+           -not ($ex | Where-Object { "$(Get-RegValue $GpuPrefKey $_)" -notmatch 'GpuPreference=2;' })
+       }
+       On    = {
+           $d = Get-GameInstallDir 'r6siege'
+           foreach ($e in @('RainbowSix.exe', 'RainbowSix_Vulkan.exe' | ForEach-Object { Join-Path $d $_ } | Where-Object { Test-Path $_ })) {
+               $cur = "$(Get-RegValue $GpuPrefKey $e)"
+               $new = if ($cur -match 'GpuPreference=\d;') { $cur -replace 'GpuPreference=\d;', 'GpuPreference=2;' } else { "GpuPreference=2;$cur" }
+               Set-RegTracked $t.Id $GpuPrefKey $e $new 'String'
+           }
+       }
+       Off   = {
+           if (Restore-RegTweak $t.Id) { return }
+           $d = Get-GameInstallDir 'r6siege'
+           foreach ($e in @('RainbowSix.exe', 'RainbowSix_Vulkan.exe' | ForEach-Object { Join-Path $d $_ })) {
+               $v = "$(Get-RegValue $GpuPrefKey $e)" -replace 'GpuPreference=2;', ''
+               if ($v) { Set-RegValue $GpuPrefKey $e $v 'String' } else { Remove-RegValue $GpuPrefKey $e }
+           }
+       } }
+
+    # ---- ue games (1.18): Marvel Rivals, Rematch, Where Winds Meet
+
+    # --------------------------------------------------------- Marvel Rivals (kernel anti-cheat: settings file and driver only)
+    @{ Id = 'mr-gpupref'; Cat = 'MarvelRivals'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'marvelrivals') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Marvel Rivals on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning Marvel-Win64-Shipping.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: nothing in the game is touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Marvel Rivals after changing it.'
+       Test  = { Test-GameGpuPref @(Get-GameExePath 'marvelrivals') }
+       On    = { Enable-GameGpuPref $t @(Get-GameExePath 'marvelrivals') }
+       Off   = { Disable-GameGpuPref $t @(Get-GameExePath 'marvelrivals') } }
+
+    @{ Id = 'mr-smoothmotion'; Cat = 'MarvelRivals'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'marvelrivals') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Marvel Rivals'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Marvel Rivals profile.'
+       Warn  = 'You want generated frames in Marvel Rivals. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Marvel Rivals'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'mr-nvpower'; Cat = 'MarvelRivals'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'marvelrivals') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for Rivals'
+       Desc  = 'When Marvel Rivals is CPU-bound the graphics card idles between frames, so the driver drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex On + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Marvel Rivals'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'mr-guide'; Cat = 'MarvelRivals'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'marvelrivals' }
+       Title = 'Marvel Rivals: low-delay menu settings (guided)'
+       Desc  = 'The settings that change input delay and frame pacing, and where they are in the menu: frame cap, display mode, low latency mode and AMD Anti-Lag 2. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Settings > Display and Graphics:`n`n1. Display Mode: Fullscreen, at your monitor's native resolution.`n2. V-Sync: Off.`n3. Limit FPS: On. With G-SYNC or FreeSync, cap 3 to 4 FPS below your refresh rate; without it, cap where your FPS stays steady in team fights.`n4. Low Latency Mode: NVIDIA Reflex Low Latency (On + Boost if the CPU is the limit). On Radeon: AMD Anti-Lag 2.`n5. Frame Generation: Off for competitive play.`n`nNetEase has asked players not to modify game files, and has flagged edited config files in matches. ZeroDelay only writes menu values while the game is closed and never touches Engine.ini.") ('Marvel Rivals') ('OK') ('Information')); 'Shown.' } }
+
+    # --------------------------------------------------------- Rematch (Easy Anti-Cheat: settings file and driver only)
+    @{ Id = 'rm-vsync-off'; Cat = 'Rematch'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'rematch' }
+       Title = 'Rematch: V-Sync off'
+       Desc  = 'Sets V-Sync to off in the settings Rematch''s menu saves, so frames are shown as soon as they are ready instead of waiting for the monitor. Only works once the game has saved this setting: change any graphics option once.'
+       Warn  = 'Tearing bothers you more than the delay. With G-SYNC or FreeSync and a frame cap, V-Sync off is still right. Rematch must be closed.'
+       GameIni = @( @{ Game = 'rematch'; Section = ''; Key = 'bUseVSync'; V = 'False'; Find = $true } )
+       Test  = { if (-not (Resolve-UeIniSection $t)) { return $null }; Test-GameIni $t }
+       On    = { if (-not (Resolve-UeIniSection $t)) { throw 'Rematch has not saved its V-Sync setting yet. Start it, change any graphics option, close it, then try again.' }; Enable-GameIni $t }
+       Off   = { if (Resolve-UeIniSection $t) { Disable-GameIni $t } } }
+
+    @{ Id = 'rm-gpupref'; Cat = 'Rematch'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'rematch') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Rematch on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning RuntimeClient-Win64-Shipping.exe (Rematch''s game exe) to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Rematch after changing it.'
+       Test  = { Test-GameGpuPref @(Get-GameExePath 'rematch') }
+       On    = { Enable-GameGpuPref $t @(Get-GameExePath 'rematch') }
+       Off   = { Disable-GameGpuPref $t @(Get-GameExePath 'rematch') } }
+
+    @{ Id = 'rm-smoothmotion'; Cat = 'Rematch'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'rematch') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Rematch'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Rematch profile.'
+       Warn  = 'You want generated frames in Rematch. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Rematch'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'rm-nvpower'; Cat = 'Rematch'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'rematch') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for Rematch'
+       Desc  = 'When Rematch is CPU-bound the graphics card idles between frames, so the driver drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex with Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Rematch'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'rm-guide'; Cat = 'Rematch'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'rematch' }
+       Title = 'Rematch: low-delay menu settings (guided)'
+       Desc  = 'The menu settings that change input delay and frame pacing in Rematch: window mode, frame cap, low latency mode and frame generation. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Rematch's graphics settings:`n`n1. Window Mode: Fullscreen.`n2. V-Sync: Off.`n3. Max FPS: with G-SYNC or FreeSync, 3 to 4 below your refresh rate; without, Off or a cap your PC holds steadily.`n4. Low latency mode (NVIDIA Reflex) On if your menu offers it.`n5. Frame Generation: Off. It adds input delay.`n6. Upscaling (DLSS, FSR or TSR) at Quality only if you need FPS. Some players report stutters or crashes with DLSS on RTX 50 cards and new drivers; if you see that, try FSR or TSR.`n`nRematch uses Easy Anti-Cheat. ZeroDelay only writes the settings file the menu saves, with the game closed.") ('Rematch') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'rm-cfgreset'; Cat = 'Rematch'; Icon = [char]0xE90F; Action = 'Fix'
+       Requires = { Test-GameInstalled 'rematch' }
+       Title = 'Rematch settings not saving: start fresh'
+       Desc  = 'Settings that will not stick are often left over from the beta. This moves Rematch''s settings folder aside (it is renamed, not deleted) so the game writes fresh defaults on the next start. Your account and progress are online and stay.'
+       Warn  = 'You will need to set graphics, controls and audio again. Rematch must be closed.'
+       Run   = {
+           $d = Get-RematchCfgDir; if (-not $d) { [void](Show-ZdDialog 'Rematch has no settings folder on this PC yet, so there is nothing to reset.' 'Rematch' 'OK' 'Information'); return 'Nothing to reset.' }
+           if ((Show-ZdDialog "This renames`n$d`nso Rematch starts with default settings. To undo, delete the new Config folder and rename the backup back to Config.`n`nContinue?" 'Rematch' 'YesNo' 'Warning') -ne 'Yes') { return 'Cancelled.' }
+           $to = Reset-RematchCfg
+           "Moved to $(Split-Path $to -Leaf)."
+       } }
+
+    # --------------------------------------------------------- Where Winds Meet (NetEase anti-cheat, binary settings: driver and Windows only)
+    @{ Id = 'wwm-gpupref'; Cat = 'WhereWindsMeet'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'wwm') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Where Winds Meet on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pins wwm.exe (both copies, Win64r and the Win64rh one for the Hong Kong, Macau and Taiwan servers) to the high-performance GPU in Windows.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart the game after changing it.'
+       Test  = { Test-GameGpuPref (Get-WwmExes) }
+       On    = { Enable-GameGpuPref $t (Get-WwmExes) }
+       Off   = { Disable-GameGpuPref $t (Get-WwmExes) } }
+
+    @{ Id = 'wwm-smoothmotion'; Cat = 'WhereWindsMeet'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'wwm') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for WWM'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay in combat. This pins it off in the driver''s own Where Winds Meet profile.'
+       Warn  = 'You play mostly for exploration and like the extra smoothness. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Where Winds Meet'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'wwm-nvpower'; Cat = 'WhereWindsMeet'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'wwm') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for WWM'
+       Desc  = 'In towns and crowded areas Where Winds Meet is often CPU-bound, so the graphics card idles, drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You are on a laptop on battery, or the PC runs hot: it uses more power even in menus.'
+       Nv    = @{ Profile = 'Where Winds Meet'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'wwm-guide'; Cat = 'WhereWindsMeet'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'wwm' }
+       Title = 'Where Winds Meet: low-delay settings (guided)'
+       Desc  = 'Where Winds Meet keeps its settings in binary files that only the game should write, so these are steps for its own menu and launch options: DirectX 12, V-Sync, Reflex, frame cap and frame generation. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("1. DirectX 12: Steam asks which version to start; pick DirectX 12. DLSS and DLSS frame generation only appear under DX12. If DX12 crashes on your PC, stay on DX11.`n`n2. In Settings > Display/Graphics:`n   - Display Mode: Fullscreen.`n   - V-Sync: Off.`n   - NVIDIA Reflex: On (On + Boost if the CPU is the limit).`n   - Frame rate limit: 3 to 4 below your refresh rate with G-SYNC or FreeSync.`n   - Frame Generation: Off for combat and PvP. It adds input delay; FSR frame generation shows the most artefacts.`n`nWhere Winds Meet uses NetEase's anti-cheat. ZeroDelay does not edit its files or folders, only the NVIDIA profile and Windows' graphics setting for wwm.exe.") ('Where Winds Meet') ('OK') ('Information')); 'Shown.' } }
+
+    # ---- sports (1.18)
+    # ------------------------------------------------------------- eFootball
+    @{ Id = 'efb-gpupref'; Cat = 'eFootball'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'efootball') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run eFootball on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning eFootball.exe to the high-performance one in Windows stops it ever starting on the integrated graphics, which would halve the frame rate or worse.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart eFootball after changing it.'
+       Test  = { Test-GameGpuPrefById 'efootball' }
+       On    = { Enable-GameGpuPrefById 'efootball' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'efootball' $t.Id } }
+
+    @{ Id = 'efb-fps'; Cat = 'eFootball'; Icon = [char]0xE9D9; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'efootball' }
+       Title = 'Frame rate and V-Sync in eFootball (guide)'
+       Desc  = 'eFootball''s own frame limit goes from 30 to 360 FPS or unlimited, and its V-Sync is double-buffered, which adds up to a frame of delay. ZeroDelay cannot set these for you: eFootball keeps them in a file it does not document.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In eFootball, open Settings > Graphics (the names can differ slightly between seasons):`n`n1. Maximum frame rate: pick your monitor's refresh rate (for example 144), or a value your PC always holds if it cannot reach that.`n2. V-Sync: Off for the least delay. Leave it on only if tearing bothers you and you have no G-SYNC or FreeSync monitor.`n3. With G-SYNC or FreeSync: V-Sync on, frame limit 3 to 4 below the refresh rate (141 on 144 Hz).`n`nCutscenes stay at 30 FPS whatever you choose; that is the engine, not your PC.") ('eFootball frame rate') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'efb-display'; Cat = 'eFootball'; Icon = [char]0xE740; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'efootball' }
+       Title = 'eFootball: fullscreen and the 720p bug (guide)'
+       Desc  = 'Exclusive fullscreen gives the lowest delay. In fullscreen eFootball always uses your desktop resolution, and with Windows display scaling above 100% it can drop to a blurry 720p. Render scale (down to 50%) is the way to gain FPS.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("1. In eFootball's display settings choose Fullscreen, not Windowed or Borderless.`n2. Need more FPS? Lower the rendering resolution percentage instead of the screen resolution: fullscreen always runs at your desktop resolution.`n3. Fullscreen looks like 720p? Set Windows Settings > System > Display > Scale to 100% and restart eFootball.`n`nZeroDelay does not apply the older 'Override high DPI scaling' compatibility fix: eFootball uses Denuvo Anti-Cheat, and compatibility flags on anti-cheat games are something ZeroDelay never changes.") ('eFootball display mode') ('OK') ('Information')); 'Shown.' } }
+
+    # ------------------------------------------------------------- NBA 2K27
+    @{ Id = 'nba-vsync-off'; Cat = 'NBA 2K27'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'nba2k27' }
+       Title = 'NBA 2K27: turn off V-Sync'
+       Desc  = 'Sets VSYNC to 0 in VideoSettings.cfg (1 is on, 2 is half the refresh rate). Frames reach the screen as soon as they are ready instead of waiting for the monitor, which removes V-Sync''s queuing delay. Use the in-game Reflex option with it.'
+       Warn  = 'Tearing bothers you, or you have G-SYNC/FreeSync and prefer V-Sync on with Reflex. Does nothing if your version of the file has no VSYNC line. NBA 2K27 must be closed.'
+       GameJson = @(@{ Game = 'nba2k27'; Key = 'VSYNC'; V = '0'; D = '1' })
+       Test  = { Test-GameJson $t }; On = { Enable-GameJson $t }; Off = { Disable-GameJson $t } }
+
+    @{ Id = 'nba-uploadheaps'; Cat = 'NBA 2K27'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'nba2k27' }
+       Title = 'NBA 2K27: GPU upload heaps off (stutter fix)'
+       Desc  = 'Sets ALLOW_GPU_UPLOAD_HEAPS to false in VideoSettings.cfg. This is the change 2K support gave NBA 2K26 players for stutter, freezes and low FPS, and players report it still helps in 2K27. It changes how textures are copied to the graphics card.'
+       Warn  = 'The game already runs smoothly for you: on some PCs it changes nothing. Only offered when your file has this line. NBA 2K27 must be closed.'
+       GameJson = @(@{ Game = 'nba2k27'; Key = 'ALLOW_GPU_UPLOAD_HEAPS'; V = 'false'; D = 'true' })
+       Test  = { Test-GameJson $t }; On = { Enable-GameJson $t }; Off = { Disable-GameJson $t } }
+
+    @{ Id = 'nba-gpupref'; Cat = 'NBA 2K27'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'nba2k27') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run NBA 2K27 on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning nba2k27.exe to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart NBA 2K27 after changing it.'
+       Test  = { Test-GameGpuPrefById 'nba2k27' }
+       On    = { Enable-GameGpuPrefById 'nba2k27' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'nba2k27' $t.Id } }
+
+    @{ Id = 'nba-nvpower'; Cat = 'NBA 2K27'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'nba2k27') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for 2K27'
+       Desc  = 'Sets Power management mode to Prefer maximum performance in NVIDIA''s own NBA 2K27 driver profile, so the graphics card does not drop its clocks between frames when the game leaves it partly idle.'
+       Warn  = 'You use Reflex On + Boost in the game (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'NBA 2K27'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'nba-reflex'; Cat = 'NBA 2K27'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'nba2k27' }
+       Title = 'NBA 2K27: Reflex and frame generation (guide)'
+       Desc  = 'NBA 2K27 adds NVIDIA Reflex and frame generation on PC. Reflex cuts input delay; frame generation adds it. The file key for Reflex is not documented, so set these in the game.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In NBA 2K27, open Settings > Video:`n`n1. Latency Reduction Method: NVIDIA Reflex Low Latency (On + Boost if you are not on battery).`n2. Frame Generation Method: None for the lowest delay. Generated frames look smoother but respond later.`n3. DLSS Neural Rendering (RTX 50 only): off if you want the most FPS; its cost grows with resolution.`n`nDo not also force Low Latency Mode in the NVIDIA app: Reflex replaces it.") ('NBA 2K27 latency') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'nba-halfrate'; Cat = 'NBA 2K27'; Icon = [char]0xE839; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'nba2k27' }
+       Title = 'NBA 2K27: Half-Rate Online Matches off (guide)'
+       Desc  = 'With Half-Rate Online Matches on, NBA 2K27 runs online games at 30 FPS, which doubles the time each frame takes. If your PC holds 60 in online play, turn it off.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In NBA 2K27, open Settings > Video and set Half-Rate Online Matches to Off.`n`nOnly leave it on if your PC cannot hold a steady 60 FPS online: a steady 30 is better than a frame rate that keeps dropping.`n`nPlayers report that the Park and other online modes stay limited to 60 FPS whatever your monitor can do. That limit is set by 2K and cannot be changed.") ('Half-Rate Online Matches') ('OK') ('Information')); 'Shown.' } }
+
+    # ------------------------------------------------------------- Undisputed
+    @{ Id = 'und-gpupref'; Cat = 'Undisputed'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'undisputed') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Undisputed on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning Undisputed.exe to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Undisputed after changing it.'
+       Test  = { Test-GameGpuPrefById 'undisputed' }
+       On    = { Enable-GameGpuPrefById 'undisputed' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'undisputed' $t.Id } }
+
+    @{ Id = 'und-fps'; Cat = 'Undisputed'; Icon = [char]0xE9D9; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'undisputed' }
+       Title = 'Undisputed: frame limits and V-Sync (guide)'
+       Desc  = 'Undisputed has separate Game and Menu Framerate Limits and a V-Sync option that reviewers found can stick the game near 27 FPS. A Menu limit of 30 has also been seen to cap the fights. Set these in the game.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Undisputed, open Settings > Graphics:`n`n1. V-Sync: Off. Use G-SYNC or FreeSync for tear-free play instead.`n2. Game Framerate Limit: your monitor's refresh rate, or the highest value your PC holds steadily.`n3. Menu Framerate Limit: 60 or higher, never 30: on some setups 30 also limits the fights.`n4. Need more FPS: lower Crowd Density first: guides name it as a big cost, and it does not affect the fight.") ('Undisputed frame rate') ('OK') ('Information')); 'Shown.' } }
+
+    # ------------------------------------------------------- more games, round 2 (1.18)
+    # ---- arena games (1.18): Rocket League, Apex Legends, THE FINALS
+
+    # --------------------------------------------------------- Rocket League (Easy Anti-Cheat: settings file and driver only)
+    @{ Id = 'rl-vsync-off'; Cat = 'RocketLeague'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'rocketleague' }
+       Title = 'Rocket League: V-Sync off'
+       Desc  = 'Sets UseVsync to False in TASystemSettings.ini, the file the game''s video menu writes. Frames are shown as soon as they are ready instead of waiting for the monitor, which removes V-Sync''s queuing delay.'
+       Warn  = 'Tearing bothers you more than the delay. With G-SYNC or FreeSync and a frame cap a few below the refresh rate, V-Sync off is still right. Rocket League must be closed.'
+       GameIni = @( @{ Game = 'rocketleague'; Section = 'SystemSettings'; Key = 'UseVsync'; V = 'False' } )
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'rl-threadlag'; Cat = 'RocketLeague'; Icon = [char]0xE9D9; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'rocketleague' }
+       Title = 'Rocket League: no render-thread frame lag'
+       Desc  = 'Sets OneFrameThreadLag to False. Unreal Engine 3 normally lets the render thread run a frame behind the game thread; this makes it keep up, which removes up to one frame of input delay. It is not in the game''s menu, but the game keeps the value.'
+       Warn  = 'Your FPS is low or uneven: the two threads stop overlapping, so FPS drops a little and some players see more stutter. Test it in free play. Rocket League must be closed.'
+       GameIni = @( @{ Game = 'rocketleague'; Section = 'SystemSettings'; Key = 'OneFrameThreadLag'; V = 'False' } )
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'rl-fullscreen'; Cat = 'RocketLeague'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'rocketleague' }
+       Title = 'Rocket League: exclusive fullscreen'
+       Desc  = 'Sets Fullscreen to True and Borderless to False in TASystemSettings.ini, the same as Window Mode: Fullscreen in the video menu. Rocket League is a DirectX 11 game, and exclusive fullscreen avoids the desktop compositor''s extra frame of delay.'
+       Warn  = 'You alt-tab a lot or use a second monitor while playing: borderless is easier. Rocket League must be closed.'
+       GameIni = @( @{ Game = 'rocketleague'; Section = 'SystemSettings'; Key = 'Fullscreen'; V = 'True' },
+                    @{ Game = 'rocketleague'; Section = 'SystemSettings'; Key = 'Borderless'; V = 'False' } )
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'rl-gpupref'; Cat = 'RocketLeague'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'rocketleague') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Rocket League on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning RocketLeague.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: nothing in the game is touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Rocket League after changing it.'
+       Test  = { Test-GameGpuPrefById 'rocketleague' }
+       On    = { Enable-GameGpuPrefById 'rocketleague' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'rocketleague' $t.Id } }
+
+    @{ Id = 'rl-nvprerender'; Cat = 'RocketLeague'; Icon = [char]0xEC4A; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'rocketleague') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: one queued frame for Rocket League'
+       Desc  = 'Rocket League has no Reflex, so the driver may queue several frames ahead when the graphics card is the limit. This sets maximum pre-rendered frames to 1 in the driver''s Rocket League profile, the same as Low Latency Mode: On.'
+       Warn  = 'Your FPS is far above your refresh rate anyway (then the queue is empty and nothing changes), or you see more stutter afterwards.'
+       Nv    = @{ Profile = 'Rocket League'; Id = 0x007BA09E; V = 1 } }
+
+    @{ Id = 'rl-nvpower'; Cat = 'RocketLeague'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'rocketleague') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for RL'
+       Desc  = 'Rocket League is light on the graphics card, so the driver often drops its clocks between frames and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You are on a laptop on battery, or the PC runs hot: it uses more power even in menus.'
+       Nv    = @{ Profile = 'Rocket League'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'rl-smoothmotion'; Cat = 'RocketLeague'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'rocketleague') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for RL'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Rocket League profile.'
+       Warn  = 'You want generated frames in Rocket League. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Rocket League'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'rl-guide'; Cat = 'RocketLeague'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'rocketleague' }
+       Title = 'Rocket League: frame cap and input buffer'
+       Desc  = 'The menu settings that change delay in Rocket League but are not in its settings file: the frame rate limit and the input buffer. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Settings > Video:`n`n1. Window Mode: Fullscreen.`n2. Frames Per Second: the highest value your PC holds in busy matches, or Uncapped. With G-SYNC or FreeSync, pick a value a few below your refresh rate if the list has one.`n3. Vertical Sync: Off.`n`nSettings > Gameplay:`n4. Input Buffer: Default. Epic says the other modes can add input delay and rubber-banding; only try STS if Default feels worse on your connection.`n`nRocket League uses Easy Anti-Cheat. ZeroDelay only writes TASystemSettings.ini with the game closed.") ('Rocket League') ('OK') ('Information')); 'Shown.' } }
+
+    # --------------------------------------------------------- Apex Legends (Easy Anti-Cheat: videoconfig.txt and driver only)
+    @{ Id = 'apex-vsync-off'; Cat = 'ApexLegends'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'apex' }
+       Title = 'Apex Legends: V-Sync off'
+       Desc  = 'Sets setting.mat_vsync_mode to 0 (Disabled) in videoconfig.txt, the file the video menu writes. Frames reach the screen as soon as they are ready instead of waiting for the monitor. Use Reflex in the game with it.'
+       Warn  = 'Tearing bothers you more than the delay. Only works once Apex has written the file: change any video setting once. Apex Legends must be closed.'
+       GameKv = @( @{ Game = 'apex'; Key = 'setting.mat_vsync_mode'; V = '0' } )
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'apex-fullscreen'; Cat = 'ApexLegends'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'apex' }
+       Title = 'Apex Legends: exclusive fullscreen'
+       Desc  = 'Sets setting.fullscreen to 1 and setting.nowindowborder to 0 in videoconfig.txt, the same as Display Mode: Full Screen. It avoids the desktop compositor and gives the lowest delay in Apex.'
+       Warn  = 'You alt-tab a lot or stream from the same PC: borderless window is easier. Apex Legends must be closed.'
+       GameKv = @( @{ Game = 'apex'; Key = 'setting.fullscreen'; V = '1' }, @{ Game = 'apex'; Key = 'setting.nowindowborder'; V = '0' } )
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'apex-gpupref'; Cat = 'ApexLegends'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'apex') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Apex Legends on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pins r5apex.exe and r5apex_dx12.exe (DirectX 11 and 12) to the high-performance one in Windows, so Apex never starts on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Apex after changing it.'
+       Test  = { Test-GameGpuPref (Get-ApexExes) }
+       On    = { Enable-GameGpuPref $t (Get-ApexExes) }
+       Off   = { Disable-GameGpuPref $t (Get-ApexExes) } }
+
+    @{ Id = 'apex-nvpower'; Cat = 'ApexLegends'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'apex') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for Apex'
+       Desc  = 'When Apex is CPU-bound the graphics card idles between frames, so the driver drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex Enabled + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Apex Legends'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'apex-smoothmotion'; Cat = 'ApexLegends'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'apex') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Apex'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Apex Legends profile.'
+       Warn  = 'You want generated frames in Apex. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Apex Legends'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'apex-guide'; Cat = 'ApexLegends'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'apex' }
+       Title = 'Apex Legends: Reflex and frame cap (guided)'
+       Desc  = 'Reflex is a menu setting and Apex''s frame cap is a launch option, so ZeroDelay shows where they are instead of changing them: Reflex, adaptive resolution and +fps_max. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Settings > Video:`n`n1. Display Mode: Full Screen. V-Sync: Disabled.`n2. NVIDIA Reflex: Enabled. Enabled + Boost only if your CPU is the limit (GPU usage well below 95%).`n3. Adaptive Resolution FPS Target: 0, so the resolution does not jump around.`n`nFrame cap (a launch option, not in the menu):`n4. Steam: right-click Apex Legends > Properties > Launch Options. EA app: Apex Legends > ... > View properties > Advanced launch options.`n5. Add +fps_max followed by your cap, for example +fps_max 237 on a 240 Hz G-SYNC or FreeSync monitor, or +fps_max 0 for no cap.`n`nApex uses Easy Anti-Cheat. ZeroDelay only writes videoconfig.txt with the game closed.") ('Apex Legends') ('OK') ('Information')); 'Shown.' } }
+
+    # --------------------------------------------------------- THE FINALS (Easy Anti-Cheat: settings file and driver only)
+    @{ Id = 'fin-vsync-off'; Cat = 'TheFinals'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'thefinals' }
+       Title = 'THE FINALS: V-Sync off'
+       Desc  = 'Sets bUseVSync to False in the settings THE FINALS'' menu saves (GameUserSettings.ini), so frames are shown as soon as they are ready. Only offered once the game has saved this setting: change any video option once.'
+       Warn  = 'Tearing bothers you more than the delay. Some players reported the menu''s V-Sync switch behaving the wrong way round in 2023; check with an FPS counter. THE FINALS must be closed.'
+       GameIni = @( @{ Game = 'thefinals'; Section = ''; Key = 'bUseVSync'; V = 'False'; Find = $true } )
+       Test  = { if (-not (Resolve-UeIniSection $t)) { return $null }; Test-GameIni $t }
+       On    = { if (-not (Resolve-UeIniSection $t)) { throw 'THE FINALS has not saved its V-Sync setting yet. Start it, change any video option, close it, then try again.' }; Enable-GameIni $t }
+       Off   = { if (Resolve-UeIniSection $t) { Disable-GameIni $t } } }
+
+    @{ Id = 'fin-gpupref'; Cat = 'TheFinals'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'thefinals') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run THE FINALS on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning Discovery.exe (THE FINALS'' game exe) to the high-performance one in Windows stops it ever starting on the integrated graphics, a common cause of crashes on laptops.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart THE FINALS after changing it.'
+       Test  = { Test-GameGpuPrefById 'thefinals' }
+       On    = { Enable-GameGpuPrefById 'thefinals' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'thefinals' $t.Id } }
+
+    @{ Id = 'fin-nvpower'; Cat = 'TheFinals'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'thefinals') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: maximum performance for THE FINALS'
+       Desc  = 'When THE FINALS is CPU-bound (big destruction, busy cash-outs) the graphics card idles between frames and the driver drops its clocks, so each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex On + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'The Finals'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'fin-smoothmotion'; Cat = 'TheFinals'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'thefinals') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for FINALS'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own The Finals profile.'
+       Warn  = 'You want generated frames in THE FINALS. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'The Finals'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'fin-guide'; Cat = 'TheFinals'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'thefinals' }
+       Title = 'THE FINALS: low-delay menu settings (guided)'
+       Desc  = 'The menu settings that change input delay and frame pacing in THE FINALS: window mode, frame cap, NVIDIA Reflex and frame generation. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In THE FINALS, Settings > Video:`n`n1. Window Mode: Fullscreen.`n2. V-Sync: Off (check with an FPS counter that it really is off).`n3. Frame rate limit: with G-SYNC or FreeSync, 3 to 4 below your refresh rate; without, a cap your PC holds in big fights.`n4. NVIDIA Reflex Low Latency: On. On + Boost only if your CPU is the limit; some players lose FPS with Boost.`n5. Frame generation (DLSS or FSR): Off. It adds input delay.`n6. Upscaling at Quality only if you need FPS.`n`nTHE FINALS uses Easy Anti-Cheat. ZeroDelay only writes the settings file the menu saves, with the game closed.") ('THE FINALS') ('OK') ('Information')); 'Shown.' } }
+
+    # ---- shooter games (1.18): Call of Duty, Battlefield 6, PUBG: BATTLEGROUNDS
+
+    # --------------------------------------------------------- Call of Duty (Ricochet: driver, Windows and guided steps only)
+    @{ Id = 'cod-gpupref'; Cat = 'CallOfDuty'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'cod') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Call of Duty on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pins cod.exe and each game exe Call of Duty HQ keeps beside it (cod25-cod.exe for Black Ops 7 and Warzone, for example) to the high-performance GPU in Windows. A Windows setting: the game is not touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Turn it on again after a big update adds a new exe. Restart the game after changing it.'
+       Test  = { Test-GameGpuPref (Get-CodExes) }
+       On    = { Enable-GameGpuPref $t (Get-CodExes) }
+       Off   = { Disable-GameGpuPref $t (Get-CodExes) } }
+
+    @{ Id = 'cod-smoothmotion'; Cat = 'CallOfDuty'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'cod') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Call of Duty'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Black Ops 7 profile, which also covers Warzone (cod.exe, cod25-cod.exe).'
+       Warn  = 'You want generated frames. It does nothing on graphics cards before RTX 40. Restart the game after changing it.'
+       Nv    = @{ Profile = 'Call of Duty: Black Ops 7'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'cod-nvpower'; Cat = 'CallOfDuty'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'cod') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for CoD'
+       Desc  = 'When Call of Duty is CPU-bound the graphics card idles between frames, so the driver drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver Black Ops 7 profile only).'
+       Warn  = 'You use Reflex On + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Call of Duty: Black Ops 7'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'cod-guide'; Cat = 'CallOfDuty'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'cod' }
+       Title = 'Call of Duty: low-delay menu settings (guided)'
+       Desc  = 'Display mode, V-Sync, the frame-rate caps, NVIDIA Reflex, frame generation, shader pre-loading and texture streaming: where they are in Black Ops 7 and Warzone, and what to pick. Nothing is changed: Activision forbids software that changes game data.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Settings > Graphics (Black Ops 7 and Warzone share them):`n`nDisplay:`n1. Display Mode: Fullscreen Exclusive.`n2. V-Sync (Gameplay): Off. V-Sync (Menus) does not matter.`n3. Custom Frame Rate Limit: Gameplay a few FPS below your refresh rate with G-SYNC/FreeSync, or a cap your PC holds in big fights; Menu and Out of Focus can be low.`n4. NVIDIA Reflex Low Latency: On + Boost (On if the GPU is always at 99%). On Radeon: AMD Anti-Lag 2 where the menu offers it.`n`nQuality:`n5. Frame Generation: Off for multiplayer. It adds input delay.`n6. Shader Pre-Loading: let it finish in the menu before playing, and run Restart Shaders Pre-Loading after a driver update. Half-built shaders cause hitches.`n7. On-Demand Texture Streaming (if your menu has it): Off if you get stutters on a slow or busy connection (it downloads textures while you play).`n`nRicochet is a kernel anti-cheat and Activision's security policy forbids software that modifies game data, so ZeroDelay only sets the NVIDIA profile and Windows' graphics setting for the game's exes.") ('Call of Duty') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'cod-secureboot'; Cat = 'CallOfDuty'; Icon = [char]0xE72E; Action = 'Check'
+       Requires = { Test-GameInstalled 'cod' }
+       Title = 'Call of Duty: Secure Boot and TPM 2.0 check'
+       Desc  = 'Black Ops 7 (and Warzone with it) needs Secure Boot and TPM 2.0 on for Ricochet. Reads both and gives the BIOS steps for any that is off. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-AcBootReport 'Call of Duty' 'Ricochet') 'Call of Duty' 'OK' 'Information'); 'Checked.' } }
+
+    # --------------------------------------------------------- Battlefield 6 (Javelin: settings file, driver and Windows only)
+    @{ Id = 'bf6-vsync-off'; Cat = 'Battlefield6'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'bf6' }
+       Title = 'Battlefield 6: V-Sync off'
+       Desc  = 'V-Sync holds each frame until the next screen refresh, which queues frames and adds input delay. Sets GstRender.VSyncMode to 0 (off) in PROFSAVE_profile, the file Battlefield 6''s own menu saves.'
+       Warn  = 'Tearing bothers you and you have no G-SYNC/FreeSync. Battlefield 6 must be closed.'
+       GameFb = @( @{ Game = 'bf6'; Key = 'GstRender.VSyncMode'; V = '0' } )
+       Test  = { Test-GameFb $t }; On = { Enable-GameFb $t }; Off = { Disable-GameFb $t } }
+
+    @{ Id = 'bf6-futureframe-off'; Cat = 'Battlefield6'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'bf6' }
+       Title = 'Battlefield 6: Future Frame Rendering off'
+       Desc  = 'Future Frame Rendering lets the CPU prepare frames ahead of the graphics card: DICE''s menu text in earlier Battlefield games says it can raise FPS but adds input delay. Sets GstRender.FutureFrameRendering to 0 in PROFSAVE_profile.'
+       Warn  = 'Your PC is weak and FPS drops a lot without it: then leave it on and use Reflex. Battlefield 6 must be closed.'
+       GameFb = @( @{ Game = 'bf6'; Key = 'GstRender.FutureFrameRendering'; V = '0' } )
+       Test  = { Test-GameFb $t }; On = { Enable-GameFb $t }; Off = { Disable-GameFb $t } }
+
+    @{ Id = 'bf6-reflex'; Cat = 'Battlefield6'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'bf6') -and (Test-NvAvailable) }
+       Title = 'Battlefield 6: NVIDIA Reflex on'
+       Desc  = 'Reflex keeps the render queue empty, NVIDIA''s documented way to cut system latency. Sets GstRender.NvidiaLowLatency to 1 (On) in PROFSAVE_profile; if you already chose On + Boost in the menu it is left as it is.'
+       Warn  = 'You use frame generation, which turns Reflex on by itself anyway. Battlefield 6 must be closed.'
+       GameFb = @( @{ Game = 'bf6'; Key = 'GstRender.NvidiaLowLatency'; V = '1'; Ok = '^[12]$' } )
+       Test  = { Test-GameFb $t }; On = { Enable-GameFb $t }; Off = { Disable-GameFb $t } }
+
+    @{ Id = 'bf6-gpupref'; Cat = 'Battlefield6'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'bf6') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Battlefield 6 on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning bf6.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: the game and Javelin are not touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Battlefield 6 after changing it.'
+       Test  = { Test-GameGpuPrefById 'bf6' }
+       On    = { Enable-GameGpuPrefById 'bf6' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'bf6' $t.Id } }
+
+    @{ Id = 'bf6-smoothmotion'; Cat = 'Battlefield6'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'bf6') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for BF6'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Battlefield 6 profile (bf6.exe, bf6event.exe).'
+       Warn  = 'You want generated frames. It does nothing on graphics cards before RTX 40. Restart the game after changing it.'
+       Nv    = @{ Profile = 'Battlefield 6'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'bf6-nvpower'; Cat = 'Battlefield6'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'bf6') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for BF6'
+       Desc  = 'In big 64-player fights Battlefield 6 is often CPU-bound, so the graphics card idles, drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex On + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Battlefield 6'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'bf6-guide'; Cat = 'Battlefield6'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'bf6' }
+       Title = 'Battlefield 6: low-delay menu settings (guided)'
+       Desc  = 'Display mode, frame-rate limiter, V-Sync, Future Frame Rendering, Reflex or Anti-Lag and frame generation: where they are in Battlefield 6 and what to pick. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Settings > Graphics:`n`n1. Display Mode: Fullscreen, at your monitor's native refresh rate.`n2. V-Sync: Off.`n3. Frame Rate Limiter: On, a few FPS below your refresh rate with G-SYNC/FreeSync, or a cap your PC holds in big fights. It goes up to 240.`n4. Future Frame Rendering: Off, unless your FPS collapses without it.`n5. NVIDIA Reflex Low Latency: On (On + Boost if the CPU is the limit). Radeon: AMD Anti-Lag 2. Intel Arc: XeLL.`n6. Frame Generation: Off for multiplayer. It adds input delay.`n`nJavelin, the anti-cheat, will not start without Secure Boot: see the Secure Boot check card. ZeroDelay never touches Javelin or user.cfg, only PROFSAVE_profile with the game closed.") ('Battlefield 6') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'bf6-secureboot'; Cat = 'Battlefield6'; Icon = [char]0xE72E; Action = 'Check'
+       Requires = { Test-GameInstalled 'bf6' }
+       Title = 'Battlefield 6: Secure Boot and TPM 2.0 check'
+       Desc  = 'Battlefield 6 will not start unless Secure Boot is on for Javelin, and EA lists TPM 2.0 too. Reads both and gives the BIOS steps for any that is off. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-AcBootReport 'Battlefield 6' 'EA Javelin') 'Battlefield 6' 'OK' 'Information'); 'Checked.' } }
+
+    # --------------------------------------------------------- PUBG: BATTLEGROUNDS (BattlEye: GameUserSettings.ini, driver and Windows only)
+    @{ Id = 'pubg-vsync-off'; Cat = 'PUBG'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'pubg' }
+       Title = 'PUBG: V-Sync off'
+       Desc  = 'V-Sync holds each frame until the next screen refresh (with a third buffer under DX12), which adds input delay. Sets bUseVSync=False in PUBG''s GameUserSettings.ini, the value the menu''s V-Sync switch saves.'
+       Warn  = 'Tearing bothers you and you have no G-SYNC/FreeSync. PUBG must be closed.'
+       GameIni = @( @{ Game = 'pubg'; Section = '/Script/TslGame.TslGameUserSettings'; Key = 'bUseVSync'; V = 'False' } )
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'pubg-fullscreen'; Cat = 'PUBG'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'pubg' }
+       Title = 'PUBG: fullscreen display mode'
+       Desc  = 'Fullscreen lets PUBG present frames straight to the display instead of through the desktop compositor, the lowest-delay path. Sets the Unreal fullscreen mode values (0 = fullscreen) in GameUserSettings.ini.'
+       Warn  = 'You alt-tab a lot or use a second monitor while playing. PUBG must be closed.'
+       GameIni = @(@{ Game = 'pubg'; Section = '/Script/TslGame.TslGameUserSettings'; Key = 'FullscreenMode'; V = '0' },
+                   @{ Game = 'pubg'; Section = '/Script/TslGame.TslGameUserSettings'; Key = 'LastConfirmedFullscreenMode'; V = '0' },
+                   @{ Game = 'pubg'; Section = '/Script/TslGame.TslGameUserSettings'; Key = 'PreferredFullscreenMode'; V = '0' })
+       Test  = { Test-GameIni $t }; On = { Enable-GameIni $t }; Off = { Disable-GameIni $t } }
+
+    @{ Id = 'pubg-gpupref'; Cat = 'PUBG'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'pubg') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run PUBG on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning TslGame.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: the game and BattlEye are not touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart PUBG after changing it.'
+       Test  = { Test-GameGpuPrefById 'pubg' }
+       On    = { Enable-GameGpuPrefById 'pubg' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'pubg' $t.Id } }
+
+    @{ Id = 'pubg-smoothmotion'; Cat = 'PUBG'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'pubg') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for PUBG'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own PUBG profile (TslGame.exe).'
+       Warn  = 'You want generated frames. It does nothing on graphics cards before RTX 40. Restart PUBG after changing it.'
+       Nv    = @{ Profile = 'PLAYERUNKNOWN''S BATTLEGROUNDS'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'pubg-nvpower'; Cat = 'PUBG'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'pubg') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for PUBG'
+       Desc  = 'PUBG is often CPU-bound, so the graphics card idles between frames, drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver PUBG profile only).'
+       Warn  = 'You use Reflex with Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'PLAYERUNKNOWN''S BATTLEGROUNDS'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'pubg-guide'; Cat = 'PUBG'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'pubg' }
+       Title = 'PUBG: low-delay menu settings (guided)'
+       Desc  = 'The in-game frame limit, DirectX version, V-Sync and low-latency settings in PUBG, and what to pick. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Settings > Graphics:`n`n1. Display Mode: Fullscreen.`n2. In-game FPS Limit: Custom, a few FPS below your refresh rate with G-SYNC/FreeSync, or a cap your PC holds on the busiest maps (the slider goes from 30 to 300). Unlimited is fine if your FPS is always well above your refresh rate.`n3. Lobby FPS Limit: 60 (only saves power and heat).`n4. V-Sync: Off.`n5. NVIDIA Reflex: On (On + Boost if the CPU is the limit) if your menu shows it.`n`nWhere your version offers DirectX 11, DirectX 11 Enhanced (the default) or DirectX 12, try each for a few matches and keep the one with the steadiest frame times.`n`nPUBG uses BattlEye. ZeroDelay only writes the GameUserSettings.ini the menu saves, with the game closed, and never Engine.ini.") ('PUBG: BATTLEGROUNDS') ('OK') ('Information')); 'Shown.' } }
+
+    # ---- moba (1.18): League of Legends, Dota 2, Deadlock
+    # ======================================================= League of Legends
+    # Vanguard + Riot's server-side settings sync: no edits to League's files. Driver profile, Windows' GPU choice, read-only check, guide.
+    @{ Id = 'lol-latency-guide'; Cat = 'LeagueOfLegends'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'lol' }
+       Title = 'League: lowest-delay video settings (guide)'
+       Desc  = 'Window mode, the frame rate cap and V-Sync decide League''s input delay. Riot keeps these on its servers (PersistedSettings.json says editing it is not recommended) and copies them back when you sign in, so set them in the game.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In a game or the Practice Tool: Esc > Video.`n`n1. Window Mode: Full Screen. Borderless and Windowed go through the Windows compositor, which can add a frame of delay.`n2. Frame Rate Cap: a value your PC holds in big team fights, at or above your monitor's refresh rate. With G-SYNC/FreeSync, a few FPS below the refresh rate.`n3. Wait for Vertical Sync: off (unless you use G-SYNC/FreeSync and dislike tearing).`n4. Lower Shadows and Effects first if FPS dips; Character and Environment quality cost less.`n`nIn the League client: Settings > General: tick Close client during game on a weaker PC, so the client stops using CPU and memory while you play.`n`nThese follow your Riot account to any PC. ZeroDelay does not edit them: Riot overwrites the local files when you sign in, and League runs Vanguard.") ('League of Legends latency settings') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'lol-cfgcheck'; Cat = 'LeagueOfLegends'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Requires = { Test-GameInstalled 'lol' }
+       Title = 'League: check window mode and V-Sync'
+       Desc  = 'Reads League''s Config\game.cfg and Riot''s synced copy (PersistedSettings.json) and shows your window mode, V-Sync and frame cap, whether the two disagree, and whether an old read-only trick is stopping League saving your settings. Changes nothing.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-LolCfgReport) ('League of Legends settings') ('OK') ('Information')); 'Checked.' } }
+
+    @{ Id = 'lol-nv-smoothmotion'; Cat = 'LeagueOfLegends'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'lol') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for League'
+       Desc  = 'Smooth Motion is NVIDIA''s driver frame generation: if it is switched on globally it inserts generated frames, which add input delay. This pins it off in the driver''s own League of Legends profile. Driver setting only; Vanguard and the game are not touched.'
+       Warn  = 'You want generated frames in League. It does nothing on graphics cards before RTX 40. Restart League after changing it.'
+       Nv    = @{ Profile = 'League of Legends'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'lol-nv-power'; Cat = 'LeagueOfLegends'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'lol') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for League'
+       Desc  = 'League is light on the graphics card and has no Reflex option, so at high FPS the driver often lowers its clocks and each frame takes longer to render. This keeps clocks up while League runs (driver League of Legends profile only).'
+       Warn  = 'You are on a laptop on battery, or you care about power and heat: the card stays at higher clocks while League is open. Restart League after changing it.'
+       Nv    = @{ Profile = 'League of Legends'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'lol-gpupref'; Cat = 'LeagueOfLegends'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'lol') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run League on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning League of Legends.exe (the match itself, not the client) to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting; the game is not touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart League after changing it.'
+       Test  = { Test-GameGpuPrefById 'lol' }
+       On    = { Enable-GameGpuPrefById 'lol' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'lol' $t.Id } }
+
+    # ======================================================= Dota 2
+    # Steam\userdata\<id>\570\local\cfg\video.txt: "setting.key"<tabs>"value". Only existing keys are changed.
+    @{ Id = 'dota-vsync-off'; Cat = 'Dota2'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'dota2' }
+       Title = 'Dota 2: turn off V-Sync'
+       Desc  = 'V-Sync holds each frame until the next screen refresh, which queues frames and adds input delay. Sets setting.mat_vsync to 0 in Dota 2''s video.txt for the Steam account that played last.'
+       Warn  = 'Tearing bothers you and you have no G-SYNC/FreeSync monitor. Dota 2 must be closed.'
+       GameKv = @(@{ Game = 'dota2'; Key = 'setting.mat_vsync'; V = '0' })
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'dota-reflex'; Cat = 'Dota2'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'dota2' }
+       Title = 'Dota 2: NVIDIA Reflex / low latency on'
+       Desc  = 'Reflex stops the CPU queuing frames ahead of the graphics card; NVIDIA measured up to 23% lower latency in Dota 2. Sets setting.r_low_latency to 1, the name CS2 and Deadlock use, only if your video.txt already has it. On + Boost (2) is kept.'
+       Warn  = 'Your card has no Reflex or Anti-Lag 2: the game greys it out. If your file lacks the line, set it in Settings > Video instead. Dota 2 must be closed.'
+       GameKv = @(@{ Game = 'dota2'; Key = 'setting.r_low_latency'; V = '1'; Ok = @('2') })
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'dota-fullscreen'; Cat = 'Dota2'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'dota2' }
+       Title = 'Dota 2: fullscreen display mode'
+       Desc  = 'Fullscreen lets Dota 2 present frames straight to the display instead of through the desktop compositor, the lowest-delay path. Sets setting.fullscreen to 1 in video.txt, the value Dota writes for its Fullscreen mode.'
+       Warn  = 'You alt-tab a lot or watch a second monitor while playing. Dota 2 must be closed.'
+       GameKv = @(@{ Game = 'dota2'; Key = 'setting.fullscreen'; V = '1' })
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'dota-nv-smoothmotion'; Cat = 'Dota2'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'dota2') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Dota 2'
+       Desc  = 'Smooth Motion is NVIDIA''s driver frame generation: if it is switched on globally it inserts generated frames, which add input delay. This pins it off in the driver''s own Dota 2 profile.'
+       Warn  = 'You want generated frames in Dota 2. It does nothing on graphics cards before RTX 40. Restart Dota 2 after changing it.'
+       Nv    = @{ Profile = 'Dota 2'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'dota-gpupref'; Cat = 'Dota2'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'dota2') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Dota 2 on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning dota2.exe to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Dota 2 after changing it.'
+       Test  = { Test-GameGpuPrefById 'dota2' }
+       On    = { Enable-GameGpuPrefById 'dota2' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'dota2' $t.Id } }
+
+    @{ Id = 'dota-latency-guide'; Cat = 'Dota2'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'dota2' }
+       Title = 'Dota 2: Reflex, frame limit, renderer (guide)'
+       Desc  = 'The frame rate limit, Reflex and the rendering API are best set in Dota 2''s own menu: the limit depends on your monitor, and AMD lists Anti-Lag 2 for Dota 2 on DirectX 11 only.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Dota 2: Settings > Video.`n`n1. Display Mode: Fullscreen.`n2. NVIDIA Reflex (NVIDIA) or AMD Anti-Lag 2 (Radeon): on. Anti-Lag 2 works with DirectX 11.`n3. Rendering API: DirectX 11 unless another one fixes a problem for you.`n4. VSync: off (unless you use G-SYNC/FreeSync and dislike tearing).`n5. Maximum frames per second: a value your PC holds in fights, at or above your refresh rate. With G-SYNC/FreeSync, a few FPS below the refresh rate.`n6. Game Screen Render Quality below 100% is the biggest FPS gain if you need one.`n`nDota 2 saves this when you close it normally. An autoexec.cfg with fps_max or mat_vsync overrides the menu at every start.") ('Dota 2 latency settings') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'dota-launchopts'; Cat = 'Dota2'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Requires = { Test-GameInstalled 'dota2' }
+       Title = 'Dota 2: check launch options'
+       Desc  = 'Reads Dota 2''s Steam launch options and flags Source 1 leftovers that do nothing now (-nod3d9ex, -noipx, -high and the like), options that override the menu, and -insecure, which blocks matchmaking. Changes nothing: Steam saves them.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-SteamLaunchReport '570' 'Dota 2') ('Dota 2 launch options') ('OK') ('Information')); 'Checked.' } }
+
+    # ======================================================= Deadlock
+    # <install>\game\citadel\cfg\video.txt, same format as Dota 2. Never gameinfo.gi, boot.vcfg or the addons folder.
+    @{ Id = 'dl-vsync-off'; Cat = 'Deadlock'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'deadlock' }
+       Title = 'Deadlock: turn off V-Sync'
+       Desc  = 'V-Sync holds each frame until the next screen refresh, which queues frames and adds input delay. Sets setting.mat_vsync to 0 in Deadlock''s video.txt.'
+       Warn  = 'Tearing bothers you and you have no G-SYNC/FreeSync monitor. Deadlock must be closed.'
+       GameKv = @(@{ Game = 'deadlock'; Key = 'setting.mat_vsync'; V = '0' })
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'dl-reflex'; Cat = 'Deadlock'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'deadlock' }
+       Title = 'Deadlock: NVIDIA Reflex / low latency on'
+       Desc  = 'Reflex stops the CPU queuing frames ahead of the graphics card, so your aim reaches the screen sooner. Sets setting.r_low_latency to 1 in video.txt (as in CS2: 1 = on, 2 = on + Boost). On + Boost chosen in the game is kept.'
+       Warn  = 'Your graphics card has no Reflex or Anti-Lag 2: the game greys the option out. Deadlock is in early access, so Valve may rename it. Deadlock must be closed.'
+       GameKv = @(@{ Game = 'deadlock'; Key = 'setting.r_low_latency'; V = '1'; Ok = @('2') })
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'dl-fullscreen'; Cat = 'Deadlock'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'deadlock' }
+       Title = 'Deadlock: fullscreen display mode'
+       Desc  = 'Fullscreen lets Deadlock present frames straight to the display instead of through the desktop compositor, the lowest-delay path. Sets setting.fullscreen to 1 in video.txt (0 is windowed or borderless).'
+       Warn  = 'You alt-tab a lot, or a non-native fullscreen resolution has frozen the game before (pick your monitor''s own resolution in the game). Deadlock must be closed.'
+       GameKv = @(@{ Game = 'deadlock'; Key = 'setting.fullscreen'; V = '1' })
+       Test  = { Test-GameKv $t }; On = { Enable-GameKv $t }; Off = { Disable-GameKv $t } }
+
+    @{ Id = 'dl-nv-smoothmotion'; Cat = 'Deadlock'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'deadlock') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Deadlock'
+       Desc  = 'Smooth Motion is NVIDIA''s driver frame generation: if it is switched on globally it inserts generated frames, which add input delay. This pins it off in the driver''s own Deadlock profile.'
+       Warn  = 'You want generated frames in Deadlock. It does nothing on graphics cards before RTX 40. Restart Deadlock after changing it.'
+       Nv    = @{ Profile = 'Deadlock'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'dl-gpupref'; Cat = 'Deadlock'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'deadlock') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Deadlock on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning deadlock.exe to the high-performance one in Windows stops it ever starting on the integrated graphics.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Deadlock after changing it.'
+       Test  = { Test-GameGpuPrefById 'deadlock' }
+       On    = { Enable-GameGpuPrefById 'deadlock' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'deadlock' $t.Id } }
+
+    @{ Id = 'dl-latency-guide'; Cat = 'Deadlock'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'deadlock' }
+       Title = 'Deadlock: FPS cap, renderer, upscaling (guide)'
+       Desc  = 'The frame limit, the renderer and upscaling are best set in Deadlock''s own menu: the limit depends on your monitor, and players widely report crashes with the experimental Vulkan renderer.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Deadlock: Settings > Video.`n`n1. Display Mode: Fullscreen, at your monitor's own resolution.`n2. NVIDIA Reflex: Enabled (or Enabled + Boost if the CPU is the limit).`n3. Max FPS: a value your PC holds in team fights, at or above your refresh rate. With G-SYNC/FreeSync, a few FPS below the refresh rate.`n4. Renderer: DirectX 11. Vulkan is experimental; if Deadlock crashes after switching, the fix players use is removing the Vulkan line from boot.vcfg (ZeroDelay does not edit that file).`n5. Upscaling (FSR or DLSS) on Quality is the cleanest FPS gain; frame generation adds delay.`n`nDeadlock saves this to video.txt when you close it normally.") ('Deadlock latency settings') ('OK') ('Information')); 'Shown.' } }
+
+    @{ Id = 'dl-launchopts'; Cat = 'Deadlock'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Requires = { Test-GameInstalled 'deadlock' }
+       Title = 'Deadlock: check launch options'
+       Desc  = 'Reads Deadlock''s Steam launch options and flags Source 1 leftovers that do nothing (-high, -threads, +mat_queue_mode and the like), options that override the menu, and -insecure, which blocks matchmaking. Changes nothing: Steam saves them.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-SteamLaunchReport '1422450' 'Deadlock') ('Deadlock launch options') ('OK') ('Information')); 'Checked.' } }
+
+    # ---- open world (1.18): GTA V Enhanced, GTA V Legacy, Roblox, Escape from Tarkov
+
+    # --------------------------------------------------------- GTA V Enhanced (BattlEye in GTA Online: settings.xml, driver and Windows only)
+    @{ Id = 'gta-vsync-off'; Cat = 'GTAV'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'gtav' }
+       Title = 'GTA V Enhanced: V-Sync off'
+       Desc  = 'Sets V-Sync to Off in the settings.xml the game''s menu saves (VSync 0; 1 is On, 2 is Half), so frames are shown as soon as they are ready instead of waiting for the monitor. With V-Sync off the game''s own Frame Limit decides the cap.'
+       Warn  = 'Tearing bothers you more than the delay, or you play only story mode with a controller. With G-SYNC or FreeSync, add a frame cap. GTA V must be closed.'
+       GameXml = @( @{ Game = 'gtav'; Parent = 'video'; Tag = 'VSync'; V = '0'; D = '1' } )
+       Test  = { Test-GameXml $t }; On = { Enable-GameXml $t }; Off = { Disable-GameXml $t } }
+
+    @{ Id = 'gta-gpupref'; Cat = 'GTAV'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'gtav') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run GTA V Enhanced on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning GTA5_Enhanced.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: nothing in the game or BattlEye is touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart GTA V after changing it.'
+       Test  = { Test-GameGpuPrefById 'gtav' }
+       On    = { Enable-GameGpuPrefById 'gtav' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'gtav' $t.Id } }
+
+    @{ Id = 'gta-smoothmotion'; Cat = 'GTAV'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'gtav') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for GTA V'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own GTA V Enhanced profile. The game''s own DLSS Frame Generation is set in its menu.'
+       Warn  = 'You play story mode only and like the extra smoothness. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Grand Theft Auto V Enhanced'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'gta-nvpower'; Cat = 'GTAV'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'gtav') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for GTA V'
+       Desc  = 'In busy parts of the city GTA V is often CPU-bound, so the graphics card idles between frames, drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex On + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Grand Theft Auto V Enhanced'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'gta-guide'; Cat = 'GTAV'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'gtav' }
+       Title = 'GTA V Enhanced: low-delay menu settings (guided)'
+       Desc  = 'The menu settings that change input delay and frame pacing: screen type, V-Sync, frame limit, NVIDIA Reflex and frame generation. Their values in settings.xml are not documented by Rockstar, so ZeroDelay shows where they are instead of writing them.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Settings > Graphics:`n`n1. Screen Type: Fullscreen, at your monitor's native resolution and refresh rate.`n2. V-Sync: Off (or use the switch on this page).`n3. Frame Limit: with G-SYNC or FreeSync, 3 to 4 FPS below your refresh rate; otherwise a cap your PC holds steadily in the city.`n4. NVIDIA Reflex: On (On + Boost if the CPU is the limit).`n5. Frame Generation (DLSS or FSR): Off for GTA Online races and combat. It adds input delay.`n6. Upscaling (DLSS or FSR) at Quality only if you need FPS.`n`nGTA Online uses BattlEye. ZeroDelay only writes settings.xml with the game closed, and never touches the game folder or BattlEye.") ('GTA V Enhanced') ('OK') ('Information')); 'Shown.' } }
+
+    # --------------------------------------------------------- GTA V Legacy (same settings.xml layout, DirectX 11)
+    @{ Id = 'gtal-vsync-off'; Cat = 'GTAVLegacy'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'gtavlegacy' }
+       Title = 'GTA V Legacy: V-Sync off'
+       Desc  = 'Sets V-Sync to Off in the settings.xml the game''s menu saves (VSync 0; 1 is On, 2 is Half), so frames are shown as soon as they are ready instead of waiting for the monitor.'
+       Warn  = 'Tearing bothers you more than the delay. With G-SYNC or FreeSync, add a frame cap in the NVIDIA or AMD control panel. GTA V must be closed.'
+       GameXml = @( @{ Game = 'gtavlegacy'; Parent = 'video'; Tag = 'VSync'; V = '0'; D = '1' } )
+       Test  = { Test-GameXml $t }; On = { Enable-GameXml $t }; Off = { Disable-GameXml $t } }
+
+    @{ Id = 'gtal-fullscreen'; Cat = 'GTAVLegacy'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'gtavlegacy' }
+       Title = 'GTA V Legacy: fullscreen instead of borderless'
+       Desc  = 'Sets Screen Type to Fullscreen (Windowed 0; 1 is Windowed, 2 is Windowed Borderless). Legacy runs on DirectX 11, where fullscreen skips the Windows desktop compositor that can add a frame of delay in borderless mode.'
+       Warn  = 'You Alt-Tab a lot: fullscreen switches more slowly and can flicker. GTA V must be closed.'
+       GameXml = @( @{ Game = 'gtavlegacy'; Parent = 'video'; Tag = 'Windowed'; V = '0'; D = '2' } )
+       Test  = { Test-GameXml $t }; On = { Enable-GameXml $t }; Off = { Disable-GameXml $t } }
+
+    @{ Id = 'gtal-gpupref'; Cat = 'GTAVLegacy'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'gtavlegacy') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run GTA V Legacy on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning GTA5.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: nothing in the game or BattlEye is touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart GTA V after changing it.'
+       Test  = { Test-GameGpuPrefById 'gtavlegacy' }
+       On    = { Enable-GameGpuPrefById 'gtavlegacy' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'gtavlegacy' $t.Id } }
+
+    @{ Id = 'gtal-smoothmotion'; Cat = 'GTAVLegacy'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'gtavlegacy') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for GTA V Legacy'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver''s own Grand Theft Auto V profile.'
+       Warn  = 'You want generated frames in GTA V. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Grand Theft Auto V'; Id = 2966652096; V = 0 } }
+
+    # --------------------------------------------------------- Roblox (Hyperion anti-cheat: only what the in-game menu can set)
+    @{ Id = 'rbx-fps240'; Cat = 'Roblox'; Icon = [char]0xE9D9; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'roblox' }
+       Title = 'Roblox: Maximum Frame Rate 240'
+       Desc  = 'Sets Roblox''s own Maximum Frame Rate menu setting to 240, the highest Roblox supports (the default is 60). More frames mean less delay on a fast monitor. No FPS unlocker or Fast Flag is used: Roblox ignores those since 2025.'
+       Warn  = 'You have a 60 Hz screen or a laptop on battery: the extra frames only add heat. Roblox must be closed.'
+       GameXml = @( @{ Game = 'roblox'; Parent = ''; Tag = 'FramerateCap'; V = '240'; D = '60' } )
+       Test  = { Test-GameXml $t }; On = { Enable-GameXml $t }; Off = { Disable-GameXml $t } }
+
+    @{ Id = 'rbx-gpupref'; Cat = 'Roblox'; Icon = [char]0xE7F8; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'roblox') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Roblox on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pins RobloxPlayerBeta.exe to the high-performance one in Windows. Roblox installs each update in a new folder, so after an update this switch shows off again: switch it back on.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Roblox after changing it.'
+       Test  = { Test-GameGpuPrefById 'roblox' }
+       On    = { Enable-GameGpuPrefById 'roblox' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'roblox' $t.Id } }
+
+    @{ Id = 'rbx-smoothmotion'; Cat = 'Roblox'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'roblox') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Roblox'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay. This pins it off in the driver profile that holds RobloxPlayerBeta.exe (NVIDIA names it Roblox VR).'
+       Warn  = 'You want generated frames in Roblox. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Roblox VR'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'rbx-nvpower'; Cat = 'Roblox'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'roblox') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for Roblox'
+       Desc  = 'Roblox is usually limited by the CPU, so the graphics card idles between frames, drops its clocks and each frame takes longer. This keeps clocks up while Roblox runs (driver profile only).'
+       Warn  = 'You are on a laptop on battery, or the PC runs hot: it uses more power even in menus.'
+       Nv    = @{ Profile = 'Roblox VR'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'rbx-guide'; Cat = 'Roblox'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'roblox' }
+       Title = 'Roblox: low-delay menu settings (guided)'
+       Desc  = 'The Roblox menu settings that change frame rate and input delay, and why ZeroDelay does not use FPS unlockers or Fast Flags. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("In Roblox, press Esc > Settings:`n`n1. Maximum Frame Rate: your monitor's refresh rate, up to 240 (or use the switch on this page).`n2. Graphics Mode: Manual, then lower Graphics Quality until the frame rate holds steady in busy servers.`n3. Fullscreen: On (F11 toggles it).`n`nSince September 2025 Roblox ignores Fast Flags that are not on its allowlist, including the old frame rate unlock flag, so ClientAppSettings.json tweaks and launcher flag presets mostly do nothing now. Roblox's anti-cheat (Hyperion) can also flag tools that modify the client. ZeroDelay only writes the menu's own settings file with Roblox closed.") ('Roblox') ('OK') ('Information')); 'Shown.' } }
+
+    # --------------------------------------------------------- Escape from Tarkov (BattlEye: Graphics.ini, driver and Windows only)
+    @{ Id = 'tk-vsync-off'; Cat = 'Tarkov'; Icon = [char]0xE7F4; Rec = $true; Lat = $true
+       Requires = { Test-GameInstalled 'tarkov' }
+       Title = 'Tarkov: V-Sync off'
+       Desc  = 'Sets VSync to false in Graphics.ini, the file Tarkov''s menu saves, so frames are shown as soon as they are ready instead of waiting for the monitor. The in-raid frame cap (Game FPS limit) then decides the frame rate.'
+       Warn  = 'Tearing bothers you more than the delay. With G-SYNC or FreeSync, set the Game FPS limit 3 to 4 below your refresh rate. Tarkov must be closed.'
+       GameJson = @( @{ Game = 'tarkov'; Key = 'VSync'; V = 'false'; D = 'true' } )
+       Test  = { Test-GameJson $t }; On = { Enable-GameJson $t }; Off = { Disable-GameJson $t } }
+
+    @{ Id = 'tk-fullscreen'; Cat = 'Tarkov'; Icon = [char]0xE740; Rec = $false; Lat = $true
+       Requires = { Test-GameInstalled 'tarkov' }
+       Title = 'Tarkov: exclusive fullscreen'
+       Desc  = 'Sets FullScreenMode to 0 in Graphics.ini, which is Unity''s exclusive fullscreen (1 is borderless, 3 windowed). On DirectX 11 it skips the Windows desktop compositor. Tarkov''s menu labels for these numbers are not documented by Battlestate Games.'
+       Warn  = 'You Alt-Tab a lot or use a second monitor during raids: exclusive fullscreen switches slowly. Tarkov must be closed.'
+       GameJson = @( @{ Game = 'tarkov'; Key = 'FullScreenMode'; V = '0'; D = '1' } )
+       Test  = { Test-GameJson $t }; On = { Enable-GameJson $t }; Off = { Disable-GameJson $t } }
+
+    @{ Id = 'tk-gpupref'; Cat = 'Tarkov'; Icon = [char]0xE7F8; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'tarkov') -and @(Get-GpuIds | Where-Object { $_ -match '^PCI' }).Count -ge 2 }
+       Title = 'Run Tarkov on the high-performance GPU'
+       Desc  = 'This PC has more than one graphics chip. Pinning EscapeFromTarkov.exe to the high-performance one in Windows stops it ever starting on the integrated graphics. A Windows setting: nothing in the game or BattlEye is touched.'
+       Warn  = 'Your monitor is plugged into the motherboard: then frames are copied across. Restart Tarkov after changing it.'
+       Test  = { Test-GameGpuPrefById 'tarkov' }
+       On    = { Enable-GameGpuPrefById 'tarkov' $t.Id }
+       Off   = { Disable-GameGpuPrefById 'tarkov' $t.Id } }
+
+    @{ Id = 'tk-smoothmotion'; Cat = 'Tarkov'; Icon = [char]0xE740; Rec = $true; Lat = $true
+       Requires = { (Test-GameInstalled 'tarkov') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: keep Smooth Motion off for Tarkov'
+       Desc  = 'If NVIDIA''s driver frame generation (Smooth Motion) is switched on globally, it inserts generated frames that add input delay in gunfights. This pins it off in the driver''s own Escape From Tarkov profile.'
+       Warn  = 'You want generated frames in Tarkov. It does nothing on graphics cards before RTX 40.'
+       Nv    = @{ Profile = 'Escape From Tarkov'; Id = 2966652096; V = 0 } }
+
+    @{ Id = 'tk-nvpower'; Cat = 'Tarkov'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { (Test-GameInstalled 'tarkov') -and (Test-NvAvailable) }
+       Title = 'NVIDIA: prefer maximum performance for Tarkov'
+       Desc  = 'On big maps like Streets and Lighthouse Tarkov is CPU-bound, so the graphics card idles, drops its clocks and each frame takes longer. This keeps clocks up while the game runs (driver profile only).'
+       Warn  = 'You use Reflex On + Boost (it does the same), or you are on a laptop on battery: it uses more power.'
+       Nv    = @{ Profile = 'Escape From Tarkov'; Id = 0x1057EB71; V = 1 } }
+
+    @{ Id = 'tk-guide'; Cat = 'Tarkov'; Icon = [char]0xE916; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'tarkov' }
+       Title = 'Tarkov: low-delay menu settings (guided)'
+       Desc  = 'The menu settings that change input delay and stutter in Tarkov: Reflex, frame caps, upscaling and texture streaming. ZeroDelay does not write the Reflex value because its exact text in Graphics.ini could not be verified. Nothing is changed.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog ("Settings > Graphics:`n`n1. Screen mode: Fullscreen.`n2. V-Sync: Off.`n3. Game FPS limit: with G-SYNC or FreeSync, 3 to 4 below your refresh rate; otherwise a cap your PC holds on big maps. Lobby FPS limit: 60 is fine.`n4. NVIDIA Reflex: On (On + Boost if the CPU is the limit).`n5. DLSS or FSR at Quality only if you need FPS; frame generation off for PvP.`n6. If textures load late or the game hitches, try Mip Streaming on with a larger buffer, or off if you have plenty of video memory.`n`nTarkov uses BattlEye. ZeroDelay only writes Graphics.ini with the game closed and never touches the game folder or BattlEye.") ('Escape from Tarkov') ('OK') ('Information')); 'Shown.' } }
+
+    # ---- stats1 (1.18)
+
+    @{ Id = 'rl-statsapi'; Cat = 'RocketLeague'; Icon = [char]0xE9D2; Rec = $false
+       Requires = { Test-GameInstalled 'rocketleague' }
+       Title = 'Rocket League match stats'
+       Desc  = 'Switches on Psyonix''s official Stats API (PacketSendRate in TAStatsAPI.ini / DefaultStatsAPI.ini), so Rocket League shares its scoreboard with ZeroDelay on this PC (127.0.0.1 only). ZeroDelay saves your goals, assists, saves, shots, score, demos and the result of each match. Restart Rocket League after switching it on.'
+       Warn  = 'Official Psyonix feature: no mods, no injection, Easy Anti-Cheat is not touched and nothing leaves your PC. Only records while ZeroDelay is open. Off puts the old values back.'
+       Test  = { if (-not $script:Backup.Custom['rl-statsapi-rec']) { if ($null -eq (Test-RlStatsApi)) { return $null }; return $false }; Test-RlStatsApi }
+       On    = { Enable-RlStatsApi; Update-RlStatsListener }
+       Off   = { Disable-RlStatsApi; Update-RlStatsListener } }
+
+    @{ Id = 'dota-gsi'; Cat = 'Dota2'; Icon = [char]0xE9D2; Rec = $false
+       Requires = { Test-GameInstalled 'dota2' }
+       Title = 'Dota 2 match stats'
+       Desc  = 'Adds a Valve Game State Integration file to Dota 2''s cfg\gamestate_integration folder, so Dota sends your own hero''s scoreboard to ZeroDelay on this PC (127.0.0.1 only). ZeroDelay saves hero, kills, deaths, assists, last hits, GPM, XPM and the result. Needs -gamestateintegration in Dota 2''s launch options.'
+       Warn  = 'Official Valve feature: no game files changed, no VAC risk, nothing leaves your PC. Add -gamestateintegration in Steam > Dota 2 > Properties > Launch options, then restart Dota 2. Only records while ZeroDelay is open.'
+       Test  = { $f = Get-DotaGsiCfgPath; if (-not $f) { return $null }; Test-Path -LiteralPath $f }
+       On    = { Enable-DotaGsi; Update-DotaGsiListener
+                 if ((Test-Dota2GsiLaunchOption) -eq $false) { [void](Show-ZdDialog 'Dota 2 match stats are switched on. One step is left: in Steam, right-click Dota 2 > Properties > General > Launch options, add -gamestateintegration, then restart Dota 2. Without it Dota 2 ignores the file.' 'Dota 2 match stats' 'OK' 'Information') } }
+       Off   = { Disable-DotaGsi; Update-DotaGsiListener } }
+
     # ======================================================= research round 6 (1.15)
     # ---- fnlog (1.15)
     # ------------------------------------------------------------- Fortnite
@@ -11661,7 +12701,7 @@ $Categories = @(
     @{ Name = 'New';        Icon = [char]0xE735; Title = 'New tweaks'
        Note = 'New and reworked in 1.15: what limits your FPS in real matches, where your matches really ran, present-mode and latency tests, your Fortnite sensitivity, and repairs for tweak-pack leftovers. Each card also stays in its usual tab. Nothing here is switched on for you.' }
     @{ Name = 'GameMode';   Icon = [char]0xE768; Title = 'Game Mode'; Page = 'GameMode' }
-    @{ Name = 'Events';     Icon = [char]0xE7C1; Title = 'Tournaments'; Page = 'Events' }
+    @{ Name = 'Events';     Icon = [char]0xE7C1; Title = 'Tournaments'; Page = 'Tournaments' }
     @{ Name = 'Potato';     Icon = [char]0xE7F4; Title = 'Potato graphics'
        Note = 'Ugly but fast. Performance mode, low mesh and lower 3D resolution give the biggest gains; Fortnite must be closed to apply.' }
     @{ Name = 'Gtx1080Ti';  Icon = [char]0xE7F4; Title = 'GTX 1080 Ti'; Requires = { Test-Gtx1080Ti }
@@ -11671,6 +12711,50 @@ $Categories = @(
     @{ Name = 'Fortnite';   Icon = [char]0xE7FC; Title = 'Fortnite' }
     @{ Name = 'CS2';        Icon = [char]0xE7FC; Title = 'Counter-Strike 2'; Requires = { Test-Cs2Installed }
        Note = 'CS2 settings, driver settings for cs2.exe, checks and a Valve server ping. Close CS2 before you flip a switch: it rewrites its settings when it exits. Everything here is a normal game setting, so it is VAC-safe; nothing touches the game files or anti-cheat.' }
+    @{ Name = 'Valorant';   Icon = [char]0xE7FC; Title = 'VALORANT'; Requires = { Test-GameInstalled 'valorant' }
+       Note = 'Latency settings for VALORANT, its NVIDIA driver profile and Windows'' GPU choice. Riot keeps most settings on your account, so several are guided. Nothing here touches Vanguard or the game files.' }
+    @{ Name = 'Overwatch';  Icon = [char]0xE7FC; Title = 'Overwatch 2'; Requires = { Test-GameInstalled 'overwatch' }
+       Note = 'Overwatch 2 video settings, its NVIDIA driver profile and Windows'' GPU choice. Close Overwatch 2 before you flip a switch; nothing here touches the game files or anti-cheat.' }
+    @{ Name = 'R6Siege';    Icon = [char]0xE7FC; Title = 'Rainbow Six Siege X'; Requires = { Test-GameInstalled 'r6siege' }
+       Note = 'Siege''s own GameSettings.ini values, its NVIDIA driver profile and Windows'' GPU choice. Close Siege before you flip a switch; nothing here touches BattlEye or the game files.' }
+    @{ Name = 'MarvelRivals'; Icon = [char]0xE7FC; Title = 'Marvel Rivals'; Requires = { Test-GameInstalled 'marvelrivals' }
+       Note = 'The NVIDIA profile and Windows'' GPU choice for Marvel Rivals, and a guide to its low-delay menu settings. NetEase asks players not to edit game files and has a kernel anti-cheat, so ZeroDelay changes nothing in the game''s own files: set those in the game menu.' }
+    @{ Name = 'Rematch'; Icon = [char]0xE7FC; Title = 'Rematch'; Requires = { Test-GameInstalled 'rematch' }
+       Note = 'Rematch''s own settings file, the NVIDIA profile and Windows'' GPU choice for the game. It uses Easy Anti-Cheat, which ZeroDelay never touches. Close Rematch before you flip a switch: it rewrites its settings when it exits.' }
+    @{ Name = 'WhereWindsMeet'; Icon = [char]0xE7FC; Title = 'Where Winds Meet'; Requires = { Test-GameInstalled 'wwm' }
+       Note = 'Where Winds Meet keeps its settings in binary files only the game should write, so here are the NVIDIA profile, Windows'' GPU choice and guided menu steps. It uses NetEase''s anti-cheat, which ZeroDelay never touches.' }
+    @{ Name = 'eFootball'; Icon = [char]0xE7FC; Title = 'eFootball'; Requires = { Test-GameInstalled 'efootball' }
+       Note = 'eFootball keeps its settings where ZeroDelay cannot safely edit them, so this page has the Windows GPU setting and step-by-step guides for the in-game options that affect delay. It uses Denuvo Anti-Cheat; nothing here touches the game files or the anti-cheat.' }
+    @{ Name = 'NBA 2K27'; Icon = [char]0xE7FC; Title = 'NBA 2K27'; Requires = { Test-GameInstalled 'nba2k27' }
+       Note = 'NBA 2K27 video settings, the NVIDIA driver profile for nba2k27.exe and guides for Reflex and online frame rate. Close the game before you flip a switch. Everything is a normal game or driver setting; nothing touches the game files or Easy Anti-Cheat.' }
+    @{ Name = 'Undisputed'; Icon = [char]0xE7FC; Title = 'Undisputed'; Requires = { Test-GameInstalled 'undisputed' }
+       Note = 'Undisputed stores its settings in a form ZeroDelay does not edit, so this page has the Windows GPU setting and a guide for the frame rate options. It uses Denuvo Anti-Cheat; nothing here touches the game files or the anti-cheat.' }
+    @{ Name = 'RocketLeague'; Icon = [char]0xE7FC; Title = 'Rocket League'; Requires = { Test-GameInstalled 'rocketleague' }
+       Note = 'Rocket League''s own settings file (V-Sync, window mode, render-thread delay), its NVIDIA profile and Windows'' GPU choice. It uses Easy Anti-Cheat, which ZeroDelay never touches. Close Rocket League before you flip a switch.' }
+    @{ Name = 'ApexLegends'; Icon = [char]0xE7FC; Title = 'Apex Legends'; Requires = { Test-GameInstalled 'apex' }
+       Note = 'Apex Legends'' videoconfig.txt (V-Sync, display mode), its NVIDIA profile and Windows'' GPU choice, plus guided steps for Reflex and the frame cap. It uses Easy Anti-Cheat, which ZeroDelay never touches. Close Apex first.' }
+    @{ Name = 'TheFinals'; Icon = [char]0xE7FC; Title = 'THE FINALS'; Requires = { Test-GameInstalled 'thefinals' }
+       Note = 'THE FINALS'' own settings file, its NVIDIA profile and Windows'' GPU choice, plus guided menu steps. It uses Easy Anti-Cheat, which ZeroDelay never touches. Close the game before you flip a switch.' }
+    @{ Name = 'CallOfDuty'; Icon = [char]0xE7FC; Title = 'Call of Duty'; Requires = { Test-GameInstalled 'cod' }
+       Note = 'The NVIDIA profile and Windows'' GPU choice for Call of Duty (Black Ops 7 and Warzone), a guide to the low-delay menu settings and a Secure Boot / TPM check. Activision forbids software that changes game data, and Ricochet is a kernel anti-cheat, so ZeroDelay never edits the game''s files.' }
+    @{ Name = 'Battlefield6'; Icon = [char]0xE7FC; Title = 'Battlefield 6'; Requires = { Test-GameInstalled 'bf6' }
+       Note = 'Battlefield 6''s own settings file (PROFSAVE_profile), the NVIDIA profile, Windows'' GPU choice and a Secure Boot check. Javelin anti-cheat needs Secure Boot and is never touched. Close the game before you flip a switch: it rewrites the file when it exits.' }
+    @{ Name = 'PUBG'; Icon = [char]0xE7FC; Title = 'PUBG: BATTLEGROUNDS'; Requires = { Test-GameInstalled 'pubg' }
+       Note = 'PUBG''s own GameUserSettings.ini (menu values only, never Engine.ini), the NVIDIA profile and Windows'' GPU choice. BattlEye is never touched. Close PUBG before you flip a switch: it rewrites its settings when it exits.' }
+    @{ Name = 'LeagueOfLegends'; Icon = [char]0xE7FC; Title = 'League of Legends'; Requires = { Test-GameInstalled 'lol' }
+       Note = 'League''s NVIDIA driver profile, Windows'' GPU choice, a read-only check of your video settings and a guide. Riot syncs your settings from its servers and League runs Vanguard, so ZeroDelay never edits League''s files.' }
+    @{ Name = 'Dota2'; Icon = [char]0xE7FC; Title = 'Dota 2'; Requires = { Test-GameInstalled 'dota2' }
+       Note = 'Dota 2''s own video.txt values, its NVIDIA driver profile, Windows'' GPU choice and a launch-options check. Close Dota 2 before you flip a switch: it rewrites video.txt when it exits. These are normal game settings, so they are VAC-safe.' }
+    @{ Name = 'Deadlock'; Icon = [char]0xE7FC; Title = 'Deadlock'; Requires = { Test-GameInstalled 'deadlock' }
+       Note = 'Deadlock''s own video.txt values, its NVIDIA driver profile, Windows'' GPU choice and a launch-options check. Close Deadlock before you flip a switch. Nothing here touches gameinfo.gi, mods or VAC.' }
+    @{ Name = 'GTAV'; Icon = [char]0xE7FC; Title = 'GTA V Enhanced'; Requires = { Test-GameInstalled 'gtav' }
+       Note = 'GTA V Enhanced''s own settings.xml, the NVIDIA profile and Windows'' GPU choice for the game, plus guided menu steps. GTA Online uses BattlEye, which ZeroDelay never touches. Close the game before you flip a switch: it rewrites its settings when it exits.' }
+    @{ Name = 'GTAVLegacy'; Icon = [char]0xE7FC; Title = 'GTA V Legacy'; Requires = { Test-GameInstalled 'gtavlegacy' }
+       Note = 'The original GTA V: its settings.xml, the NVIDIA profile and Windows'' GPU choice. GTA Online uses BattlEye, which ZeroDelay never touches. Close the game first: it rewrites its settings when it exits.' }
+    @{ Name = 'Roblox'; Icon = [char]0xE7FC; Title = 'Roblox'; Requires = { Test-GameInstalled 'roblox' }
+       Note = 'Roblox''s own menu settings file, the NVIDIA profile and Windows'' GPU choice. Roblox has a strict anti-cheat (Hyperion) and ignores most local Fast Flags since 2025, so ZeroDelay uses no FPS unlockers or Fast Flags: only what the in-game menu can set.' }
+    @{ Name = 'Tarkov'; Icon = [char]0xE7FC; Title = 'Escape from Tarkov'; Requires = { Test-GameInstalled 'tarkov' }
+       Note = 'Tarkov''s own Graphics.ini (the file its menu saves), the NVIDIA profile and Windows'' GPU choice. Tarkov uses BattlEye, which ZeroDelay never touches. Close the game before you flip a switch.' }
     @{ Name = 'System';     Icon = [char]0xE7F8; Title = 'System' }
     @{ Name = 'Power';      Icon = [char]0xE945; Title = 'Power & CPU' }
     @{ Name = 'Graphics';   Icon = [char]0xE7F4; Title = 'Graphics' }
@@ -11695,9 +12779,9 @@ $Categories = @(
     @{ Name = 'Benchmark';  Icon = [char]0xE9D9; Title = 'Benchmark'; Page = 'Benchmark'
        Note = 'Measure real FPS, 1% lows and latency in Fortnite, then compare before and after a change.' }
     @{ Name = 'Trends';     Icon = [char]0xE9D2; Title = 'Trends'; Page = 'Trends'
-       Note = 'Your matches over time: did the changes help? Lines mark when tweaks changed and when Fortnite or the graphics driver updated.' }
+       Note = 'Your matches over time, per game: did the changes help? Lines mark when tweaks changed and when Fortnite or the graphics driver updated.' }
     @{ Name = 'Matches';    Icon = [char]0xE7FC; Title = 'Match reports'; Page = 'Matches'
-       Note = 'After each Fortnite session: stutters and what was busy at that moment, GPU heat, background apps and memory.' }
+       Note = 'After each Fortnite or other game session: stutters and what was busy at that moment, GPU heat, background apps and memory.' }
     @{ Name = 'Debloat';    Icon = [char]0xE74D; Title = 'Debloat'; Page = 'Debloat'
        Note = 'Preinstalled apps and trials most people never use. You pick what goes; nothing is removed on its own.' }
     @{ Name = 'Booster';    Icon = [char]0xE9F5; Title = 'Ping booster'; Page = 'Booster'; Requires = { @(Get-InstalledBoosters).Count -gt 0 }
@@ -13323,7 +14407,7 @@ function New-SettingsPage {
         @{ Key = 'closetotray'; Title = 'Closing the window keeps ZeroDelay in the tray'; Desc = 'The X button hides ZeroDelay next to the clock instead of quitting. Right-click the tray icon to exit.' }
         @{ Key = 'startup';    Title = 'Start ZeroDelay when you sign in to Windows'; Desc = 'Opens quietly in the tray (no window), so Game Mode and match reports work without opening the app. Uses a Windows scheduled task named ZeroDelay; switching this off removes it.' }
         @{ Key = 'autofix';    Title = 'Automatically re-apply settings other programs change'; Desc = 'Instead of showing the orange bar, ZeroDelay quietly puts your settings back and tells you.' }
-        @{ Key = 'matchreport'; Title = 'Match reports'; Desc = 'Watches quietly while Fortnite runs and shows what got in the way when you close it (Tools > Match reports). Uses about 1% of one CPU core.' }
+        @{ Key = 'matchreport'; Title = 'Match reports'; Desc = 'Watches quietly while Fortnite or another supported game runs (one at a time) and shows what got in the way when you close it (Tools > Match reports, Trends and the game''s page). Uses about 1% of one CPU core.' }
         @{ Key = 'autoupdate'; Title = 'Check for new versions'; Desc = 'Asks GitHub when ZeroDelay starts and every 6 hours whether a newer version is out. Nothing is downloaded or installed unless you choose to.' }
     )
     $xr = ($rows | ForEach-Object {
@@ -13620,6 +14704,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.18.0' = @(
+        @{ T = '22 more games'; D = 'Valorant, Marvel Rivals, Overwatch 2, Rainbow Six Siege X, Rematch, Where Winds Meet, eFootball, NBA 2K27, Undisputed, Rocket League, Apex Legends, THE FINALS, Call of Duty, Battlefield 6, PUBG, League of Legends, Dota 2, Deadlock, GTA V (Enhanced and Legacy), Roblox and Escape from Tarkov, each with its own page, logo and tweaks. Games with kernel anti-cheat only get settings their makers allow, and every change can be undone.' }
+        @{ T = 'Tournaments'; D = 'A new place in the menu. Pick a game and see the tournaments that are live now or coming up, with dates, prize money and tier, from Liquipedia. Every game links to its official schedule, and you can add your own calendar for any game.' }
+        @{ T = 'Your stats for every game'; D = 'Every game you play with ZeroDelay open gets its own FPS, stutter and temperature trends. Fortnite (replays), Counter-Strike 2, Rocket League, Dota 2 and League of Legends also record your match results through the games'' own official features.' }
+    )
     '1.17.0' = @(
         @{ T = 'A simpler ZeroDelay'; D = 'Six places in the menu instead of about forty: Home, Games, Tweaks, Checks, Tools and Settings. Every tweak, check and tool is still here.' }
         @{ T = 'Home shows your results first'; D = 'Your last matches: ping, packet loss, FPS and stutters, then your score with Boost now and Restore, the live view, and how much is on for each part of your PC.' }
@@ -13968,9 +15057,9 @@ function Stop-MouseTest {
     } else { $m.Hz.Text = '-'; $m.Sub.Text = 'Click Start, then move your mouse in fast circles for 5 seconds.' }
 }
 
-# --- Match reports: while Fortnite runs, a background sampler notes CPU hogs, GPU heat/slowdowns and free memory
-#     every 5 s, and PresentMon (if downloaded on the Benchmark page) records frame times. When Fortnite closes,
-#     the two are lined up so each stutter shows what was busy at that moment.
+# --- Match reports: while Fortnite (or another supported game, one at a time) runs, a background sampler notes CPU
+#     hogs, GPU heat/slowdowns and free memory every 5 s, and PresentMon (if downloaded on the Benchmark page) records
+#     frame times. When the game closes, the two are lined up so each stutter shows what was busy at that moment.
 $MatchDir = Join-Path $DataDir 'matches'
 $MatchSampler = {
     param($sync, $smi, $smiField, $cores, $exclude, $selfPid, $gmFile, $pingHost, $boostRx)
@@ -14059,14 +15148,17 @@ function Get-MatchPingHost {
     $script:MatchPingRegion = $name
     if ($h) { $h.Host } else { $null }
 }
-function Start-MatchRecorder {
+# $Run = @{ Def = <$GameDefs entry>; Proc = <running process name> } from Find-RunningGame; none = Fortnite
+function Start-MatchRecorder($Run) {
     [ZdWatchdog]::Step = 'Start-MatchRecorder'
     Invoke-UpdateCheck
-    $rec = @{ Start = Get-Date; Csv = $null; Pm = $null }
-    if ((Test-Path $PresentMonExe) -and -not ($script:BenchProc -and -not $script:BenchProc.HasExited)) {
+    if (-not $Run) { $Run = @{ Def = (Get-GameDef 'fortnite'); Proc = ($FortniteExeName -replace '\.exe$') } }
+    $gd = $Run.Def
+    $rec = @{ Start = Get-Date; Csv = $null; Pm = $null; Game = "$($gd.Id)"; Title = "$($gd.Title)"; Procs = @(Get-GameProcNames $gd) }
+    if ((Test-PresentMonReady) -and -not ($script:BenchProc -and -not $script:BenchProc.HasExited)) {
         $rec.Csv = Join-Path $ToolsDir "match-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
         # at most one hour per recording: a Fortnite left open for hours otherwise grew one file to 800 MB+
-        $pmArgs = @('--process_name', $FortniteExeName, '--output_file', "`"$($rec.Csv)`"", '--terminate_on_proc_exit',
+        $pmArgs = @('--process_name', "$($Run.Proc).exe", '--output_file', "`"$($rec.Csv)`"", '--terminate_on_proc_exit',
                     '--timed', '3600', '--terminate_after_timed',
                     '--no_console_stats', '--stop_existing_session', '--session_name', 'ZeroDelayMatch')
         try { $rec.Pm = Start-Process $PresentMonExe -ArgumentList $pmArgs -WindowStyle Hidden -PassThru } catch { $rec.Csv = $null }
@@ -14080,7 +15172,9 @@ function Start-MatchRecorder {
     } else { $smi = $null }
     $sync = [hashtable]::Synchronized(@{ Stop = $false; Samples = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)) })
     $ps = [powershell]::Create()
-    [void]$ps.AddScript($MatchSampler.ToString()).AddArgument($sync).AddArgument($smi).AddArgument($script:SmiField).AddArgument([Environment]::ProcessorCount).AddArgument(@('Idle', ($FortniteExeName -replace '\.exe$'))).AddArgument($PID).AddArgument($GameModeFile).AddArgument((Get-MatchPingHost)).AddArgument('^(gearup_booster|ExitLag|WTFast|NoPing)')
+    # ping: Epic's server for your region in Fortnite; other games only when their entry names a ping host
+    $pingHost = if ($rec.Game -eq 'fortnite') { Get-MatchPingHost } else { $script:MatchPingRegion = $gd.PingRegion; $gd.PingHost }
+    [void]$ps.AddScript($MatchSampler.ToString()).AddArgument($sync).AddArgument($smi).AddArgument($script:SmiField).AddArgument([Environment]::ProcessorCount).AddArgument(@('Idle', $Run.Proc)).AddArgument($PID).AddArgument($GameModeFile).AddArgument($pingHost).AddArgument('^(gearup_booster|ExitLag|WTFast|NoPing)')
     $rec.PS = $ps; $rec.Sync = $sync; $rec.Handle = $ps.BeginInvoke()
     $script:MatchRec = $rec
     if ($script:MatchUi) { Update-MatchesPage }
@@ -14111,20 +15205,25 @@ function Complete-MatchReport {
     if ($a.Rec.Csv) { Remove-Item $a.Rec.Csv -Force -ErrorAction SilentlyContinue }
     if ($script:MatchUi) { Update-MatchesPage }
     if (($a.Rec.End - $a.Rec.Start).TotalMinutes -lt 2) { return }   # too short to say anything useful
-    $r = New-MatchReport $a.Rec.Start $a.Rec.End $frames @($a.Rec.Sync.Samples)
+    $r = New-MatchReport $a.Rec.Start $a.Rec.End $frames @($a.Rec.Sync.Samples) $a.Rec.Game
     Save-MatchReport $r
+    $fnRec = (Get-ReportGame $r) -eq 'fortnite'
+    if (-not $fnRec) { $script:MatchGame = $r.Game; $script:TrendGame = $r.Game }
+    if ($script:GameSel -and $script:GameSel.Id -eq $r.Game) { Update-GameStats }
     $w = $script:Backup.Custom['shaderwarm']
-    if ($w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; if ($script:HomeUi) { Update-HomePage } }
+    if ($fnRec -and $w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; if ($script:HomeUi) { Update-HomePage } }
     if ($script:MatchUi) { Update-MatchesPage }
     $n = @($r.Issues).Count
     $sum = if ($n) { "$n thing$(if ($n -ne 1) { 's' }) got in the way." } else { 'Smooth session: nothing got in the way.' }
-    Show-Toast "Match report ready. $sum" $(if ($n) { '#FF9F0A' } else { '#30D158' })
+    $what = if ($fnRec) { 'Match report' } else { "$($a.Rec.Title) session report" }
+    Show-Toast "$what ready. $sum" $(if ($n) { '#FF9F0A' } else { '#30D158' })
     if (-not $window.IsVisible -and $script:TrayIcon) {
         $script:BalloonPage = 'Matches'
-        $script:TrayIcon.ShowBalloonTip(6000, 'ZeroDelay match report', "$sum Click to see it.", 'None')
+        $script:TrayIcon.ShowBalloonTip(6000, $(if ($fnRec) { 'ZeroDelay match report' } else { "ZeroDelay: $($a.Rec.Title)" }), "$sum Click to see it.", 'None')
     }
 }
-function New-MatchReport($Start, $End, $Frames, $Samples) {
+function New-MatchReport($Start, $End, $Frames, $Samples, [string]$Game = 'fortnite') {
+    if (-not $Game) { $Game = 'fortnite' }
     $samples = @($Samples | Where-Object { $_ })
     $n = [Math]::Max(1, $samples.Count)
     $issues = @()
@@ -14143,6 +15242,7 @@ function New-MatchReport($Start, $End, $Frames, $Samples) {
     $maxT = if ($g) { ($g | ForEach-Object { $_.Gpu.Temp } | Measure-Object -Maximum).Maximum } else { $null }
     $hot = if ($g) { [int][Math]::Round(100 * @($g | Where-Object { $_.Gpu.Thermal }).Count / $g.Count) } else { 0 }
     $slow = if ($g) { [int][Math]::Round(100 * @($g | Where-Object { $_.Gpu.HwSlow }).Count / $g.Count) } else { 0 }
+    $util = if ($g) { [int][Math]::Round(($g | ForEach-Object { $_.Gpu.Util } | Measure-Object -Average).Average) } else { $null }
     if ($hot -ge 5) { $issues += "Your graphics card slowed itself down because it got too hot (up to $maxT °C) for $hot% of the session. Clean out the dust or set a stronger fan curve." }
     if ($slow -ge 5) { $issues += "Your graphics card hit a hardware slowdown (power or heat protection) for $slow% of the session. Check its power cables and that the power supply is strong enough." }
     # memory
@@ -14160,12 +15260,12 @@ function New-MatchReport($Start, $End, $Frames, $Samples) {
         $lossPct = if ($sent) { [Math]::Round(100.0 * $lostN / $sent, 1) } else { 0 }
     }
     $boosted = @($samples | Where-Object { $_.Boost }).Count -gt $n / 2
-    if ($null -ne $lossPct -and $lossPct -ge 1) { $issues += "$lossPct% of pings to Epic's servers got no answer during the match. Lost packets feel like rubber-banding and shots that do not count." }
+    if ($null -ne $lossPct -and $lossPct -ge 1) { $issues += "$lossPct% of pings to $(if ($Game -eq 'fortnite') { "Epic's servers" } else { "the game's servers" }) got no answer during the match. Lost packets feel like rubber-banding and shots that do not count." }
     if ($null -ne $jitter -and $jitter -ge 8) { $issues += "Your ping jumped around a lot (jitter $jitter ms on average around $pingAvg ms). Steady ping matters more than low ping." }
     # first matches after a Fortnite or driver update compile shaders, which stutters
     $warm = $script:Backup.Custom['shaderwarm']
     $afterUpdate = $null
-    if ($warm -and $warm.Since) { try { if ([datetime]$warm.Since -le $Start -and $Start -le ([datetime]$warm.Since).AddDays(3)) { $afterUpdate = "$($warm.Why)" } } catch {} }
+    if ($Game -eq 'fortnite' -and $warm -and $warm.Since) { try { if ([datetime]$warm.Since -le $Start -and $Start -le ([datetime]$warm.Since).AddDays(3)) { $afterUpdate = "$($warm.Why)" } } catch {} }
     # frames
     $stutters = @(); $fps = $null
     if ($Frames -and $Frames.Frames -gt 0) {
@@ -14187,9 +15287,9 @@ function New-MatchReport($Start, $End, $Frames, $Samples) {
         if ($Frames.Low1Fps -lt 0.5 * $Frames.AvgFps) { $issues += "Your 1% lows ($($fps.Low1) FPS) are less than half your average ($($fps.Avg) FPS), so the game felt less smooth than the FPS counter says." }
     }
     [pscustomobject]@{
-        Version = 1; Start = $Start.ToString('o'); End = $End.ToString('o'); Minutes = [int][Math]::Round(($End - $Start).TotalMinutes)
+        Version = 1; Game = $Game; Start = $Start.ToString('o'); End = $End.ToString('o'); Minutes = [int][Math]::Round(($End - $Start).TotalMinutes)
         Fps = $fps; StutterCount = $(if ($Frames) { $Frames.StutterCount } else { $null }); Stutters = $stutters
-        GpuMaxTemp = $maxT; GpuHotPct = $hot; GpuSlowPct = $slow; Hogs = $hogs; MinFreeMb = $minFree; Issues = @($issues)
+        GpuMaxTemp = $maxT; GpuHotPct = $hot; GpuSlowPct = $slow; GpuUtilAvg = $util; Hogs = $hogs; MinFreeMb = $minFree; Issues = @($issues)
         GameModePct = $(if (@($samples | Where-Object { $null -ne $_.GM }).Count) { [int][Math]::Round(100 * @($samples | Where-Object { $_.GM }).Count / $n) } else { $null })
         Latency = $(if ($Frames -and $Frames.LatAvg -gt 0) { [Math]::Round($Frames.LatAvg, 1) } else { $null }); LatencyKind = $(if ($Frames) { $Frames.LatKind } else { $null })
         PingAvg = $pingAvg; Jitter = $jitter; LossPct = $lossPct; PingRegion = $script:MatchPingRegion; Boosted = $boosted; AfterUpdate = $afterUpdate
@@ -14204,6 +15304,7 @@ function Get-MatchFixes($r) {
     $fixes = New-Object Collections.ArrayList
     $gp = Get-GameModePrefs; $sp = Get-SessionPrefs
     $gmOff = ($null -ne $r.GameModePct -and $r.GameModePct -lt 50)
+    $gt = if ((Get-ReportGame $r) -eq 'fortnite') { 'Fortnite' } else { Get-GameTitle $r.Game }
     function Add-Fix($f) { [void]$fixes.Add($f) }
     # 1. apps that were busy during the match or during stutters
     $names = @{}
@@ -14225,8 +15326,8 @@ function Get-MatchFixes($r) {
                    Kind = 'session'; AppKeys = $closeKeys; Button = 'Close them in Game Mode'; Done = $done }
     }
     if ($others) {
-        Add-Fix @{ Icon = 0xE9D9; Tint = '#0A84FF'; Title = "$($others -join ', ') took CPU time from Fortnite"
-                   Desc = 'Close them before you play. Game Mode can also push apps like these to low priority so Fortnite always comes first.'
+        Add-Fix @{ Icon = 0xE9D9; Tint = '#0A84FF'; Title = "$($others -join ', ') took CPU time from $gt"
+                   Desc = "Close them before you play. Game Mode can also push apps like these to low priority so $gt always comes first."
                    Kind = 'gmstep'; Step = 'priority'; Button = 'Lower their priority'; Done = [bool]$gp.priority -and -not $gmOff }
     }
     if ($names.ContainsKey('MsMpEng')) {
@@ -14262,7 +15363,7 @@ function Get-MatchFixes($r) {
     if ($r.Fps -and $r.Fps.Low1 -lt 0.5 * $r.Fps.Avg) {
         $t = Get-OffTweaks @('fpscap', 'perfmode', 'minstate', 'coreparking', 'gamemode', 'timer')
         Add-Fix @{ Icon = 0xE9D9; Tint = '#FFD60A'; Title = 'Your FPS jumps around a lot'
-                   Desc = $(if ($t.Count) { "1% lows of $($r.Fps.Low1) against $($r.Fps.Avg) average. A frame cap you can always hold and steady CPU clocks even it out: $(@($t | ForEach-Object { $_.Title }) -join ', ')." } else { "1% lows of $($r.Fps.Low1) against $($r.Fps.Avg) average. Try a frame cap a little under your 1% lows on the Fortnite tab." })
+                   Desc = $(if ($t.Count) { "1% lows of $($r.Fps.Low1) against $($r.Fps.Avg) average. A frame cap you can always hold and steady CPU clocks even it out: $(@($t | ForEach-Object { $_.Title }) -join ', ')." } else { "1% lows of $($r.Fps.Low1) against $($r.Fps.Avg) average. Try a frame cap a little under your 1% lows $(if ($gt -eq 'Fortnite') { 'on the Fortnite tab' } else { "in $gt's settings" })." })
                    Kind = 'tweaks'; Ids = @($t | ForEach-Object { $_.Id }); Button = "Switch on $($t.Count)"; Done = -not $t.Count }
     }
     # 4. heat and power
@@ -14283,7 +15384,7 @@ function Get-MatchFixes($r) {
                    Kind = 'page'; Page = 'Memory'; Button = 'Open Memory'; Done = $false }
     }
     # 6. Game Mode off while things went wrong
-    if ($gmOff -and @($r.Issues).Count -and -not $gp.auto) {
+    if ($gt -eq 'Fortnite' -and $gmOff -and @($r.Issues).Count -and -not $gp.auto) {
         Add-Fix @{ Icon = 0xE768; Tint = '#2EE6A6'; Title = 'Game Mode was off for this match'
                    Desc = 'Let it switch on by itself whenever Fortnite starts, so background apps are dealt with every time.'
                    Kind = 'gmstep'; Step = 'auto'; Button = 'Start it automatically'; Done = $false }
@@ -14325,8 +15426,9 @@ function Invoke-MatchFix($fx) {
 }
 function Save-MatchReport($r) {
     New-Item -ItemType Directory -Force $MatchDir | Out-Null
-    $r | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $MatchDir "$(([datetime]$r.Start).ToString('yyyyMMdd-HHmmss')).json") -Encoding UTF8
-    Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -Skip 60 | Remove-Item -Force -ErrorAction SilentlyContinue
+    $gid = Get-ReportGame $r
+    $r | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $MatchDir "$(([datetime]$r.Start).ToString('yyyyMMdd-HHmmss'))$(if ($gid -ne 'fortnite') { "-$gid" }).json") -Encoding UTF8
+    Get-ChildItem $MatchDir -Filter '*.json' | Group-Object { Get-ReportFileGame $_.Name } | ForEach-Object { $_.Group | Sort-Object Name -Descending | Select-Object -Skip 60 } | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 function Get-MatchReports {
     if ($Snapshot -and $env:ZD_FAKE_MATCH) { return @(New-FakeMatchReport) }
@@ -14364,10 +15466,11 @@ function New-MatchesPage {
       <TextBlock x:Name='How' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,0,0' TextWrapping='Wrap' LineHeight='18' LineStackingStrategy='BlockLineHeight'/>
     </StackPanel>
   </Border>
+  <WrapPanel x:Name='Games' Margin='0,0,0,8'/>
   <StackPanel x:Name='List'/>
 </StackPanel>
 "@)
-    $script:MatchUi = @{ State = $root.FindName('State'); How = $root.FindName('How'); List = $root.FindName('List') }
+    $script:MatchUi = @{ State = $root.FindName('State'); How = $root.FindName('How'); List = $root.FindName('List'); Games = $root.FindName('Games') }
     Update-MatchesPage
     New-PageScroll $root
 }
@@ -14376,17 +15479,21 @@ function Update-MatchesPage {
     $on = [bool](Get-Setting 'matchreport' $true)
     $pm = Test-Path $PresentMonExe
     $mu.State.Text = if (-not $on) { 'Match reports are off (Settings).' }
+                     elseif ($script:MatchRec -and $script:MatchRec.Game -and $script:MatchRec.Game -ne 'fortnite') { "Recording $($script:MatchRec.Title) since $($script:MatchRec.Start.ToString('HH:mm')). The report appears when you close it." }
                      elseif ($script:MatchRec) { "Recording since $($script:MatchRec.Start.ToString('HH:mm')). The report appears when you close Fortnite." }
                      elseif ($script:MatchAnalysis) { 'Building the report...' }
-                     else { 'Ready. Play with ZeroDelay open (the tray is enough) and close Fortnite when you are done.' }
+                     else { 'Ready. Play Fortnite or another game from the Games page with ZeroDelay open (the tray is enough) and close the game when you are done.' }
     $mu.How.Text = 'ZeroDelay checks every 5 seconds which apps use your CPU, how hot your graphics card is and how much memory is free. ' +
                    $(if ($pm) { 'PresentMon records every frame, so each stutter is shown with what was busy at that moment.' }
                      else { 'To also find stutters, download PresentMon once on the Benchmark page.' })
     $mu.List.Children.Clear()
-    $reports = Get-MatchReports
+    $games = @(Get-ReportGames)
+    $script:MatchGame = Select-ReportGame $script:MatchGame $games
+    Set-GameChips $mu.Games $games $script:MatchGame { param($id) $script:MatchGame = $id; Update-MatchesPage }
+    $reports = @(Get-GameReports $script:MatchGame)
     if (-not $reports) {
         $tb = New-Object Windows.Controls.TextBlock
-        $tb.Text = 'No reports yet. Your first one appears after your next Fortnite session (at least 2 minutes).'
+        $tb.Text = 'No reports yet. Your first one appears after your next session in Fortnite or another supported game (at least 2 minutes).'
         $tb.Foreground = ConvertTo-Brush '#98989D'; $tb.FontSize = 13; $tb.Margin = '4,4,0,0'
         [void]$mu.List.Children.Add($tb); return
     }
@@ -14413,7 +15520,7 @@ function Update-MatchesPage {
         }
         $gpuX = if ($r.GpuMaxTemp) { "  ·  GPU up to $($r.GpuMaxTemp) °C" } else { '' }
         if ($r.Latency) { $gpuX = "  ·  $($r.Latency) ms $("$($r.LatencyKind)" -replace '^input latency$', 'input-to-frame estimate')" + $gpuX }
-        $netX = if ($null -ne $r.PingAvg) { "Connection to Epic's $($r.PingRegion) servers: $($r.PingAvg) ms ping, $($r.Jitter) ms jitter, $($r.LossPct)% lost$(if ($r.Boosted) { '   (a ping booster was running: it routes the game''s own traffic, so this shows your normal connection)' })" } else { '' }
+        $netX = if ($null -ne $r.PingAvg) { "Connection to $(if ((Get-ReportGame $r) -eq 'fortnite') { "Epic's " })$(if ($r.PingRegion) { "$($r.PingRegion) " })servers: $($r.PingAvg) ms ping, $($r.Jitter) ms jitter, $($r.LossPct)% lost$(if ($r.Boosted) { '   (a ping booster was running: it routes the game''s own traffic, so this shows your normal connection)' })" } else { '' }
         $warmX = if ($r.AfterUpdate) { "<TextBlock Text='$(Esc "First match after an update ($($r.AfterUpdate)): some stutter while shaders compile is normal.")' FontSize='12' Foreground='#0A84FF' Margin='0,6,0,0' TextWrapping='Wrap'/>" } else { '' }
         $fixes = @(Get-MatchFixes $r)
         $fixX = ''
@@ -14505,7 +15612,7 @@ function Initialize-Worker {
         $iss.Commands.Add((New-Object Management.Automation.Runspaces.SessionStateFunctionEntry $fn.Name, $fn.Definition))
     }
     # plain data only: never windows, timers, jobs or tray objects
-    $skip = 'window', 'ui', 'Tweaks', 't', 'Splash', 'ReadCache', 'Worker', 'WorkerQueue', 'WorkerJob', 'BgJobs', 'AnimQueue', 'Uncache', 'Pages', 'PageRefresh', 'NavButtons', 'NavGroups', 'Tray'
+    $skip = 'Cs2Gsi', 'EsportsGate', 'EsportsPending', 'ZdStats', 'LolPoller', 'window', 'ui', 'Tweaks', 't', 'Splash', 'ReadCache', 'Worker', 'WorkerQueue', 'WorkerJob', 'BgJobs', 'AnimQueue', 'Uncache', 'Pages', 'PageRefresh', 'NavButtons', 'NavGroups', 'Tray'
     # PowerShell's own variables are left out: the worker has its own (a script run with -File shares the global scope)
     $builtin = [powershell]::Create(); $builtinNames = @($builtin.AddScript('(Get-Variable).Name').Invoke()) + 'args', 'input', 'MyInvocation', 'PSBoundParameters', 'PSCommandPath', 'PSScriptRoot', 'this', '_', 'foreach', 'switch', 'Matches', 'LASTEXITCODE', 'Error', 'StackTrace', 'PSItem', 'sender', 'EventArgs', 'Event'; $builtin.Dispose()
     foreach ($v in Get-Variable -Scope Script) {
@@ -14602,6 +15709,7 @@ function Complete-StateRefresh {
         Update-PauseCard
         if ($script:HomeUi) { Update-HomePage }
         if ($script:BoostUi) { Update-BoostPage }
+        if ($script:GameSel -and $script:GamesUi) { Update-GameTools }
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
         if ($script:StateAgain) { $script:StateAgain = $false; Clear-ReadCache; Start-StateRefresh $null }
 }
@@ -15954,6 +17062,2847 @@ $GameDefs = @(
                  @{ Id = 'cs-launchcheck'; Kind = 'FPS' }, @{ Id = 'cs-shaderwarm'; Kind = 'FPS' }, @{ Id = 'cs-sens'; Kind = 'FPS' },
                  @{ Id = 'cs-install'; Kind = 'Repair' }, @{ Id = 'pack-scan'; Kind = 'Repair' }) }
 )
+# =============================================================== More games (1.18): shared engine
+# Where each game is installed and what its exe and processes are called. Plain data only (no script blocks), so the
+# background card checks can use it too. Fields: Name, Steam (app id), Epic (DisplayName or AppName), Uninstall (regex on
+# the uninstall entry's DisplayName), Reg (@(@{ P; N }) registry values holding the folder), Dirs (known folders, %ENV% ok),
+# Exe (path of the game's exe under the install folder), Proc (process names without .exe).
+$GameFind = @{}
+# The game's own settings file: patterns with %ENV% variables, * wildcards and {Install} for the install folder.
+# The newest existing match wins (games that keep one folder per account).
+$GameCfgPaths = @{}
+
+# Steam library folders (cached for the session)
+function Get-SteamLibraries {
+    if ($null -ne $script:SteamLibs) { return $script:SteamLibs }
+    $libs = @(); $s = Get-SteamPath
+    if ($s) {
+        $libs += $s
+        $lf = Join-Path $s 'steamapps\libraryfolders.vdf'
+        if (Test-Path $lf) { foreach ($m in [regex]::Matches([IO.File]::ReadAllText($lf), '"path"\s+"([^"]+)"')) { $libs += ($m.Groups[1].Value -replace '\\\\', '\') } }
+    }
+    $script:SteamLibs = @($libs | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+    $script:SteamLibs
+}
+# install folder of a Steam app id, or $null
+function Find-SteamApp([string]$AppId) {
+    foreach ($l in Get-SteamLibraries) {
+        $m = Join-Path $l "steamapps\appmanifest_$AppId.acf"
+        if (-not (Test-Path $m)) { continue }
+        if ([IO.File]::ReadAllText($m) -match '"installdir"\s+"([^"]+)"') { $d = Join-Path $l "steamapps\common\$($Matches[1])"; if (Test-Path $d) { return $d } }
+    }
+    $null
+}
+# install folder of an Epic Games Store app (by DisplayName or AppName), or $null
+function Find-EpicApp([string]$Name) {
+    foreach ($f in Get-ChildItem "$env:ProgramData\Epic\EpicGamesLauncher\Data\Manifests" -Filter *.item -ErrorAction SilentlyContinue) {
+        $j = try { [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { $null }
+        if ($j -and ($j.DisplayName -eq $Name -or $j.AppName -eq $Name) -and $j.InstallLocation -and (Test-Path $j.InstallLocation)) { return $j.InstallLocation }
+    }
+    $null
+}
+# install folder from Windows' list of installed programs (DisplayName matches the regex), or $null
+function Find-UninstallDir([string]$Pattern) {
+    if ($null -eq $script:UninstallRows) {
+        $script:UninstallRows = @(foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+            Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and $_.InstallLocation } | ForEach-Object { [pscustomobject]@{ Name = "$($_.DisplayName)"; Dir = "$($_.InstallLocation)".Trim('"') } }
+        })
+    }
+    foreach ($r in $script:UninstallRows) { if ($r.Name -match $Pattern -and (Test-Path $r.Dir)) { return $r.Dir } }
+    $null
+}
+# install folder of a game from $GameFind, or $null when it is not installed (cached for the session)
+function Get-GameInstallDir([string]$Game) {
+    if (-not $script:GameDirCache) { $script:GameDirCache = @{} }
+    if ($script:GameDirCache.ContainsKey($Game)) { return $script:GameDirCache[$Game] }
+    $f = $GameFind[$Game]; $d = $null
+    if ($f) {
+        if (-not $d -and $f.Steam) { $d = Find-SteamApp $f.Steam }
+        if (-not $d -and $f.Epic) { $d = Find-EpicApp $f.Epic }
+        if (-not $d -and $f.Uninstall) { $d = Find-UninstallDir $f.Uninstall }
+        if (-not $d -and $f.Reg) { foreach ($r in @($f.Reg)) { $v = Get-RegValue $r.P $r.N; if ($v -and (Test-Path "$v")) { $d = "$v"; break } } }
+        if (-not $d -and $f.Dirs) { foreach ($x in @($f.Dirs)) { $p = [Environment]::ExpandEnvironmentVariables($x); if (Test-Path $p) { $d = $p; break } } }
+        # a folder only counts when the game's exe is really in it
+        if ($d -and $f.Exe -and -not (Test-Path (Join-Path $d $f.Exe))) { $d = $null }
+    }
+    $script:GameDirCache[$Game] = $d
+    $d
+}
+function Test-GameInstalled([string]$Game) { [bool](Get-GameInstallDir $Game) }
+function Get-GameExePath([string]$Game) { $d = Get-GameInstallDir $Game; $f = $GameFind[$Game]; if ($d -and $f.Exe) { Join-Path $d $f.Exe } else { $null } }
+function Test-GameRunning([string]$Game) { foreach ($n in @($GameFind[$Game].Proc)) { if ($n -and (Get-Process $n -ErrorAction SilentlyContinue)) { return $true } }; $false }
+function Assert-GameClosed([string]$Game) { if (Test-GameRunning $Game) { throw "Close $($GameFind[$Game].Name) first: it rewrites its settings when it exits." } }
+# the game's settings file, or $null when the game has not written one yet
+function Get-GameCfgPath([string]$Game) {
+    $best = $null
+    foreach ($pat in @($GameCfgPaths[$Game])) {
+        if (-not $pat) { continue }
+        $p = [Environment]::ExpandEnvironmentVariables($pat)
+        if ($p.Contains('{Install}')) { $d = Get-GameInstallDir $Game; if (-not $d) { continue }; $p = $p.Replace('{Install}', $d) }
+        foreach ($f in @(Get-ChildItem -Path $p -File -Force -ErrorAction SilentlyContinue)) { if (-not $best -or $f.LastWriteTime -gt $best.LastWriteTime) { $best = $f } }
+    }
+    if ($best) { $best.FullName } else { $null }
+}
+# a settings file as lines, with its text encoding and line endings kept for writing back
+function Read-GameCfg([string]$Path) {
+    $b = [IO.File]::ReadAllBytes($Path)
+    $enc = if ($b.Length -ge 2 -and $b[0] -eq 0xFF -and $b[1] -eq 0xFE) { New-Object Text.UnicodeEncoding $false, $true }
+           elseif ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { New-Object Text.UTF8Encoding $true }
+           else { New-Object Text.UTF8Encoding $false }
+    $text = $enc.GetString($b); if ($text.Length -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    @{ Enc = $enc; Nl = $(if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }); Lines = [Collections.ArrayList]@($text -split "`r?`n") }
+}
+function Write-GameCfg([string]$Path, $c) {
+    if ((Get-Item -LiteralPath $Path -Force).IsReadOnly) { throw "$([IO.Path]::GetFileName($Path)) is read-only, which someone set on purpose (often to stop the game resetting it). ZeroDelay leaves it alone." }
+    [IO.File]::WriteAllText($Path, ($c.Lines -join $c.Nl), $c.Enc)
+}
+# line index of Key inside [Section] ('' = before the first section), or -1
+function Find-IniKey($Lines, [string]$Section, [string]$Key) {
+    $in = [string]::IsNullOrEmpty($Section)
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $l = "$($Lines[$i])".Trim()
+        if ($l.StartsWith('[') -and $l.EndsWith(']')) { $in = ($l.Substring(1, $l.Length - 2) -eq $Section); continue }
+        if ($in -and $l -match '^([^=;#]+?)\s*=' -and $Matches[1].Trim() -eq $Key) { return $i }
+    }
+    -1
+}
+function Get-GameIniValue([string]$Game, [string]$Section, [string]$Key) {
+    $p = Get-GameCfgPath $Game; if (-not $p) { return $null }
+    $c = Read-GameCfg $p; $i = Find-IniKey $c.Lines $Section $Key
+    if ($i -lt 0) { return $null }
+    $l = "$($c.Lines[$i])"; $l.Substring($l.IndexOf('=') + 1).Trim()
+}
+# sets Key in [Section] (adds the key or section when missing); $null removes the key
+function Set-GameIniValue([string]$Game, [string]$Section, [string]$Key, $Value) {
+    $p = Get-GameCfgPath $Game
+    if (-not $p) { throw "$($GameFind[$Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    $c = Read-GameCfg $p; $i = Find-IniKey $c.Lines $Section $Key
+    if ($null -eq $Value) {
+        if ($i -ge 0) {
+            $c.Lines.RemoveAt($i)
+            # a section left empty (ZeroDelay added it) goes too, with the blank line before it
+            $next = if ($i -lt $c.Lines.Count) { "$($c.Lines[$i])".Trim() } else { '' }
+            if ($Section -and $i -gt 0 -and "$($c.Lines[$i - 1])".Trim() -eq "[$Section]" -and ($next -eq '' -or $next.StartsWith('['))) {
+                $c.Lines.RemoveAt($i - 1)
+                if ($i -gt 1 -and "$($c.Lines[$i - 2])" -eq '') { $c.Lines.RemoveAt($i - 2) }
+            }
+        }
+    }
+    elseif ($i -ge 0) {
+        $l = "$($c.Lines[$i])"; $eq = $l.IndexOf('='); $rest = $l.Substring($eq + 1)
+        $c.Lines[$i] = $l.Substring(0, $eq + 1) + $rest.Substring(0, $rest.Length - $rest.TrimStart().Length) + "$Value"
+    } else {
+        $h = -1
+        if ($Section) { for ($j = 0; $j -lt $c.Lines.Count; $j++) { if ("$($c.Lines[$j])".Trim() -eq "[$Section]") { $h = $j; break } } }
+        if ($h -ge 0 -or -not $Section) { $c.Lines.Insert($h + 1, "$Key=$Value") }
+        else {
+            $end = $c.Lines.Count; while ($end -gt 0 -and "$($c.Lines[$end - 1])" -eq '') { $end-- }
+            $c.Lines.Insert($end, "[$Section]"); $c.Lines.Insert($end + 1, "$Key=$Value")
+            if ($end -gt 0) { $c.Lines.Insert($end, '') }
+        }
+    }
+    Write-GameCfg $p $c
+}
+# --- card engine for a game's settings file. On a card: GameIni = @( @{ Game; Section; Key; V } ... ) (one or more
+#     values, all set together). Test: all equal V; $null when the game has no settings file. On backs up each old value.
+function Test-GameIni($t) {
+    $items = @($t.GameIni); if (-not (Get-GameCfgPath $items[0].Game)) { return $null }
+    -not ($items | Where-Object { "$(Get-GameIniValue $_.Game $_.Section $_.Key)" -ne "$($_.V)" })
+}
+function Enable-GameIni($t) {
+    $items = @($t.GameIni); Assert-GameClosed $items[0].Game
+    $key = "gcfg:$($t.Id)"
+    if (-not $script:Backup.Custom.ContainsKey($key)) {
+        $script:Backup.Custom[$key] = @(foreach ($g in $items) { $old = Get-GameIniValue $g.Game $g.Section $g.Key; @{ Had = ($null -ne $old); Value = "$old" } })
+        Save-Backup
+    }
+    foreach ($g in $items) { Set-GameIniValue $g.Game $g.Section $g.Key "$($g.V)" }
+}
+function Disable-GameIni($t) {
+    $items = @($t.GameIni); Assert-GameClosed $items[0].Game
+    $key = "gcfg:$($t.Id)"; $saved = @($script:Backup.Custom[$key])
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $g = $items[$i]; $b = if ($i -lt $saved.Count) { $saved[$i] } else { $null }
+        if ($b) { Set-GameIniValue $g.Game $g.Section $g.Key $(if ($b.Had) { "$($b.Value)" } else { $null }) }
+        elseif ($g.ContainsKey('D')) { Set-GameIniValue $g.Game $g.Section $g.Key $g.D }
+    }
+    $script:Backup.Custom.Remove($key)
+}
+# --- The 1.18 games: helpers
+# ---- ue games (1.18): helpers for Marvel Rivals, Rematch and Where Winds Meet cards
+
+# GameIni items with Find = $true: sets .Section to the section of the game's settings file that already holds the key
+# (Unreal games keep menu settings under their own [/Script/<Project>.<Class>] section). $false when a key is missing.
+function Resolve-UeIniSection($t) {
+    $items = @($t.GameIni); $p = Get-GameCfgPath $items[0].Game; if (-not $p) { return $false }
+    $lines = (Read-GameCfg $p).Lines
+    foreach ($g in $items) {
+        if (-not $g.Find) { continue }
+        $sec = $null; $cur = ''
+        foreach ($l in $lines) {
+            $s = "$l".Trim()
+            if ($s.StartsWith('[') -and $s.EndsWith(']')) { $cur = $s.Substring(1, $s.Length - 2); continue }
+            if ($cur -match 'GameUserSettings$' -and $s -match '^([^=;#]+?)\s*=' -and $Matches[1].Trim() -eq $g.Key) { $sec = $cur; break }
+        }
+        if (-not $sec) { return $false }
+        $g.Section = $sec
+    }
+    $true
+}
+
+# every copy of Where Winds Meet's exe: Win64r, and Win64rh (the build for the Hong Kong, Macau and Taiwan servers) when present
+function Get-WwmExes {
+    $e = Get-GameExePath 'wwm'; if (-not $e) { return @() }
+    $rh = Join-Path (Split-Path (Split-Path $e -Parent) -Parent) 'Win64rh\wwm.exe'
+    @($e) + @(if (Test-Path -LiteralPath $rh) { $rh })
+}
+
+# true when every exe is pinned to the high-performance GPU in Windows' per-app graphics settings, $null without an exe
+function Test-GameGpuPref([string[]]$Exes) {
+    $Exes = @($Exes | Where-Object { $_ }); if (-not $Exes.Count) { return $null }
+    -not ($Exes | Where-Object { "$(Get-RegValue $GpuPrefKey $_)" -notmatch 'GpuPreference=2;' })
+}
+
+# pins each exe to the high-performance GPU, keeping any other per-app options already in the value (tracked per card)
+function Enable-GameGpuPref($t, [string[]]$Exes) {
+    $Exes = @($Exes | Where-Object { $_ }); if (-not $Exes.Count) { throw 'The game''s exe was not found.' }
+    foreach ($e in $Exes) {
+        $cur = "$(Get-RegValue $GpuPrefKey $e)"
+        $new = if ($cur -match 'GpuPreference=\d;') { $cur -replace 'GpuPreference=\d;', 'GpuPreference=2;' } else { "GpuPreference=2;$cur" }
+        Set-RegTracked $t.Id $GpuPrefKey $e $new 'String'
+    }
+}
+
+# puts back what Enable-GameGpuPref changed; without a backup it just removes GpuPreference=2;
+function Disable-GameGpuPref($t, [string[]]$Exes) {
+    if (Restore-RegTweak $t.Id) { return }
+    foreach ($e in @($Exes | Where-Object { $_ })) {
+        $v = "$(Get-RegValue $GpuPrefKey $e)" -replace 'GpuPreference=2;', ''
+        if ($v) { Set-RegValue $GpuPrefKey $e $v 'String' } else { Remove-RegValue $GpuPrefKey $e }
+    }
+}
+
+# Rematch's settings folder (%LOCALAPPDATA%\Runtime\Saved\Config), or $null
+function Get-RematchCfgDir {
+    $d = Join-Path $env:LOCALAPPDATA 'Runtime\Saved\Config'
+    if (Test-Path -LiteralPath $d) { $d } else { $null }
+}
+
+# moves Rematch's settings folder aside (never deletes it) so the game writes fresh defaults; returns the backup folder
+function Reset-RematchCfg {
+    Assert-GameClosed 'rematch'
+    $d = Get-RematchCfgDir; if (-not $d) { throw 'Rematch has no settings folder on this PC yet.' }
+    $to = "$d.zerodelay-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    Rename-Item -LiteralPath $d -NewName (Split-Path $to -Leaf) -ErrorAction Stop
+    $to
+}
+
+# ---- sports (1.18): JSON-style settings files (NBA 2K27 VideoSettings.cfg: one "KEY": value, pair per line)
+# line index of "Key": in a one-pair-per-line JSON file, or -1
+function Find-JsonKey($Lines, [string]$Key) {
+    $rx = '^\s*"' + [regex]::Escape($Key) + '"\s*:'
+    for ($i = 0; $i -lt $Lines.Count; $i++) { if ("$($Lines[$i])" -match $rx) { return $i } }
+    -1
+}
+# raw value text of "Key" (true, 0, 1.5 ...), or $null when the file or the key is missing
+function Get-GameJsonValue([string]$Game, [string]$Key) {
+    $p = Get-GameCfgPath $Game; if (-not $p) { return $null }
+    $c = Read-GameCfg $p; $i = Find-JsonKey $c.Lines $Key
+    if ($i -lt 0) { return $null }
+    if ("$($c.Lines[$i])" -match '^\s*"[^"]*"\s*:\s*(.*?)\s*,?\s*$') { $Matches[1] } else { $null }
+}
+# replaces the value of an existing "Key" in place, keeping indentation and the trailing comma
+function Set-GameJsonValue([string]$Game, [string]$Key, [string]$Value) {
+    $p = Get-GameCfgPath $Game
+    if (-not $p) { throw "$($GameFind[$Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    $c = Read-GameCfg $p; $i = Find-JsonKey $c.Lines $Key
+    if ($i -lt 0) { throw "This version of $($GameFind[$Game].Name) has no $Key setting, so ZeroDelay leaves the file alone." }
+    $l = "$($c.Lines[$i])"
+    if ($l -notmatch '^(\s*"[^"]*"\s*:\s*)(.*?)(\s*,?\s*)$') { throw "Unexpected line for $Key in the settings file." }
+    $c.Lines[$i] = $Matches[1] + $Value + $Matches[3]
+    Write-GameCfg $p $c
+}
+# --- card engine: GameJson = @( @{ Game; Key; V; D } ... ). Test: $null when the file or any key is missing (other game version).
+function Test-GameJson($t) {
+    $items = @($t.GameJson); if (-not (Get-GameCfgPath $items[0].Game)) { return $null }
+    foreach ($g in $items) { $v = Get-GameJsonValue $g.Game $g.Key; if ($null -eq $v) { return $null }; if ("$v" -ne "$($g.V)") { return $false } }
+    $true
+}
+function Enable-GameJson($t) {
+    $items = @($t.GameJson); Assert-GameClosed $items[0].Game
+    if (-not (Get-GameCfgPath $items[0].Game)) { throw "$($GameFind[$items[0].Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    foreach ($g in $items) { if ($null -eq (Get-GameJsonValue $g.Game $g.Key)) { throw "This version of $($GameFind[$g.Game].Name) has no $($g.Key) setting, so ZeroDelay leaves the file alone." } }
+    $key = "gcfg:$($t.Id)"
+    if (-not $script:Backup.Custom.ContainsKey($key)) {
+        $script:Backup.Custom[$key] = @(foreach ($g in $items) { @{ Had = $true; Value = "$(Get-GameJsonValue $g.Game $g.Key)" } })
+        Save-Backup
+    }
+    foreach ($g in $items) { Set-GameJsonValue $g.Game $g.Key "$($g.V)" }
+}
+function Disable-GameJson($t) {
+    $items = @($t.GameJson); Assert-GameClosed $items[0].Game
+    $key = "gcfg:$($t.Id)"; $saved = @($script:Backup.Custom[$key])
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $g = $items[$i]; $b = if ($i -lt $saved.Count) { $saved[$i] } else { $null }
+        if ($null -eq (Get-GameJsonValue $g.Game $g.Key)) { continue }
+        if ($b) { Set-GameJsonValue $g.Game $g.Key "$($b.Value)" } elseif ($g.ContainsKey('D')) { Set-GameJsonValue $g.Game $g.Key "$($g.D)" }
+    }
+    $script:Backup.Custom.Remove($key)
+}
+# Windows per-app GPU preference for a game's exe (shared by the efb-/nba-/und- gpupref cards)
+function Test-GameGpuPrefById([string]$Game) { $e = Get-GameExePath $Game; if (-not $e) { return $null }; "$(Get-RegValue $GpuPrefKey $e)" -match 'GpuPreference=2;' }
+function Enable-GameGpuPrefById([string]$Game, [string]$Id) {
+    $e = Get-GameExePath $Game; if (-not $e) { throw "$($GameFind[$Game].Name) is not installed." }
+    $cur = "$(Get-RegValue $GpuPrefKey $e)"
+    $new = if ($cur -match 'GpuPreference=\d;') { $cur -replace 'GpuPreference=\d;', 'GpuPreference=2;' } else { "GpuPreference=2;$cur" }
+    Set-RegTracked $Id $GpuPrefKey $e $new 'String'
+}
+function Disable-GameGpuPrefById([string]$Game, [string]$Id) {
+    if (Restore-RegTweak $Id) { return }
+    $e = Get-GameExePath $Game; if (-not $e) { return }
+    $v = "$(Get-RegValue $GpuPrefKey $e)" -replace 'GpuPreference=2;', ''
+    if ($v) { Set-RegValue $GpuPrefKey $e $v 'String' } else { Remove-RegValue $GpuPrefKey $e }
+}
+
+# --- 1.18 match stats: Fortnite replays and CS2 Game State Integration
+
+# --- Research round 11 (1.18): Fortnite match stats from the player's own saved replays (fnstats)
+# Reads only the replay file header and Event chunks (AthenaMatchStats, AthenaMatchTeamStats, playerElim); ReplayData and
+# Checkpoint chunks are skipped with a seek. Event payloads are AES-256-ECB with the key stored in the replay's own header.
+# Layout: see r11-fnstats-notes.md (Shiqan/FortniteReplayDecompressor and xNocken/replay-reader, both MIT).
+$FnReplayStatsSource = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+public class ZdFnElim {
+    public string Eliminated; public string Eliminator; public int GunType; public bool Knocked; public uint TimeMs;
+}
+
+public class ZdFnReplayResult {
+    public string Path; public string Error;            // Error = null when the whole file was read
+    public bool HeaderOk; public bool IsLive; public bool IsEncrypted; public bool IsCompressed;
+    public uint FileVersion; public uint NetworkVersion; public uint Changelist; public uint HeaderNetworkVersion;
+    public string FriendlyName = "";
+    public bool HasTimestamp; public DateTime Start; public uint DurationMs;
+    public bool HasStats; public bool HasTeamStats;
+    public float AccuracyRaw; public double AccuracyPct;
+    public uint Assists, Eliminations, WeaponDamage, OtherDamage, Revives, DamageTaken, DamageToStructures, MaterialsGathered, MaterialsUsed, TotalTraveled;
+    public int Placement = -1; public int TotalPlayers = -1;
+    public int ChunkCount, EventCount, BadEvents;
+    public int ElimEvents;                              // playerElim events seen
+    public List<ZdFnElim> Elims = new List<ZdFnElim>(); // the ones whose payload could be decoded
+    public string OwnerId = "";                         // inferred: the one player whose finishing-elim count equals the stats event
+    public int OwnerElims = -1;                         // -1 = could not be matched
+}
+
+public static class ZdFnReplay {
+    const uint FileMagic = 0x1CA2E27F;
+    const uint NetworkMagic = 0x2CF5A13D;
+    const int MaxEventBytes = 1 << 20;    // one decoded event payload
+    const int MaxStringChars = 4096;
+    const int MaxChunks = 500000;
+    const int MaxElims = 4000;
+
+    // Never throws: problems end up in result.Error.
+    public static ZdFnReplayResult Read(string path) {
+        ZdFnReplayResult r = new ZdFnReplayResult(); r.Path = path;
+        try {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 4096, FileOptions.RandomAccess))
+            using (BinaryReader br = new BinaryReader(fs)) {
+                ReadInto(fs, br, r);
+            }
+        } catch (EndOfStreamException) {
+            if (r.Error == null) r.Error = r.HeaderOk ? "The file ends in the middle of a chunk (incomplete replay)." : "The file is too short to be a replay.";
+        } catch (Exception e) {
+            if (r.Error == null) r.Error = e.GetType().Name + ": " + e.Message;
+        }
+        try { FindOwner(r); } catch { }
+        return r;
+    }
+
+    static void ReadInto(FileStream fs, BinaryReader br, ZdFnReplayResult r) {
+        long len = fs.Length;
+        if (len < 32) { r.Error = "The file is too short to be a replay."; return; }
+        if (br.ReadUInt32() != FileMagic) { r.Error = "Not an Unreal Engine replay (wrong magic number)."; return; }
+        r.FileVersion = br.ReadUInt32();
+        if (r.FileVersion > 1000) { r.Error = "Unknown replay file version " + r.FileVersion + "."; return; }
+        if (r.FileVersion >= 7) {                                   // HISTORY_CUSTOM_VERSIONS
+            int n = br.ReadInt32();
+            if (n < 0 || n > 4096) { r.Error = "Bad custom-version count."; return; }
+            Skip(fs, (long)n * 20, len);                            // 16-byte GUID + int32 version each
+        }
+        r.DurationMs = br.ReadUInt32();
+        r.NetworkVersion = br.ReadUInt32();
+        r.Changelist = br.ReadUInt32();
+        r.FriendlyName = ReadFString(br);
+        r.IsLive = br.ReadUInt32() != 0;
+        if (r.FileVersion >= 3) {                                   // HISTORY_RECORDED_TIMESTAMP
+            long ticks = br.ReadInt64() & 0x3FFFFFFFFFFFFFFFL;      // FDateTime ticks (100 ns since 0001-01-01)
+            if (ticks > new DateTime(2015, 1, 1).Ticks && ticks < new DateTime(2100, 1, 1).Ticks) { r.Start = new DateTime(ticks, DateTimeKind.Unspecified); r.HasTimestamp = true; }
+        }
+        if (r.FileVersion >= 2) r.IsCompressed = br.ReadUInt32() != 0;   // HISTORY_COMPRESSION
+        byte[] key = new byte[0];
+        if (r.FileVersion >= 6) {                                   // HISTORY_ENCRYPTION
+            r.IsEncrypted = br.ReadUInt32() != 0;
+            uint ks = br.ReadUInt32();
+            if (ks > 64) { r.Error = "Bad encryption key size."; return; }
+            key = ReadExact(br, (int)ks);
+        }
+        r.HeaderOk = true;
+        if (r.IsLive) return;                                       // still recording or never finished: stats are not final
+        if (r.IsEncrypted && key.Length != 32 && key.Length != 24 && key.Length != 16) { r.Error = "Encrypted replay without a usable key."; return; }
+
+        Aes aes = null;
+        try {
+            if (r.IsEncrypted) { aes = Aes.Create(); aes.Mode = CipherMode.ECB; aes.Padding = PaddingMode.None; aes.Key = key; }
+            while (fs.Position + 8 <= len) {
+                uint type = br.ReadUInt32();
+                int size = br.ReadInt32();
+                long start = fs.Position;
+                if (size < 0 || start + size > len) { r.Error = "The file ends in the middle of a chunk (incomplete replay)."; return; }
+                if (++r.ChunkCount > MaxChunks) { r.Error = "Too many chunks; stopped reading."; return; }
+                if (type == 0 && size >= 8) {                       // Header chunk: only the magic and network version
+                    if (br.ReadUInt32() == NetworkMagic) r.HeaderNetworkVersion = br.ReadUInt32();
+                } else if (type == 3) {                             // Event chunk; 1 = ReplayData and 2 = Checkpoint are skipped
+                    r.EventCount++;
+                    try { ReadEvent(fs, br, r, aes, start + size); } catch (EndOfStreamException) { r.BadEvents++; } catch (FormatException) { r.BadEvents++; } catch (CryptographicException) { r.BadEvents++; }
+                }
+                fs.Seek(start + size, SeekOrigin.Begin);
+            }
+            if (fs.Position != len) r.Error = "The file ends in the middle of a chunk (incomplete replay).";
+        } finally { if (aes != null) aes.Dispose(); }
+    }
+
+    static void ReadEvent(FileStream fs, BinaryReader br, ZdFnReplayResult r, Aes aes, long chunkEnd) {
+        string id = ReadFString(br), group = ReadFString(br), meta = ReadFString(br);
+        uint t0 = br.ReadUInt32(); br.ReadUInt32();
+        int size = br.ReadInt32();
+        bool elim = group == "playerElim" || meta == "playerElim";
+        bool stats = meta == "AthenaMatchStats" || group == "AthenaMatchStats";
+        bool team = meta == "AthenaMatchTeamStats" || group == "AthenaMatchTeamStats";
+        if (!elim && !stats && !team) return;
+        if (size <= 0 || size > MaxEventBytes || fs.Position + size > chunkEnd) { r.BadEvents++; return; }
+        byte[] raw = ReadExact(br, size);
+        byte[] p = raw;
+        int plen = raw.Length;
+        if (aes != null) {
+            if (size % 16 != 0) { r.BadEvents++; return; }
+            using (ICryptoTransform d = aes.CreateDecryptor()) { p = d.TransformFinalBlock(raw, 0, raw.Length); }
+            plen = p.Length;
+            int pad = p[plen - 1];                                  // PKCS#7, as both reference readers decrypt it
+            if (pad >= 1 && pad <= 16 && pad <= plen) {
+                bool okPad = true;
+                for (int i = plen - pad; i < plen; i++) if (p[i] != pad) { okPad = false; break; }
+                if (okPad) plen -= pad;
+            }
+        }
+        if (stats) {
+            if (plen < 48) { r.BadEvents++; return; }
+            int o = 4;                                              // leading unknown uint32
+            r.AccuracyRaw = BitConverter.ToSingle(p, o); o += 4;
+            r.Assists = U(p, ref o); r.Eliminations = U(p, ref o); r.WeaponDamage = U(p, ref o); r.OtherDamage = U(p, ref o);
+            r.Revives = U(p, ref o); r.DamageTaken = U(p, ref o); r.DamageToStructures = U(p, ref o);
+            r.MaterialsGathered = U(p, ref o); r.MaterialsUsed = U(p, ref o); r.TotalTraveled = U(p, ref o);
+            double a = r.AccuracyRaw;
+            if (double.IsNaN(a) || double.IsInfinity(a) || a < 0) a = 0;
+            r.AccuracyPct = a <= 1.0001 ? a * 100.0 : (a <= 100.0 ? a : 0);   // stored as a 0-1 fraction (inferred)
+            r.HasStats = true;
+        } else if (team) {
+            if (plen < 12) { r.BadEvents++; return; }
+            int o = 4;
+            uint pl = U(p, ref o), tp = U(p, ref o);
+            if (pl > 100000 || tp > 100000) { r.BadEvents++; return; }
+            r.Placement = (int)pl; r.TotalPlayers = (int)tp; r.HasTeamStats = true;
+        } else {
+            r.ElimEvents++;
+            if (r.Elims.Count >= MaxElims) return;
+            ZdFnElim e = ParseElim(p, plen);
+            if (e == null && plen != p.Length) e = ParseElim(p, p.Length);
+            if (e == null) { r.BadEvents++; return; }
+            e.TimeMs = t0; r.Elims.Add(e);
+        }
+    }
+
+    // playerElim: [version int32][1 byte][0-3 transforms][eliminated][eliminator][gun type byte][knocked uint32].
+    // The size of the transform block depends on the engine version, so try the documented offsets and accept the
+    // one where both players parse and exactly 5 bytes are left (gun type + knocked flag).
+    static readonly int[] TypedOffsets = new int[] { 165, 245, 85, 125, 45, 325, 205 };
+    static readonly int[] StringOffsets = new int[] { 45, 12, 40, 8, 36 };
+    static ZdFnElim ParseElim(byte[] p, int plen) {
+        foreach (int o in TypedOffsets) { ZdFnElim e = TryElim(p, plen, o, true); if (e != null) return e; }
+        foreach (int o in StringOffsets) { ZdFnElim e = TryElim(p, plen, o, false); if (e != null) return e; }
+        for (int o = 0; o < Math.Min(plen, 512); o++) { ZdFnElim e = TryElim(p, plen, o, true); if (e != null) return e; }
+        return null;
+    }
+    static ZdFnElim TryElim(byte[] p, int plen, int o, bool typed) {
+        if (o >= plen) return null;
+        string a, b;
+        if (typed) { a = TypedPlayer(p, plen, ref o); if (a == null) return null; b = TypedPlayer(p, plen, ref o); if (b == null) return null; }
+        else { a = BufFString(p, plen, ref o); if (a == null) return null; b = BufFString(p, plen, ref o); if (b == null) return null; }
+        if (o + 5 != plen) return null;
+        uint k = BitConverter.ToUInt32(p, o + 1);
+        if (k > 1) return null;
+        ZdFnElim e = new ZdFnElim(); e.Eliminated = a; e.Eliminator = b; e.GunType = p[o]; e.Knocked = k == 1;
+        return e;
+    }
+    static string TypedPlayer(byte[] p, int plen, ref int o) {
+        if (o >= plen) return null;
+        byte t = p[o++];
+        if (t == 3) return "Bot";                                   // BOT
+        if (t == 16) return BufFString(p, plen, ref o);             // NAMED_BOT
+        if (t == 17) {                                              // PLAYER: id length byte + id bytes (16)
+            if (o >= plen) return null;
+            int n = p[o++];
+            if (n < 1 || n > 64 || o + n > plen) return null;
+            StringBuilder sb = new StringBuilder(n * 2);
+            for (int i = 0; i < n; i++) sb.Append(p[o + i].ToString("x2"));
+            o += n; return sb.ToString();
+        }
+        return null;
+    }
+    static string BufFString(byte[] p, int plen, ref int o) {
+        if (o + 4 > plen) return null;
+        int n = BitConverter.ToInt32(p, o); o += 4;
+        if (n == 0) return "";
+        if (n < 0) {
+            if (n < -MaxStringChars) return null;
+            int bytes = -n * 2; if (o + bytes > plen) return null;
+            string s = Encoding.Unicode.GetString(p, o, bytes); o += bytes; return s.TrimEnd('\0').Trim();
+        }
+        if (n > MaxStringChars || o + n > plen) return null;
+        string s2 = Encoding.UTF8.GetString(p, o, n); o += n; return s2.TrimEnd('\0').Trim();
+    }
+
+    static void FindOwner(ZdFnReplayResult r) {
+        if (!r.HasStats || r.Elims.Count == 0) return;
+        Dictionary<string, int> c = new Dictionary<string, int>();
+        foreach (ZdFnElim e in r.Elims) {
+            if (e.Knocked || string.IsNullOrEmpty(e.Eliminator) || e.Eliminator == "Bot" || e.Eliminator == e.Eliminated) continue;
+            int v; c.TryGetValue(e.Eliminator, out v); c[e.Eliminator] = v + 1;
+        }
+        string hit = null; int hits = 0;
+        foreach (KeyValuePair<string, int> kv in c) if (kv.Value == (int)r.Eliminations) { hit = kv.Key; hits++; }
+        if (hits == 1) { r.OwnerId = hit; r.OwnerElims = c[hit]; }
+    }
+
+    static uint U(byte[] p, ref int o) { uint v = BitConverter.ToUInt32(p, o); o += 4; return v; }
+    static void Skip(FileStream fs, long n, long len) { if (fs.Position + n > len) throw new EndOfStreamException(); fs.Seek(n, SeekOrigin.Current); }
+    static byte[] ReadExact(BinaryReader br, int n) { byte[] b = br.ReadBytes(n); if (b.Length != n) throw new EndOfStreamException(); return b; }
+    static string ReadFString(BinaryReader br) {
+        int n = br.ReadInt32();
+        if (n == 0) return "";
+        if (n < 0) {
+            if (n < -MaxStringChars) throw new FormatException("String too long.");
+            return Encoding.Unicode.GetString(ReadExact(br, -n * 2)).TrimEnd('\0').Trim();
+        }
+        if (n > MaxStringChars) throw new FormatException("String too long.");
+        return Encoding.UTF8.GetString(ReadExact(br, n)).TrimEnd('\0').Trim();
+    }
+}
+'@
+
+# worker: compiles the reader once per process if needed and parses the given replays (no app functions in there)
+$FnReplayWorker = @'
+param($src, $files)
+if (-not ('ZdFnReplay' -as [type])) { try { Add-Type -TypeDefinition $src -ErrorAction Stop } catch { return @{ Err = "The replay reader could not start: $($_.Exception.Message)"; Items = @() } } }
+$list = New-Object System.Collections.ArrayList
+foreach ($f in $files) { [void]$list.Add([pscustomobject]@{ File = $f; Result = [ZdFnReplay]::Read([string]$f.Path) }) }
+@{ Err = $null; Items = $list.ToArray() }
+'@
+$script:FnReplayScanBusy = $false
+$script:FnReplayPending = @()
+
+# compiles the replay reader on the current thread (about 0.5-1 s the first time; use the worker when it is not loaded yet)
+function Initialize-FnReplayType {
+    if ('ZdFnReplay' -as [type]) { return $true }
+    try { Add-Type -TypeDefinition $FnReplayStatsSource -ErrorAction Stop; $true } catch { $false }
+}
+
+# the Demos folder Fortnite records into
+function Get-FnReplayDir { Join-Path $env:LOCALAPPDATA 'FortniteGame\Saved\Demos' }
+
+# path of the per-file stats cache
+function Get-FnReplayCachePath { Join-Path $DataDir 'fn-replay-stats.json' }
+
+# file descriptor for the cache key: name + size + last write (UTC ticks)
+function Get-FnReplayFileSpec([IO.FileInfo]$f) {
+    [pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Size = [long]$f.Length; Ticks = [long]$f.LastWriteTimeUtc.Ticks
+                       Created = $f.CreationTime; CreatedUtc = $f.CreationTimeUtc; Key = "$($f.Name)|$($f.Length)|$($f.LastWriteTimeUtc.Ticks)" }
+}
+
+# one ZdFnReplayResult -> flat cache row (live files are cached too: the key changes as soon as Fortnite writes to the file again)
+function ConvertTo-FnReplayRow($spec, $r) {
+    if ($null -eq $r) { return $null }
+    # match time: the header timestamp (FDateTime, local time expected); if it sits on the file's UTC creation time instead, convert it
+    $start = $spec.Created
+    if ($r.HasTimestamp) {
+        $ts = [datetime]$r.Start
+        if ([Math]::Abs(($ts - $spec.CreatedUtc).TotalMinutes) -lt 10 -and [Math]::Abs(($ts - $spec.Created).TotalMinutes) -ge 10) { $start = [datetime]::SpecifyKind($ts, 'Utc').ToLocalTime() } else { $start = $ts }
+    }
+    $status = if ($r.HeaderOk -and $r.IsLive) { 'live' } elseif ($r.HasStats) { 'ok' } elseif (-not $r.HeaderOk) { 'error' } else { 'nostats' }
+    $dist = [double]$r.TotalTraveled; if ($dist -gt 50000) { $dist = [Math]::Round($dist / 100) }   # unit unverified: very large values are taken as centimetres
+    [pscustomobject]@{
+        Key = $spec.Key; Name = $spec.Name; Status = $status; Error = [string]$r.Error; Encrypted = [bool]$r.IsEncrypted
+        Start = $start.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture); DurationS = [int]($r.DurationMs / 1000)
+        Placement = [int]$r.Placement; Players = [int]$r.TotalPlayers; Elims = [int]$r.Eliminations; Assists = [int]$r.Assists
+        Accuracy = [Math]::Round([double]$r.AccuracyPct, 1); WeaponDamage = [int]$r.WeaponDamage; OtherDamage = [int]$r.OtherDamage
+        DamageTaken = [int]$r.DamageTaken; DamageToStructures = [int]$r.DamageToStructures; Revives = [int]$r.Revives
+        MaterialsGathered = [int]$r.MaterialsGathered; MaterialsUsed = [int]$r.MaterialsUsed; Distance = [int]$dist
+        ElimEvents = [int]$r.ElimEvents; OwnerElims = [int]$r.OwnerElims
+    }
+}
+
+# cache file -> hashtable Key -> row (empty when missing or unreadable)
+function Read-FnReplayCache {
+    $h = @{}
+    $p = Get-FnReplayCachePath
+    if (-not (Test-Path $p)) { return $h }
+    try { $j = [IO.File]::ReadAllText($p) | ConvertFrom-Json; foreach ($row in @($j.Files)) { if ($row.Key -and "$($row.Start)" -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$') { $h[[string]$row.Key] = $row } } } catch {}
+    $h
+}
+
+# writes the rows for the replays still on disk (temp file + replace, so a crash never leaves half a file)
+function Save-FnReplayCache($rows) {
+    try {
+        $p = Get-FnReplayCachePath; $dir = Split-Path $p
+        if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        $json = [pscustomobject]@{ Version = 1; Files = @($rows) } | ConvertTo-Json -Depth 4
+        [IO.File]::WriteAllText("$p.tmp", $json, (New-Object Text.UTF8Encoding $false))
+        if (Test-Path $p) { [IO.File]::Replace("$p.tmp", $p, [NullString]::Value) } else { [IO.File]::Move("$p.tmp", $p) }
+    } catch {}
+}
+
+# all replays, newest first; parses at most $MaxParse new files here and leaves the rest in $script:FnReplayPending
+function Get-FnReplayMatches([int]$MaxParse = [int]::MaxValue) {
+    $files = @(Get-ChildItem (Get-FnReplayDir) -Filter '*.replay' -File -ErrorAction SilentlyContinue | ForEach-Object { Get-FnReplayFileSpec $_ })
+    $cache = Read-FnReplayCache
+    $rows = New-Object System.Collections.ArrayList; $pending = New-Object System.Collections.ArrayList; $changed = $false
+    foreach ($f in $files) {
+        if ($cache.ContainsKey($f.Key)) { [void]$rows.Add($cache[$f.Key]); continue }
+        if ($MaxParse -le 0 -or -not (Initialize-FnReplayType)) { [void]$pending.Add($f); continue }
+        $MaxParse--
+        $row = ConvertTo-FnReplayRow $f ([ZdFnReplay]::Read($f.Path))
+        if ($row) { [void]$rows.Add($row); $changed = $true }
+    }
+    if ($changed -or $cache.Count -ne $rows.Count) { Save-FnReplayCache $rows }
+    $script:FnReplayPending = $pending.ToArray()
+    @($rows | Sort-Object { $_.Start } -Descending)
+}
+
+# parses the pending replays in the worker, stores them in the cache, then calls $OnDone (UI thread)
+function Start-FnReplayScan([scriptblock]$OnDone) {
+    if ($script:FnReplayScanBusy -or -not @($script:FnReplayPending).Count) { return }
+    $script:FnReplayScanBusy = $true
+    $script:FnReplayScanDone = $OnDone
+    Invoke-Worker $FnReplayWorker @($FnReplayStatsSource, @($script:FnReplayPending)) {
+        param($out, $errs)
+        $script:FnReplayScanBusy = $false
+        $res = Get-WorkerResult $out
+        if ($res -and -not $res.Err) {
+            $cache = Read-FnReplayCache
+            foreach ($it in @($res.Items)) { $row = ConvertTo-FnReplayRow $it.File $it.Result; if ($row) { $cache[$row.Key] = $row } }
+            $keys = @{}; foreach ($f in @(Get-ChildItem (Get-FnReplayDir) -Filter '*.replay' -File -ErrorAction SilentlyContinue)) { $keys["$($f.Name)|$($f.Length)|$($f.LastWriteTimeUtc.Ticks)"] = 1 }
+            Save-FnReplayCache @($cache.Values | Where-Object { $keys.ContainsKey([string]$_.Key) })
+        }
+        $script:FnReplayPending = @()
+        if ($script:FnReplayScanDone) { try { & $script:FnReplayScanDone } catch {} }
+    }
+}
+
+# Fortnite gameplay-stats contract for the stats page; $OnUpdate is called once a background scan has finished
+function Get-FnGameplayStats([scriptblock]$OnUpdate) {
+    $title = 'Your Fortnite matches'
+    # inline only when the reader is already compiled and at most two files are new; otherwise the worker does it
+    $max = if ('ZdFnReplay' -as [type]) { 2 } else { 0 }
+    $all = @(Get-FnReplayMatches -MaxParse $max)
+    $pending = @($script:FnReplayPending).Count
+    if (-not $all.Count -and -not $pending) {
+        return @{ Title = $title; Rows = @(); Charts = @(); Summary = @()
+                  Note = 'Turn on Fortnite > Settings > Game > Replays > Record Replays, then play a match: ZeroDelay reads the end-of-match stats Fortnite saves in each replay (nothing is sent anywhere). Recording adds some disk writes during matches; switch it off again whenever you like.' }
+    }
+    if ($pending) { Start-FnReplayScan $OnUpdate }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $ok = @($all | Where-Object { $_.Status -eq 'ok' } | Select-Object -First 200)
+    $rows = @(foreach ($m in $ok) {
+        [pscustomobject]@{
+            Time = [datetime]::ParseExact([string]$m.Start, 'yyyy-MM-ddTHH:mm:ss', $inv)
+            Placement = $(if ([int]$m.Placement -gt 0) { [int]$m.Placement } else { $null }); Players = $(if ([int]$m.Players -gt 0) { [int]$m.Players } else { $null })
+            Elims = [int]$m.Elims; Assists = [int]$m.Assists; Accuracy = [double]$m.Accuracy
+            Damage = [int]$m.WeaponDamage + [int]$m.OtherDamage; DamageTaken = [int]$m.DamageTaken; Revives = [int]$m.Revives
+            Built = [int]$m.MaterialsUsed; Distance = [int]$m.Distance
+        }
+    })
+    $live = @($all | Where-Object { $_.Status -eq 'live' }).Count
+    $skipped = $all.Count - $ok.Count - $live
+    $wait = if ($pending) { " Reading $pending new replay$(if ($pending -ne 1) { 's' }) in the background..." } else { '' }
+    $note = "From your saved replays in $(Get-FnReplayDir) ($($rows.Count) match$(if ($rows.Count -ne 1) { 'es' }) with stats"
+    $note += $(if ($skipped) { "; $skipped without end-of-match stats, such as matches left early, Creative or damaged files, are left out)." } else { ').' })
+    if ($live) { $note += " $live replay$(if ($live -ne 1) { 's are' } else { ' is' }) still being recorded or never finished." }
+    $note += " Deleted replays drop off this list.$wait"
+    if (-not $rows.Count) { return @{ Title = $title; Rows = @(); Charts = @(); Summary = @(); Note = $note } }
+    $placed = @($rows | Where-Object { $null -ne $_.Placement })
+    $f1 = { param($v) [string]::Format($inv, '{0:0.0}', [double]$v) }
+    $summary = @(
+        @{ Label = 'Wins'; Value = [string]@($placed | Where-Object { $_.Placement -eq 1 }).Count }
+        @{ Label = 'Avg eliminations'; Value = (& $f1 ($rows | Measure-Object Elims -Average).Average) }
+        @{ Label = 'Avg placement'; Value = $(if ($placed.Count) { '#' + [string][Math]::Round(($placed | Measure-Object Placement -Average).Average) } else { '-' }) }
+        @{ Label = 'Damage per match'; Value = [string][Math]::Round(($rows | Measure-Object Damage -Average).Average) }
+        @{ Label = 'Accuracy'; Value = ([string][Math]::Round(($rows | Measure-Object Accuracy -Average).Average) + '%') }
+    )
+    @{
+        Title = $title; Rows = $rows; Summary = $summary; Note = $note
+        Charts = @(
+            @{ Name = 'Eliminations'; Field = 'Elims'; Unit = ''; LowerBetter = $false }
+            @{ Name = 'Damage dealt'; Field = 'Damage'; Unit = ''; LowerBetter = $false }
+            @{ Name = 'Placement'; Field = 'Placement'; Unit = ''; LowerBetter = $true }
+            @{ Name = 'Accuracy'; Field = 'Accuracy'; Unit = '%'; LowerBetter = $false }
+        )
+    }
+}
+
+# per-game stats dispatcher (CS2 is added by another file)
+function Get-GameplayStats([string]$Game, [scriptblock]$OnUpdate) {
+    switch ($Game) {
+        'fortnite' { Get-FnGameplayStats $OnUpdate }
+        'cs2' { if (Get-Command Get-Cs2GameplayStats -ErrorAction SilentlyContinue) { Get-Cs2GameplayStats } }
+        'rocketleague' { if (Get-Command Get-RlGameplayStats -ErrorAction SilentlyContinue) { Get-RlGameplayStats } }
+        'dota2' { if (Get-Command Get-Dota2GameplayStats -ErrorAction SilentlyContinue) { Get-Dota2GameplayStats } }
+        'lol' { if (Get-Command Get-LolGameplayStats -ErrorAction SilentlyContinue) { Get-LolGameplayStats } }
+        default { $null }
+    }
+}
+
+
+# a hand-edited stats record with text where a number belongs is skipped instead of breaking the whole list
+function Test-ZdRecordNumbers($r) { foreach ($p in $r.PSObject.Properties) { if ($p.Value -is [string] -and $p.Name -in 'Kills','Deaths','Assists','Mvps','Score','HsKills','Damage','Rounds','RoundsWon','RoundsLost','Goals','Saves','Shots','Demos','Touches','TeamGoals','OppGoals','PlaylistId','Level','LastHits','Denies','Gpm','Xpm','NetWorth','Seconds','CS','Gold') { $n = 0.0; if (-not [double]::TryParse($p.Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $false } } }; $true }
+
+# --- CS2 match stats (1.18): Valve's Game State Integration (GSI) -> local listener -> cs2-matches.json
+# CS2 reads every game\csgo\cfg\gamestate_integration_*.cfg at start and POSTs JSON game state to its "uri" while you play.
+# Official Valve feature (also used by Logitech G HUB, Medal, HUD makers): no game files, no injection, no VAC risk.
+$script:Cs2GsiPort = 37810                                   # fixed: it is written into the cfg file
+$script:Cs2GsiFileName = 'gamestate_integration_zerodelay.cfg'
+$script:Cs2GsiMaxMatches = 200
+
+# path of ZeroDelay's GSI cfg in the CS2 install ($Cs2Dir overrides for tests); $null when CS2 is not found
+function Get-Cs2GsiCfgPath([string]$Cs2Dir) {
+    if (-not $Cs2Dir) { $Cs2Dir = Get-Cs2Dir }
+    if (-not $Cs2Dir) { return $null }
+    Join-Path $Cs2Dir "game\csgo\cfg\$($script:Cs2GsiFileName)"
+}
+# where finished matches are kept ($DataDir\cs2-matches.json)
+function Get-Cs2MatchesFile { Join-Path $DataDir 'cs2-matches.json' }
+# the random auth token for this install (created once, kept in the backup file so it survives Off/On)
+function Get-Cs2GsiToken {
+    $tok = "$($script:Backup.Custom['cs-gsi-token'])"
+    if ($tok -notmatch '^[0-9a-f]{32}$') {
+        $b = New-Object byte[] 16; $rng = New-Object Security.Cryptography.RNGCryptoServiceProvider
+        try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+        $tok = -join ($b | ForEach-Object { $_.ToString('x2') })
+        $script:Backup.Custom['cs-gsi-token'] = $tok
+        Save-Backup
+    }
+    $tok
+}
+# the cfg text in Valve's KeyValues format (only the player_* sections: allplayers_* are sent to spectators/GOTV only)
+function New-Cs2GsiCfgText([string]$Token, [int]$Port = $script:Cs2GsiPort) {
+    $nl = "`r`n"
+    ('"ZeroDelay match stats"', '{',
+     "`t`"uri`"`t`t`"http://127.0.0.1:$Port/`"",
+     "`t`"timeout`"`t`"5.0`"", "`t`"buffer`"`t`"0.1`"", "`t`"throttle`"`t`"0.5`"", "`t`"heartbeat`"`t`"10.0`"",
+     "`t`"auth`"", "`t{", "`t`t`"token`"`t`"$Token`"", "`t}",
+     "`t`"data`"", "`t{",
+     "`t`t`"provider`"`t`t`t`"1`"", "`t`t`"map`"`t`t`t`t`"1`"", "`t`t`"round`"`t`t`t`t`"1`"",
+     "`t`t`"player_id`"`t`t`t`"1`"", "`t`t`"player_state`"`t`t`"1`"", "`t`t`"player_match_stats`"`t`"1`"",
+     "`t}", '}') -join $nl
+}
+# minimal Valve KeyValues parser ("key" "value" / "key" { ... }, // comments); throws on a syntax error
+function ConvertFrom-ValveKv([string]$Text) {
+    $toks = New-Object Collections.Generic.List[object]
+    foreach ($m in [regex]::Matches($Text, '//[^\n]*|"((?:[^"\\]|\\.)*)"|([{}])|(\S+)')) {
+        if ($m.Value.StartsWith('//')) { continue }
+        if ($m.Groups[1].Success) { $toks.Add(@{ S = $m.Groups[1].Value }) }
+        elseif ($m.Groups[2].Success) { $toks.Add(@{ B = $m.Groups[2].Value }) }
+        else { $toks.Add(@{ S = $m.Groups[3].Value }) }   # unquoted tokens are legal KeyValues
+    }
+    $parse = $null
+    $parse = {
+        param([bool]$Inner)
+        $o = [ordered]@{}
+        while ($script:kvI -lt $toks.Count) {
+            $k = $toks[$script:kvI]; $script:kvI++
+            if ($k.B -eq '}') { if ($Inner) { return $o } else { throw 'unexpected }' } }
+            if ($k.B -eq '{') { throw 'a { without a key' }
+            if ($script:kvI -ge $toks.Count) { throw "key `"$($k.S)`" has no value" }
+            $v = $toks[$script:kvI]; $script:kvI++
+            if ($v.B -eq '{') { $o[$k.S] = & $parse $true }
+            elseif ($v.B -eq '}') { throw "key `"$($k.S)`" has no value" }
+            else { $o[$k.S] = $v.S }
+        }
+        if ($Inner) { throw 'missing }' }
+        $o
+    }
+    $script:kvI = 0
+    & $parse $false
+}
+# checks a GSI cfg against Valve's documented format; returns @{ Ok; Problems; Kv }
+function Test-Cs2GsiCfgText([string]$Text) {
+    $p = @()
+    $kv = try { ConvertFrom-ValveKv $Text } catch { $p += "syntax: $($_.Exception.Message)"; $null }
+    if ($kv) {
+        if ($kv.Count -ne 1) { $p += 'the file must have exactly one root block' }
+        $root = @($kv.Values)[0]
+        if ($root -isnot [Collections.IDictionary]) { $p += 'the root must be a { } block' }
+        else {
+            if ("$($root['uri'])" -notmatch '^http://(127\.0\.0\.1|localhost):\d+/?$') { $p += 'uri must be http://127.0.0.1:<port>/' }
+            foreach ($k in 'timeout', 'buffer', 'throttle', 'heartbeat') {
+                $n = 0.0
+                if (-not [double]::TryParse("$($root[$k])", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or $n -lt 0) { $p += "$k must be a number of seconds" }
+            }
+            if ($root['auth'] -isnot [Collections.IDictionary] -or -not $root['auth']['token']) { $p += 'auth { token } missing' }
+            $known = 'provider', 'tournamentdraft', 'map', 'map_round_wins', 'round', 'player_id', 'player_state', 'player_weapons', 'player_match_stats', 'player_position', 'phase_countdowns', 'allplayers_id', 'allplayers_state', 'allplayers_match_stats', 'allplayers_weapons', 'allplayers_position', 'allgrenades', 'bomb'
+            if ($root['data'] -isnot [Collections.IDictionary]) { $p += 'data { } missing' }
+            else {
+                foreach ($k in $root['data'].Keys) { if ($known -notcontains $k) { $p += "unknown data section $k" } elseif ("$($root['data'][$k])" -notin '0', '1') { $p += "data $k must be 0 or 1" } }
+                foreach ($k in 'provider', 'map', 'round', 'player_id', 'player_state', 'player_match_stats') { if ("$($root['data'][$k])" -ne '1') { $p += "data $k must be 1" } }
+            }
+        }
+    }
+    @{ Ok = -not $p.Count; Problems = $p; Kv = $kv }
+}
+# card On: writes the cfg (UTF-8 without BOM, like Valve's samples); $Cs2Dir overrides for tests
+function Enable-Cs2Gsi([string]$Cs2Dir) {
+    $f = Get-Cs2GsiCfgPath $Cs2Dir
+    if (-not $f) { throw 'Counter-Strike 2 was not found.' }
+    $dir = Split-Path $f
+    if (-not (Test-Path $dir)) { throw "CS2's cfg folder was not found ($dir). Verify the game files in Steam." }
+    [IO.File]::WriteAllText($f, (New-Cs2GsiCfgText (Get-Cs2GsiToken)), (New-Object Text.UTF8Encoding $false))
+}
+# card Off: deletes exactly ZeroDelay's cfg file, nothing else in the folder
+function Disable-Cs2Gsi([string]$Cs2Dir) {
+    $f = Get-Cs2GsiCfgPath $Cs2Dir
+    if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force }
+}
+
+# The listener runspace. $S is a synchronized hashtable: Port, Token, File, Max (in); Stop (set by the app);
+# Running, Error, Posts, BadAuth, LastPost, Live (current match), Saved (count) (out).
+$script:Cs2GsiListenerCode = @'
+param($S)
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$script:m = $null
+function Get-Int($v) { $n = 0; if ($null -ne $v -and [int]::TryParse("$v", [ref]$n)) { $n } else { 0 } }
+function Add-RoundTotals {   # adds the current round's headshots and damage to the match and starts a new round
+    if (-not $script:m) { return }
+    $script:m.HsKills += $script:m.CurHs; $script:m.Damage += $script:m.CurDmg; $script:m.CurHs = 0; $script:m.CurDmg = 0
+}
+function Save-Match([bool]$Finished) {
+    Add-RoundTotals
+    $rounds = $script:m.Won + $script:m.Lost
+    $res = if (-not $Finished) { 'Unfinished' } elseif ($rounds -eq 0) { '' } elseif ($script:m.Won -gt $script:m.Lost) { 'Win' } elseif ($script:m.Won -lt $script:m.Lost) { 'Loss' } else { 'Draw' }
+    $rec = [pscustomobject][ordered]@{
+        Start = $script:m.Start.ToString('o'); End = (Get-Date).ToString('o'); Map = $script:m.Map; Mode = $script:m.Mode
+        Kills = $script:m.Kills; Deaths = $script:m.Deaths; Assists = $script:m.Assists; Mvps = $script:m.Mvps; Score = $script:m.Score
+        HsKills = $script:m.HsKills; Damage = $script:m.Damage; Rounds = $rounds; RoundsWon = $script:m.Won; RoundsLost = $script:m.Lost
+        Team = $script:m.Team; Result = $res; Finished = $Finished }
+    $old = @()
+    # PS 5.1 returns a JSON array as one object: piping the variable unrolls it
+    if (Test-Path -LiteralPath $S.File) { try { $arr = [IO.File]::ReadAllText($S.File) | ConvertFrom-Json; $old = @($arr | Where-Object { $_ }) } catch { $old = @() } }
+    $all = @(@($rec) + $old | Select-Object -First $S.Max)
+    $dir = Split-Path $S.File; if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $tmp = "$($S.File).tmp"
+    [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $all -Depth 3), (New-Object Text.UTF8Encoding $false))
+    if (Test-Path -LiteralPath $S.File) { [IO.File]::Replace($tmp, $S.File, [NullString]::Value) } else { [IO.File]::Move($tmp, $S.File) }
+    $S.Saved++
+}
+function Close-Match {      # left the map (menu, other map, CS2 closed): keep it only if at least 5 rounds were played
+    if ($script:m -and -not $script:m.Saved -and $script:m.Live -and ($script:m.Won + $script:m.Lost) -ge 5) { Save-Match $false }
+    $script:m = $null
+}
+function Read-State($j) {
+    $map = $j.map
+    if (-not $map -or -not $map.name) { Close-Match; return }   # main menu
+    $name = "$($map.name)"; $phase = "$($map.phase)"
+    if ($script:m -and $script:m.Map -ne $name) { Close-Match }
+    if ($script:m -and $script:m.Saved -and $phase -ne 'gameover') { $script:m = $null }   # next match on the same map
+    if (-not $script:m) {
+        if ($phase -eq 'gameover') { return }   # joined at the scoreboard: nothing to record
+        $script:m = @{ Map = $name; Mode = "$($map.mode)"; Start = (Get-Date); Live = $false; Saved = $false; Team = ''
+            Kills = 0; Deaths = 0; Assists = 0; Mvps = 0; Score = 0; HsKills = 0; Damage = 0; CurHs = 0; CurDmg = 0; Won = 0; Lost = 0 }
+    }
+    if ($phase -eq 'warmup') { $script:m.Live = $false; return }   # warmup kills do not count
+    if (-not $script:m.Live) { $script:m.Live = $true; $script:m.Start = Get-Date; $script:m.HsKills = 0; $script:m.Damage = 0; $script:m.CurHs = 0; $script:m.CurDmg = 0 }
+    $ct = Get-Int $map.team_ct.score; $tt = Get-Int $map.team_t.score
+    $p = $j.player
+    # when you are dead the player block is whoever you spectate: only your own SteamID counts
+    if ($p -and "$($p.steamid)" -and "$($p.steamid)" -eq "$($j.provider.steamid)") {
+        if ("$($p.team)" -in 'CT', 'T') { $script:m.Team = "$($p.team)" }
+        $ms = $p.match_stats
+        if ($ms) { $script:m.Kills = Get-Int $ms.kills; $script:m.Deaths = Get-Int $ms.deaths; $script:m.Assists = Get-Int $ms.assists; $script:m.Mvps = Get-Int $ms.mvps; $script:m.Score = Get-Int $ms.score }
+        $st = $p.state
+        if ($st) {
+            $hs = Get-Int $st.round_killhs; $dmg = Get-Int $st.round_totaldmg
+            # round_killhs / round_totaldmg restart at 0 each round: a new freeze time or a drop closes the round
+            if ("$($j.round.phase)" -eq 'freezetime' -or $hs -lt $script:m.CurHs -or $dmg -lt $script:m.CurDmg) { Add-RoundTotals }
+            if ("$($j.round.phase)" -ne 'freezetime') { if ($hs -gt $script:m.CurHs) { $script:m.CurHs = $hs }; if ($dmg -gt $script:m.CurDmg) { $script:m.CurDmg = $dmg } }
+        }
+    }
+    if ($script:m.Team -eq 'CT') { $script:m.Won = $ct; $script:m.Lost = $tt } elseif ($script:m.Team -eq 'T') { $script:m.Won = $tt; $script:m.Lost = $ct }
+    $S.Live = [pscustomobject]@{ Map = $script:m.Map; Mode = $script:m.Mode; Kills = $script:m.Kills; Deaths = $script:m.Deaths; Assists = $script:m.Assists; RoundsWon = $script:m.Won; RoundsLost = $script:m.Lost; Phase = $phase }
+    if ($phase -eq 'gameover' -and -not $script:m.Saved) { Save-Match $true; $script:m.Saved = $true }
+}
+function Send-Reply($ns, [string]$Status) {
+    $b = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $Status`r`nContent-Type: text/plain`r`nContent-Length: 0`r`nConnection: close`r`n`r`n")
+    $ns.Write($b, 0, $b.Length)
+}
+function Read-Request($c) {   # returns the body text, or $null (after answering) for anything that is not a valid POST
+    $c.ReceiveTimeout = 2000; $c.SendTimeout = 2000
+    $ns = $c.GetStream(); $buf = New-Object byte[] 65536; $ms = New-Object IO.MemoryStream
+    $hdrEnd = -1; $len = -1; $sentContinue = $false
+    while ($true) {
+        if ($hdrEnd -lt 0) {
+            $all = $ms.ToArray(); $txt = [Text.Encoding]::ASCII.GetString($all)
+            $hdrEnd = $txt.IndexOf("`r`n`r`n")
+            if ($hdrEnd -ge 0) {
+                $head = $txt.Substring(0, $hdrEnd)
+                if ($head -notmatch '^POST ') { Send-Reply $ns '405 Method Not Allowed'; return $null }
+                if ($head -match '(?im)^Content-Length:\s*(\d+)') { $len = [int]$Matches[1] }
+                if ($len -gt 4MB) { Send-Reply $ns '413 Payload Too Large'; return $null }
+                if ($head -match '(?im)^Expect:\s*100-continue' -and $all.Length -eq $hdrEnd + 4) { $cb = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n"); $ns.Write($cb, 0, $cb.Length); $sentContinue = $true }
+            }
+        }
+        if ($hdrEnd -ge 0 -and $len -ge 0 -and $ms.Length -ge $hdrEnd + 4 + $len) { break }
+        if ($ms.Length -gt 4MB) { Send-Reply $ns '413 Payload Too Large'; return $null }
+        $n = try { $ns.Read($buf, 0, $buf.Length) } catch { 0 }
+        if ($n -le 0) { break }
+        $ms.Write($buf, 0, $n)
+    }
+    if ($hdrEnd -lt 0) { return $null }
+    $all = $ms.ToArray(); $start = $hdrEnd + 4
+    $cnt = if ($len -ge 0) { [Math]::Min($len, $all.Length - $start) } else { $all.Length - $start }
+    [Text.Encoding]::UTF8.GetString($all, $start, [Math]::Max(0, $cnt))
+}
+$l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, [int]$S.Port)
+try {
+    $l.Server.ExclusiveAddressUse = $true
+    $l.Start()
+    $S.Running = $true; $S.Error = $null
+    while (-not $S.Stop) {
+        if (-not $l.Pending()) { Start-Sleep -Milliseconds 50; continue }
+        $c = $l.AcceptTcpClient()
+        try {
+            $body = Read-Request $c
+            if ($null -eq $body) { continue }
+            $j = try { $body | ConvertFrom-Json } catch { $null }
+            if (-not $j) { Send-Reply $c.GetStream() '400 Bad Request'; continue }
+            if ("$($j.auth.token)" -ne $S.Token) { $S.BadAuth++; Send-Reply $c.GetStream() '403 Forbidden'; continue }
+            Send-Reply $c.GetStream() '200 OK'   # answer first: CS2 waits for it before the next update
+            $S.Posts++; $S.LastPost = Get-Date
+            try { Read-State $j } catch { $S.Error = "state: $($_.Exception.Message)" }
+        } catch { $S.Error = "request: $($_.Exception.Message)" }
+        finally { $c.Close() }
+    }
+} catch { $S.Error = $_.Exception.Message }
+finally {
+    try { Close-Match } catch { $S.Error = "save: $($_.Exception.Message)" }
+    try { $l.Stop() } catch {}
+    $S.Running = $false
+}
+'@
+
+# starts the listener in its own runspace (returns at once); $File overrides the matches file for tests
+function Start-Cs2GsiListener([int]$Port = $script:Cs2GsiPort, [string]$Token, [string]$File) {
+    if ($script:Cs2Gsi -and $script:Cs2Gsi.PS -and -not $script:Cs2Gsi.Handle.IsCompleted) { return }
+    if (-not $Token) { $Token = Get-Cs2GsiToken }
+    if (-not $File) { $File = Get-Cs2MatchesFile }
+    $st = [hashtable]::Synchronized(@{ Port = $Port; Token = $Token; File = $File; Max = $script:Cs2GsiMaxMatches; Stop = $false; Running = $false; Error = $null; Posts = 0; BadAuth = 0; Saved = 0; LastPost = $null; Live = $null })
+    $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'MTA'; $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($script:Cs2GsiListenerCode).AddArgument($st)
+    $script:Cs2Gsi = @{ State = $st; PS = $ps; RS = $rs; Handle = $ps.BeginInvoke(); Started = Get-Date }
+}
+# asks the listener to stop (it saves an unfinished match of 5+ rounds first); -Wait up to 2 s for app exit
+function Stop-Cs2GsiListener([switch]$Wait) {
+    $g = $script:Cs2Gsi; if (-not $g) { return }
+    $g.State.Stop = $true
+    if ($Wait) { [void]$g.Handle.AsyncWaitHandle.WaitOne(2000) }
+    if ($g.Handle.IsCompleted) { Remove-Cs2GsiListener }
+}
+# frees a finished listener runspace
+function Remove-Cs2GsiListener {
+    $g = $script:Cs2Gsi; if (-not $g) { return }
+    try { [void]$g.PS.EndInvoke($g.Handle) } catch {}
+    try { $g.PS.Dispose(); $g.RS.Dispose() } catch {}
+    $script:Cs2GsiLastError = $g.State.Error
+    $script:Cs2Gsi = $null
+}
+# call every few seconds from a UI timer: runs the listener only while CS2 runs and the cs-gsi cfg is in place (cheap, never blocks)
+function Update-Cs2GsiListener {
+    $g = $script:Cs2Gsi
+    if ($g -and $g.Handle.IsCompleted) {   # stopped, or crashed (port taken): a crash waits 30 s before the next try
+        if (-not $g.State.Stop) { $script:Cs2GsiRetry = (Get-Date).AddSeconds(30) }
+        Remove-Cs2GsiListener; $g = $null
+    }
+    $f = Get-Cs2GsiCfgPath
+    $want = $f -and (Test-Path -LiteralPath $f) -and (Test-Cs2Running)
+    if ($want -and -not $g) {
+        if ($script:Cs2GsiRetry -and (Get-Date) -lt $script:Cs2GsiRetry) { return }
+        Start-Cs2GsiListener
+    } elseif (-not $want -and $g -and -not $g.State.Stop) { Stop-Cs2GsiListener }
+}
+# reads the saved matches, newest first
+function Read-Cs2Matches([string]$File) {
+    if (-not $File) { $File = Get-Cs2MatchesFile }
+    if (-not (Test-Path -LiteralPath $File)) { return @() }
+    try { $j = [IO.File]::ReadAllText($File) | ConvertFrom-Json; @($j | Where-Object { $_ -and $_.Map -and (Test-ZdRecordNumbers $_) }) } catch { @() }   # piping the variable unrolls the array
+}
+# Valve's mode ids as players know them
+function Format-Cs2Mode([string]$Mode) {
+    switch ($Mode) { 'competitive' { 'Competitive' } 'premier' { 'Premier' } 'scrimcomp2v2' { 'Wingman' } 'casual' { 'Casual' } 'deathmatch' { 'Deathmatch' } 'gungameprogressive' { 'Arms Race' } 'gungametrbomb' { 'Demolition' } 'survival' { 'Danger Zone' } default { if ($Mode) { (Get-Culture).TextInfo.ToTitleCase($Mode) } else { '' } } }
+}
+# stats contract for the Gameplay page: Title, Rows (newest first), Charts, Summary, Note
+function Get-Cs2GameplayStats([string]$File) {
+    $note = 'From Valve''s Game State Integration: while CS2 runs, it sends your own scoreboard to ZeroDelay on this PC. Headshot % and damage per round are added up round by round; matches you leave before 5 rounds are not kept.'
+    $ms = @(Read-Cs2Matches $File)
+    $charts = @(@{ Name = 'K/D'; Field = 'KD'; Unit = ''; LowerBetter = $false }, @{ Name = 'Headshot %'; Field = 'HS'; Unit = '%' }, @{ Name = 'Damage per round'; Field = 'ADR' }, @{ Name = 'Kills'; Field = 'Kills' })
+    if (-not $ms.Count) {
+        return @{ Title = 'Your CS2 matches'; Rows = @(); Charts = $charts; Summary = @()
+                  Note = 'No CS2 matches recorded yet. Switch on "CS2 match stats" in the CS2 section, restart CS2, keep ZeroDelay open and play a match.' }
+    }
+    $rows = foreach ($x in $ms) {
+        $k = [int]$x.Kills; $d = [int]$x.Deaths; $r = [int]$x.Rounds
+        $time = try { [datetime]::Parse("$($x.End)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { $null }
+        [pscustomobject]@{ Time = $time; Map = ("$($x.Map)" -replace '^(de|cs|ar|dz)_', ''); Mode = (Format-Cs2Mode "$($x.Mode)")
+            Kills = $k; Deaths = $d; Assists = [int]$x.Assists
+            KD = [Math]::Round($k / [Math]::Max($d, 1), 2)
+            HS = $(if ($k) { [int][Math]::Round(100.0 * [int]$x.HsKills / $k) } else { 0 })
+            ADR = $(if ($r) { [int][Math]::Round([double]$x.Damage / $r) } else { $null })
+            Mvps = [int]$x.Mvps; Score = [int]$x.Score; RoundsWon = [int]$x.RoundsWon; RoundsLost = [int]$x.RoundsLost; Result = "$($x.Result)" }
+    }
+    $rows = @($rows | Sort-Object Time -Descending)
+    $sk = ($ms | Measure-Object Kills -Sum).Sum; $sd = ($ms | Measure-Object Deaths -Sum).Sum
+    $shs = ($ms | Measure-Object HsKills -Sum).Sum
+    $withR = @($ms | Where-Object { [int]$_.Rounds -gt 0 })
+    $sdmg = if ($withR.Count) { ($withR | Measure-Object Damage -Sum).Sum } else { 0 }; $sr = if ($withR.Count) { ($withR | Measure-Object Rounds -Sum).Sum } else { 0 }
+    $decided = @($ms | Where-Object { "$($_.Result)" -in 'Win', 'Loss', 'Draw' })
+    $wins = @($decided | Where-Object { $_.Result -eq 'Win' }).Count
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $summary = @(
+        @{ Label = 'K/D'; Value = ([Math]::Round($sk / [Math]::Max($sd, 1), 2)).ToString('0.00', $inv) }
+        @{ Label = 'Win rate'; Value = $(if ($decided.Count) { "$([Math]::Round(100.0 * $wins / $decided.Count))%" } else { '-' }) }
+        @{ Label = 'Headshot %'; Value = $(if ($sk) { "$([Math]::Round(100.0 * $shs / $sk))%" } else { '-' }) }
+        @{ Label = 'ADR'; Value = $(if ($sr) { "$([Math]::Round($sdmg / $sr))" } else { '-' }) }
+        @{ Label = 'Matches'; Value = "$($ms.Count)" })
+    @{ Title = 'Your CS2 matches'; Rows = $rows; Charts = $charts; Summary = $summary; Note = $note }
+}
+
+# --- The 1.18 games: where they are installed, their settings files and their pages
+# ---- fps games (1.18): Valorant, Overwatch 2, Rainbow Six Siege X
+# VALORANT (Riot Client). The Riot Client registers the game under HKCU Uninstall\Riot Game valorant.live (DisplayName VALORANT).
+# The real game exe (the one Windows' GPU preference and NVIDIA's 'Valorant' profile must match) is VALORANT-Win64-Shipping.exe.
+$GameFind['valorant'] = @{ Name = 'VALORANT'; Uninstall = '^VALORANT$'
+    Reg = @(@{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Riot Game valorant.live'; N = 'InstallLocation' })
+    Dirs = @('C:\Riot Games\VALORANT\live', '%ProgramFiles%\Riot Games\VALORANT\live', 'D:\Riot Games\VALORANT\live')
+    Exe = 'ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe'; Proc = @('VALORANT-Win64-Shipping', 'VALORANT') }
+# one folder per Riot account (<puuid>-<region>); the newest one is the account that played last
+$GameCfgPaths['valorant'] = @('%LOCALAPPDATA%\VALORANT\Saved\Config\*\Windows\GameUserSettings.ini')
+
+# Overwatch 2 (Battle.net, or Steam app 2357570). Battle.net registers HKLM uninstall entry 'Overwatch'.
+$GameFind['overwatch'] = @{ Name = 'Overwatch 2'; Steam = '2357570'; Uninstall = '^Overwatch( 2)?$'
+    Dirs = @('%ProgramFiles(x86)%\Overwatch', '%ProgramFiles%\Overwatch')
+    Exe = '_retail_\Overwatch.exe'; Proc = @('Overwatch') }
+$GameCfgPaths['overwatch'] = @('%USERPROFILE%\Documents\Overwatch\Settings\Settings_v0.ini', '%OneDrive%\Documents\Overwatch\Settings\Settings_v0.ini')
+
+# Rainbow Six Siege X (Steam 359550, or Ubisoft Connect game id 635)
+$GameFind['r6siege'] = @{ Name = 'Rainbow Six Siege'; Steam = '359550'; Uninstall = 'Rainbow Six.? Siege'
+    Reg = @(@{ P = 'HKLM:\SOFTWARE\WOW6432Node\Ubisoft\Launcher\Installs\635'; N = 'InstallDir' })
+    Dirs = @('%ProgramFiles(x86)%\Ubisoft\Ubisoft Game Launcher\games\Tom Clancy''s Rainbow Six Siege')
+    Exe = 'RainbowSix.exe'; Proc = @('RainbowSix', 'RainbowSix_Vulkan', 'RainbowSix_BE') }
+# one folder per Ubisoft profile id
+$GameCfgPaths['r6siege'] = @('%USERPROFILE%\Documents\My Games\Rainbow Six - Siege\*\GameSettings.ini', '%OneDrive%\Documents\My Games\Rainbow Six - Siege\*\GameSettings.ini')
+
+$GameDefs += @{ Id = 'valorant'; Title = 'VALORANT'; Sub = 'Riot Games'; Proc = 'VALORANT-Win64-Shipping'; From = '#FF4655'; To = '#2A1A2E'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'valorant' }
+    IconFile = { Get-GameExePath 'valorant' }
+    Launch = {
+        # the Riot Client lists its own path in RiotClientInstalls.json
+        $rc = $null; $j = "$env:ProgramData\Riot Games\RiotClientInstalls.json"
+        if (Test-Path $j) { $o = try { [IO.File]::ReadAllText($j) | ConvertFrom-Json } catch { $null }; if ($o -and $o.rc_default -and (Test-Path $o.rc_default)) { $rc = $o.rc_default } }
+        if (-not $rc -and (Test-Path 'C:\Riot Games\Riot Client\RiotClientServices.exe')) { $rc = 'C:\Riot Games\Riot Client\RiotClientServices.exe' }
+        if (-not $rc) { return 'Open the Riot Client to start VALORANT.' }
+        Start-Process $rc -ArgumentList '--launch-product=valorant', '--launch-patchline=live'; 'Launching VALORANT through the Riot Client.' }
+    Tools = @(@{ Id = 'val-latency-guide'; Kind = 'FPS' }, @{ Id = 'val-vsync-off'; Kind = 'Settings' }, @{ Id = 'val-fullscreen'; Kind = 'Settings' },
+              @{ Id = 'val-nv-smoothmotion'; Kind = 'Settings' }, @{ Id = 'val-nv-power'; Kind = 'Settings' }, @{ Id = 'val-gpupref'; Kind = 'Settings' }) }
+
+$GameDefs += @{ Id = 'overwatch'; Title = 'Overwatch 2'; Sub = 'Blizzard'; Proc = 'Overwatch'; From = '#F99E1A'; To = '#405275'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'overwatch' }
+    IconFile = { Get-GameExePath 'overwatch' }
+    Launch = { if (Find-SteamApp '2357570') { Start-Process 'steam://rungameid/2357570'; 'Launching Overwatch 2 through Steam.' } else { Start-Process 'battlenet://Pro'; 'Opening Overwatch 2 in Battle.net.' } }
+    Tools = @(@{ Id = 'ow-latency-guide'; Kind = 'FPS' }, @{ Id = 'ow-vsync-off'; Kind = 'Settings' }, @{ Id = 'ow-triplebuffer-off'; Kind = 'Settings' },
+              @{ Id = 'ow-nv-smoothmotion'; Kind = 'Settings' }, @{ Id = 'ow-gpupref'; Kind = 'Settings' }) }
+
+$GameDefs += @{ Id = 'r6siege'; Title = 'Rainbow Six Siege X'; Sub = 'Ubisoft'; Proc = 'RainbowSix'; From = '#2B3A4A'; To = '#C8A24A'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'r6siege' }
+    IconFile = { Get-GameExePath 'r6siege' }
+    Launch = { if (Find-SteamApp '359550') { Start-Process 'steam://rungameid/359550'; 'Launching Rainbow Six Siege through Steam.' } else { Start-Process 'uplay://launch/635/0'; 'Launching Rainbow Six Siege through Ubisoft Connect.' } }
+    Tools = @(@{ Id = 'r6-vsync-off'; Kind = 'Settings' }, @{ Id = 'r6-reflex'; Kind = 'Settings' }, @{ Id = 'r6-buffered'; Kind = 'Settings' },
+              @{ Id = 'r6-fullscreen'; Kind = 'Settings' }, @{ Id = 'r6-nv-smoothmotion'; Kind = 'Settings' }, @{ Id = 'r6-gpupref'; Kind = 'Settings' }) }
+
+# ---- ue games (1.18): Marvel Rivals, Rematch, Where Winds Meet
+# Marvel Rivals: Steam 2767030 (installdir MarvelRivals), Epic, NetEase's own launcher. The exe names are confirmed by the
+# NVIDIA driver's own 'Marvel Rivals' profile on this PC (marvel-win64-shipping.exe).
+$GameFind['marvelrivals'] = @{ Name = 'Marvel Rivals'; Steam = '2767030'; Epic = 'Marvel Rivals'; Uninstall = '^Marvel Rivals'
+    Exe = 'MarvelGame\Marvel\Binaries\Win64\Marvel-Win64-Shipping.exe'; Proc = @('Marvel-Win64-Shipping', 'MarvelRivals_Launcher') }
+$GameCfgPaths['marvelrivals'] = @('%LOCALAPPDATA%\Marvel\Saved\Config\Windows\GameUserSettings.ini')
+
+# Rematch: Steam 2138720 (installdir Rematch), Epic (store id runtime-7a61b6). The Unreal project is called "Runtime".
+# The driver's 'Rematch' profile lists rematch/runtime/binaries/win64/runtimeclient-win64-shipping.exe. The PC Game Pass
+# build (runtimeclient-wingdk-shipping.exe) lives in a protected folder and is not detected.
+$GameFind['rematch'] = @{ Name = 'Rematch'; Steam = '2138720'; Epic = 'REMATCH'
+    Exe = 'Runtime\Binaries\Win64\RuntimeClient-Win64-Shipping.exe'; Proc = @('RuntimeClient-Win64-Shipping', 'RuntimeClient') }
+$GameCfgPaths['rematch'] = @('%LOCALAPPDATA%\Runtime\Saved\Config\WindowsClient\GameUserSettings.ini', '%LOCALAPPDATA%\Runtime\Saved\Config\Windows\GameUserSettings.ini')
+
+# Where Winds Meet: Steam 3564740 (installdir Where Winds Meet), Epic, NetEase's own launcher (game folder wwm_standard).
+# Messiah engine, not Unreal. The driver's 'Where Winds Meet' profile lists wwm.exe and yysls.exe.
+$GameFind['wwm'] = @{ Name = 'Where Winds Meet'; Steam = '3564740'; Epic = 'Where Winds Meet'; Uninstall = '^Where Winds Meet'
+    Exe = 'Engine\Binaries\Win64r\wwm.exe'; Proc = @('wwm') }
+# its settings are binary files under %APPDATA%\yysls and the install's LocalData folder: nothing ZeroDelay can safely edit
+$GameCfgPaths['wwm'] = @()
+
+$GameDefs += @{ Id = 'marvelrivals'; Title = 'Marvel Rivals'; Sub = 'NetEase'; Proc = 'Marvel-Win64-Shipping'; From = '#B3121B'; To = '#F2A900'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'marvelrivals' }
+    IconFile = { Get-GameExePath 'marvelrivals' }
+    Launch = { if (Find-SteamApp '2767030') { Start-Process 'steam://rungameid/2767030'; 'Launching Marvel Rivals through Steam.' } elseif (Find-EpicApp 'Marvel Rivals') { Start-Process 'com.epicgames.launcher://library'; 'Opened the Epic Games Launcher: start Marvel Rivals from your library.' } else { 'Start Marvel Rivals from its launcher.' } }
+    Tools = @(
+              @{ Id = 'mr-gpupref'; Kind = 'Settings' }, @{ Id = 'mr-smoothmotion'; Kind = 'Settings' }, @{ Id = 'mr-nvpower'; Kind = 'Settings' },
+              @{ Id = 'mr-guide'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'rematch'; Title = 'Rematch'; Sub = 'Sloclap'; Proc = 'RuntimeClient-Win64-Shipping'; From = '#0E9F7E'; To = '#D7EE45'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'rematch' }
+    IconFile = { Get-GameExePath 'rematch' }
+    Launch = { if (Find-SteamApp '2138720') { Start-Process 'steam://rungameid/2138720'; 'Launching Rematch through Steam.' } else { Start-Process 'com.epicgames.launcher://library'; 'Opened the Epic Games Launcher: start Rematch from your library.' } }
+    Tools = @(@{ Id = 'rm-vsync-off'; Kind = 'Settings' }, @{ Id = 'rm-gpupref'; Kind = 'Settings' }, @{ Id = 'rm-smoothmotion'; Kind = 'Settings' },
+              @{ Id = 'rm-nvpower'; Kind = 'Settings' }, @{ Id = 'rm-guide'; Kind = 'FPS' }, @{ Id = 'rm-cfgreset'; Kind = 'Repair' }) }
+
+$GameDefs += @{ Id = 'wwm'; Title = 'Where Winds Meet'; Sub = 'Everstone / NetEase'; Proc = 'wwm'; From = '#2E6B5E'; To = '#C9B27C'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'wwm' }
+    IconFile = { Get-GameExePath 'wwm' }
+    Launch = { if (Find-SteamApp '3564740') { Start-Process 'steam://rungameid/3564740'; 'Launching Where Winds Meet through Steam.' } elseif (Find-EpicApp 'Where Winds Meet') { Start-Process 'com.epicgames.launcher://library'; 'Opened the Epic Games Launcher: start Where Winds Meet from your library.' } else { 'Start Where Winds Meet from its launcher.' } }
+    Tools = @(@{ Id = 'wwm-gpupref'; Kind = 'Settings' }, @{ Id = 'wwm-smoothmotion'; Kind = 'Settings' }, @{ Id = 'wwm-nvpower'; Kind = 'Settings' },
+              @{ Id = 'wwm-guide'; Kind = 'FPS' }) }
+
+# ---- sports (1.18): eFootball, NBA 2K27, Undisputed
+# eFootball (Konami, Steam 1665460, Unreal Engine 4.26, Denuvo Anti-Cheat). Real game exe is under eFootball\Binaries\Win64.
+$GameFind['efootball'] = @{ Name = 'eFootball'; Steam = '1665460'; Exe = 'eFootball\Binaries\Win64\eFootball.exe'; Proc = @('eFootball') }
+# eFootball keeps no plain-text settings file we could verify (Documents\KONAMI\eFootball\ST holds Konami's own data), so no cfg path.
+
+# NBA 2K27 (2K, Steam 4356430, Easy Anti-Cheat). nba2k27.exe is the app name in NVIDIA's predefined 'NBA 2K27' driver profile.
+$GameFind['nba2k27'] = @{ Name = 'NBA 2K27'; Steam = '4356430'; Exe = 'nba2k27.exe'; Proc = @('nba2k27') }
+$GameCfgPaths['nba2k27'] = @('%LOCALAPPDATA%\2K Sports\NBA 2K27\VideoSettings.cfg')
+
+# Undisputed (Steel City Interactive / Deep Silver, Steam 1451190, Unity, Denuvo Anti-Tamper and Anti-Cheat)
+$GameFind['undisputed'] = @{ Name = 'Undisputed'; Steam = '1451190'; Exe = 'Undisputed.exe'; Proc = @('Undisputed') }
+# Unity PlayerPrefs (hashed registry values) hold its settings; not edited, so no cfg path.
+
+$GameDefs += @{ Id = 'efootball'; Title = 'eFootball'; Sub = 'Konami'; Proc = 'eFootball'; From = '#1B3FA8'; To = '#1FB76A'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'efootball' }
+    IconFile = { Get-GameExePath 'efootball' }
+    Launch = { Start-Process 'steam://rungameid/1665460'; 'Launching eFootball through Steam.' }
+    Tools = @(@{ Id = 'efb-gpupref'; Kind = 'Settings' }, @{ Id = 'efb-fps'; Kind = 'FPS' }, @{ Id = 'efb-display'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'nba2k27'; Title = 'NBA 2K27'; Sub = '2K'; Proc = 'nba2k27'; From = '#C8102E'; To = '#1D428A'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'nba2k27' }
+    IconFile = { Get-GameExePath 'nba2k27' }
+    Launch = { Start-Process 'steam://rungameid/4356430'; 'Launching NBA 2K27 through Steam.' }
+    Tools = @(@{ Id = 'nba-vsync-off'; Kind = 'Settings' }, @{ Id = 'nba-uploadheaps'; Kind = 'Settings' }, @{ Id = 'nba-gpupref'; Kind = 'Settings' },
+              @{ Id = 'nba-nvpower'; Kind = 'Settings' }, @{ Id = 'nba-reflex'; Kind = 'FPS' }, @{ Id = 'nba-halfrate'; Kind = 'Network' }) }
+
+$GameDefs += @{ Id = 'undisputed'; Title = 'Undisputed'; Sub = 'Deep Silver'; Proc = 'Undisputed'; From = '#C9A227'; To = '#5A0E12'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'undisputed' }
+    IconFile = { Get-GameExePath 'undisputed' }
+    Launch = { Start-Process 'steam://rungameid/1451190'; 'Launching Undisputed through Steam.' }
+    Tools = @(@{ Id = 'und-gpupref'; Kind = 'Settings' }, @{ Id = 'und-fps'; Kind = 'FPS' }) }
+
+# --- More games (1.18, round 2): helpers
+# ---- moba (1.18): helpers for League of Legends, Dota 2 and Deadlock cards
+
+# --- Source 2 video.txt ("setting.key"<tab><tab>"value" per line, Dota 2 and Deadlock)
+# line index of "Key" in a Source 2 key/value file, or -1
+function Find-KvKey($Lines, [string]$Key) {
+    $rx = '^\s*"' + [regex]::Escape($Key) + '"\s+"'
+    for ($i = 0; $i -lt $Lines.Count; $i++) { if ("$($Lines[$i])" -match $rx) { return $i } }
+    -1
+}
+# value of "Key" in the game's video.txt, or $null when the file or the key is missing
+function Get-GameKvValue([string]$Game, [string]$Key) {
+    $p = Get-GameCfgPath $Game; if (-not $p) { return $null }
+    $c = Read-GameCfg $p; $i = Find-KvKey $c.Lines $Key
+    if ($i -lt 0) { return $null }
+    if ("$($c.Lines[$i])" -match '^\s*"[^"]*"\s+"([^"]*)"') { $Matches[1] } else { $null }
+}
+# replaces the value of an existing "Key" in place (keeps tabs and line endings); never adds keys
+function Set-GameKvValue([string]$Game, [string]$Key, [string]$Value) {
+    $p = Get-GameCfgPath $Game
+    if (-not $p) { throw "$($GameFind[$Game].Name) has not saved its video settings on this PC yet. Start it once, change any video setting, close it, then try again." }
+    $c = Read-GameCfg $p; $i = Find-KvKey $c.Lines $Key
+    if ($i -lt 0) { throw "This version of $($GameFind[$Game].Name) has no $Key setting, so ZeroDelay leaves the file alone." }
+    $l = "$($c.Lines[$i])"
+    if ($l -notmatch '^(\s*"[^"]*"\s+")([^"]*)(".*)$') { throw "Unexpected line for $Key in video.txt. Nothing was changed." }
+    $c.Lines[$i] = $Matches[1] + $Value + $Matches[3]
+    Write-GameCfg $p $c
+}
+# --- card engine: GameKv = @( @{ Game; Key; V; Ok = @(values that also count as on) } ... ).
+#     Test: $null when the file or any key is missing (other game version). On refuses rather than adding keys.
+function Test-GameKv($t) {
+    $items = @($t.GameKv); if (-not (Get-GameCfgPath $items[0].Game)) { return $null }
+    foreach ($g in $items) {
+        $v = Get-GameKvValue $g.Game $g.Key; if ($null -eq $v) { return $null }
+        $ok = @("$($g.V)") + @($g.Ok | Where-Object { $null -ne $_ } | ForEach-Object { "$_" })
+        if ($ok -notcontains "$v") { return $false }
+    }
+    $true
+}
+function Enable-GameKv($t) {
+    $items = @($t.GameKv); Assert-GameClosed $items[0].Game
+    if (-not (Get-GameCfgPath $items[0].Game)) { throw "$($GameFind[$items[0].Game].Name) has not saved its video settings on this PC yet. Start it once, change any video setting, close it, then try again." }
+    foreach ($g in $items) { if ($null -eq (Get-GameKvValue $g.Game $g.Key)) { throw "This version of $($GameFind[$g.Game].Name) has no $($g.Key) setting, so ZeroDelay leaves the file alone." } }
+    $key = "gcfg:$($t.Id)"
+    if (-not $script:Backup.Custom.ContainsKey($key)) {
+        $script:Backup.Custom[$key] = @(foreach ($g in $items) { @{ Had = $true; Value = "$(Get-GameKvValue $g.Game $g.Key)" } })
+        Save-Backup
+    }
+    foreach ($g in $items) {
+        # a value that already counts as on (Reflex On + Boost) is kept as the player chose it
+        $cur = "$(Get-GameKvValue $g.Game $g.Key)"
+        if (@($g.Ok | Where-Object { $null -ne $_ } | ForEach-Object { "$_" }) -contains $cur) { continue }
+        Set-GameKvValue $g.Game $g.Key "$($g.V)"
+    }
+}
+function Disable-GameKv($t) {
+    $items = @($t.GameKv); Assert-GameClosed $items[0].Game
+    $key = "gcfg:$($t.Id)"; $saved = @($script:Backup.Custom[$key])
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $g = $items[$i]; $b = if ($i -lt $saved.Count) { $saved[$i] } else { $null }
+        if ($null -eq (Get-GameKvValue $g.Game $g.Key)) { continue }
+        if ($b) { Set-GameKvValue $g.Game $g.Key "$($b.Value)" } elseif ($g.ContainsKey('D')) { Set-GameKvValue $g.Game $g.Key "$($g.D)" }
+    }
+    $script:Backup.Custom.Remove($key)
+}
+
+# --- Steam launch options (read-only: Steam rewrites localconfig.vdf while it runs, so ZeroDelay never edits it)
+# Steam's userdata\<account> folder that played this app last, or $null
+function Get-SteamAppAccountDir([string]$AppId) {
+    $s = Get-SteamPath; if (-not $s) { return $null }
+    $best = Get-ChildItem (Join-Path $s 'userdata') -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path (Join-Path $_.FullName $AppId) } |
+        Sort-Object { (Get-Item (Join-Path $_.FullName $AppId)).LastWriteTime } -Descending | Select-Object -First 1
+    if ($best) { $best.FullName } else { $null }
+}
+# plain-text report on a Steam game's launch options: what helps, what is a Source 1 leftover, what blocks matchmaking
+function Get-SteamLaunchReport([string]$AppId, [string]$GameName) {
+    $acc = Get-SteamAppAccountDir $AppId
+    if (-not $acc) { return "Could not find your Steam account folder for $GameName. Start $GameName once through Steam, then try again." }
+    $lc = Join-Path $acc 'config\localconfig.vdf'
+    $text = if (Test-Path -LiteralPath $lc) { [IO.File]::ReadAllText($lc) } else { '' }
+    $opt = Get-VdfAppValue $text 'LaunchOptions' $AppId
+    $out = @()
+    if (-not "$opt".Trim()) { $out += "Launch options: none. That is the right default for ${GameName}: every setting that matters is in the game's own menu." }
+    else {
+        $out += "Launch options: $opt"
+        $tok = @([regex]::Matches($opt, '"[^"]*"|\S+') | ForEach-Object { $_.Value.ToLower() })
+        $has = { param($names) @($tok | Where-Object { $names -contains $_ }) }
+        $bad = & $has @('-insecure')
+        if ($bad.Count) { $out += "PROBLEM: -insecure turns off VAC, so you cannot join matchmaking. Remove it unless you use it on purpose offline." }
+        $old = & $has @('-novid', '-nod3d9ex', '-d3d9ex', '-dxlevel', '-noipx', '-noaafonts', '-heapsize', '-nojoy', '-tickrate', '-useforcedmparms', '-noforcemaccel', '-noforcemparms', '-noforcemspd', '+mat_queue_mode', '+cl_forcepreload', '-m_rawinput', '+m_rawinput')
+        if ($old.Count) { $out += "Leftovers from the old Source 1 engine with no documented effect in $GameName (Source 2): $($old -join ' '). Harmless, but you can remove them." }
+        $cpu = & $has @('-high', '-threads', '-realtime', '-low', '-processheap', '-mainthreadpriority')
+        if ($cpu.Count) { $out += "No measured benefit: $($cpu -join ' '). Source 2 sizes its own threads and Windows already favours the game in the foreground." }
+        if (& $has @('-autoconfig')) { $out += 'Note: -autoconfig resets your video settings to detected defaults at every start. Use it once, then remove it.' }
+        if (& $has @('-vulkan')) { $out += "Note: -vulkan moves $GameName off its default DirectX 11 renderer. Reflex and AMD Anti-Lag 2 are documented for DirectX 11; keep Vulkan only if it fixes a problem for you." }
+        if (& $has @('+fps_max')) { $out += 'Note: +fps_max in the launch options overrides the in-game frame limit at every start. Set the limit in the game instead.' }
+        if (& $has @('-fullscreen', '-sw', '-windowed', '-noborder', '-w', '-h')) { $out += 'Note: window or resolution options here override the Display Mode you pick in the game.' }
+    }
+    $out += "`nTo change them: Steam > Library > right-click $GameName > Properties > General > Launch Options. Steam must be the one to save them; ZeroDelay only reads them."
+    $out -join "`n"
+}
+
+# --- League of Legends: read-only report on Config\game.cfg and Riot's server-synced PersistedSettings.json
+function Get-LolSettingValue($Json, [string]$Section, [string]$Name) {
+    foreach ($f in @($Json.files)) { if ("$($f.name)" -ne 'Game.cfg') { continue }
+        foreach ($s in @($f.sections)) { if ("$($s.name)" -ne $Section) { continue }
+            foreach ($v in @($s.settings)) { if ("$($v.name)" -eq $Name) { return "$($v.value)" } } } }
+    $null
+}
+function Get-LolCfgReport {
+    $d = Get-GameInstallDir 'lol'; if (-not $d) { return 'League of Legends is not installed.' }
+    $cfg = Join-Path $d 'Config\game.cfg'; $ps = Join-Path $d 'Config\PersistedSettings.json'
+    if (-not (Test-Path -LiteralPath $cfg)) { return 'League has not saved its settings on this PC yet. Play one game (or the Practice Tool), then check again.' }
+    $c = Read-GameCfg $cfg
+    $val = { param($sec, $key) $i = Find-IniKey $c.Lines $sec $key; if ($i -lt 0) { $null } else { $l = "$($c.Lines[$i])"; $l.Substring($l.IndexOf('=') + 1).Trim() } }
+    $j = $null; if (Test-Path -LiteralPath $ps) { $j = try { [IO.File]::ReadAllText($ps) | ConvertFrom-Json } catch { $null } }
+    $rows = @(
+        @{ Sec = 'General'; Key = 'WindowMode'; Label = 'Window Mode'; Good = $null; Meaning = @{ '0' = 'Full Screen'; '1' = 'Windowed'; '2' = 'Borderless' } }
+        @{ Sec = 'General'; Key = 'WaitForVerticalSync'; Label = 'Wait for Vertical Sync'; Good = '0'; Meaning = @{ '0' = 'off'; '1' = 'on' } }
+        @{ Sec = 'Performance'; Key = 'FrameCapType'; Label = 'Frame Rate Cap'; Good = $null; Meaning = @{} }
+    )
+    $out = @('Your League video settings (read only; ZeroDelay changes nothing here):', '')
+    $differ = $false
+    foreach ($r in $rows) {
+        $v = & $val $r.Sec $r.Key; $sv = if ($j) { Get-LolSettingValue $j $r.Sec $r.Key } else { $null }
+        $m = if ($null -ne $v -and $r.Meaning.ContainsKey("$v")) { " ($($r.Meaning["$v"]))" } else { '' }
+        $line = "$($r.Label): $(if ($null -ne $v) { "$v$m" } else { 'not in game.cfg (default)' })"
+        if ($r.Good -and $null -ne $v -and "$v" -ne $r.Good) { $line += '  <- not the lowest-delay choice' }
+        if ($null -ne $sv -and "$sv" -ne "$v") { $line += "  [Riot's synced copy says $sv]"; $differ = $true }
+        $out += $line
+    }
+    $out += '', 'Window Mode numbers follow the community''s reading of the file; Riot does not document them or the Frame Rate Cap numbers, so pick those in the game.'
+    if ($differ) { $out += 'Your synced copy differs from game.cfg: Riot applies its copy the next time you sign in, so change the setting in the game, not in the file.' }
+    $ro = @(foreach ($f in $cfg, $ps) { if ((Test-Path -LiteralPath $f) -and (Get-Item -LiteralPath $f -Force).IsReadOnly) { [IO.Path]::GetFileName($f) } })
+    if ($ro.Count) { $out += '', "Read-only: $($ro -join ', '). Old guides suggest this to stop Riot resetting a hand-edited file. It also stops the game saving anything you change in the menu; untick Read-only in the file's Properties if your settings keep coming back." }
+    $out -join "`n"
+}
+
+# ---- arena games (1.18): helpers for Rocket League, Apex Legends and THE FINALS cards
+
+# (the Valve key-value engine GameKv is defined with the moba helpers)
+# both Apex Legends exes that exist: r5apex.exe (DirectX 11) and r5apex_dx12.exe (DirectX 12)
+function Get-ApexExes {
+    $d = Get-GameInstallDir 'apex'; if (-not $d) { return @() }
+    @(foreach ($n in 'r5apex.exe', 'r5apex_dx12.exe') { $p = Join-Path $d $n; if (Test-Path -LiteralPath $p) { $p } })
+}
+
+# ---- shooter games (1.18): helpers for Call of Duty, Battlefield 6 and PUBG cards
+
+# line index of Key in a Frostbite profile (Battlefield's PROFSAVE_profile: one "Key value" per line), or -1
+function Find-FbKey($Lines, [string]$Key) {
+    $rx = '^\s*' + [regex]::Escape($Key) + '(\s|$)'
+    for ($i = 0; $i -lt $Lines.Count; $i++) { if ("$($Lines[$i])" -match $rx) { return $i } }
+    -1
+}
+# value text after the key, or $null when the file or the key is missing
+function Get-GameFbValue([string]$Game, [string]$Key) {
+    $p = Get-GameCfgPath $Game; if (-not $p) { return $null }
+    $c = Read-GameCfg $p; $i = Find-FbKey $c.Lines $Key
+    if ($i -lt 0) { return $null }
+    if ("$($c.Lines[$i])" -match '^\s*\S+\s*(.*?)\s*$') { $Matches[1] } else { '' }
+}
+# replaces the value of an existing key in place (keeps the separator); never adds keys the game did not write
+function Set-GameFbValue([string]$Game, [string]$Key, [string]$Value) {
+    $p = Get-GameCfgPath $Game
+    if (-not $p) { throw "$($GameFind[$Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    $c = Read-GameCfg $p; $i = Find-FbKey $c.Lines $Key
+    if ($i -lt 0) { throw "This version of $($GameFind[$Game].Name) has no $Key setting, so ZeroDelay leaves the file alone." }
+    if ("$($c.Lines[$i])" -notmatch '^(\s*\S+)(\s*)(.*?)(\s*)$') { throw "Unexpected line for $Key in the settings file." }
+    $sep = if ($Matches[2]) { $Matches[2] } else { ' ' }
+    $c.Lines[$i] = $Matches[1] + $sep + $Value + $Matches[4]
+    Write-GameCfg $p $c
+}
+# --- card engine: GameFb = @( @{ Game; Key; V; Ok = '<optional regex of values that already count as on>' } ... ).
+#     Test: $null when the file or any key is missing (other game version). On backs up each old value.
+function Test-GameFb($t) {
+    $items = @($t.GameFb); if (-not (Get-GameCfgPath $items[0].Game)) { return $null }
+    foreach ($g in $items) {
+        $v = Get-GameFbValue $g.Game $g.Key; if ($null -eq $v) { return $null }
+        $ok = if ($g.Ok) { "$v" -match $g.Ok } else { "$v" -eq "$($g.V)" }
+        if (-not $ok) { return $false }
+    }
+    $true
+}
+function Enable-GameFb($t) {
+    $items = @($t.GameFb); Assert-GameClosed $items[0].Game
+    if (-not (Get-GameCfgPath $items[0].Game)) { throw "$($GameFind[$items[0].Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    foreach ($g in $items) { if ($null -eq (Get-GameFbValue $g.Game $g.Key)) { throw "This version of $($GameFind[$g.Game].Name) has no $($g.Key) setting, so ZeroDelay leaves the file alone." } }
+    $key = "gcfg:$($t.Id)"
+    if (-not $script:Backup.Custom.ContainsKey($key)) {
+        $script:Backup.Custom[$key] = @(foreach ($g in $items) { @{ Had = $true; Value = "$(Get-GameFbValue $g.Game $g.Key)" } })
+        Save-Backup
+    }
+    foreach ($g in $items) {
+        # a value that already counts as on (Reflex On + Boost) is left as it is
+        if ($g.Ok -and "$(Get-GameFbValue $g.Game $g.Key)" -match $g.Ok) { continue }
+        Set-GameFbValue $g.Game $g.Key "$($g.V)"
+    }
+}
+function Disable-GameFb($t) {
+    $items = @($t.GameFb); Assert-GameClosed $items[0].Game
+    $key = "gcfg:$($t.Id)"; $saved = @($script:Backup.Custom[$key])
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $g = $items[$i]; $b = if ($i -lt $saved.Count) { $saved[$i] } else { $null }
+        if ($null -eq (Get-GameFbValue $g.Game $g.Key)) { continue }
+        if ($b) { Set-GameFbValue $g.Game $g.Key "$($b.Value)" } elseif ($g.ContainsKey('D')) { Set-GameFbValue $g.Game $g.Key "$($g.D)" }
+    }
+    $script:Backup.Custom.Remove($key)
+}
+
+# Call of Duty HQ's exes: _retail_\cod.exe plus the per-game exes beside it or one folder down (cod25-cod.exe, sp24-cod.exe ...)
+function Get-CodExes {
+    $e = Get-GameExePath 'cod'; if (-not $e -or -not (Test-Path -LiteralPath $e)) { return @() }
+    $d = Split-Path $e -Parent
+    $more = @(Get-ChildItem -LiteralPath $d -Filter '*-cod.exe' -File -ErrorAction SilentlyContinue) +
+            @(Get-ChildItem -LiteralPath $d -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter '*-cod.exe' -File -ErrorAction SilentlyContinue })
+    @($e) + @($more | ForEach-Object { $_.FullName } | Sort-Object -Unique)
+}
+
+# Secure Boot and TPM 2.0 state for games whose kernel anti-cheat refuses to start without them (read-only)
+function Get-AcBootReport([string]$Game, [string]$AntiCheat) {
+    $fw = "$env:firmware_type"
+    $sb = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled'
+    $tpm = Get-TpmInfo
+    $sbOk = ($sb -eq 1); $tpmOk = ($tpm.Present -eq $true -and $tpm.Spec -match '(^|,\s*)2\.0')
+    $l = @()
+    $l += 'Secure Boot: ' + $(if ($sbOk) { 'on' } elseif ($fw -eq 'Legacy') { 'OFF, and Windows boots in legacy BIOS (CSM) mode, so it cannot be switched on yet' } else { 'OFF' })
+    $l += 'TPM 2.0: ' + $(if ($null -eq $tpm.Present) { 'unknown (needs administrator)' } elseif ($tpmOk) { "on ($($tpm.Mfr) $($tpm.Ver))" } elseif ($tpm.Present) { "a TPM is present but reports version $($tpm.Spec), not 2.0" } else { 'NOT FOUND (fTPM / PTT is off in the BIOS)' })
+    $head = "$Game's anti-cheat ($AntiCheat) will not start unless Secure Boot and TPM 2.0 are on.`n`n$($l -join "`n")"
+    if ($sbOk -and $tpmOk) { return "$head`n`nThis PC meets the requirement. Nothing to change." }
+    $steps = @()
+    if (-not $sbOk) { $steps += if ($fw -eq 'Legacy') { 'Secure Boot: first convert Windows to UEFI boot (administrator prompt: mbr2gpt /validate /allowFullOS, then mbr2gpt /convert /allowFullOS), then BIOS > Boot > CSM: Disabled, Secure Boot > OS Type: Windows UEFI mode.' } else { 'Secure Boot: BIOS > Boot > Secure Boot > OS Type: Windows UEFI mode (CSM must be Disabled). If it says ''Setup mode'', choose Install default Secure Boot keys / Restore factory keys.' } }
+    if (-not $tpmOk -and $null -ne $tpm.Present) { $steps += 'TPM 2.0: BIOS > Advanced > AMD fTPM configuration: Firmware TPM (AMD), or PCH-FW / Security > PTT: Enabled (Intel).' }
+    if (-not $steps.Count) { return "$head`n`nSecure Boot is on; the TPM can only be read with administrator rights, so run ZeroDelay as administrator to finish the check." }
+    $steps += 'If BitLocker or Device Encryption is on, suspend it first (Settings > Privacy & security > Device encryption, or manage-bde -protectors -disable C:), or the next boot asks for the recovery key.'
+    "$head`n`n$($steps -join "`n`n")`n`nZeroDelay cannot change firmware settings; these are the BIOS steps. Neither costs FPS."
+}
+
+# ---- open world (1.18): XML settings files, edited line by line so the game's own layout is kept byte for byte.
+# Two element shapes are handled: Rockstar's <Tag value="x" /> (GTA V settings.xml) and Roblox's <type name="Tag">x</type>
+# (GlobalBasicSettings_13.xml). Parent limits the search to the lines between <Parent> and </Parent> ('' = anywhere).
+
+# line index of a setting element, or -1
+function Find-XmlSetting($Lines, [string]$Parent, [string]$Tag) {
+    $in = [string]::IsNullOrEmpty($Parent); $t = [regex]::Escape($Tag)
+    $rxA = '^\s*<' + $t + '\s+value="[^"]*"\s*/>'
+    $rxN = '^\s*<\w+\s+name="' + $t + '">[^<]*</\w+>'
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $l = "$($Lines[$i])"
+        if ($Parent) {
+            if ($l -match ('^\s*<' + [regex]::Escape($Parent) + '>\s*$')) { $in = $true; continue }
+            if ($l -match ('^\s*</' + [regex]::Escape($Parent) + '>')) { $in = $false; continue }
+        }
+        if ($in -and ($l -match $rxA -or $l -match $rxN)) { return $i }
+    }
+    -1
+}
+# value text of a setting ('1', '240', 'true'), or $null when the file or the element is missing
+function Get-GameXmlValue([string]$Game, [string]$Parent, [string]$Tag) {
+    $p = Get-GameCfgPath $Game; if (-not $p) { return $null }
+    $c = Read-GameCfg $p; $i = Find-XmlSetting $c.Lines $Parent $Tag
+    if ($i -lt 0) { return $null }
+    $l = "$($c.Lines[$i])"
+    if ($l -match '\s+value="([^"]*)"') { return $Matches[1] }
+    if ($l -match '">([^<]*)</') { return $Matches[1] }
+    $null
+}
+# replaces the value of an existing setting in place (never adds elements: an unknown element could break the file)
+function Set-GameXmlValue([string]$Game, [string]$Parent, [string]$Tag, [string]$Value) {
+    $p = Get-GameCfgPath $Game
+    if (-not $p) { throw "$($GameFind[$Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    if ($Value -notmatch '^[\w.\-]*$') { throw "Unexpected value for $Tag." }
+    $c = Read-GameCfg $p; $i = Find-XmlSetting $c.Lines $Parent $Tag
+    if ($i -lt 0) { throw "This version of $($GameFind[$Game].Name) has no $Tag setting, so ZeroDelay leaves the file alone." }
+    $l = "$($c.Lines[$i])"
+    if ($l -match '^(.*?\s+value=")[^"]*(".*)$' -or $l -match '^(.*?">)[^<]*(</.*)$') { $c.Lines[$i] = $Matches[1] + $Value + $Matches[2] }
+    else { throw "Unexpected line for $Tag in the settings file." }
+    Write-GameCfg $p $c
+}
+# --- card engine: GameXml = @( @{ Game; Parent; Tag; V; D } ... ). Test: $null when the file or any element is missing.
+function Test-GameXml($t) {
+    $items = @($t.GameXml); if (-not (Get-GameCfgPath $items[0].Game)) { return $null }
+    foreach ($g in $items) { $v = Get-GameXmlValue $g.Game $g.Parent $g.Tag; if ($null -eq $v) { return $null }; if ("$v" -ne "$($g.V)") { return $false } }
+    $true
+}
+function Enable-GameXml($t) {
+    $items = @($t.GameXml); Assert-GameClosed $items[0].Game
+    if (-not (Get-GameCfgPath $items[0].Game)) { throw "$($GameFind[$items[0].Game].Name) has not saved its settings on this PC yet. Start it once, change any setting, close it, then try again." }
+    foreach ($g in $items) { if ($null -eq (Get-GameXmlValue $g.Game $g.Parent $g.Tag)) { throw "This version of $($GameFind[$g.Game].Name) has no $($g.Tag) setting, so ZeroDelay leaves the file alone." } }
+    $key = "gcfg:$($t.Id)"
+    if (-not $script:Backup.Custom.ContainsKey($key)) {
+        $script:Backup.Custom[$key] = @(foreach ($g in $items) { @{ Had = $true; Value = "$(Get-GameXmlValue $g.Game $g.Parent $g.Tag)" } })
+        Save-Backup
+    }
+    foreach ($g in $items) { Set-GameXmlValue $g.Game $g.Parent $g.Tag "$($g.V)" }
+}
+function Disable-GameXml($t) {
+    $items = @($t.GameXml); Assert-GameClosed $items[0].Game
+    $key = "gcfg:$($t.Id)"; $saved = @($script:Backup.Custom[$key])
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $g = $items[$i]; $b = if ($i -lt $saved.Count) { $saved[$i] } else { $null }
+        if ($null -eq (Get-GameXmlValue $g.Game $g.Parent $g.Tag)) { continue }
+        # a backed-up value equal to the card's own value would leave the switch on: fall back to the default instead
+        if ($b -and "$($b.Value)" -ne "$($g.V)") { Set-GameXmlValue $g.Game $g.Parent $g.Tag "$($b.Value)" }
+        elseif ($g.ContainsKey('D')) { Set-GameXmlValue $g.Game $g.Parent $g.Tag "$($g.D)" }
+    }
+    $script:Backup.Custom.Remove($key)
+}
+
+# --- More games (1.18, round 2): where they are installed, their settings files and their pages
+# ---- arena games (1.18): Rocket League, Apex Legends, THE FINALS
+# Rocket League: Epic Games Store (AppName Sugar, manifest checked on this PC: InstallLocation E:\games\rocketleague,
+# DisplayName "Rocket League(R)"), older Steam installs (252950). Unreal Engine 3. The driver's 'Rocket League' profile
+# lists rocketleague.exe. RocketLeague_EAC.exe and Launcher.exe sit next to it: ZeroDelay never touches them.
+$GameFind['rocketleague'] = @{ Name = 'Rocket League'; Epic = 'Sugar'; Steam = '252950'
+    Exe = 'Binaries\Win64\RocketLeague.exe'; Proc = @('RocketLeague') }
+# TASystemSettings.ini holds V-Sync, window mode and the render-thread setting (checked on this PC). OneDrive moves Documents.
+$GameCfgPaths['rocketleague'] = @('%USERPROFILE%\Documents\My Games\Rocket League\TAGame\Config\TASystemSettings.ini',
+    '%USERPROFILE%\OneDrive\Documents\My Games\Rocket League\TAGame\Config\TASystemSettings.ini')
+
+# Apex Legends: Steam 1172470 (installdir Apex Legends), EA app (Respawn's registry value). Source-engine derived.
+# The driver's 'Apex Legends' profile lists r5apex.exe and r5apex_dx12.exe.
+$GameFind['apex'] = @{ Name = 'Apex Legends'; Steam = '1172470'; Uninstall = '^Apex Legends'
+    Reg = @(@{ P = 'HKLM:\SOFTWARE\Respawn\Apex'; N = 'Install Dir' }, @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Respawn\Apex'; N = 'Install Dir' })
+    Exe = 'r5apex.exe'; Proc = @('r5apex', 'r5apex_dx12') }
+$GameCfgPaths['apex'] = @('%USERPROFILE%\Saved Games\Respawn\Apex\local\videoconfig.txt')
+
+# THE FINALS: Steam 2073850. Unreal Engine 5, project "Discovery". The real game exe is Discovery\Binaries\Win64\Discovery.exe
+# (a Proton log lists both it and the small Discovery.exe starter in the install root). The driver's 'The Finals' profile
+# lists discovery.exe and thefinals.exe.
+$GameFind['thefinals'] = @{ Name = 'THE FINALS'; Steam = '2073850'
+    Exe = 'Discovery\Binaries\Win64\Discovery.exe'; Proc = @('Discovery') }
+$GameCfgPaths['thefinals'] = @('%LOCALAPPDATA%\Discovery\Saved\Config\WindowsClient\GameUserSettings.ini', '%LOCALAPPDATA%\Discovery\Saved\Config\Windows\GameUserSettings.ini')
+
+$GameDefs += @{ Id = 'rocketleague'; Title = 'Rocket League'; Sub = 'Psyonix / Epic Games'; Proc = 'RocketLeague'; From = '#1565D8'; To = '#F28A1E'; Glyph = [char]0xE7FC; Cat = 'RocketLeague'
+    Installed = { Test-GameInstalled 'rocketleague' }
+    IconFile = { Get-GameExePath 'rocketleague' }
+    Launch = { if (Find-EpicApp 'Sugar') { Start-Process 'com.epicgames.launcher://apps/9773aa1aa54f4f7b80e44bef04986cea%3A530145df28a24424923f5828cc9031a1%3ASugar?action=launch&silent=true'; 'Launching Rocket League through the Epic Games Launcher.' } else { Start-Process 'steam://rungameid/252950'; 'Launching Rocket League through Steam.' } }
+    Tools = @(@{ Id = 'rl-vsync-off'; Kind = 'Settings' }, @{ Id = 'rl-threadlag'; Kind = 'Settings' }, @{ Id = 'rl-fullscreen'; Kind = 'Settings' },
+              @{ Id = 'rl-gpupref'; Kind = 'Settings' }, @{ Id = 'rl-nvprerender'; Kind = 'Settings' }, @{ Id = 'rl-nvpower'; Kind = 'Settings' },
+              @{ Id = 'rl-smoothmotion'; Kind = 'Settings' }, @{ Id = 'rl-guide'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'apex'; Title = 'Apex Legends'; Sub = 'Respawn / EA'; Proc = 'r5apex'; From = '#C8202F'; To = '#3B3431'; Glyph = [char]0xE7FC; Cat = 'ApexLegends'
+    Installed = { Test-GameInstalled 'apex' }
+    IconFile = { Get-GameExePath 'apex' }
+    Launch = { if (Find-SteamApp '1172470') { Start-Process 'steam://rungameid/1172470'; 'Launching Apex Legends through Steam.' } else { 'Start Apex Legends from the EA app.' } }
+    Tools = @(@{ Id = 'apex-vsync-off'; Kind = 'Settings' }, @{ Id = 'apex-fullscreen'; Kind = 'Settings' }, @{ Id = 'apex-gpupref'; Kind = 'Settings' },
+              @{ Id = 'apex-nvpower'; Kind = 'Settings' }, @{ Id = 'apex-smoothmotion'; Kind = 'Settings' }, @{ Id = 'apex-guide'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'thefinals'; Title = 'THE FINALS'; Sub = 'Embark Studios'; Proc = 'Discovery'; From = '#E8173C'; To = '#F5C518'; Glyph = [char]0xE7FC; Cat = 'TheFinals'
+    Installed = { Test-GameInstalled 'thefinals' }
+    IconFile = { Get-GameExePath 'thefinals' }
+    Launch = { Start-Process 'steam://rungameid/2073850'; 'Launching THE FINALS through Steam.' }
+    Tools = @(@{ Id = 'fin-vsync-off'; Kind = 'Settings' }, @{ Id = 'fin-gpupref'; Kind = 'Settings' }, @{ Id = 'fin-nvpower'; Kind = 'Settings' },
+              @{ Id = 'fin-smoothmotion'; Kind = 'Settings' }, @{ Id = 'fin-guide'; Kind = 'FPS' }) }
+
+# ---- shooter games (1.18): Call of Duty (Black Ops 7 / Warzone), Battlefield 6, PUBG: BATTLEGROUNDS
+# Call of Duty HQ: Steam 1938090 (one app for BO6, BO7 and Warzone), Battle.net (default C:\Program Files (x86)\Call of Duty).
+# Both keep the launcher exe at _retail_\cod.exe and the per-game exes (cod25-cod.exe ...) under _retail_. The driver's
+# 'Call of Duty: Black Ops 7' profile lists cod.exe, cod25-cod.exe and mp25-cod.exe. Ricochet: no settings-file edits at all.
+$GameFind['cod'] = @{ Name = 'Call of Duty'; Steam = '1938090'; Uninstall = '^Call of Duty$'
+    Dirs = @('%ProgramFiles(x86)%\Call of Duty', '%ProgramFiles%\Call of Duty')
+    Exe = '_retail_\cod.exe'; Proc = @('cod', 'cod25-cod', 'mp25-cod', 'sp25-cod', 'sp24-cod') }
+# Activision's security policy forbids software that modifies game data on disk, so no file is listed (the cards are guided)
+$GameCfgPaths['cod'] = @()
+
+# Battlefield 6: Steam 2807960 (installdir Battlefield 6), EA app (C:\Program Files\EA Games\Battlefield 6), Epic.
+# bf6.exe sits in the install folder; bf6event.exe is the limited-time-event build. Both are in the driver's 'Battlefield 6' profile.
+$GameFind['bf6'] = @{ Name = 'Battlefield 6'; Steam = '2807960'; Epic = 'Battlefield 6'; Uninstall = '^Battlefield\W{0,2} ?6$'
+    Dirs = @('%ProgramFiles%\EA Games\Battlefield 6', '%ProgramFiles%\Epic Games\Battlefield6')
+    Exe = 'bf6.exe'; Proc = @('bf6', 'bf6event') }
+# PROFSAVE_profile ("Key value" per line) sits in settings\ or in a steam / ea / epic subfolder; the newest one is the live one
+$GameCfgPaths['bf6'] = @('%USERPROFILE%\Documents\Battlefield 6\settings\PROFSAVE_profile', '%USERPROFILE%\Documents\Battlefield 6\settings\*\PROFSAVE_profile',
+    '%OneDrive%\Documents\Battlefield 6\settings\PROFSAVE_profile', '%OneDrive%\Documents\Battlefield 6\settings\*\PROFSAVE_profile')
+
+# PUBG: BATTLEGROUNDS: Steam 578080 (installdir PUBG), Epic. Unreal Engine 4 project "TslGame"; BattlEye.
+$GameFind['pubg'] = @{ Name = 'PUBG: BATTLEGROUNDS'; Steam = '578080'; Epic = 'PUBG: BATTLEGROUNDS'
+    Exe = 'TslGame\Binaries\Win64\TslGame.exe'; Proc = @('TslGame') }
+$GameCfgPaths['pubg'] = @('%LOCALAPPDATA%\TslGame\Saved\Config\WindowsNoEditor\GameUserSettings.ini')
+
+$GameDefs += @{ Id = 'cod'; Title = 'Call of Duty'; Sub = 'Activision'; Proc = 'cod'; From = '#2F3B26'; To = '#D98E2B'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'cod' }
+    IconFile = { Get-GameExePath 'cod' }
+    Launch = { if (Find-SteamApp '1938090') { Start-Process 'steam://rungameid/1938090'; 'Launching Call of Duty through Steam.' } else { Start-Process 'battlenet://'; 'Opened Battle.net: start Call of Duty from there.' } }
+    Tools = @(@{ Id = 'cod-gpupref'; Kind = 'Settings' }, @{ Id = 'cod-smoothmotion'; Kind = 'Settings' }, @{ Id = 'cod-nvpower'; Kind = 'Settings' },
+              @{ Id = 'cod-guide'; Kind = 'FPS' }, @{ Id = 'cod-secureboot'; Kind = 'Repair' }) }
+
+$GameDefs += @{ Id = 'bf6'; Title = 'Battlefield 6'; Sub = 'EA / Battlefield Studios'; Proc = 'bf6'; From = '#10263F'; To = '#F26B1D'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'bf6' }
+    IconFile = { Get-GameExePath 'bf6' }
+    Launch = { if (Find-SteamApp '2807960') { Start-Process 'steam://rungameid/2807960'; 'Launching Battlefield 6 through Steam.' } elseif (Find-EpicApp 'Battlefield 6') { Start-Process 'com.epicgames.launcher://library'; 'Opened the Epic Games Launcher: start Battlefield 6 from your library.' } else { 'Start Battlefield 6 from the EA app.' } }
+    Tools = @(@{ Id = 'bf6-vsync-off'; Kind = 'Settings' }, @{ Id = 'bf6-futureframe-off'; Kind = 'Settings' }, @{ Id = 'bf6-reflex'; Kind = 'Settings' },
+              @{ Id = 'bf6-gpupref'; Kind = 'Settings' }, @{ Id = 'bf6-smoothmotion'; Kind = 'Settings' }, @{ Id = 'bf6-nvpower'; Kind = 'Settings' },
+              @{ Id = 'bf6-guide'; Kind = 'FPS' }, @{ Id = 'bf6-secureboot'; Kind = 'Repair' }) }
+
+$GameDefs += @{ Id = 'pubg'; Title = 'PUBG: BATTLEGROUNDS'; Sub = 'KRAFTON'; Proc = 'TslGame'; From = '#3B352A'; To = '#F2B705'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'pubg' }
+    IconFile = { Get-GameExePath 'pubg' }
+    Launch = { if (Find-SteamApp '578080') { Start-Process 'steam://rungameid/578080'; 'Launching PUBG through Steam.' } else { Start-Process 'com.epicgames.launcher://library'; 'Opened the Epic Games Launcher: start PUBG from your library.' } }
+    Tools = @(@{ Id = 'pubg-vsync-off'; Kind = 'Settings' }, @{ Id = 'pubg-fullscreen'; Kind = 'Settings' }, @{ Id = 'pubg-gpupref'; Kind = 'Settings' },
+              @{ Id = 'pubg-smoothmotion'; Kind = 'Settings' }, @{ Id = 'pubg-nvpower'; Kind = 'Settings' }, @{ Id = 'pubg-guide'; Kind = 'FPS' }) }
+
+# ---- moba (1.18): League of Legends, Dota 2, Deadlock
+# League of Legends (Riot Client, Vanguard). The Riot Client registers HKCU Uninstall\Riot Game league_of_legends.live
+# (DisplayName League of Legends). The match exe, and the app in NVIDIA's 'League of Legends' profile, is Game\League of Legends.exe.
+$GameFind['lol'] = @{ Name = 'League of Legends'; Uninstall = '^League of Legends$'
+    Reg = @(@{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Riot Game league_of_legends.live'; N = 'InstallLocation' })
+    Dirs = @('C:\Riot Games\League of Legends', '%ProgramFiles%\Riot Games\League of Legends', 'D:\Riot Games\League of Legends')
+    Exe = 'Game\League of Legends.exe'; Proc = @('League of Legends', 'LeagueClient', 'LeagueClientUx') }
+# game.cfg is what the in-game menu writes; Riot copies most of it to its servers through PersistedSettings.json
+$GameCfgPaths['lol'] = @('{Install}\Config\game.cfg')
+
+# Dota 2 (Steam 570, Source 2, VAC). Since Source 2 the video settings live per Steam account in userdata\<id>\570\local\cfg.
+$GameFind['dota2'] = @{ Name = 'Dota 2'; Steam = '570'; Exe = 'game\bin\win64\dota2.exe'; Proc = @('dota2') }
+$GameCfgPaths['dota2'] = @(@(Get-SteamPath) | Where-Object { $_ } | ForEach-Object { "$_\userdata\*\570\local\cfg\video.txt" }) + @('%ProgramFiles(x86)%\Steam\userdata\*\570\local\cfg\video.txt')
+
+# Deadlock (Valve, Steam 1422450, Source 2, VAC). Internal name 'citadel'; video.txt sits in the game's own cfg folder.
+# NVIDIA's 'Deadlock' profile lists deadlock.exe and project8.exe (the playtest name).
+$GameFind['deadlock'] = @{ Name = 'Deadlock'; Steam = '1422450'; Exe = 'game\bin\win64\deadlock.exe'; Proc = @('deadlock', 'project8') }
+$GameCfgPaths['deadlock'] = @('{Install}\game\citadel\cfg\video.txt') + @(@(Get-SteamPath) | Where-Object { $_ } | ForEach-Object { "$_\userdata\*\1422450\local\cfg\video.txt" })
+
+$GameDefs += @{ Id = 'lol'; Title = 'League of Legends'; Sub = 'Riot Games'; Proc = 'League of Legends'; From = '#C8AA6E'; To = '#0A1428'; Glyph = [char]0xE7FC; Cat = 'LeagueOfLegends'
+    Installed = { Test-GameInstalled 'lol' }
+    IconFile = { Get-GameExePath 'lol' }
+    Launch = {
+        $rc = $null; $j = "$env:ProgramData\Riot Games\RiotClientInstalls.json"
+        if (Test-Path $j) { $o = try { [IO.File]::ReadAllText($j) | ConvertFrom-Json } catch { $null }; if ($o -and $o.rc_default -and (Test-Path $o.rc_default)) { $rc = $o.rc_default } }
+        if (-not $rc -and (Test-Path 'C:\Riot Games\Riot Client\RiotClientServices.exe')) { $rc = 'C:\Riot Games\Riot Client\RiotClientServices.exe' }
+        if (-not $rc) { return 'Open the Riot Client to start League of Legends.' }
+        Start-Process $rc -ArgumentList '--launch-product=league_of_legends', '--launch-patchline=live'; 'Launching League of Legends through the Riot Client.' }
+    Tools = @(@{ Id = 'lol-nv-smoothmotion'; Kind = 'Settings' }, @{ Id = 'lol-nv-power'; Kind = 'Settings' }, @{ Id = 'lol-gpupref'; Kind = 'Settings' },
+              @{ Id = 'lol-latency-guide'; Kind = 'FPS' }, @{ Id = 'lol-cfgcheck'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'dota2'; Title = 'Dota 2'; Sub = 'Valve'; Proc = 'dota2'; From = '#A3201C'; To = '#1B1B1F'; Glyph = [char]0xE7FC; Cat = 'Dota2'
+    Installed = { Test-GameInstalled 'dota2' }
+    IconFile = { Get-GameExePath 'dota2' }
+    Launch = { Start-Process 'steam://rungameid/570'; 'Launching Dota 2 through Steam.' }
+    Tools = @(@{ Id = 'dota-vsync-off'; Kind = 'Settings' }, @{ Id = 'dota-reflex'; Kind = 'Settings' }, @{ Id = 'dota-fullscreen'; Kind = 'Settings' },
+              @{ Id = 'dota-nv-smoothmotion'; Kind = 'Settings' }, @{ Id = 'dota-gpupref'; Kind = 'Settings' },
+              @{ Id = 'dota-latency-guide'; Kind = 'FPS' }, @{ Id = 'dota-launchopts'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'deadlock'; Title = 'Deadlock'; Sub = 'Valve'; Proc = 'deadlock'; From = '#C9A66B'; To = '#2B2320'; Glyph = [char]0xE7FC; Cat = 'Deadlock'
+    Installed = { Test-GameInstalled 'deadlock' }
+    IconFile = { Get-GameExePath 'deadlock' }
+    Launch = { Start-Process 'steam://rungameid/1422450'; 'Launching Deadlock through Steam.' }
+    Tools = @(@{ Id = 'dl-vsync-off'; Kind = 'Settings' }, @{ Id = 'dl-reflex'; Kind = 'Settings' }, @{ Id = 'dl-fullscreen'; Kind = 'Settings' },
+              @{ Id = 'dl-nv-smoothmotion'; Kind = 'Settings' }, @{ Id = 'dl-gpupref'; Kind = 'Settings' },
+              @{ Id = 'dl-latency-guide'; Kind = 'FPS' }, @{ Id = 'dl-launchopts'; Kind = 'FPS' }) }
+
+# ---- open world (1.18): GTA V Enhanced, GTA V Legacy, Roblox, Escape from Tarkov
+# GTA V Enhanced: Epic (DisplayName 'Grand Theft Auto V Enhanced', confirmed in this PC's Epic manifest), Steam 3240220,
+# Rockstar Games Launcher. Rockstar writes the folder to HKLM\SOFTWARE\WOW6432Node\Rockstar Games\GTAV Enhanced
+# (InstallFolderEpic on this PC; InstallFolderSteam / InstallFolder for the other stores). The driver's predefined
+# 'Grand Theft Auto V Enhanced' profile lists gta5_enhanced.exe. GTA5_Enhanced_BE.exe is the BattlEye wrapper (never touched).
+$GameFind['gtav'] = @{ Name = 'GTA V Enhanced'; Steam = '3240220'; Epic = 'Grand Theft Auto V Enhanced'
+    Reg = @(@{ P = 'HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\GTAV Enhanced'; N = 'InstallFolderEpic' }, @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\GTAV Enhanced'; N = 'InstallFolderSteam' },
+            @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\GTAV Enhanced'; N = 'InstallFolder' })
+    Exe = 'GTA5_Enhanced.exe'; Proc = @('GTA5_Enhanced', 'GTA5_Enhanced_BE') }
+$GameCfgPaths['gtav'] = @('%USERPROFILE%\Documents\Rockstar Games\GTAV Enhanced\settings.xml', '%OneDrive%\Documents\Rockstar Games\GTAV Enhanced\settings.xml')
+
+# GTA V Legacy: Epic ('Grand Theft Auto V'), Steam 271590, Rockstar Games Launcher; registry key 'Grand Theft Auto V'.
+# Same settings.xml layout as Enhanced (older version, no Reflex). Driver profile 'Grand Theft Auto V' lists gta5.exe.
+$GameFind['gtavlegacy'] = @{ Name = 'GTA V Legacy'; Steam = '271590'; Epic = 'Grand Theft Auto V'
+    Reg = @(@{ P = 'HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\Grand Theft Auto V'; N = 'InstallFolderEpic' }, @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\Grand Theft Auto V'; N = 'InstallFolderSteam' },
+            @{ P = 'HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\Grand Theft Auto V'; N = 'InstallFolder' })
+    Exe = 'GTA5.exe'; Proc = @('GTA5', 'GTA5_BE') }
+$GameCfgPaths['gtavlegacy'] = @('%USERPROFILE%\Documents\Rockstar Games\GTA V\settings.xml', '%OneDrive%\Documents\Rockstar Games\GTA V\settings.xml')
+
+# Roblox Player: per-user install under %LOCALAPPDATA%\Roblox\Versions\version-<hash>; the uninstall entry
+# 'Roblox Player for <user>' (HKCU) points at the current version folder, which changes with every Roblox update.
+# The Microsoft Store build (windows10universal.exe) is not detected. Driver: robloxplayerbeta.exe is in the predefined
+# profile named 'Roblox VR' on this PC (the 'Roblox' profile holds only the Store app).
+$GameFind['roblox'] = @{ Name = 'Roblox'; Uninstall = '^Roblox Player'; Exe = 'RobloxPlayerBeta.exe'; Proc = @('RobloxPlayerBeta') }
+$GameCfgPaths['roblox'] = @('%LOCALAPPDATA%\Roblox\GlobalBasicSettings_13.xml')
+
+# Escape from Tarkov: BSG launcher (uninstall entry 'EscapeFromTarkov', default folder C:\Battlestate Games\...) or
+# Steam 3932890 (since 1.0, 15 Nov 2025). Arena (EscapeFromTarkovArena) is a separate game and not matched.
+# Driver profile 'Escape From Tarkov' lists escapefromtarkov.exe. EscapeFromTarkov_BE.exe is BattlEye (never touched).
+$GameFind['tarkov'] = @{ Name = 'Escape from Tarkov'; Steam = '3932890'; Uninstall = '^(EscapeFromTarkov|Escape from Tarkov)$'
+    Dirs = @('%SystemDrive%\Battlestate Games\Escape from Tarkov', '%SystemDrive%\Battlestate Games\EFT', '%SystemDrive%\Battlestate Games\EFT (live)')
+    Exe = 'EscapeFromTarkov.exe'; Proc = @('EscapeFromTarkov', 'EscapeFromTarkov_BE') }
+$GameCfgPaths['tarkov'] = @('%APPDATA%\Battlestate Games\Escape from Tarkov\Settings\Graphics.ini')
+
+$GameDefs += @{ Id = 'gtav'; Title = 'GTA V Enhanced'; Sub = 'Rockstar Games'; Proc = 'GTA5_Enhanced'; Cat = 'GTAV'; From = '#FF8A3D'; To = '#7B2FBE'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'gtav' }
+    IconFile = { Get-GameExePath 'gtav' }
+    Launch = { if (Find-EpicApp 'Grand Theft Auto V Enhanced') { Start-Process 'com.epicgames.launcher://apps/8769e24080ea413b8ebca3f1b8c50951?action=launch&silent=true'; 'Launching GTA V Enhanced through the Epic Games Launcher.' }
+               elseif (Find-SteamApp '3240220') { Start-Process 'steam://rungameid/3240220'; 'Launching GTA V Enhanced through Steam.' } else { 'Start GTA V Enhanced from the Rockstar Games Launcher.' } }
+    Tools = @(@{ Id = 'gta-vsync-off'; Kind = 'Settings' }, @{ Id = 'gta-gpupref'; Kind = 'Settings' }, @{ Id = 'gta-smoothmotion'; Kind = 'Settings' },
+              @{ Id = 'gta-nvpower'; Kind = 'Settings' }, @{ Id = 'gta-guide'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'gtavlegacy'; Title = 'GTA V Legacy'; Sub = 'Rockstar Games'; Proc = 'GTA5'; Cat = 'GTAVLegacy'; From = '#2F7D4A'; To = '#C9A227'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'gtavlegacy' }
+    IconFile = { Get-GameExePath 'gtavlegacy' }
+    Launch = { if (Find-EpicApp 'Grand Theft Auto V') { Start-Process 'com.epicgames.launcher://apps/9d2d0eb64d5c44529cece33fe2a46482?action=launch&silent=true'; 'Launching GTA V Legacy through the Epic Games Launcher.' }
+               elseif (Find-SteamApp '271590') { Start-Process 'steam://rungameid/271590'; 'Launching GTA V Legacy through Steam.' } else { 'Start GTA V Legacy from the Rockstar Games Launcher.' } }
+    Tools = @(@{ Id = 'gtal-vsync-off'; Kind = 'Settings' }, @{ Id = 'gtal-fullscreen'; Kind = 'Settings' }, @{ Id = 'gtal-gpupref'; Kind = 'Settings' },
+              @{ Id = 'gtal-smoothmotion'; Kind = 'Settings' }) }
+
+$GameDefs += @{ Id = 'roblox'; Title = 'Roblox'; Sub = 'Roblox Corporation'; Proc = 'RobloxPlayerBeta'; Cat = 'Roblox'; From = '#335FFF'; To = '#00B06F'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'roblox' }
+    IconFile = { Get-GameExePath 'roblox' }
+    Launch = { Start-Process 'https://www.roblox.com/home'; 'Opened Roblox in your browser: pick an experience and it starts the Roblox Player.' }
+    Tools = @(@{ Id = 'rbx-fps240'; Kind = 'Settings' }, @{ Id = 'rbx-gpupref'; Kind = 'Settings' }, @{ Id = 'rbx-smoothmotion'; Kind = 'Settings' },
+              @{ Id = 'rbx-nvpower'; Kind = 'Settings' }, @{ Id = 'rbx-guide'; Kind = 'FPS' }) }
+
+$GameDefs += @{ Id = 'tarkov'; Title = 'Escape from Tarkov'; Sub = 'Battlestate Games'; Proc = 'EscapeFromTarkov'; Cat = 'Tarkov'; From = '#3D3B2C'; To = '#A8925C'; Glyph = [char]0xE7FC
+    Installed = { Test-GameInstalled 'tarkov' }
+    IconFile = { Get-GameExePath 'tarkov' }
+    Launch = { if (Find-SteamApp '3932890') { Start-Process 'steam://rungameid/3932890'; 'Launching Escape from Tarkov through Steam.' }
+               else { $l = Find-UninstallDir '^BsgLauncher'; if ($l -and (Test-Path (Join-Path $l 'BsgLauncher.exe'))) { Start-Process (Join-Path $l 'BsgLauncher.exe'); 'Opened the Battlestate Games Launcher.' } else { 'Start Escape from Tarkov from the Battlestate Games Launcher.' } } }
+    Tools = @(@{ Id = 'tk-vsync-off'; Kind = 'Settings' }, @{ Id = 'tk-fullscreen'; Kind = 'Settings' }, @{ Id = 'tk-gpupref'; Kind = 'Settings' },
+              @{ Id = 'tk-smoothmotion'; Kind = 'Settings' }, @{ Id = 'tk-nvpower'; Kind = 'Settings' }, @{ Id = 'tk-guide'; Kind = 'FPS' }) }
+
+# --- Match stats (1.18): Rocket League Stats API, Dota 2 GSI, League of Legends Live Client Data
+
+# --- Match stats for Rocket League and Dota 2 (1.18), same design as the CS2 GSI stats:
+# official game feature -> background runspace on 127.0.0.1 -> one record per match in $DataDir\<game>-matches.json.
+# Rocket League: Psyonix's Stats API (the GAME listens on 127.0.0.1:<Port>, ZeroDelay connects as a TCP client).
+# Dota 2: Valve's Game State Integration (Dota POSTs JSON to ZeroDelay's listener, like CS2).
+# Nothing is injected, no game file other than the documented config files is touched, nothing leaves the PC.
+$script:ZdStatsMaxMatches = 200
+$script:RlStatsSection = 'TAGame.MatchStatsExporter_TA'
+$script:RlStatsRate = 2                                       # UpdateState packets per second ZeroDelay asks for (events are sent at once anyway)
+$script:RlStatsDefaultPort = 49123
+$script:DotaGsiPort = 37811                                  # fixed: it is written into the cfg file (CS2 uses 37810)
+$script:DotaGsiFileName = 'gamestate_integration_zerodelay.cfg'
+
+# ======================================================================= shared runner (runspace per game)
+# Saving code shared by the runspaces: Save-ZdRecord adds one record (newest first, last $S.Max) to $S.File atomically
+$script:ZdStatsSaveCode = @'
+function Save-ZdRecord($S, $Rec) {
+    $old = @()
+    # PS 5.1 returns a JSON array as one object: piping the variable unrolls it
+    if (Test-Path -LiteralPath $S.File) { try { $arr = [IO.File]::ReadAllText($S.File) | ConvertFrom-Json; $old = @($arr | Where-Object { $_ }) } catch { $old = @() } }
+    $all = @(@($Rec) + $old | Select-Object -First $S.Max)
+    $dir = Split-Path $S.File; if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $tmp = "$($S.File).tmp"
+    [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $all -Depth 3), (New-Object Text.UTF8Encoding $false))
+    if (Test-Path -LiteralPath $S.File) { [IO.File]::Replace($tmp, $S.File, [NullString]::Value) } else { [IO.File]::Move($tmp, $S.File) }
+    $S.Saved++
+}
+function Get-ZdInt($v) { $n = 0.0; if ($null -ne $v -and [double]::TryParse("$v", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { [int][Math]::Round($n) } else { 0 } }
+'@
+
+# starts $Code (script text using $S; param($S) is added here) in its own runspace under $script:ZdStats[$Key]; $Init fills the synchronized state
+function Start-ZdStatsRunner([string]$Key, [string]$Code, [hashtable]$Init) {
+    if (-not $script:ZdStats) { $script:ZdStats = @{} }
+    $g = $script:ZdStats[$Key]
+    if ($g -and $g.PS -and -not $g.Handle.IsCompleted) { return }
+    $st = [hashtable]::Synchronized(@{ Stop = $false; Running = $false; Error = $null; Saved = 0; Live = $null; Max = $script:ZdStatsMaxMatches })
+    foreach ($k in $Init.Keys) { $st[$k] = $Init[$k] }
+    $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'MTA'; $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript("param(`$S)`r`n" + $script:ZdStatsSaveCode + "`r`n" + $Code).AddArgument($st)
+    $script:ZdStats[$Key] = @{ State = $st; PS = $ps; RS = $rs; Handle = $ps.BeginInvoke(); Started = Get-Date }
+}
+# asks a runner to stop (it saves its open match itself); -Wait up to 2 s, for app exit
+function Stop-ZdStatsRunner([string]$Key, [switch]$Wait) {
+    if (-not $script:ZdStats) { return }
+    $g = $script:ZdStats[$Key]; if (-not $g) { return }
+    $g.State.Stop = $true
+    if ($Wait) { [void]$g.Handle.AsyncWaitHandle.WaitOne(2000) }
+    if ($g.Handle.IsCompleted) { Remove-ZdStatsRunner $Key }
+}
+# frees a finished runner runspace (its last error is kept in $script:ZdStatsLastError[$Key])
+function Remove-ZdStatsRunner([string]$Key) {
+    if (-not $script:ZdStats) { return }
+    $g = $script:ZdStats[$Key]; if (-not $g) { return }
+    try { [void]$g.PS.EndInvoke($g.Handle) } catch {}
+    try { $g.PS.Dispose(); $g.RS.Dispose() } catch {}
+    if (-not $script:ZdStatsLastError) { $script:ZdStatsLastError = @{} }
+    $script:ZdStatsLastError[$Key] = $g.State.Error
+    $script:ZdStats.Remove($Key)
+}
+# timer step for one runner: starts it when $Want, stops it otherwise, frees finished ones, 30 s pause after a crash
+function Update-ZdStatsRunner([string]$Key, [bool]$Want, [scriptblock]$Start) {
+    if (-not $script:ZdStats) { $script:ZdStats = @{} }
+    if (-not $script:ZdStatsRetry) { $script:ZdStatsRetry = @{} }
+    $g = $script:ZdStats[$Key]
+    if ($g -and $g.Handle.IsCompleted) {
+        if (-not $g.State.Stop) { $script:ZdStatsRetry[$Key] = (Get-Date).AddSeconds(30) }
+        Remove-ZdStatsRunner $Key; $g = $null
+    }
+    if ($Want -and -not $g) {
+        if ($script:ZdStatsRetry[$Key] -and (Get-Date) -lt $script:ZdStatsRetry[$Key]) { return }
+        & $Start
+    } elseif (-not $Want -and $g -and -not $g.State.Stop) { Stop-ZdStatsRunner $Key }
+}
+# saved matches of a stats file, newest first (records without a Start are skipped)
+function Read-ZdMatches([string]$File) {
+    if (-not $File -or -not (Test-Path -LiteralPath $File)) { return @() }
+    try { $j = [IO.File]::ReadAllText($File) | ConvertFrom-Json; @($j | Where-Object { $_ -and $_.Start -and (Test-ZdRecordNumbers $_) }) } catch { @() }   # piping the variable unrolls the array
+}
+# ISO 8601 text from a record -> local [datetime], or $null
+function ConvertFrom-ZdTime([string]$Text) {
+    try { [datetime]::Parse($Text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { $null }
+}
+# number formatting for summaries (invariant culture: 1.5, not 1,5)
+function Format-ZdNum([double]$N, [string]$Fmt = '0.0') { $N.ToString($Fmt, [Globalization.CultureInfo]::InvariantCulture) }
+
+# ======================================================================= Rocket League: Psyonix Stats API
+# install folder of Rocket League ($GameFind 'rocketleague' when the games table has it, else the Epic manifest 'Sugar')
+function Get-RlDir {
+    if ($GameFind -and $GameFind['rocketleague']) { return (Get-GameInstallDir 'rocketleague') }
+    $d = Find-EpicApp 'Sugar'; if (-not $d) { $d = Find-EpicApp 'Rocket League' }
+    $d
+}
+# the per-user config folder the game writes its TA*.ini files to (Documents\My Games\Rocket League\TAGame\Config)
+function Get-RlUserCfgDir { Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'My Games\Rocket League\TAGame\Config' }
+# Stats API ini files that exist: install TAStatsAPI.ini, install DefaultStatsAPI.ini, user TAStatsAPI.ini ($RlDir/$UserDir override for tests)
+function Get-RlStatsIniFiles([string]$RlDir, [string]$UserDir) {
+    if (-not $RlDir) { $RlDir = Get-RlDir }
+    if (-not $UserDir) { $UserDir = Get-RlUserCfgDir }
+    $out = @()
+    if ($RlDir) { foreach ($n in 'TAStatsAPI.ini', 'DefaultStatsAPI.ini') { $f = Join-Path $RlDir "TAGame\Config\$n"; if (Test-Path -LiteralPath $f) { $out += $f } } }
+    if ($UserDir) { $f = Join-Path $UserDir 'TAStatsAPI.ini'; if (Test-Path -LiteralPath $f) { $out += $f } }
+    $out
+}
+# value of Key in the [TAGame.MatchStatsExporter_TA] section of an ini, or $null
+function Get-RlIniValue([string]$File, [string]$Key) {
+    if (-not (Test-Path -LiteralPath $File)) { return $null }
+    $in = $false
+    foreach ($line in [IO.File]::ReadAllLines($File)) {
+        $t = $line.Trim()
+        if ($t -match '^\[(.+)\]$') { $in = $Matches[1] -eq $script:RlStatsSection; continue }
+        if ($in -and $t -match "^$([regex]::Escape($Key))\s*=\s*(.*)$") { return $Matches[1].Trim().Trim('"') }
+    }
+    $null
+}
+# sets (or with $null removes) Key in the Stats API section, keeping every other line, the encoding and the line ends; returns the old value
+function Set-RlIniValue([string]$File, [string]$Key, $Value) {
+    $bytes = [IO.File]::ReadAllBytes($File)
+    $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $text = [IO.File]::ReadAllText($File)
+    $nl = if ($text -match "`r`n") { "`r`n" } else { "`n" }
+    $lines = New-Object Collections.Generic.List[string]; foreach ($l in ($text -split "`r?`n")) { $lines.Add($l) }
+    $old = $null; $in = $false; $secAt = -1; $hit = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^\[(.+)\]$') { $in = $Matches[1] -eq $script:RlStatsSection; if ($in) { $secAt = $i }; continue }
+        if ($in -and $t -match "^$([regex]::Escape($Key))\s*=\s*(.*)$") { $old = $Matches[1].Trim().Trim('"'); $hit = $i; break }
+    }
+    if ($null -eq $Value) { if ($hit -ge 0) { $lines.RemoveAt($hit) } }
+    elseif ($hit -ge 0) { $lines[$hit] = "$Key=$Value" }
+    elseif ($secAt -ge 0) { $lines.Insert($secAt + 1, "$Key=$Value") }
+    else { if ($lines.Count -and $lines[$lines.Count - 1] -ne '') { $lines.Add('') }; $lines.Add("[$($script:RlStatsSection)]"); $lines.Add("$Key=$Value"); $lines.Add('') }
+    [IO.File]::WriteAllText($File, ($lines -join $nl), (New-Object Text.UTF8Encoding $bom))
+    $old
+}
+# effective config: Rate/Port from the user TAStatsAPI.ini when it exists (the copy the game runs with), else the install files
+function Get-RlStatsApiConfig([string]$RlDir, [string]$UserDir) {
+    $files = @(Get-RlStatsIniFiles $RlDir $UserDir)
+    if (-not $files.Count) { return $null }
+    $eff = $files[$files.Count - 1]; if ($eff -like '*DefaultStatsAPI.ini' -and $files.Count -gt 1) { $eff = $files[0] }   # user TA > install TA > Default
+    $n = 0.0; $rate = if ([double]::TryParse("$(Get-RlIniValue $eff 'PacketSendRate')", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { $n } else { 0.0 }
+    $p = 0; $port = if ([int]::TryParse("$(Get-RlIniValue $eff 'Port')", [ref]$p)) { $p } else { $script:RlStatsDefaultPort }
+    @{ Files = $files; Effective = $eff; Rate = $rate; Port = $port }
+}
+# card Test: $true when every Stats API ini has PacketSendRate > 0 and a TCP Port, $null without Rocket League
+function Test-RlStatsApi([string]$RlDir, [string]$UserDir) {
+    $files = @(Get-RlStatsIniFiles $RlDir $UserDir)
+    if (-not $files.Count) { return $null }
+    foreach ($f in $files) {
+        $n = 0.0
+        if (-not [double]::TryParse("$(Get-RlIniValue $f 'PacketSendRate')", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or $n -le 0) { return $false }
+        if ("$(Get-RlIniValue $f 'Port')" -eq '0') { return $false }
+    }
+    $true
+}
+# card On: PacketSendRate (and Port when it is 0/missing) in every Stats API ini; old values kept in $script:Backup.Custom['rl-statsapi']
+function Enable-RlStatsApi([string]$RlDir, [string]$UserDir) {
+    $files = @(Get-RlStatsIniFiles $RlDir $UserDir)
+    if (-not $files.Count) { throw 'Rocket League''s Stats API config (TAGame\Config\DefaultStatsAPI.ini) was not found. Update Rocket League or verify its files in the Epic Games Launcher.' }
+    $bk = @(); foreach ($e in @($script:Backup.Custom['rl-statsapi'])) { if ($e) { $bk += $e } }
+    foreach ($f in $files) {
+        $orig = [IO.File]::ReadAllBytes($f)
+        $n = 0.0; $cur = Get-RlIniValue $f 'PacketSendRate'
+        if (-not [double]::TryParse("$cur", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or $n -le 0) {
+            if (-not ($bk | Where-Object { $_.File -eq $f -and $_.Key -eq 'PacketSendRate' })) { $bk += @{ File = $f; Key = 'PacketSendRate'; Old = $cur; New = "$($script:RlStatsRate)" } }
+            [void](Set-RlIniValue $f 'PacketSendRate' $script:RlStatsRate)
+        }
+        $cp = Get-RlIniValue $f 'Port'
+        if ($null -eq $cp -or $cp -eq '0') {
+            if (-not ($bk | Where-Object { $_.File -eq $f -and $_.Key -eq 'Port' })) { $bk += @{ File = $f; Key = 'Port'; Old = $cp; New = "$($script:RlStatsDefaultPort)" } }
+            [void](Set-RlIniValue $f 'Port' $script:RlStatsDefaultPort)
+        }
+        # whole original file too: Off puts it back byte for byte while nothing else changed it
+        $now = [IO.File]::ReadAllBytes($f)
+        if ([Convert]::ToBase64String($now) -ne [Convert]::ToBase64String($orig) -and -not ($bk | Where-Object { $_.File -eq $f -and $_.Key -eq '*' })) {
+            $bk += @{ File = $f; Key = '*'; Old = [Convert]::ToBase64String($orig); New = [Convert]::ToBase64String($now) }
+        }
+    }
+    $script:Backup.Custom['rl-statsapi'] = $bk
+    $script:Backup.Custom['rl-statsapi-rec'] = $true   # consent to record: the client runs only with it, even when the API was on already
+    Save-Backup
+}
+# card Off: puts back the values ZeroDelay changed (only where they still hold ZeroDelay's value), then forgets the backup
+function Disable-RlStatsApi {
+    $whole = @{}
+    foreach ($e in @($script:Backup.Custom['rl-statsapi'])) {   # files untouched since On: original bytes back
+        if (-not $e -or $e.Key -ne '*' -or -not (Test-Path -LiteralPath "$($e.File)")) { continue }
+        if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($e.File)) -eq "$($e.New)") { [IO.File]::WriteAllBytes($e.File, [Convert]::FromBase64String("$($e.Old)")); $whole["$($e.File)"] = $true }
+    }
+    foreach ($e in @($script:Backup.Custom['rl-statsapi'])) {   # files changed since (game update, user): only our keys
+        if (-not $e -or $e.Key -eq '*' -or $whole["$($e.File)"] -or -not (Test-Path -LiteralPath "$($e.File)")) { continue }
+        if ("$(Get-RlIniValue $e.File $e.Key)" -eq "$($e.New)") { [void](Set-RlIniValue $e.File $e.Key $(if ($null -eq $e.Old) { $null } else { "$($e.Old)" })) }
+    }
+    $script:Backup.Custom.Remove('rl-statsapi'); $script:Backup.Custom.Remove('rl-statsapi-rec')
+    Save-Backup
+}
+# where finished Rocket League matches are kept ($DataDir\rl-matches.json)
+function Get-RlMatchesFile { Join-Path $DataDir 'rl-matches.json' }
+# Rocket League is running (the games table when present, else the RocketLeague process)
+function Test-RlRunning { if ($GameFind -and $GameFind['rocketleague']) { Test-GameRunning 'rocketleague' } else { [bool](Get-Process RocketLeague -ErrorAction SilentlyContinue) } }
+
+# The Rocket League client runspace. $S (synchronized): Port, File, Max (in); Stop (set by the app);
+# Running, Connected, Error, Messages, Saved, LastMsg, Live (out). Psyonix sends one JSON object per message,
+# {"Event": "...", "Data": {...}} (Data can also arrive as a JSON string); objects are split by brace depth.
+$script:RlStatsClientCode = @'
+if (-not ('ZdJsonSplit' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Collections.Generic;
+public static class ZdJsonSplit {
+    // removes and returns every complete top-level JSON object at the start of sb (text before a '{' is dropped)
+    public static List<string> Take(StringBuilder sb) {
+        var res = new List<string>(); int depth = 0, start = -1, cut = 0; bool inStr = false, esc = false;
+        for (int i = 0; i < sb.Length; i++) {
+            char c = sb[i];
+            if (inStr) { if (esc) esc = false; else if (c == '\\') esc = true; else if (c == '"') inStr = false; continue; }
+            if (c == '"') { if (depth > 0) inStr = true; continue; }
+            if (c == '{') { if (depth == 0) start = i; depth++; }
+            else if (c == '}' && depth > 0) { depth--; if (depth == 0) { res.Add(sb.ToString(start, i - start + 1)); cut = i + 1; } }
+            else if (depth == 0) cut = i + 1;
+        }
+        if (cut > 0) sb.Remove(0, cut);
+        return res;
+    }
+}
+"@
+}
+$script:m = $null; $script:done = @{}; $script:lastUpd = $null; $script:lastUpdParsed = [datetime]::MinValue
+# training and single-player modes are not matches
+$script:skipPlaylists = @(9, 19, 20, 21)
+function Get-Data($j) { $d = $j.Data; if ($d -is [string]) { try { $d = $d | ConvertFrom-Json } catch { $d = $null } }; $d }
+function Get-PKey($p) { if ("$($p.PrimaryId)") { "$($p.PrimaryId)" } else { "$($p.Name)|$($p.TeamNum)" } }
+function Find-PKey($ref) {   # player key for a {Name, Shortcut, TeamNum} reference
+    if (-not $ref -or -not $script:m) { return $null }
+    if ($ref -is [string]) { foreach ($k in $script:m.Players.Keys) { if ($script:m.Players[$k].Name -eq $ref) { return $k } }; return $null }
+    foreach ($k in $script:m.Players.Keys) {
+        $p = $script:m.Players[$k]
+        if ("$($ref.PrimaryId)" -and "$($ref.PrimaryId)" -eq $p.Id) { return $k }
+        if ($null -ne $ref.Shortcut -and "$($ref.Shortcut)" -ne '' -and "$($ref.Shortcut)" -eq $p.Shortcut -and "$($ref.TeamNum)" -eq "$($p.Team)") { return $k }
+    }
+    foreach ($k in $script:m.Players.Keys) { $p = $script:m.Players[$k]; if ("$($ref.Name)" -and "$($ref.Name)" -eq $p.Name -and "$($ref.TeamNum)" -eq "$($p.Team)") { return $k } }
+    $null
+}
+function Get-MeKey {   # you = the player the camera followed most outside replays
+    if (-not $script:m -or -not $script:m.Votes.Count) { return $null }
+    ($script:m.Votes.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+}
+function Save-RlMatch([bool]$Finished) {
+    $mk = Get-MeKey; $me = if ($mk) { $script:m.Players[$mk] } else { $null }
+    if (-not $me) { $S.Error = 'match ended but your car could not be identified (no camera target seen)'; return }
+    $tg = $script:m.TeamGoals
+    $mine = Get-ZdInt $tg["$($me.Team)"]; $theirs = 0; foreach ($k in $tg.Keys) { if ($k -ne "$($me.Team)") { $theirs += (Get-ZdInt $tg[$k]) } }
+    $res = if (-not $Finished) { 'Unfinished' } elseif ($null -eq $script:m.Winner -or $script:m.Winner -lt 0) { 'No contest' } elseif ($script:m.Winner -eq $me.Team) { 'Win' } else { 'Loss' }
+    $rec = [pscustomobject][ordered]@{
+        Start = $script:m.Start.ToString('o'); End = (Get-Date).ToString('o'); MatchGuid = $script:m.Guid; PlaylistId = $script:m.Playlist; Arena = $script:m.Arena
+        Name = $me.Name; Team = $me.Team; Goals = $me.Goals; Assists = $me.Assists; Saves = $me.Saves; Shots = $me.Shots; Score = $me.Score; Demos = $me.Demos; Touches = $me.Touches
+        TeamGoals = $mine; OppGoals = $theirs; Mvp = [bool]$script:m.Mvp; Overtime = [bool]$script:m.Overtime; Players = $script:m.Players.Count
+        Seconds = [int]$script:m.LiveSecs; Result = $res; Finished = $Finished }
+    Save-ZdRecord $S $rec
+    $script:done[$script:m.Guid] = $true
+}
+function Close-RlMatch([bool]$Finished) {   # saves a finished match, or an unfinished one with 60+ s of play; then forgets it
+    if ($script:m -and -not $script:m.Saved) {
+        if ($script:lastUpd) {   # the newest scoreboard first (only when it belongs to this match)
+            $d = try { Get-Data ($script:lastUpd | ConvertFrom-Json) } catch { $null }
+            $gu = "$($d.MatchGuid)"; if (-not $gu) { $gu = 'offline' }
+            if ($d -and $gu -eq $script:m.Guid) { Read-Update $d }
+        }
+        if ($Finished -or $script:m.LiveSecs -ge $S.MinSecs) { Save-RlMatch $Finished }
+    }
+    $script:m = $null; $script:lastUpd = $null
+}
+function Read-Update($d) {
+    $script:lastUpd = $null; $script:lastUpdParsed = Get-Date
+    if (-not $d) { return }
+    $g = $d.Game; $guid = "$($d.MatchGuid)"; if (-not $guid) { $guid = 'offline' }
+    $players = @($d.Players | Where-Object { $_ })
+    if ($script:m -and $script:m.Guid -ne $guid) { Close-RlMatch ([bool]$script:m.Ended) }
+    if (-not $script:m) {
+        if ($script:done[$guid] -or $players.Count -lt 2) { return }
+        $pl = if ($null -ne $g.PlaylistId) { Get-ZdInt $g.PlaylistId } else { -1 }
+        if ($script:skipPlaylists -contains $pl) { return }
+        $script:m = @{ Guid = $guid; Start = (Get-Date); Playlist = $pl; Arena = "$($g.Arena)"; Players = @{}; Votes = @{}; TeamGoals = @{}
+                       LiveSecs = 0.0; LastTick = $null; Winner = $null; Ended = $false; EndedAt = $null; Mvp = $false; Overtime = $false; Saved = $false }
+    }
+    foreach ($p in $players) {
+        $script:m.Players[(Get-PKey $p)] = @{ Id = "$($p.PrimaryId)"; Name = "$($p.Name)"; Shortcut = "$($p.Shortcut)"; Team = (Get-ZdInt $p.TeamNum)
+            Goals = (Get-ZdInt $p.Goals); Assists = (Get-ZdInt $p.Assists); Saves = (Get-ZdInt $p.Saves); Shots = (Get-ZdInt $p.Shots)
+            Score = (Get-ZdInt $p.Score); Demos = (Get-ZdInt $p.Demos); Touches = (Get-ZdInt $p.Touches) }
+    }
+    foreach ($t in @($g.Teams)) { if ($t) { $script:m.TeamGoals["$(Get-ZdInt $t.TeamNum)"] = Get-ZdInt $t.Score } }
+    if ($g.bOvertime -eq $true) { $script:m.Overtime = $true }
+    if ($g.Arena) { $script:m.Arena = "$($g.Arena)" }
+    $now = Get-Date
+    if ($g.bReplay -ne $true -and -not $script:m.Ended) {
+        if ($script:m.LastTick) { $script:m.LiveSecs += [Math]::Min(5.0, ($now - $script:m.LastTick).TotalSeconds) }
+        if ($g.bHasTarget -ne $false -and $g.Target) { $k = Find-PKey $g.Target; if ($k) { $script:m.Votes[$k] = 1 + [int]$script:m.Votes[$k] } }
+    }
+    $script:m.LastTick = $now
+    $mk = Get-MeKey; $me = if ($mk) { $script:m.Players[$mk] } else { $null }
+    $S.Live = [pscustomobject]@{ Playlist = $script:m.Playlist; Arena = $script:m.Arena; Name = $(if ($me) { $me.Name } else { '' }); Goals = $(if ($me) { $me.Goals } else { 0 })
+        Saves = $(if ($me) { $me.Saves } else { 0 }); Shots = $(if ($me) { $me.Shots } else { 0 }); Score = $(if ($me) { $me.Score } else { 0 }); Seconds = [int]$script:m.LiveSecs }
+}
+function Read-Message([string]$Text) {
+    $ev = if ($Text -match '^\s*\{\s*"Event"\s*:\s*"(\w+)"') { $Matches[1] } else { $null }
+    # UpdateState can come 120 times a second: keep only the newest and read it at most twice a second
+    if ($ev -eq 'UpdateState') { $script:lastUpd = $Text; return }
+    $j = try { $Text | ConvertFrom-Json } catch { $null }
+    if (-not $j) { return }
+    if (-not $ev) { $ev = "$($j.Event)" }
+    if ($ev -eq 'UpdateState') { $script:lastUpd = $Text; return }
+    $d = Get-Data $j
+    switch ($ev) {
+        'MatchEnded' {
+            if ($script:lastUpd) { Read-Update (Get-Data ($script:lastUpd | ConvertFrom-Json)) }
+            if ($script:m -and -not $script:m.Saved) { $script:m.Ended = $true; $script:m.EndedAt = Get-Date; $script:m.Winner = $(if ($null -ne $d.WinnerTeamNum) { Get-ZdInt $d.WinnerTeamNum } else { $null }) }
+        }
+        'MatchDestroyed' { if ($script:m) { Close-RlMatch ([bool]$script:m.Ended) } }
+        'StatfeedEvent' {
+            if ($script:m -and "$($d.EventName)$($d.Type)" -match 'MVP') { $mk = Get-MeKey; if ($mk -and (Find-PKey $d.MainTarget) -eq $mk) { $script:m.Mvp = $true } }
+        }
+    }
+}
+function Step-Pending {   # parses the newest UpdateState when due; saves an ended match once its final scoreboard is in (or after 3 s)
+    if ($script:lastUpd -and ((Get-Date) - $script:lastUpdParsed).TotalMilliseconds -ge 500) {
+        $txt = $script:lastUpd
+        try { Read-Update (Get-Data ($txt | ConvertFrom-Json)) } catch { $S.Error = "state: $($_.Exception.Message)"; $script:lastUpd = $null }
+        if ($script:m -and $script:m.Ended -and -not $script:m.Saved -and $script:m.EndedAt -and $script:lastUpdParsed -gt $script:m.EndedAt) { Save-RlMatch $true; $script:m.Saved = $true }
+    }
+    if ($script:m -and $script:m.Ended -and -not $script:m.Saved -and ((Get-Date) - $script:m.EndedAt).TotalSeconds -ge 3) { Save-RlMatch $true; $script:m.Saved = $true }
+}
+$S.Running = $true; $S.Error = $null
+$buf = New-Object byte[] 65536
+try {
+    while (-not $S.Stop) {
+        $c = New-Object Net.Sockets.TcpClient
+        try {
+            $ar = $c.BeginConnect([Net.IPAddress]::Loopback, [int]$S.Port, $null, $null)
+            if (-not $ar.AsyncWaitHandle.WaitOne(1000) -or -not $c.Connected) { try { $c.EndConnect($ar) } catch {}; throw 'not listening' }
+            $c.EndConnect($ar)
+        } catch {
+            $c.Close(); $S.Connected = $false
+            for ($i = 0; $i -lt 20 -and -not $S.Stop; $i++) { Start-Sleep -Milliseconds 100 }   # the game opens the port when it starts: retry every 2 s
+            continue
+        }
+        $S.Connected = $true; $sock = $c.Client
+        $dec = [Text.Encoding]::UTF8.GetDecoder(); $chars = New-Object char[] 65536; $sb = New-Object Text.StringBuilder
+        try {
+            while (-not $S.Stop) {
+                if ($sock.Poll(200000, [Net.Sockets.SelectMode]::SelectRead)) {
+                    $n = $sock.Receive($buf)
+                    if ($n -le 0) { break }   # the game closed the connection
+                    $cn = $dec.GetChars($buf, 0, $n, $chars, 0); [void]$sb.Append($chars, 0, $cn)
+                    if ($sb.Length -gt 8MB) { [void]$sb.Clear() }
+                    foreach ($o in [ZdJsonSplit]::Take($sb)) {
+                        $S.Messages++; $S.LastMsg = Get-Date
+                        try { Read-Message $o } catch { $S.Error = "message: $($_.Exception.Message)" }
+                    }
+                }
+                try { Step-Pending } catch { $S.Error = "save: $($_.Exception.Message)" }
+            }
+        } catch { $S.Error = "socket: $($_.Exception.Message)" }
+        finally { $c.Close(); $S.Connected = $false }
+        try { if ($script:m) { Close-RlMatch ([bool]$script:m.Ended) } } catch { $S.Error = "save: $($_.Exception.Message)" }   # game closed or left
+    }
+} catch { $S.Error = $_.Exception.Message }
+finally {
+    try { if ($script:m) { Close-RlMatch ([bool]$script:m.Ended) } } catch { $S.Error = "save: $($_.Exception.Message)" }
+    $S.Running = $false
+}
+'@
+
+# starts the Rocket League client runspace (returns at once); $Port/$File override for tests
+function Start-RlStatsListener([int]$Port, [string]$File) {
+    if (-not $Port) { $cfg = Get-RlStatsApiConfig; $Port = if ($cfg -and $cfg.Port -gt 0) { $cfg.Port } else { $script:RlStatsDefaultPort } }
+    if (-not $File) { $File = Get-RlMatchesFile }
+    Start-ZdStatsRunner 'rocketleague' $script:RlStatsClientCode @{ Port = $Port; File = $File; MinSecs = 60; Connected = $false; Messages = 0; LastMsg = $null }
+}
+# stops it (it saves an ended or 60+ s match first); -Wait for app exit
+function Stop-RlStatsListener([switch]$Wait) { Stop-ZdStatsRunner 'rocketleague' -Wait:$Wait }
+# call every few seconds from the app's timer: runs the client only while Rocket League runs and ZeroDelay switched the Stats API on
+function Update-RlStatsListener {
+    $want = [bool]$script:Backup.Custom['rl-statsapi-rec'] -and (Test-RlRunning)
+    Update-ZdStatsRunner 'rocketleague' $want { Start-RlStatsListener }
+}
+# Psyonix playlist ids as players know them
+function Format-RlPlaylist([int]$Id) {
+    switch ($Id) {
+        1 { 'Duel' } 2 { 'Doubles' } 3 { 'Standard' } 4 { 'Chaos' } 6 { 'Private match' } 7 { 'Season' } 8 { 'Exhibition' }
+        10 { 'Ranked Duel' } 11 { 'Ranked Doubles' } 13 { 'Ranked Standard' } 15 { 'Snow Day' } 17 { 'Hoops' } 18 { 'Rumble' } 22 { 'Tournament' } 23 { 'Dropshot' }
+        27 { 'Ranked Hoops' } 28 { 'Ranked Rumble' } 29 { 'Ranked Dropshot' } 30 { 'Ranked Snow Day' } 34 { 'Tournament' } 38 { 'Heatseeker' }
+        -1 { '' } default { "Playlist $Id" }
+    }
+}
+# stats contract for the Gameplay page: Title, Rows (newest first), Charts, Summary, Note
+function Get-RlGameplayStats([string]$File) {
+    if (-not $File) { $File = Get-RlMatchesFile }
+    $charts = @(@{ Name = 'Goals'; Field = 'Goals'; Unit = ''; LowerBetter = $false }, @{ Name = 'Saves'; Field = 'Saves'; Unit = '' }, @{ Name = 'Shot %'; Field = 'ShotPct'; Unit = '%' }, @{ Name = 'Score'; Field = 'Score'; Unit = '' })
+    $ms = @(Read-ZdMatches $File)
+    if (-not $ms.Count) {
+        return @{ Title = 'Your Rocket League matches'; Rows = @(); Charts = $charts; Summary = @()
+                  Note = 'No Rocket League matches recorded yet. Switch on "Rocket League match stats", restart Rocket League, keep ZeroDelay open and play a match.' }
+    }
+    $rows = foreach ($x in $ms) {
+        $g = [int]$x.Goals; $s = [int]$x.Shots
+        [pscustomobject]@{ Time = (ConvertFrom-ZdTime "$($x.End)"); Mode = (Format-RlPlaylist ([int]$x.PlaylistId)); Result = "$($x.Result)"
+            Goals = $g; Assists = [int]$x.Assists; Saves = [int]$x.Saves; Shots = $s; Score = [int]$x.Score; Demos = [int]$x.Demos
+            ShotPct = $(if ($s) { [int][Math]::Round(100.0 * [Math]::Min($g, $s) / $s) } else { $null })
+            TeamScore = "$([int]$x.TeamGoals)-$([int]$x.OppGoals)"; Mvp = [bool]$x.Mvp; Arena = "$($x.Arena)" }
+    }
+    $rows = @($rows | Sort-Object Time -Descending)
+    $n = $ms.Count
+    $sg = ($ms | Measure-Object Goals -Sum).Sum; $ss = ($ms | Measure-Object Saves -Sum).Sum; $sh = ($ms | Measure-Object Shots -Sum).Sum
+    $decided = @($ms | Where-Object { "$($_.Result)" -in 'Win', 'Loss' }); $wins = @($decided | Where-Object { $_.Result -eq 'Win' }).Count
+    $summary = @(
+        @{ Label = 'Win rate'; Value = $(if ($decided.Count) { "$([Math]::Round(100.0 * $wins / $decided.Count))%" } else { '-' }) }
+        @{ Label = 'Goals/match'; Value = (Format-ZdNum ($sg / $n) '0.00') }
+        @{ Label = 'Saves/match'; Value = (Format-ZdNum ($ss / $n) '0.00') }
+        @{ Label = 'Shot %'; Value = $(if ($sh) { "$([Math]::Round(100.0 * [Math]::Min($sg, $sh) / $sh))%" } else { '-' }) }
+        @{ Label = 'Matches'; Value = "$n" })
+    @{ Title = 'Your Rocket League matches'; Rows = $rows; Charts = $charts; Summary = $summary
+       Note = 'From Psyonix''s official Stats API: while Rocket League runs, it shares the live scoreboard with apps on this PC. Your car is the one the camera follows outside replays. Matches you leave before a minute of play are not kept; unfinished ones do not count in the win rate.' }
+}
+
+# ======================================================================= Dota 2: Valve Game State Integration
+# install folder of Dota 2 ($GameFind 'dota2' when the games table has it, else Steam app 570)
+function Get-Dota2Dir { if ($GameFind -and $GameFind['dota2']) { Get-GameInstallDir 'dota2' } else { Find-SteamApp '570' } }
+# path of ZeroDelay's GSI cfg ($DotaDir overrides for tests); $null when Dota 2 is not found
+function Get-DotaGsiCfgPath([string]$DotaDir) {
+    if (-not $DotaDir) { $DotaDir = Get-Dota2Dir }
+    if (-not $DotaDir) { return $null }
+    Join-Path $DotaDir "game\dota\cfg\gamestate_integration\$($script:DotaGsiFileName)"
+}
+# where finished Dota 2 matches are kept ($DataDir\dota2-matches.json)
+function Get-Dota2MatchesFile { Join-Path $DataDir 'dota2-matches.json' }
+# the random auth token for Dota (created once, kept in the backup file so it survives Off/On)
+function Get-DotaGsiToken {
+    $tok = "$($script:Backup.Custom['dota-gsi-token'])"
+    if ($tok -notmatch '^[0-9a-f]{32}$') {
+        $b = New-Object byte[] 16; $rng = New-Object Security.Cryptography.RNGCryptoServiceProvider
+        try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+        $tok = -join ($b | ForEach-Object { $_.ToString('x2') })
+        $script:Backup.Custom['dota-gsi-token'] = $tok
+        Save-Backup
+    }
+    $tok
+}
+# the cfg text in Valve's KeyValues format (provider, map, player, hero only: no items, abilities, minimap or draft)
+function New-DotaGsiCfgText([string]$Token, [int]$Port = $script:DotaGsiPort) {
+    $nl = "`r`n"
+    ('"ZeroDelay match stats"', '{',
+     "`t`"uri`"`t`t`"http://127.0.0.1:$Port/`"",
+     "`t`"timeout`"`t`"5.0`"", "`t`"buffer`"`t`"0.5`"", "`t`"throttle`"`t`"1.0`"", "`t`"heartbeat`"`t`"30.0`"",
+     "`t`"auth`"", "`t{", "`t`t`"token`"`t`"$Token`"", "`t}",
+     "`t`"data`"", "`t{",
+     "`t`t`"provider`"`t`"1`"", "`t`t`"map`"`t`t`"1`"", "`t`t`"player`"`t`"1`"", "`t`t`"hero`"`t`t`"1`"",
+     "`t}", '}') -join $nl
+}
+# checks a Dota GSI cfg against the documented format; returns @{ Ok; Problems; Kv } (uses ConvertFrom-ValveKv from the CS2 stats)
+function Test-DotaGsiCfgText([string]$Text) {
+    $p = @()
+    $kv = try { ConvertFrom-ValveKv $Text } catch { $p += "syntax: $($_.Exception.Message)"; $null }
+    if ($kv) {
+        if ($kv.Count -ne 1) { $p += 'the file must have exactly one root block' }
+        $root = @($kv.Values)[0]
+        if ($root -isnot [Collections.IDictionary]) { $p += 'the root must be a { } block' }
+        else {
+            if ("$($root['uri'])" -notmatch '^http://(127\.0\.0\.1|localhost):\d+/?$') { $p += 'uri must be http://127.0.0.1:<port>/' }
+            foreach ($k in 'timeout', 'buffer', 'throttle', 'heartbeat') {
+                $n = 0.0
+                if (-not [double]::TryParse("$($root[$k])", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or $n -lt 0) { $p += "$k must be a number of seconds" }
+            }
+            if ($root['auth'] -isnot [Collections.IDictionary] -or -not $root['auth']['token']) { $p += 'auth { token } missing' }
+            $known = 'provider', 'map', 'player', 'hero', 'abilities', 'items', 'events', 'buildings', 'league', 'draft', 'wearables', 'minimap', 'roshan', 'couriers', 'neutralitems'
+            if ($root['data'] -isnot [Collections.IDictionary]) { $p += 'data { } missing' }
+            else {
+                foreach ($k in $root['data'].Keys) { if ($known -notcontains $k) { $p += "unknown data section $k" } elseif ("$($root['data'][$k])" -notin '0', '1') { $p += "data $k must be 0 or 1" } }
+                foreach ($k in 'provider', 'map', 'player', 'hero') { if ("$($root['data'][$k])" -ne '1') { $p += "data $k must be 1" } }
+            }
+        }
+    }
+    @{ Ok = -not $p.Count; Problems = $p; Kv = $kv }
+}
+# card On: writes the cfg (UTF-8 without BOM), creating the gamestate_integration folder when needed
+function Enable-DotaGsi([string]$DotaDir) {
+    $f = Get-DotaGsiCfgPath $DotaDir
+    if (-not $f) { throw 'Dota 2 was not found.' }
+    $cfgDir = Split-Path (Split-Path $f)
+    if (-not (Test-Path $cfgDir)) { throw "Dota 2's cfg folder was not found ($cfgDir). Verify the game files in Steam." }
+    $dir = Split-Path $f
+    if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force); $script:Backup.Custom['dota-gsi-dir'] = $dir; Save-Backup }
+    [IO.File]::WriteAllText($f, (New-DotaGsiCfgText (Get-DotaGsiToken)), (New-Object Text.UTF8Encoding $false))
+}
+# card Off: deletes exactly ZeroDelay's cfg file, and the gamestate_integration folder only if ZeroDelay made it and it is now empty
+function Disable-DotaGsi([string]$DotaDir) {
+    $f = Get-DotaGsiCfgPath $DotaDir
+    if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force }
+    $made = "$($script:Backup.Custom['dota-gsi-dir'])"
+    if ($made -and $f -and $made -eq (Split-Path $f) -and (Test-Path -LiteralPath $made) -and -not (Get-ChildItem -LiteralPath $made -Force)) { Remove-Item -LiteralPath $made -Force }
+    if ($made) { $script:Backup.Custom.Remove('dota-gsi-dir'); Save-Backup }
+}
+# Dota 2's Steam launch options (read-only, from Steam's localconfig.vdf); $null when unknown
+function Get-Dota2LaunchOptions([string]$SteamDir) {
+    if (-not $SteamDir) { $SteamDir = Get-SteamPath }
+    if (-not $SteamDir) { return $null }
+    $best = $null; $bestTime = [datetime]::MinValue
+    foreach ($f in Get-ChildItem (Join-Path $SteamDir 'userdata') -Directory -ErrorAction SilentlyContinue) {
+        $lc = Join-Path $f.FullName 'config\localconfig.vdf'
+        if ((Test-Path -LiteralPath $lc) -and (Get-Item -LiteralPath $lc).LastWriteTime -gt $bestTime) { $best = $lc; $bestTime = (Get-Item -LiteralPath $lc).LastWriteTime }
+    }
+    if (-not $best) { return $null }
+    $m = [regex]::Match([IO.File]::ReadAllText($best), '"570"\s*\{(?:[^{}]|\{[^{}]*\})*?"LaunchOptions"\s*"((?:[^"\\]|\\.)*)"')
+    if ($m.Success) { $m.Groups[1].Value } else { '' }
+}
+# $true when Dota 2's launch options contain -gamestateintegration (Dota only reads GSI files with it), $false without, $null unknown
+function Test-Dota2GsiLaunchOption([string]$SteamDir) {
+    $o = try { Get-Dota2LaunchOptions $SteamDir } catch { $null }
+    if ($null -eq $o) { return $null }
+    $o -match '(^|\s)-gamestateintegration(\s|$)'
+}
+# Dota 2 is running
+function Test-Dota2Running { if ($GameFind -and $GameFind['dota2']) { Test-GameRunning 'dota2' } else { [bool](Get-Process dota2 -ErrorAction SilentlyContinue) } }
+
+# Generic GSI HTTP server for a runspace (generalised from the CS2 listener). The game-specific script text defines
+# Read-State($j) and Close-Match; $S: Port, Token, File, Max (in); Stop; Running, Error, Posts, BadAuth, LastPost, Live, Saved (out).
+$script:ZdGsiServerCode = @'
+function Send-Reply($ns, [string]$Status) {
+    $b = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $Status`r`nContent-Type: text/plain`r`nContent-Length: 0`r`nConnection: close`r`n`r`n")
+    $ns.Write($b, 0, $b.Length)
+}
+function Read-Request($c) {   # returns the body text, or $null (after answering) for anything that is not a valid POST
+    $c.ReceiveTimeout = 2000; $c.SendTimeout = 2000
+    $ns = $c.GetStream(); $buf = New-Object byte[] 65536; $ms = New-Object IO.MemoryStream
+    $hdrEnd = -1; $len = -1
+    while ($true) {
+        if ($hdrEnd -lt 0) {
+            $all = $ms.ToArray(); $txt = [Text.Encoding]::ASCII.GetString($all)
+            $hdrEnd = $txt.IndexOf("`r`n`r`n")
+            if ($hdrEnd -ge 0) {
+                $head = $txt.Substring(0, $hdrEnd)
+                if ($head -notmatch '^POST ') { Send-Reply $ns '405 Method Not Allowed'; return $null }
+                if ($head -match '(?im)^Content-Length:\s*(\d+)') { $len = [int]$Matches[1] }
+                if ($len -gt 4MB) { Send-Reply $ns '413 Payload Too Large'; return $null }
+                if ($head -match '(?im)^Expect:\s*100-continue' -and $all.Length -eq $hdrEnd + 4) { $cb = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n"); $ns.Write($cb, 0, $cb.Length) }
+            }
+        }
+        if ($hdrEnd -ge 0 -and $len -ge 0 -and $ms.Length -ge $hdrEnd + 4 + $len) { break }
+        if ($ms.Length -gt 4MB) { Send-Reply $ns '413 Payload Too Large'; return $null }
+        $n = try { $ns.Read($buf, 0, $buf.Length) } catch { 0 }
+        if ($n -le 0) { break }
+        $ms.Write($buf, 0, $n)
+    }
+    if ($hdrEnd -lt 0) { return $null }
+    $all = $ms.ToArray(); $start = $hdrEnd + 4
+    $cnt = if ($len -ge 0) { [Math]::Min($len, $all.Length - $start) } else { $all.Length - $start }
+    [Text.Encoding]::UTF8.GetString($all, $start, [Math]::Max(0, $cnt))
+}
+$l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, [int]$S.Port)
+try {
+    $l.Server.ExclusiveAddressUse = $true
+    $l.Start()
+    $S.Running = $true; $S.Error = $null
+    while (-not $S.Stop) {
+        if (-not $l.Pending()) { Start-Sleep -Milliseconds 50; continue }
+        $c = $l.AcceptTcpClient()
+        try {
+            $body = Read-Request $c
+            if ($null -eq $body) { continue }
+            $j = try { $body | ConvertFrom-Json } catch { $null }
+            if (-not $j) { Send-Reply $c.GetStream() '400 Bad Request'; continue }
+            if ("$($j.auth.token)" -ne $S.Token) { $S.BadAuth++; Send-Reply $c.GetStream() '403 Forbidden'; continue }
+            Send-Reply $c.GetStream() '200 OK'   # answer first: the game waits for it before the next update
+            $S.Posts++; $S.LastPost = Get-Date
+            try { Read-State $j } catch { $S.Error = "state: $($_.Exception.Message)" }
+        } catch { $S.Error = "request: $($_.Exception.Message)" }
+        finally { $c.Close() }
+    }
+} catch { $S.Error = $_.Exception.Message }
+finally {
+    try { Close-Match } catch { $S.Error = "save: $($_.Exception.Message)" }
+    try { $l.Stop() } catch {}
+    $S.Running = $false
+}
+'@
+
+# Dota 2 state reducer for the GSI server: one record per matchid, your own player block only
+$script:DotaGsiStateCode = @'
+$script:m = $null; $script:done = @{}
+function Save-Match([bool]$Finished, [string]$WinTeam) {
+    $res = if (-not $Finished) { 'Unfinished' } elseif (-not $WinTeam -or -not $script:m.Team) { '' } elseif ($WinTeam -eq $script:m.Team) { 'Win' } else { 'Loss' }
+    $rec = [pscustomobject][ordered]@{
+        Start = $script:m.Start.ToString('o'); End = (Get-Date).ToString('o'); MatchId = $script:m.Id; Hero = $script:m.Hero; Level = $script:m.Level; Team = $script:m.Team
+        Kills = $script:m.Kills; Deaths = $script:m.Deaths; Assists = $script:m.Assists; LastHits = $script:m.LastHits; Denies = $script:m.Denies
+        Gpm = $script:m.Gpm; Xpm = $script:m.Xpm; NetWorth = $script:m.NetWorth; Seconds = $script:m.Clock; Result = $res; Finished = $Finished }
+    Save-ZdRecord $S $rec
+    $script:done[$script:m.Id] = $true; $script:m.Saved = $true
+}
+function Close-Match {   # left the game (menu, other match, Dota closed): keep it only after 10+ minutes of game clock
+    if ($script:m -and -not $script:m.Saved -and $script:m.Clock -ge $S.MinClock) { Save-Match $false '' }
+    $script:m = $null
+}
+function Read-State($j) {
+    $map = $j.map; $p = $j.player
+    if (-not $map -or -not "$($map.matchid)" -or "$($map.matchid)" -eq '0') { Close-Match; return }   # main menu
+    if ("$($map.customgamename)" -or "$($map.name)" -match 'demo|tutorial') { return }   # arcade, hero demo, tutorial
+    if (-not $p -or -not "$($p.steamid)") { return }   # spectating: the player block then holds team2/team3, not you
+    $id = "$($map.matchid)"; $gs = "$($map.game_state)"
+    if ($script:m -and $script:m.Id -ne $id) { Close-Match }
+    if ($script:done[$id]) { return }
+    if (-not $script:m) {
+        if ($gs -eq 'DOTA_GAMERULES_STATE_POST_GAME') { return }   # joined at the end: nothing to record
+        $script:m = @{ Id = $id; Start = (Get-Date); Saved = $false; Hero = ''; Level = 0; Team = ''; Kills = 0; Deaths = 0; Assists = 0; LastHits = 0; Denies = 0; Gpm = 0; Xpm = 0; NetWorth = 0; Clock = 0 }
+    }
+    $script:m.Kills = Get-ZdInt $p.kills; $script:m.Deaths = Get-ZdInt $p.deaths; $script:m.Assists = Get-ZdInt $p.assists
+    $script:m.LastHits = Get-ZdInt $p.last_hits; $script:m.Denies = Get-ZdInt $p.denies; $script:m.Gpm = Get-ZdInt $p.gpm; $script:m.Xpm = Get-ZdInt $p.xpm
+    if ($null -ne $p.net_worth) { $script:m.NetWorth = Get-ZdInt $p.net_worth }
+    if ("$($p.team_name)" -in 'radiant', 'dire') { $script:m.Team = "$($p.team_name)".ToLower() }
+    $h = $j.hero; if ($h -and "$($h.name)") { $script:m.Hero = "$($h.name)"; $script:m.Level = Get-ZdInt $h.level }
+    $ck = Get-ZdInt $map.clock_time; if ($ck -gt $script:m.Clock) { $script:m.Clock = $ck }
+    $S.Live = [pscustomobject]@{ Hero = $script:m.Hero; Kills = $script:m.Kills; Deaths = $script:m.Deaths; Assists = $script:m.Assists; LastHits = $script:m.LastHits; Gpm = $script:m.Gpm; Clock = $ck; State = $gs }
+    $win = "$($map.win_team)".ToLower()
+    if ($gs -eq 'DOTA_GAMERULES_STATE_POST_GAME' -and $win -in 'radiant', 'dire') { Save-Match $true $win }
+}
+'@
+
+# starts the Dota 2 GSI listener in its own runspace (returns at once); $Port/$Token/$File override for tests
+function Start-DotaGsiListener([int]$Port = $script:DotaGsiPort, [string]$Token, [string]$File) {
+    if (-not $Token) { $Token = Get-DotaGsiToken }
+    if (-not $File) { $File = Get-Dota2MatchesFile }
+    Start-ZdStatsRunner 'dota2' ($script:DotaGsiStateCode + "`r`n" + $script:ZdGsiServerCode) @{ Port = $Port; Token = $Token; File = $File; MinClock = 600; Posts = 0; BadAuth = 0; LastPost = $null }
+}
+# stops it (it saves an unfinished match of 10+ minutes first); -Wait for app exit
+function Stop-DotaGsiListener([switch]$Wait) { Stop-ZdStatsRunner 'dota2' -Wait:$Wait }
+# call every few seconds from the app's timer: runs the listener only while Dota 2 runs and the cfg is in place
+function Update-DotaGsiListener {
+    $f = Get-DotaGsiCfgPath
+    $want = [bool]($f -and (Test-Path -LiteralPath $f) -and (Test-Dota2Running))
+    Update-ZdStatsRunner 'dota2' $want { Start-DotaGsiListener }
+}
+# Dota's internal hero names (npc_dota_hero_*) as players know them
+function Format-Dota2Hero([string]$Name) {
+    $n = $Name -replace '^npc_dota_hero_', ''
+    $map = @{ nevermore = 'Shadow Fiend'; zuus = 'Zeus'; furion = 'Nature''s Prophet'; obsidian_destroyer = 'Outworld Destroyer'; wisp = 'Io'; magnataur = 'Magnus'
+              rattletrap = 'Clockwerk'; windrunner = 'Windranger'; skeleton_king = 'Wraith King'; queenofpain = 'Queen of Pain'; shredder = 'Timbersaw'; life_stealer = 'Lifestealer'
+              necrolyte = 'Necrophos'; doom_bringer = 'Doom'; treant = 'Treant Protector'; centaur = 'Centaur Warrunner'; abyssal_underlord = 'Underlord'; antimage = 'Anti-Mage'
+              vengefulspirit = 'Vengeful Spirit'; keeper_of_the_light = 'Keeper of the Light'; sand_king = 'Sand King'; tiny = 'Tiny'; spirit_breaker = 'Spirit Breaker'
+              night_stalker = 'Night Stalker'; drow_ranger = 'Drow Ranger'; crystal_maiden = 'Crystal Maiden'; skywrath_mage = 'Skywrath Mage'; storm_spirit = 'Storm Spirit'
+              ember_spirit = 'Ember Spirit'; earth_spirit = 'Earth Spirit'; void_spirit = 'Void Spirit'; monkey_king = 'Monkey King'; faceless_void = 'Faceless Void'
+              phantom_assassin = 'Phantom Assassin'; templar_assassin = 'Templar Assassin'; nyx_assassin = 'Nyx Assassin'; winter_wyvern = 'Winter Wyvern'; arc_warden = 'Arc Warden' }
+    if ($map.ContainsKey($n)) { return $map[$n] }
+    if (-not $n) { return '' }
+    (Get-Culture).TextInfo.ToTitleCase(($n -replace '_', ' '))
+}
+# stats contract for the Gameplay page: Title, Rows (newest first), Charts, Summary, Note
+function Get-Dota2GameplayStats([string]$File) {
+    if (-not $File) { $File = Get-Dota2MatchesFile }
+    $charts = @(@{ Name = 'KDA'; Field = 'KDA'; Unit = ''; LowerBetter = $false }, @{ Name = 'GPM'; Field = 'GPM'; Unit = '' }, @{ Name = 'Last hits'; Field = 'LastHits'; Unit = '' })
+    $ms = @(Read-ZdMatches $File)
+    if (-not $ms.Count) {
+        $lo = Test-Dota2GsiLaunchOption
+        $lead = if ($lo -eq $false) { 'Dota 2''s Steam launch options do not contain -gamestateintegration yet: add it in Steam > Dota 2 > Properties > Launch options.' } else { 'Dota 2 needs -gamestateintegration in its Steam launch options.' }
+        return @{ Title = 'Your Dota 2 matches'; Rows = @(); Charts = $charts; Summary = @()
+                  Note = "No Dota 2 matches recorded yet. Switch on `"Dota 2 match stats`", restart Dota 2, keep ZeroDelay open and play a match. $lead" }
+    }
+    $rows = foreach ($x in $ms) {
+        $k = [int]$x.Kills; $d = [int]$x.Deaths; $a = [int]$x.Assists
+        [pscustomobject]@{ Time = (ConvertFrom-ZdTime "$($x.End)"); Hero = (Format-Dota2Hero "$($x.Hero)"); Result = "$($x.Result)"
+            K = $k; D = $d; A = $a; KDA = [Math]::Round(($k + $a) / [Math]::Max($d, 1), 2)
+            LastHits = [int]$x.LastHits; Denies = [int]$x.Denies; GPM = [int]$x.Gpm; XPM = [int]$x.Xpm; Minutes = [int][Math]::Floor([int]$x.Seconds / 60) }
+    }
+    $rows = @($rows | Sort-Object Time -Descending)
+    $sk = ($ms | Measure-Object Kills -Sum).Sum; $sd = ($ms | Measure-Object Deaths -Sum).Sum; $sa = ($ms | Measure-Object Assists -Sum).Sum
+    $gpm = ($ms | Measure-Object Gpm -Average).Average
+    $decided = @($ms | Where-Object { "$($_.Result)" -in 'Win', 'Loss' }); $wins = @($decided | Where-Object { $_.Result -eq 'Win' }).Count
+    $summary = @(
+        @{ Label = 'Win rate'; Value = $(if ($decided.Count) { "$([Math]::Round(100.0 * $wins / $decided.Count))%" } else { '-' }) }
+        @{ Label = 'KDA'; Value = (Format-ZdNum (($sk + $sa) / [Math]::Max($sd, 1)) '0.00') }
+        @{ Label = 'GPM'; Value = "$([Math]::Round($gpm))" }
+        @{ Label = 'Matches'; Value = "$($ms.Count)" })
+    @{ Title = 'Your Dota 2 matches'; Rows = $rows; Charts = $charts; Summary = $summary
+       Note = 'From Valve''s Game State Integration: while Dota 2 runs, it sends your own hero''s scoreboard to ZeroDelay on this PC. KDA is (kills + assists) / deaths. Matches you leave before 10 minutes are not kept; unfinished ones do not count in the win rate.' }
+}
+
+# --- League of Legends match stats (1.18): Riot's Live Client Data API -> poller runspace -> lol-matches.json
+# While a League game runs, the game itself serves https://127.0.0.1:2999/liveclientdata/ (documented by Riot at
+# developer.riotgames.com/docs/lol, no API key, local only). ZeroDelay reads it every 5 s and keeps your own final line.
+# Read-only HTTPS GETs to the game's own documented endpoint: nothing is injected, nothing touches the game or Vanguard.
+$script:LolApiUrl = 'https://127.0.0.1:2999/liveclientdata/allgamedata'
+$script:LolPollMs = 5000
+$script:LolMinSeconds = 300                                   # shorter games (remakes) are not kept
+$script:LolMaxMatches = 200
+# Riot's root for the game's self-signed certificate ("LoL Game Engineering Certificate Authority", valid to 2043,
+# SHA-1 E685683BEA79CBD35ADEBCB98D40A0CB8DE016CA), from https://static.developer.riotgames.com/docs/lol/riotgames.pem
+$script:LolRiotRootB64 = 'MIIEIDCCAwgCCQDJC+QAdVx4UDANBgkqhkiG9w0BAQUFADCB0TELMAkGA1UEBhMCVVMxEzARBgNVBAgTCkNhbGlmb3JuaWExFTATBgNVBAcTDFNhbnRhIE1vbmljYTETMBEGA1UEChMKUmlvdCBHYW1lczEdMBsGA1UECxMUTG9MIEdhbWUgRW5naW5lZXJpbmcxMzAxBgNVBAMTKkxvTCBHYW1lIEVuZ2luZWVyaW5nIENlcnRpZmljYXRlIEF1dGhvcml0eTEtMCsGCSqGSIb3DQEJARYeZ2FtZXRlY2hub2xvZ2llc0ByaW90Z2FtZXMuY29tMB4XDTEzMTIwNDAwNDgzOVoXDTQzMTEyNzAwNDgzOVowgdExCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRUwEwYDVQQHEwxTYW50YSBNb25pY2ExEzARBgNVBAoTClJpb3QgR2FtZXMxHTAbBgNVBAsTFExvTCBHYW1lIEVuZ2luZWVyaW5nMTMwMQYDVQQDEypMb0wgR2FtZSBFbmdpbmVlcmluZyBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkxLTArBgkqhkiG9w0BCQEWHmdhbWV0ZWNobm9sb2dpZXNAcmlvdGdhbWVzLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKoJemF/6PNG3GRJGbjzImTdOo1OJRDI7noRwJgDqkaJFkwv0X8aPUGbZSUzUO23cQcCgpYj21ygzKu5dtCN2EcQVVpNtyPuM2V4eEGr1woodzALtufL3Nlyh6g5jKKuDIfeUBHvJNyQf2h3Uha16lnrXmz9o9wsX/jf+jUAljBJqsMeACOpXfuZy+YKUCxSPOZaYTLCy+0GQfiT431pJHBQlrXAUwzOmaJPQ7M6mLfsnpHibSkxUfMfHROaYCZ/sbWKl3lrZA9DbwaKKfS1Iw0ucAeDudyuqb4JntGU/W0aboKA0c3YB02mxAM4oDnqseuKV/CX8SQAiaXnYotuNXMCAwEAATANBgkqhkiG9w0BAQUFAAOCAQEAf3KPmddqEqqC8iLslcd0euC4F5+USp9YsrZ3WuOzHqVxTtX3hR1scdlDXNvrsebQZUqwGdZGMS16ln3kWObw7BbhU89tDNCN7Lt/IjT4MGRYRE+TmRc5EeIXxHkQ78bQqbmAI3GsW+7kJsoOq3DdeE+M+BUJrhWorsAQCgUyZO166SAtKXKLIcxa+ddC49NvMQPJyzm3V+2b1roPSvD2WV8gRYUnGmy/N0+u6ANq5EsbhZ548zZc+BI4upsWChTLyxt2RxR7+uGlS1+5EcGfKZ+g024k/J32XP4hdho7WYAS2xMiV83CfLR/MNi8oSMaVQTdKD8cpgiWJk3LXWehWA=='
+# per-request certificate check (compiled once, inside the poller runspace): only for 127.0.0.1:2999 and only a
+# certificate that chains to the pinned root. Never set on ServicePointManager, so other HTTPS in the app is unchanged.
+$script:LolCertCode = @'
+using System;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class ZdLolCert {
+    static X509Certificate2 root; static string host = "127.0.0.1"; static int port = 2999;
+    public static readonly RemoteCertificateValidationCallback Callback = new RemoteCertificateValidationCallback(Check);
+    public static void Configure(byte[] rootDer, string h, int p) { root = new X509Certificate2(rootDer); host = h; port = p; }
+    public static bool Check(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+        try {
+            HttpWebRequest r = sender as HttpWebRequest;
+            if (r == null || root == null || cert == null) return false;
+            if (!r.RequestUri.IsLoopback || r.RequestUri.Host != host || r.RequestUri.Port != port) return false;
+            if ((errors & SslPolicyErrors.RemoteCertificateNotAvailable) != 0) return false;
+            // the game's certificate is not issued for "127.0.0.1" (Riot: ignore the name, validate against riotgames.pem)
+            using (X509Chain c = new X509Chain()) {
+                c.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                c.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority | X509VerificationFlags.IgnoreNotTimeValid;
+                c.ChainPolicy.ExtraStore.Add(root);
+                if (!c.Build(new X509Certificate2(cert))) return false;
+                if (c.ChainElements.Count < 2) return false;      // a lone self-signed certificate is never accepted
+                X509Certificate2 top = c.ChainElements[c.ChainElements.Count - 1].Certificate;
+                return string.Equals(top.Thumbprint, root.Thumbprint, StringComparison.OrdinalIgnoreCase);
+            }
+        } catch { return false; }
+    }
+}
+'@
+
+# The poller runspace. $S is a synchronized hashtable: Url, RootB64, CertCode, File, Max, PollMs, MinSeconds (in);
+# Stop (set by the app); Running, Error, Polls, Ok, LastOk, LastFail, Spectator, Live, Saved (out).
+$script:LolPollerCode = @'
+param($S)
+$script:g = $null
+function Get-Num($v) { $d = 0.0; if ($null -ne $v -and [double]::TryParse("$v", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { $d } else { 0.0 } }
+function Get-Text {
+    $req = [Net.HttpWebRequest]::Create($S.Url)
+    $req.Method = 'GET'; $req.Timeout = 2000; $req.ReadWriteTimeout = 2000; $req.KeepAlive = $false; $req.Proxy = $null
+    $req.ServerCertificateValidationCallback = [ZdLolCert]::Callback     # this request only
+    $resp = $req.GetResponse()
+    try { $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8); $sr.ReadToEnd() } finally { $resp.Close() }
+}
+function Save-Game([string]$Result) {
+    $x = $script:g
+    $secs = [int][Math]::Round([Math]::Max($x.GameTime, $x.EndTime))
+    if ($secs -lt $S.MinSeconds) { $x.Saved = $true; return }      # remake or very short game: not kept
+    $rec = [pscustomobject][ordered]@{
+        Start = $x.Start.ToString('o'); End = (Get-Date).ToString('o'); Mode = $x.Mode; Map = $x.Map; Champion = $x.Champion
+        Kills = $x.Kills; Deaths = $x.Deaths; Assists = $x.Assists; CS = $x.CS; Level = $x.Level
+        Gold = [int]($x.CurrentGold + $x.ItemGold); CurrentGold = [int]$x.CurrentGold; ItemGold = [int]$x.ItemGold
+        Seconds = $secs; Team = $x.Team; Result = $Result }
+    $old = @()
+    # PS 5.1 returns a JSON array as one object: piping the variable unrolls it
+    if (Test-Path -LiteralPath $S.File) { try { $arr = [IO.File]::ReadAllText($S.File) | ConvertFrom-Json; $old = @($arr | Where-Object { $_ }) } catch { $old = @() } }
+    $all = @(@($rec) + $old | Select-Object -First $S.Max)
+    $dir = Split-Path $S.File; if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $tmp = "$($S.File).tmp"
+    [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $all -Depth 3), (New-Object Text.UTF8Encoding $false))
+    if (Test-Path -LiteralPath $S.File) { [IO.File]::Replace($tmp, $S.File, [NullString]::Value) } else { [IO.File]::Move($tmp, $S.File) }
+    $x.Saved = $true; $S.Saved++
+}
+function Close-Game {   # the game went away without a GameEnd event (closed, crashed, ZeroDelay closing): kept as Unfinished
+    if ($script:g -and -not $script:g.Saved) { Save-Game 'Unfinished' }
+    $script:g = $null
+}
+function Read-Game($j) {
+    $gd = $j.gameData; if (-not $gd) { return }
+    $mode = "$($gd.gameMode)"; $gt = Get-Num $gd.gameTime
+    if ($mode -match '^(PRACTICETOOL|TUTORIAL)') { return }           # practice tool / tutorial: not a match
+    $ap = $j.activePlayer
+    # spectating (or a replay) has no active player: activePlayer is missing or only holds an "error" text
+    if (-not $ap -or $ap.error -or $null -eq $ap.level) { $S.Spectator = $true; return }
+    $S.Spectator = $false
+    $all = @($j.allPlayers | Where-Object { $_ })
+    $me = $null
+    foreach ($k in 'riotId', 'riotIdGameName', 'summonerName') {
+        $v = "$($ap.$k)"; if (-not $v) { continue }
+        $me = @($all | Where-Object { "$($_.$k)" -eq $v })[0]; if ($me) { break }
+    }
+    if (-not $me) { return }
+    if ($script:g -and $gt + 30 -lt $script:g.GameTime) { Close-Game }   # the clock went back: a new game
+    if ($script:g -and $script:g.Saved) { return }                       # end screen after the save
+    if (-not $script:g) {
+        $script:g = @{ Start = (Get-Date).AddSeconds(-$gt); Mode = $mode; Map = "$($gd.mapName)"; Champion = "$($me.championName)"; Team = "$($me.team)"
+            Kills = 0; Deaths = 0; Assists = 0; CS = 0; Level = 0; CurrentGold = 0.0; ItemGold = 0.0; GameTime = 0.0; EndTime = 0.0; Saved = $false }
+    }
+    $x = $script:g
+    $sc = $me.scores
+    if ($sc) { $x.Kills = [int](Get-Num $sc.kills); $x.Deaths = [int](Get-Num $sc.deaths); $x.Assists = [int](Get-Num $sc.assists); $x.CS = [int](Get-Num $sc.creepScore) }
+    $x.Level = [int](Get-Num $ap.level); $x.CurrentGold = Get-Num $ap.currentGold
+    $ig = 0.0; foreach ($it in @($me.items | Where-Object { $_ })) { $c = Get-Num $it.count; if ($c -lt 1) { $c = 1 }; $ig += (Get-Num $it.price) * $c }
+    $x.ItemGold = $ig
+    if ("$($me.championName)") { $x.Champion = "$($me.championName)" }
+    if ($gt -gt $x.GameTime) { $x.GameTime = $gt }
+    $res = $null
+    foreach ($e in @($j.events.Events | Where-Object { $_ })) {
+        if ("$($e.EventName)" -eq 'GameEnd') {
+            $x.EndTime = Get-Num $e.EventTime
+            $res = switch ("$($e.Result)") { 'Win' { 'Win' } 'Lose' { 'Loss' } 'Loss' { 'Loss' } default { 'Unfinished' } }
+        }
+    }
+    $S.Live = [pscustomobject]@{ Champion = $x.Champion; Mode = $x.Mode; Kills = $x.Kills; Deaths = $x.Deaths; Assists = $x.Assists; CS = $x.CS; Level = $x.Level; GameTime = [int]$x.GameTime }
+    if ($res) { Save-Game $res }
+}
+try {
+    if (-not ('ZdLolCert' -as [type])) { Add-Type -TypeDefinition $S.CertCode -Language CSharp }
+    $u = [Uri]$S.Url
+    [ZdLolCert]::Configure([Convert]::FromBase64String($S.RootB64), $u.Host, $u.Port)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $S.Running = $true; $S.Error = $null
+    while (-not $S.Stop) {
+        $t0 = [Environment]::TickCount
+        $S.Polls++
+        $txt = $null
+        try { $txt = Get-Text } catch { $S.LastFail = $_.Exception.Message }   # loading screen, game closing, no game: try again
+        if ($txt) {
+            $j = try { $txt | ConvertFrom-Json } catch { $null }
+            if ($j) { $S.Ok++; $S.LastOk = Get-Date; try { Read-Game $j } catch { $S.Error = "state: $($_.Exception.Message)" } }
+        }
+        while (-not $S.Stop -and ([Environment]::TickCount - $t0) -lt $S.PollMs) { Start-Sleep -Milliseconds 100 }
+    }
+} catch { $S.Error = $_.Exception.Message }
+finally {
+    try { Close-Game } catch { $S.Error = "save: $($_.Exception.Message)" }
+    $S.Running = $false
+}
+'@
+
+# where finished games are kept ($DataDir\lol-matches.json)
+function Get-LolMatchesFile { Join-Path $DataDir 'lol-matches.json' }
+# the League game itself (not the client/launcher) is running
+function Test-LolRunning { [bool](Get-Process -Name 'League of Legends' -ErrorAction SilentlyContinue) }
+# starts the poller in its own runspace (returns at once); parameters override the URL, file, pinned root and interval for tests
+function Start-LolStatsPoller([string]$Url, [string]$File, [string]$RootB64, [int]$PollMs) {
+    if ($script:LolPoller -and $script:LolPoller.PS -and -not $script:LolPoller.Handle.IsCompleted) { return }
+    if (-not $Url) { $Url = $script:LolApiUrl }
+    if (-not $File) { $File = Get-LolMatchesFile }
+    if (-not $RootB64) { $RootB64 = $script:LolRiotRootB64 }
+    if ($PollMs -le 0) { $PollMs = $script:LolPollMs }
+    $st = [hashtable]::Synchronized(@{ Url = $Url; RootB64 = $RootB64; CertCode = $script:LolCertCode; File = $File; Max = $script:LolMaxMatches
+        PollMs = $PollMs; MinSeconds = $script:LolMinSeconds; Stop = $false; Running = $false; Error = $null; Polls = 0; Ok = 0
+        LastOk = $null; LastFail = $null; Spectator = $false; Live = $null; Saved = 0 })
+    $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'MTA'; $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($script:LolPollerCode).AddArgument($st)
+    $script:LolPoller = @{ State = $st; PS = $ps; RS = $rs; Handle = $ps.BeginInvoke(); Started = Get-Date }
+}
+# asks the poller to stop (it saves a game of 5+ minutes without a result as Unfinished); -Wait up to 3 s for app exit
+function Stop-LolStatsPoller([switch]$Wait) {
+    $p = $script:LolPoller; if (-not $p) { return }
+    $p.State.Stop = $true
+    if ($Wait) { [void]$p.Handle.AsyncWaitHandle.WaitOne(3000) }
+    if ($p.Handle.IsCompleted) { Remove-LolStatsPoller }
+}
+# frees a finished poller runspace
+function Remove-LolStatsPoller {
+    $p = $script:LolPoller; if (-not $p) { return }
+    try { [void]$p.PS.EndInvoke($p.Handle) } catch {}
+    try { $p.PS.Dispose(); $p.RS.Dispose() } catch {}
+    $script:LolStatsLastError = $p.State.Error
+    $script:LolPoller = $null
+}
+# call every few seconds from a UI timer: polls only while the League game runs (cheap, never blocks); setting 'lol-stats' = $false turns it off
+function Update-LolStatsPoller {
+    $p = $script:LolPoller
+    if ($p -and $p.Handle.IsCompleted) {   # stopped, or crashed: a crash waits 30 s before the next try
+        if (-not $p.State.Stop) { $script:LolStatsRetry = (Get-Date).AddSeconds(30) }
+        Remove-LolStatsPoller; $p = $null
+    }
+    $on = $true
+    if (Get-Command Get-Setting -CommandType Function -ErrorAction SilentlyContinue) { $on = [bool](Get-Setting 'lol-stats' $true) }
+    $want = $on -and (Test-LolRunning)
+    if ($want -and -not $p) {
+        if ($script:LolStatsRetry -and (Get-Date) -lt $script:LolStatsRetry) { return }
+        Start-LolStatsPoller
+    } elseif (-not $want -and $p -and -not $p.State.Stop) { Stop-LolStatsPoller }
+}
+# reads the saved games, newest first
+function Read-LolMatches([string]$File) {
+    if (-not $File) { $File = Get-LolMatchesFile }
+    if (-not (Test-Path -LiteralPath $File)) { return @() }
+    try { $j = [IO.File]::ReadAllText($File) | ConvertFrom-Json; @($j | Where-Object { $_ -and $_.Mode -and (Test-ZdRecordNumbers $_) }) } catch { @() }   # piping the variable unrolls the array
+}
+# Riot's gameMode ids as players know them
+function Format-LolMode([string]$Mode) {
+    switch ($Mode) { 'CLASSIC' { 'Summoner''s Rift' } 'SWIFTPLAY' { 'Swiftplay' } 'ARAM' { 'ARAM' } 'CHERRY' { 'Arena' } 'URF' { 'URF' } 'ARURF' { 'ARURF' } 'ONEFORALL' { 'One for All' } 'NEXUSBLITZ' { 'Nexus Blitz' } 'ULTBOOK' { 'Ultimate Spellbook' } 'STRAWBERRY' { 'Swarm' } default { if ($Mode) { (Get-Culture).TextInfo.ToTitleCase($Mode.ToLower()) } else { '' } } }
+}
+# 1834 -> '30:34'
+function Format-LolDuration([int]$Seconds) { '{0}:{1:00}' -f [Math]::Floor($Seconds / 60), ($Seconds % 60) }
+# stats contract for the Gameplay page: Title, Rows (newest first), Charts, Summary, Note
+function Get-LolGameplayStats([string]$File) {
+    $note = 'From Riot''s Live Client Data API: while a League game runs, the game shares your own scoreboard with apps on this PC. ZeroDelay reads it every 5 seconds and keeps your final line. Gold is your items plus unspent gold at the end. Games under 5 minutes (remakes) and the practice tool are not kept.'
+    $ms = @(Read-LolMatches $File)
+    $charts = @(@{ Name = 'KDA'; Field = 'KDA'; Unit = ''; LowerBetter = $false }, @{ Name = 'CS per minute'; Field = 'CSPerMin'; Unit = '' }, @{ Name = 'Gold'; Field = 'Gold'; Unit = '' })
+    if (-not $ms.Count) {
+        return @{ Title = 'Your League matches'; Rows = @(); Charts = $charts; Summary = @()
+                  Note = 'No League of Legends games recorded yet. Keep ZeroDelay open while you play: your own stats are read from the game on this PC, nothing to switch on.' }
+    }
+    $rows = foreach ($x in $ms) {
+        $k = [int]$x.Kills; $d = [int]$x.Deaths; $a = [int]$x.Assists; $sec = [int]$x.Seconds
+        $time = try { [datetime]::Parse("$($x.End)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() } catch { $null }
+        [pscustomobject]@{ Time = $time; Champion = "$($x.Champion)"; Mode = (Format-LolMode "$($x.Mode)"); Result = "$($x.Result)"
+            K = $k; D = $d; A = $a; KDA = [Math]::Round(($k + $a) / [Math]::Max($d, 1), 2)
+            CS = [int]$x.CS; CSPerMin = $(if ($sec -gt 0) { [Math]::Round([int]$x.CS * 60.0 / $sec, 1) } else { $null })
+            Gold = [int]$x.Gold; Duration = (Format-LolDuration $sec) }
+    }
+    $rows = @($rows | Sort-Object Time -Descending)
+    $sk = ($ms | Measure-Object Kills -Sum).Sum; $sd = ($ms | Measure-Object Deaths -Sum).Sum; $sa = ($ms | Measure-Object Assists -Sum).Sum
+    $scs = ($ms | Measure-Object CS -Sum).Sum; $ssec = ($ms | Measure-Object Seconds -Sum).Sum
+    $decided = @($ms | Where-Object { "$($_.Result)" -in 'Win', 'Loss' })
+    $wins = @($decided | Where-Object { $_.Result -eq 'Win' }).Count
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $summary = @(
+        @{ Label = 'Win rate'; Value = $(if ($decided.Count) { "$([Math]::Round(100.0 * $wins / $decided.Count))%" } else { '-' }) }
+        @{ Label = 'KDA'; Value = ([Math]::Round(($sk + $sa) / [Math]::Max($sd, 1), 2)).ToString('0.00', $inv) }
+        @{ Label = 'CS/min'; Value = $(if ($ssec) { ([Math]::Round($scs * 60.0 / $ssec, 1)).ToString('0.0', $inv) } else { '-' }) }
+        @{ Label = 'Games'; Value = "$($ms.Count)" })
+    @{ Title = 'Your League matches'; Rows = $rows; Charts = $charts; Summary = $summary; Note = $note }
+}
+
+# ---- Sessions for every game (1.18): the match recorder, Matches, Trends and each game's "Your stats"
+# Reports keep the game's id in a Game field and in the file name (yyyyMMdd-HHmmss-<id>.json). Reports from before
+# 1.18 have neither and are Fortnite's. ZeroDelay keeps the newest 60 of each game.
+
+# game id of a saved report (no Game field = Fortnite)
+function Get-ReportGame($r) { $id = "$($r.Game)"; if ($id) { $id } else { 'fortnite' } }
+# game id from a report file name (no suffix = Fortnite)
+function Get-ReportFileGame([string]$Name) { if ($Name -match '^\d{8}-\d{6}-([A-Za-z0-9_-]+)\.json$') { $Matches[1] } else { 'fortnite' } }
+# the $GameDefs entry with this id, or $null
+function Get-GameDef([string]$Id) { $GameDefs | Where-Object { $_.Id -eq $Id } | Select-Object -First 1 }
+# display name of a game id
+function Get-GameTitle([string]$Id) { $g = Get-GameDef $Id; if ($g) { "$($g.Title)" } else { 'the game' } }
+# 'match' for Fortnite (the recorder follows one match at a time there), 'session' for the other games
+function Get-SessionWord([string]$Id, [int]$Count = 1) { $w = if ($Id -eq 'fortnite') { 'match' } else { 'session' }; if ($Count -eq 1) { $w } elseif ($w -eq 'match') { 'matches' } else { 'sessions' } }
+# saved reports of one game, newest first. $From = reports already read; otherwise only that game's files are read.
+function Get-GameReports([string]$Game = 'fortnite', $From) {
+    if (-not $Game) { $Game = 'fortnite' }
+    if ($null -ne $From) { return @(@($From) | Where-Object { $_ -and (Get-ReportGame $_) -eq $Game }) }
+    if ($Snapshot -and $env:ZD_FAKE_MATCH) { return @(Get-MatchReports | Where-Object { (Get-ReportGame $_) -eq $Game }) }
+    if (-not (Test-Path $MatchDir)) { return @() }
+    @(Get-ChildItem $MatchDir -Filter '*.json' | Where-Object { (Get-ReportFileGame $_.Name) -eq $Game } | Sort-Object Name -Descending | ForEach-Object {
+        $f = $_.FullName
+        try { Get-Content $f -Raw | ConvertFrom-Json | Add-Member -NotePropertyName File -NotePropertyValue $f -PassThru } catch {}
+    })
+}
+# games that have reports, in library order: rows of Id and Count (from the file names, nothing is parsed)
+function Get-ReportGames {
+    $cnt = @{}
+    if ($Snapshot -and $env:ZD_FAKE_MATCH) { foreach ($r in @(Get-MatchReports)) { $k = Get-ReportGame $r; $cnt[$k] = 1 + [int]$cnt[$k] } }
+    elseif (Test-Path $MatchDir) { foreach ($f in Get-ChildItem $MatchDir -Filter '*.json') { $k = Get-ReportFileGame $f.Name; $cnt[$k] = 1 + [int]$cnt[$k] } }
+    @($GameDefs | Where-Object { $cnt.ContainsKey($_.Id) } | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Count = $cnt[$_.Id] } })
+}
+# the game a page shows: the one picked before if it still has reports, else Fortnite, else the first with reports
+function Select-ReportGame([string]$Want, $Games) {
+    $ids = @($Games | ForEach-Object { $_.Id })
+    if ($Want -and $ids -contains $Want) { $Want } elseif (-not $ids.Count -or $ids -contains 'fortnite') { 'fortnite' } else { $ids[0] }
+}
+# game picker chips (hidden when Fortnite is the only game with reports, so that page looks as before)
+function Set-GameChips($Panel, $Games, [string]$Sel, [scriptblock]$Pick) {
+    $Panel.Children.Clear()
+    $rows = @($Games)
+    $show = $rows.Count -ge 2 -or ($rows.Count -eq 1 -and $rows[0].Id -ne 'fortnite')
+    $Panel.Visibility = if ($show) { 'Visible' } else { 'Collapsed' }
+    if (-not $show) { return }
+    foreach ($r in $rows) {
+        $on = $r.Id -eq $Sel
+        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$(Esc "$(Get-GameTitle $r.Id)  ·  $($r.Count)")' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
+        $c.Tag = @{ Id = $r.Id; Pick = $Pick }
+        $c.Add_Click({ param($s, $e) & $s.Tag.Pick $s.Tag.Id })
+        $c.Background = ConvertTo-Brush $(if ($on) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($on) { '#FDFDFD' } else { '#F5F5F7' })
+        [void]$Panel.Children.Add($c)
+    }
+}
+
+# --- recorder: which game runs
+# process names that mean a game is being played: its library entry's main process (launchers do not count)
+function Get-GameProcNames($g) { @(@($g.Proc) | Where-Object { $_ } | ForEach-Object { "$_" -replace '\.exe$' } | Select-Object -Unique) }
+# the first supported game that is running, in library order: @{ Def; Proc } or $null. One process lookup for all games.
+function Find-RunningGame {
+    $names = @($GameDefs | ForEach-Object { Get-GameProcNames $_ } | Select-Object -Unique)
+    if (-not $names.Count) { return $null }
+    $run = @(Get-Process -Name $names -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
+    if (-not $run.Count) { return $null }
+    foreach ($g in $GameDefs) { foreach ($n in Get-GameProcNames $g) { if ($run -contains $n) { return @{ Def = $g; Proc = $n } } } }
+    $null
+}
+# true while the game a recording follows is still running
+function Test-RecGameRunning($rec) {
+    $p = @($rec.Procs | Where-Object { $_ })
+    if (-not $p.Count) { return (Test-FortniteRunning) }
+    [bool](Get-Process -Name $p -ErrorAction SilentlyContinue)
+}
+# PresentMon is in the tools folder and is exactly Intel's 2.6.0 release (hash checked once per file version)
+function Test-PresentMonReady {
+    $f = Get-Item -LiteralPath $PresentMonExe -ErrorAction SilentlyContinue
+    if (-not $f) { return $false }
+    $key = "$($f.Length)|$($f.LastWriteTimeUtc.Ticks)"
+    if ($script:PmReady -and $script:PmReady.Key -eq $key) { return $script:PmReady.Ok }
+    $ok = [bool](Test-PresentMonFile $PresentMonExe)
+    $script:PmReady = @{ Key = $key; Ok = $ok }
+    $ok
+}
+
+# --- "Your stats" on a game's page
+# runs in the worker: the numbers for the game's "Your stats"
+$GameStatsCode = @'
+param($id)
+@{ Id = $id; Data = (Get-GameStatsData @(Get-GameReports $id)) }
+'@
+# the game's own match stats (Get-GameplayStats, when this build has a reader for it), or $null. Readers are built to be
+# called here on the window's thread: slow parsing goes to the worker by itself and $OnUpdate redraws when it is done.
+function Get-GameStatsPlay($g) {
+    $cmd = Get-Command Get-GameplayStats -CommandType Function -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    try {
+        if ($cmd.Parameters.ContainsKey('OnUpdate')) { Get-GameplayStats $g.Id { if ($script:GameSel) { Update-GameStats } } } else { Get-GameplayStats $g.Id }
+    } catch { $null }
+}
+# reads the open game's sessions in the background and draws "Your stats" when they arrive
+function Update-GameStats {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.Stats) { return }
+    if ($h.StatsFor -ne $g.Id) { Show-GameStats $g $null $true; $h.StatsFor = $g.Id }
+    Invoke-Worker $GameStatsCode @($g.Id) {
+        param($out, $errs)
+        $res = Get-WorkerResult $out
+        $g = $script:GameSel; if (-not $g -or -not $script:GamesUi) { return }
+        if ($res -is [hashtable] -and $res.Id -ne $g.Id) { return }
+        Show-GameStats $g $(if ($res -is [hashtable]) { $res.Data } else { $null }) $false
+    }
+}
+# number for a chart: $null for missing or non-numeric values
+function ConvertTo-StatNumber($v) { if ($null -eq $v -or "$v" -eq '') { return $null }; $d = 0.0; if ([double]::TryParse("$v", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { $d } else { $null } }
+# a small number tile in the app's card style
+function New-StatTile([string]$Value, [string]$Label) {
+    $b = New-Object Windows.Controls.Border; $b.SetResourceReference([Windows.FrameworkElement]::StyleProperty, 'Card'); $b.Padding = '14,10'; $b.Margin = '0,0,8,8'; $b.MinWidth = 100
+    $sp = New-Object Windows.Controls.StackPanel
+    $v = New-Object Windows.Controls.TextBlock; $v.Text = $Value; $v.FontSize = 21; $v.FontWeight = 'Bold'; [Windows.Documents.Typography]::SetNumeralAlignment($v, 'Tabular')
+    $l = New-Object Windows.Controls.TextBlock; $l.Text = $Label; $l.FontSize = 12; $l.Foreground = ConvertTo-Brush '#A1A1A6'; $l.Margin = '0,2,0,0'
+    [void]$sp.Children.Add($v); [void]$sp.Children.Add($l); $b.Child = $sp
+    $b
+}
+# a short note in a card, with an info icon
+function New-StatNote([string]$Text) {
+    [ZdTheme]::Parse("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='16,12' Margin='0,0,0,10'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+        "<TextBlock Text='&#xE946;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#0A84FF' Margin='0,1,10,0' VerticalAlignment='Top'/>" +
+        "<TextBlock Grid.Column='1' Text='$(Esc $Text)' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' LineHeight='18' LineStackingStrategy='BlockLineHeight'/></Grid></Border>")
+}
+# two charts side by side
+function New-StatChartGrid { $u = New-Object Windows.Controls.Primitives.UniformGrid; $u.Columns = 2; $u.Margin = '0,0,-12,0'; $u }
+function Add-StatChart($Grid, $Chart) { $Chart.Margin = '0,0,12,12'; [void]$Grid.Children.Add($Chart) }
+# a value with sensible decimals
+function Format-StatValue($v) { if ($null -eq $v) { '-' } elseif ([Math]::Abs($v) -ge 20) { '{0:0}' -f $v } elseif ([Math]::Abs($v) -ge 1) { '{0:0.#}' -f $v } else { '{0:0.##}' -f $v } }
+# the honest note for games whose match stats ZeroDelay cannot read
+function Get-GameStatsNote($g) { "$($g.Title) keeps match stats like these only inside the game and on its servers; ZeroDelay cannot read them without breaking the game's rules. See them in the game's career or stats screen." }
+# drawing work for "Your stats" runs one step per dispatcher turn (one chart each), so the window never stalls on it;
+# a newer drawing replaces the queue and the rest of the old one is dropped
+function Start-GameStatsSteps($Steps) {
+    $script:GameStatsSteps = New-Object Collections.Queue
+    foreach ($s in @($Steps)) { $script:GameStatsSteps.Enqueue($s) }
+    if ($script:GameStatsSteps.Count) { [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [action] { Invoke-GameStatsStep }) }
+}
+function Invoke-GameStatsStep {
+    $q = $script:GameStatsSteps; if (-not $q -or -not $q.Count) { return }
+    $st = $q.Dequeue()
+    try {
+        if ($st.Kind -eq 'chart') { Add-StatChart $st.Grid (New-TrendChart $st.Title $st.Series $st.Unit $st.Reps @() ([bool]$st.Lower)) }
+        elseif ($st.Kind -eq 'play' -and $script:GameSel -and $script:GameSel.Id -eq $st.G.Id) { Show-GameplayStats $st.G }
+    } catch { [Console]::Error.WriteLine("Your stats: $($_.Exception.Message)") }
+    if ($q.Count) { [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [action] { Invoke-GameStatsStep }) }
+}
+# a chart step for the queue
+function New-StatChartStep($Grid, [string]$Title, $Series, [string]$Unit, $Reps, [bool]$Lower) { @{ Kind = 'chart'; Grid = $Grid; Title = $Title; Series = $Series; Unit = $Unit; Reps = $Reps; Lower = $Lower } }
+# the numbers behind "Your stats" (runs in the worker): reports oldest first, the last 30 as chart series, and the
+# averages of the last 5 for the tiles. Plain loops: this runs for up to 60 reports.
+function Get-GameStatsData($Reps) {
+    $all = @($Reps | Where-Object { $_ } | Sort-Object { [datetime]$_.Start })
+    $d = @{ Count = $all.Count; Minutes = 0.0; Since = $null; Reports = @(); FpsA = @(); FpsL = @(); Spm = @(); Png = @(); Tmp = @(); Gpu = @(); Len = @(); Last = @{} }
+    if (-not $all.Count) { return $d }
+    foreach ($r in $all) { $m = ConvertTo-StatNumber $r.Minutes; if ($m) { $d.Minutes += $m } }
+    $d.Since = "$($all[0].Start)"
+    $chart = @($all | Select-Object -Last 30); $d.Reports = $chart
+    $fa = New-Object Collections.ArrayList; $fl = New-Object Collections.ArrayList; $sp = New-Object Collections.ArrayList; $pg = New-Object Collections.ArrayList
+    $tp = New-Object Collections.ArrayList; $gu = New-Object Collections.ArrayList; $ln = New-Object Collections.ArrayList
+    foreach ($r in $chart) {
+        $f = $r.Fps
+        [void]$fa.Add($(if ($f) { ConvertTo-StatNumber $f.Avg } else { $null })); [void]$fl.Add($(if ($f) { ConvertTo-StatNumber $f.Low1 } else { $null }))
+        $s = ConvertTo-StatNumber $r.StutterCount; $m = ConvertTo-StatNumber $r.Minutes
+        [void]$sp.Add($(if ($null -ne $s -and $m -gt 0) { [Math]::Round($s / $m, 2) } else { $null }))
+        [void]$pg.Add((ConvertTo-StatNumber $r.PingAvg)); [void]$tp.Add((ConvertTo-StatNumber $r.GpuMaxTemp)); [void]$gu.Add((ConvertTo-StatNumber $r.GpuUtilAvg)); [void]$ln.Add($m)
+    }
+    $d.FpsA = $fa.ToArray(); $d.FpsL = $fl.ToArray(); $d.Spm = $sp.ToArray(); $d.Png = $pg.ToArray(); $d.Tmp = $tp.ToArray(); $d.Gpu = $gu.ToArray(); $d.Len = $ln.ToArray()
+    $k = [Math]::Min(5, $chart.Count)
+    foreach ($n in 'FpsA', 'FpsL', 'Spm', 'Png', 'Tmp', 'Gpu') {
+        $sum = 0.0; $c = 0; $arr = $d[$n]
+        for ($i = $arr.Count - $k; $i -lt $arr.Count; $i++) { if ($null -ne $arr[$i]) { $sum += $arr[$i]; $c++ } }
+        $d.Last[$n] = if ($c) { $sum / $c } else { $null }
+    }
+    $d
+}
+# draws "Your stats": performance tiles now (numbers from Get-GameStatsData), then queued: the trend charts and the game's own match stats
+function Show-GameStats($g, $Data, [bool]$Loading) {
+    $h = $script:GamesUi; $p = $h.Stats; if (-not $p) { return }
+    $p.Children.Clear(); $script:GameStatsSteps = $null
+    $col = Get-TrendColors
+    $word = Get-SessionWord $g.Id
+    $head = New-Object Windows.Controls.TextBlock; $head.Text = 'Your stats'; $head.FontSize = 20; $head.FontWeight = 'SemiBold'
+    [void]$p.Children.Add($head)
+    $sub = New-Object Windows.Controls.TextBlock; $sub.FontSize = 12.5; $sub.Foreground = ConvertTo-Brush '#A1A1A6'; $sub.TextWrapping = 'Wrap'; $sub.Margin = '0,4,0,14'; $sub.MaxWidth = 760; $sub.HorizontalAlignment = 'Left'
+    [void]$p.Children.Add($sub)
+    if ($Loading) { $sub.Text = 'Reading your sessions...'; return }
+    $steps = New-Object Collections.ArrayList
+    $n = if ($Data) { [int]$Data.Count } else { 0 }
+    if (-not $n) {
+        $sub.Text = "No $(Get-SessionWord $g.Id 2) recorded yet. Play $($g.Title) with ZeroDelay open (the tray is enough): every session of 2 minutes or more is recorded, with FPS, stutters and how hot your graphics card ran." +
+            $(if (-not (Get-Setting 'matchreport' $true)) { ' Match reports are switched off in Settings.' } elseif (-not (Test-Path $PresentMonExe)) { ' For FPS and stutters, download PresentMon once on the Benchmark page.' } else { '' })
+    } else {
+        $mins = [double]$Data.Minutes
+        $played = if ($mins -ge 120) { '{0:0.#} hours' -f ($mins / 60) } else { "$([int]$mins) minutes" }
+        $sub.Text = "$n $(Get-SessionWord $g.Id $n) recorded since $(([datetime]$Data.Since).ToString('d MMM')), $played in all. The tiles are the average of your last $([Math]::Min(5, $n))." +
+            $(if ($n -lt 2) { ' The charts start after your second one.' } else { '' })
+        $tiles = New-Object Windows.Controls.WrapPanel; $tiles.Margin = '0,0,0,4'
+        foreach ($t in @(@('average FPS', 'FpsA', ''), @('1% low FPS', 'FpsL', ''), @('stutters per minute', 'Spm', ''), @('ping', 'Png', ' ms'), @('hottest GPU', 'Tmp', ' °C'), @('GPU load', 'Gpu', '%'))) {
+            $v = $Data.Last[$t[1]]; if ($null -ne $v) { [void]$tiles.Children.Add((New-StatTile "$(Format-StatValue $v)$($t[2])" $t[0])) }
+        }
+        [void]$tiles.Children.Add((New-StatTile "$n" "$(Get-SessionWord $g.Id $n) recorded"))
+        [void]$p.Children.Add($tiles)
+        $chart = @($Data.Reports)
+        if ($chart.Count -ge 2) {
+            $grid = New-StatChartGrid; [void]$p.Children.Add($grid)
+            $has = { param($arr) foreach ($x in $arr) { if ($null -ne $x) { return $true } }; $false }
+            if (& $has $Data.FpsA) { [void]$steps.Add((New-StatChartStep $grid 'FPS' @(@{ Name = 'Average'; Values = $Data.FpsA; Color = $col.S1 }, @{ Name = '1% low'; Values = $Data.FpsL; Color = $col.S2 }) 'FPS' $chart $false)) }
+            if (& $has $Data.Spm) { [void]$steps.Add((New-StatChartStep $grid 'Stutters per minute' @(@{ Name = 'Stutters per minute'; Values = $Data.Spm; Color = $col.S1 }) '' $chart $true)) }
+            if (& $has $Data.Png) { [void]$steps.Add((New-StatChartStep $grid $(if ($g.Id -eq 'fortnite') { 'Ping to Epic''s servers' } else { 'Ping' }) @(@{ Name = 'Ping'; Values = $Data.Png; Color = $col.S1 }) 'ms' $chart $true)) }
+            if (& $has $Data.Tmp) { [void]$steps.Add((New-StatChartStep $grid 'Hottest GPU temperature' @(@{ Name = 'GPU temperature'; Values = $Data.Tmp; Color = $col.S1 }) '°C' $chart $true)) }
+            if (& $has $Data.Gpu) { [void]$steps.Add((New-StatChartStep $grid 'GPU load (average)' @(@{ Name = 'GPU load'; Values = $Data.Gpu; Color = $col.S1 }) '%' $chart $false)) }
+            if (& $has $Data.Len) { [void]$steps.Add((New-StatChartStep $grid "$((Get-Culture).TextInfo.ToTitleCase($word)) length" @(@{ Name = 'Length'; Values = $Data.Len; Color = $col.S1 }) 'min' $chart $false)) }
+        }
+    }
+    [void]$steps.Add(@{ Kind = 'play'; G = $g })
+    Start-GameStatsSteps $steps
+}# the game's own match stats under the performance part (a queued step: its charts are queued after it)
+function Show-GameplayStats($g) {
+    $p = $script:GamesUi.Stats; $col = Get-TrendColors
+    $Play = Get-GameStatsPlay $g
+    $rows = if ($Play) { @($Play.Rows | Where-Object { $_ }) } else { @() }
+    $gh = New-Object Windows.Controls.TextBlock; $gh.FontSize = 15; $gh.FontWeight = 'SemiBold'; $gh.Margin = '0,10,0,10'
+    $gh.Text = if ($Play -and $Play.Title) { "$($Play.Title)" } else { 'Your matches' }
+    [void]$p.Children.Add($gh)
+    if (-not $Play) { [void]$p.Children.Add((New-StatNote (Get-GameStatsNote $g))); return }
+    $sum = @($Play.Summary | Where-Object { $_ })
+    if ($sum.Count) {
+        $st = New-Object Windows.Controls.WrapPanel; $st.Margin = '0,0,0,4'
+        foreach ($s in $sum) { [void]$st.Children.Add((New-StatTile "$($s.Value)" "$($s.Label)")) }
+        [void]$p.Children.Add($st)
+    }
+    if ($rows.Count -ge 2) {
+        $old = @($rows | Select-Object -First 30); [array]::Reverse($old)     # rows come newest first
+        $when = @($old | ForEach-Object { [pscustomobject]@{ Start = $_.Time } })
+        $grid = New-StatChartGrid; [void]$p.Children.Add($grid)
+        foreach ($c in @($Play.Charts | Where-Object { $_ -and $_.Field })) {
+            $vals = @($old | ForEach-Object { ConvertTo-StatNumber $_.($c.Field) })
+            if (-not @($vals | Where-Object { $null -ne $_ }).Count) { continue }
+            $script:GameStatsSteps.Enqueue((New-StatChartStep $grid "$($c.Name)" @(@{ Name = "$($c.Name)"; Values = $vals; Color = $col.S1 }) "$($c.Unit)" $when ([bool]$c.LowerBetter)))
+        }
+    }
+    if ($Play.Note) { [void]$p.Children.Add((New-StatNote "$($Play.Note)")) }
+    elseif (-not $rows.Count -and -not $sum.Count) { [void]$p.Children.Add((New-StatNote (Get-GameStatsNote $g))) }
+}
 # the game's own logo from its installed .exe (256 px), or $null when the game is not installed
 function Get-GameLogo($g) {
     if (-not $script:GameLogos) { $script:GameLogos = @{} }
@@ -16060,7 +20009,7 @@ function New-GameTile($g) {
   <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,1'><GradientStop Color='$($g.From)' Offset='0'/><GradientStop Color='$($g.To)' Offset='1'/></LinearGradientBrush></Border.Background>
   <Grid ClipToBounds='True'>
     <TextBlock x:Name='Glyph' Text='$('&#x{0:X};' -f [int]$g.Glyph)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='170' Foreground='#26FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-6,-44,0'/>
-    <TextBlock x:Name='Big' Text='$(Esc $g.Title.ToUpper())' FontSize='29' FontWeight='Black' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
+    <TextBlock x:Name='Big' Text='$(Esc $g.Title.ToUpper())' FontSize='$([Math]::Min(29, [Math]::Floor(184 / (0.82 * [Math]::Max(1, ($g.Title -split '[\s-]' | Measure-Object Length -Maximum).Maximum)))))' FontWeight='Black' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
     <Border x:Name='Logo' Width='124' Height='124' CornerRadius='28' HorizontalAlignment='Center' VerticalAlignment='Top' Margin='0,52,0,0' Visibility='Collapsed'>
       <Border.Effect><DropShadowEffect BlurRadius='28' ShadowDepth='6' Direction='270' Opacity='0.45' Color='Black'/></Border.Effect>
     </Border>
@@ -16077,6 +20026,8 @@ function New-GameTile($g) {
 </Border>
 "@)
     $ok = try { [bool](& $g.Installed) } catch { $false }
+    $g.InstalledNow = $ok
+    if (-not $ok) { $b.Opacity = 0.82 }
     $logo = Get-GameLogo $g
     if ($logo) {
         $lb = $b.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
@@ -16099,6 +20050,9 @@ function New-GamesPage {
   <StackPanel x:Name='Library'>
     <TextBlock Text='Pick a game to see its server, your live route and the tools for it. ZeroDelay adds games when it can optimize them for real, not just list them.' FontSize='13' Foreground='#A1A1A6' TextWrapping='Wrap' MaxWidth='760' HorizontalAlignment='Left' Margin='0,0,0,18'/>
     <WrapPanel x:Name='Tiles'/>
+    <TextBlock x:Name='MoreHead' Text='Also supported' FontSize='15' FontWeight='SemiBold' Margin='0,10,0,2' Visibility='Collapsed'/>
+    <TextBlock x:Name='MoreSub' Text='Not installed on this PC. Install one and ZeroDelay finds it by itself, with its logo and its settings.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,0,0,14' Visibility='Collapsed'/>
+    <WrapPanel x:Name='MoreTiles'/>
   </StackPanel>
   <Grid x:Name='Detail' Visibility='Collapsed'>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='320'/></Grid.ColumnDefinitions>
@@ -16123,7 +20077,7 @@ function New-GamesPage {
           </StackPanel>
         </Grid>
       </Border>
-      <Border Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
+      <Border x:Name='ServerCard' Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
           <StackPanel>
@@ -16171,6 +20125,7 @@ function New-GamesPage {
         </Button>
         <TextBlock x:Name='PlayNote' Grid.Column='1' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' VerticalAlignment='Center' Margin='18,0,0,0'/>
       </Grid>
+      <StackPanel x:Name='Stats' Margin='0,30,0,0'/>
     </StackPanel>
     <Border Grid.Column='1' Style='{DynamicResource Card}' Padding='18,16' VerticalAlignment='Top'>
       <StackPanel>
@@ -16183,10 +20138,14 @@ function New-GamesPage {
 </Grid>
 "@)
     $h = @{ Root = $root }
-    foreach ($n in 'Library', 'Tiles', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroLogo', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
-                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList') { $h[$n] = $root.FindName($n) }
+    foreach ($n in 'Library', 'Tiles', 'MoreHead', 'MoreSub', 'MoreTiles', 'ServerCard', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroLogo', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
+                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats') { $h[$n] = $root.FindName($n) }
     $script:GamesUi = $h
-    foreach ($g in $GameDefs) { [void]$h.Tiles.Children.Add((New-GameTile $g)) }
+    foreach ($g in $GameDefs) {
+        $tile = New-GameTile $g
+        if ($tile.Tag.InstalledNow) { [void]$h.Tiles.Children.Add($tile) } else { [void]$h.MoreTiles.Children.Add($tile) }
+    }
+    if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
         $n = [ZdTheme]::Parse(@"
@@ -16216,11 +20175,6 @@ function New-GamesPage {
         Update-GameModeUi; Update-GameDetail
     })
     # tool filter chips
-    foreach ($k in 'All', 'Network', 'FPS', 'Repair') {
-        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$k' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
-        $c.Tag = $k; $c.Add_Click({ param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools })
-        [void]$h.ToolChips.Children.Add($c)
-    }
     $script:GameToolKind = 'All'
     if (-not $script:GamesTimer) {
         $script:GamesTimer = New-Object Windows.Threading.DispatcherTimer
@@ -16228,7 +20182,7 @@ function New-GamesPage {
         $script:GamesTimer.Add_Tick({ try { Update-GameDetailTick } catch { $script:GamesTimer.Stop(); Stop-RouteMonitor; Write-CrashLog $_.Exception 'game page' } })
         $script:GamesTimer.Start()
     }
-    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail } }
+    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail; Update-GameStats } }
     if ($env:ZD_GAME) { $g0 = $GameDefs | Where-Object { $_.Id -eq $env:ZD_GAME } | Select-Object -First 1; if ($g0) { Show-GameDetail $g0 } }
     New-PageScroll $root
 }
@@ -16266,11 +20220,13 @@ function Show-GameDetail($g) {
         }
         $h.ServerBtn.IsEnabled = $true
     } else { $h.ServerBtn.IsEnabled = $false }
+    $h.ServerCard.Visibility = if ($servers.Count) { 'Visible' } else { 'Collapsed' }
     $saved = $script:Backup.Custom["gameserver_$($g.Id)"]
     $pick = if ($saved) { $servers | Where-Object { $_.Name -eq $saved } | Select-Object -First 1 } else { $null }
     Select-GameServer $pick
     Update-GameTools
     Update-GameDetail
+    Update-GameStats
     if ($script:Anim) { Show-Animated $h.Detail 12 260 }
 }
 function Hide-GameDetail {
@@ -16299,7 +20255,14 @@ function Update-GameDetail {
     $gm = Test-ZDGameMode
     $h.GmChipText.Text = if ($gm) { 'Game Mode on' } else { 'Game Mode off' }
     $h.GmChip.Background = ConvertTo-Brush $(if ($gm) { '#5530D158' } else { '#33FDFDFD' })
-    $p = Get-Process $g.Proc -ErrorAction SilentlyContinue | Select-Object -First 1
+    $inst = try { [bool](& $g.Installed) } catch { $false }
+    $h.Play.IsEnabled = $inst; $h.Play.Opacity = $(if ($inst) { 1 } else { 0.45 })
+    $p = if ($inst) { Get-Process $g.Proc -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+    if (-not $inst) {
+        $h.RunText.Text = 'Not installed'; $h.PlayText.Text = 'Not installed'
+        $h.PlayNote.Text = "Install $($g.Title) from $($g.Sub); ZeroDelay finds it by itself, with its logo and settings."
+        return
+    }
     if ($p) {
         $span = try { (Get-Date) - $p.StartTime } catch { $null }
         $h.RunText.Text = if ($span) { 'Running · {0:00}:{1:00}:{2:00}' -f [int][Math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds } else { 'Running' }
@@ -16308,7 +20271,7 @@ function Update-GameDetail {
         $h.RunText.Text = 'Not running'
         $h.PlayText.Text = 'Start Game'
     }
-    $h.PlayNote.Text = if ($g.Id -eq 'fortnite') { 'Turns Game Mode on (background apps closed, match power settings) and launches Fortnite through the Epic Games Launcher.' } else { "Launches $($g.Title). Game Mode is built for Fortnite; the tweaks on the CS2 tab apply to this game." }
+    $h.PlayNote.Text = if ($g.Id -eq 'fortnite') { 'Turns Game Mode on (background apps closed, match power settings) and launches Fortnite through the Epic Games Launcher.' } else { "Launches $($g.Title). For background apps closed while you play, switch Game Mode on in the sidebar first." }
 }
 # once a second while a game page is on screen: keeps the route monitor running and shows its numbers
 function Update-GameDetailTick {
@@ -16325,12 +20288,13 @@ function Update-GameDetailTick {
     $h.Nodes[1].Children[2].Text = if ($s.Gw) { & $fmt $s.GwMs } else { 'finding...' }
     $h.Nodes[2].Children[2].Text = if ([int]$s.Rounds -ge 3 -and (-not $s.Isp -or [int]$s.IspMs -lt 0)) { 'hidden' } elseif ($s.Isp) { & $fmt $s.IspMs } else { 'finding...' }
     if (-not $script:GameServer) { $h.Nodes[3].Children[1].Text = if ($s.AutoName) { "$($s.AutoName) (auto)" } else { 'Game server' } }
-    $h.Nodes[3].Children[2].Text = if ($s.Target) { & $fmt $s.SrvMs } elseif ($script:GameServers.Count) { 'measuring...' } else { 'see tools' }
+    $h.Nodes[3].Children[2].Text = if ($s.Target) { & $fmt $s.SrvMs } elseif ($script:GameServers.Count) { 'measuring...' } else { 'not visible' }
     $h.PingVal.Text = if ([int]$s.SrvMs -ge 0 -and $s.Target) { "$($s.SrvMs)" } else { '-' }
     $h.LossVal.Text = if ([int]$s.Sent -ge 5) { '{0:0.#}' -f (100.0 * [int]$s.Lost / [int]$s.Sent) } else { '-' }
     $h.JitVal.Text = if ([double]$s.Jitter -ge 0) { '{0:0.#}' -f [double]$s.Jitter } else { '-' }
     $prov = if ($script:GameServer) { $script:GameServer.Prov } else { $s.AutoProv }
-    $h.RouteNote.Text = if ($s.Target -and [int]$s.Sent -ge 5 -and [int]$s.Lost -eq [int]$s.Sent -and $prov -match 'Google') { 'This server is on Google Cloud, which does not answer ping. Your matches still run normally; pick an Amazon (AWS) server to watch a live number, or use Where your matches ran in the tools.' }
+    $h.RouteNote.Text = if (-not $script:GameServers.Count) { "ZeroDelay cannot see $($g.Title)'s servers, so this is your side of the route: PC, router and provider. For the server part, use the game's own network statistics." }
+        elseif ($s.Target -and [int]$s.Sent -ge 5 -and [int]$s.Lost -eq [int]$s.Sent -and $prov -match 'Google') { 'This server is on Google Cloud, which does not answer ping. Your matches still run normally; pick an Amazon (AWS) server to watch a live number, or use Where your matches ran in the tools.' }
         elseif ([int]$s.GwMs -gt 5) { 'Your router answers slowly (over 5 ms). On a cable that points to a busy or weak router; on Wi-Fi it is normal. The Network tab has a router test.' }
         elseif ($s.Isp -and [int]$s.IspMs -ge 0 -and [int]$s.SrvMs -ge 0 -and ([int]$s.SrvMs - [int]$s.IspMs) -gt 60) { 'Most of the delay is after your provider: the distance to the server. A closer server helps more than any setting.' }
         elseif ([int]$s.Rounds -ge 3 -and (-not $s.Isp -or [int]$s.IspMs -lt 0)) { 'Your provider''s routers do not answer ping (many providers hide them), so only your router and the game server are measured. Each is pinged once a second while this page is open.' }
@@ -16338,31 +20302,61 @@ function Update-GameDetailTick {
 }
 function Update-GameTools {
     $g = $script:GameSel; $h = $script:GamesUi; if (-not $g) { return }
+    $inst = try { [bool](& $g.Installed) } catch { $false }
+    # the game's own switches (its tweak area) come first, then the listed checks and tools
+    $gcat = if ($g.Cat) { $g.Cat } else { @{ fortnite = 'Fortnite'; cs2 = 'CS2' }[$g.Id] }
+    $listed = @($g.Tools | ForEach-Object { $_.Id })
+    $auto = @($Tweaks | Where-Object { $gcat -and $_.Cat -eq $gcat -and $_.Toggle -and $listed -notcontains $_.Id } | ForEach-Object { @{ Id = $_.Id; Kind = 'Settings' } })
+    $all = @(@($g.Tools | Where-Object { $_.Kind -eq 'Settings' }) + $auto + @($g.Tools | Where-Object { $_.Kind -ne 'Settings' }))
+    $kinds = @('All') + @($all | ForEach-Object { $_.Kind } | Select-Object -Unique | Sort-Object { @('Settings', 'Network', 'FPS', 'Repair').IndexOf($_) })
+    if ($kinds -notcontains $script:GameToolKind) { $script:GameToolKind = 'All' }
+    $h.ToolChips.Children.Clear()
+    foreach ($k in $kinds) {
+        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$k' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
+        $c.Tag = $k; $c.Add_Click({ param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools })
+        $c.Background = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#FDFDFD' } else { '#F5F5F7' })
+        [void]$h.ToolChips.Children.Add($c)
+    }
     $h.ToolList.Children.Clear()
-    foreach ($c in $h.ToolChips.Children) { $c.Background = ConvertTo-Brush $(if ($c.Tag -eq $script:GameToolKind) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($c.Tag -eq $script:GameToolKind) { '#FDFDFD' } else { '#F5F5F7' }) }
-    foreach ($tool in $g.Tools) {
+    if (-not $inst) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 12; $tb.Margin = '0,0,0,10'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'
+        $tb.Text = "$($g.Title) is not installed on this PC. This is what ZeroDelay offers for it once it is:"
+        [void]$h.ToolList.Children.Add($tb)
+    }
+    foreach ($tool in $all) {
         if ($script:GameToolKind -ne 'All' -and $tool.Kind -ne $script:GameToolKind) { continue }
         $t = $Tweaks | Where-Object { $_.Id -eq $tool.Id } | Select-Object -First 1
-        if (-not $t -or $t.Hidden) { continue }
+        if (-not $t -or ($inst -and $t.Hidden)) { continue }
         $desc = "$($t.Desc)"; if ($desc.Length -gt 90) { $desc = $desc.Substring(0, 87).TrimEnd() + '...' }
+        $isSwitch = [bool]$t.Toggle
+        $right = if ($isSwitch) { "<ToggleButton x:Name='Sw' Grid.Column='2' Style='{DynamicResource Switch}' VerticalAlignment='Center' Margin='6,0,0,0'/>" } else { "<TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#98989D' VerticalAlignment='Center'/>" }
+        $tag = if ($isSwitch) { 'Border' } else { 'Button' }
         $row = [ZdTheme]::Parse(@"
-<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Background='Transparent' HorizontalContentAlignment='Stretch' Padding='8,8' Margin='0,0,0,2'>
+<$tag xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' $(if ($isSwitch) { "Background='Transparent' Padding='8,8' CornerRadius='10'" } else { "Style='{DynamicResource Btn}' Background='Transparent' HorizontalContentAlignment='Stretch' Padding='8,8'" }) Margin='0,0,0,2'>
   <Grid>
     <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
     <Border Width='32' Height='32' CornerRadius='9' Background='#2C2C2E' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$t.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
     <StackPanel Grid.Column='1' Margin='10,0,6,0'>
-      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>
+      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>
       <TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/>
     </StackPanel>
-    <TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#98989D' VerticalAlignment='Center'/>
+    $right
   </Grid>
-</Button>
+</$tag>
 "@)
-        $row.Tag = $t
-        $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
+        if ($isSwitch) {
+            $sw = $row.FindName('Sw'); $sw.Tag = $t
+            $sw.IsChecked = [bool]$t.State; $sw.IsEnabled = $inst -and $null -ne $t.State
+            $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools })
+        } else {
+            $row.Tag = $t
+            $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
+            $row.IsEnabled = $inst
+        }
+        if (-not $inst) { $row.Opacity = 0.55 }
         [void]$h.ToolList.Children.Add($row)
     }
-    if (-not $h.ToolList.Children.Count) { $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'No tools of this kind for this game yet.'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'; $tb.FontSize = 12; [void]$h.ToolList.Children.Add($tb) }
+    if ($h.ToolList.Children.Count -eq [int](-not $inst)) { $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Nothing of this kind for this game yet.'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'; $tb.FontSize = 12; [void]$h.ToolList.Children.Add($tb) }
 }
 
 # --- Boost page: how much of the recommended setup is on, the parts of the PC it covers, Boost now and Restore
@@ -16602,7 +20596,7 @@ function Update-HomePage {
         $h.Warm.Visibility = 'Visible'
     } else { $h.Warm.Visibility = 'Collapsed' }
     # last matches (up to 5)
-    $reps = @(Get-MatchReports | Select-Object -First 5)
+    $reps = @(Get-GameReports 'fortnite' | Select-Object -First 5)
     $num = { param($v) if ($null -eq $v) { $null } else { [double]$v } }
     $avg = { param($vals) $v = @($vals | Where-Object { $null -ne $_ }); if ($v.Count) { ($v | Measure-Object -Average).Average } else { $null } }
     $ping = & $avg @($reps | ForEach-Object { & $num $_.PingAvg })
@@ -16648,7 +20642,7 @@ function Update-HomePage {
 # =============================================================== Navigation (1.17): six places in the menu
 # Home, Games, Tweaks, Checks, Tools and Settings. Every other page opens from inside those, and every tweak area is a
 # filter chip on the Tweaks page, so nothing is lost: Select-NavPage still takes any page or area name.
-$MainNav = @('Home', 'Games', 'Tweaks', 'Checks', 'Tools', 'Settings')
+$MainNav = @('Home', 'Games', 'Events', 'Tweaks', 'Checks', 'Tools', 'Settings')
 $CheckActions = @('Check', 'Test', 'Run test', 'Test ping')
 # a card that only looks and reports (it changes nothing): these live on the Checks page
 function Test-CheckCard($t) { [bool]($t.Action -and $CheckActions -contains $t.Action) }
@@ -16777,7 +20771,6 @@ $ToolInfo = [ordered]@{
     'Matches'  = 'A report after every match: FPS, stutters, ping, and what got in the way.'
     'Trends'   = 'How your matches change over days, and after each change you make.'
     'Benchmark' = 'Measure FPS and frame times before and after a change.'
-    'Events'   = 'Epic''s competitive schedule for the region you play.'
     'Active'   = 'Everything ZeroDelay has switched on, when, and a switch to undo each one.'
     'ThisPC'   = 'Your hardware, drivers and Windows, and how ZeroDelay adapted to them.'
     'Nvidia'   = 'G-SYNC, V-Sync, Reflex and frame-cap check with one-click presets.'
@@ -17313,6 +21306,637 @@ $CompTips = @(
     , @(0xE714, '#FF6482', 'Watch your deaths', 'Fortnite saves your replays (Career > Replays). Watch the last 30 seconds of a bad game at quarter speed; the mistake is usually there.')
     , @(0xE787, '#8E8E93', 'Rest between sessions', 'Stand up, drink water and rest your eyes between rounds. Tired hands and eyes cost more than any setting.')
 )
+# =============================================================== Tournament sources (1.18): official pages, Liquipedia, your own calendars
+# --- Tournament schedules (1.18): official links per game + key-free ICS calendar fetcher
+# Research result (r14-tour-notes.md): no publisher offers a key-free, documented schedule feed (JSON/ICS/RSS) today.
+# lolesports/valorantesports (x-api-key), start.gg (token), PUBG API (key), Leaguepedia Cargo (anonymous calls are rate-limited
+# at once) are all closed to key-free use, and the official sites are HTML-only. So this file ships:
+#  1. $script:TourSources: the official schedule page per game (opened in the browser, never fetched), the Liquipedia wiki
+#     for the r13 fetcher (or $null when Liquipedia has no wiki), and an Ics slot for a vetted official calendar (none yet).
+#  2. Start-TourIcsFetch: reads any ICS calendar the user adds for a game (organisers and teams publish these), with the
+#     same result contract as the Liquipedia fetcher. Calendar files are made for machine reading, so this is within terms.
+$script:TourMaxAgeH = 6              # disk cache lifetime, hours
+$script:TourIcsMaxBytes = 2097152    # 2 MB: refuse anything bigger
+$script:TourIcsMaxRows = 300
+$script:TourSources = [ordered]@{
+    'fortnite'     = @{ Name = 'Fortnite'; Official = 'https://www.fortnite.com/competitive'; Liquipedia = 'fortnite'; Ics = $null; Verdict = 'Liquipedia (FNCS); Epic''s events API needs an account token.' }
+    'cs2'          = @{ Name = 'Counter-Strike 2'; Official = 'https://www.counter-strike.net/'; Liquipedia = 'counterstrike'; Ics = $null; Verdict = 'Liquipedia. Valve publishes no schedule feed.' }
+    'valorant'     = @{ Name = 'VALORANT'; Official = 'https://valorantesports.com/'; Liquipedia = 'valorant'; Ics = $null; Verdict = 'Liquipedia. The VCT site API needs an x-api-key (403 without).' }
+    'lol'          = @{ Name = 'League of Legends'; Official = 'https://lolesports.com/'; Liquipedia = 'leagueoflegends'; Ics = $null; Verdict = 'Liquipedia. lolesports API needs an x-api-key; Leaguepedia Cargo rate-limits anonymous calls.' }
+    'overwatch'    = @{ Name = 'Overwatch 2'; Official = 'https://esports.overwatch.com/en-us/schedule'; Liquipedia = 'overwatch'; Ics = $null; Verdict = 'Liquipedia. The OWCS site is HTML only.' }
+    'r6siege'      = @{ Name = 'Rainbow Six Siege X'; Official = 'https://www.ubisoft.com/en-us/esports/rainbow-six/siege/calendar'; Liquipedia = 'rainbowsix'; Ics = $null; Verdict = 'Liquipedia. Ubisoft''s calendar is HTML only.' }
+    'marvelrivals' = @{ Name = 'Marvel Rivals'; Official = 'https://www.marvelrivals.com/news/'; Liquipedia = 'marvelrivals'; Ics = $null; Verdict = 'Liquipedia (Ignite, MRC). NetEase posts schedules as news only.' }
+    'rocketleague' = @{ Name = 'Rocket League'; Official = 'https://www.rocketleague.com/en/esports'; Liquipedia = 'rocketleague'; Ics = $null; Verdict = 'Liquipedia. start.gg needs a token.' }
+    'apex'         = @{ Name = 'Apex Legends'; Official = 'https://www.ea.com/games/apex-legends/compete'; Liquipedia = 'apexlegends'; Ics = $null; Verdict = 'Liquipedia (ALGS). EA has no feed.' }
+    'cod'          = @{ Name = 'Call of Duty'; Official = 'https://www.callofdutyleague.com/en-us/schedule'; Liquipedia = 'callofduty'; Ics = $null; Verdict = 'Liquipedia (CDL). The CDL site is HTML only.' }
+    'pubg'         = @{ Name = 'PUBG: Battlegrounds'; Official = 'https://pubgesports.com/en'; Liquipedia = 'pubg'; Ics = $null; Verdict = 'Liquipedia (PNC, PGS). The PUBG API needs a key (401 without).' }
+    'dota2'        = @{ Name = 'Dota 2'; Official = 'https://www.dota2.com/esports'; Liquipedia = 'dota2'; Ics = $null; Verdict = 'Liquipedia. Steam Web API league calls need a key.' }
+    'deadlock'     = @{ Name = 'Deadlock'; Official = $null; Liquipedia = 'deadlock'; Ics = $null; Verdict = 'Liquipedia only: no official competitive programme.' }
+    'thefinals'    = @{ Name = 'THE FINALS'; Official = 'https://www.reachthefinals.com/'; Liquipedia = 'thefinals'; Ics = $null; Verdict = 'Liquipedia. Embark announces events as news only.' }
+    'efootball'    = @{ Name = 'eFootball'; Official = 'https://www.konami.com/efootball/en/'; Liquipedia = $null; Ics = $null; Verdict = 'No feed and no Liquipedia wiki. Konami posts the eFootball Championship as news.' }
+    'nba2k27'      = @{ Name = 'NBA 2K27'; Official = 'https://www.nba.com/news/category/nba-2k-league'; Liquipedia = $null; Ics = $null; Verdict = 'No feed. NBA 2K League news on NBA.com; in-game Play NBA 2K tournaments are not public.' }
+    'rematch'      = @{ Name = 'Rematch'; Official = 'https://www.playrematch.com/'; Liquipedia = $null; Ics = $null; Verdict = 'No feed. Sloclap runs in-game events (for example the Nations Cup) announced as news.' }
+    'undisputed'   = @{ Name = 'Undisputed'; Official = $null; Liquipedia = $null; Ics = $null; Verdict = 'No organised competitive scene found.' }
+    'wwm'          = @{ Name = 'Where Winds Meet'; Official = $null; Liquipedia = $null; Ics = $null; Verdict = 'No organised competitive scene found.' }
+    'bf6'          = @{ Name = 'Battlefield 6'; Official = $null; Liquipedia = $null; Ics = $null; Verdict = 'No official league found; community cups only.' }
+}
+# the few IANA zone names ICS files use most, mapped to Windows zone ids (.NET Framework knows only Windows ids)
+$script:TourTzMap = @{
+    'UTC' = 'UTC'; 'Etc/UTC' = 'UTC'; 'GMT' = 'UTC'; 'Europe/London' = 'GMT Standard Time'; 'Europe/Dublin' = 'GMT Standard Time'
+    'Europe/Berlin' = 'W. Europe Standard Time'; 'Europe/Paris' = 'Romance Standard Time'; 'Europe/Madrid' = 'Romance Standard Time'
+    'Europe/Amsterdam' = 'W. Europe Standard Time'; 'Europe/Stockholm' = 'W. Europe Standard Time'; 'Europe/Warsaw' = 'Central European Standard Time'
+    'Europe/Bucharest' = 'GTB Standard Time'; 'Europe/Kyiv' = 'FLE Standard Time'; 'Europe/Istanbul' = 'Turkey Standard Time'; 'Europe/Moscow' = 'Russian Standard Time'
+    'America/New_York' = 'Eastern Standard Time'; 'America/Toronto' = 'Eastern Standard Time'; 'America/Chicago' = 'Central Standard Time'
+    'America/Denver' = 'Mountain Standard Time'; 'America/Los_Angeles' = 'Pacific Standard Time'; 'America/Sao_Paulo' = 'E. South America Standard Time'
+    'America/Mexico_City' = 'Central Standard Time (Mexico)'; 'Asia/Riyadh' = 'Arab Standard Time'; 'Asia/Dubai' = 'Arabian Standard Time'
+    'Asia/Shanghai' = 'China Standard Time'; 'Asia/Seoul' = 'Korea Standard Time'; 'Asia/Tokyo' = 'Tokyo Standard Time'
+    'Asia/Singapore' = 'Singapore Standard Time'; 'Asia/Bangkok' = 'SE Asia Standard Time'; 'Australia/Sydney' = 'AUS Eastern Standard Time'
+}
+
+# the source entry for an app game id ($null when unknown)
+function Get-TourSource([string]$Game) { if ($Game -and $script:TourSources.Contains($Game)) { $script:TourSources[$Game] } else { $null } }
+# normalises a calendar address the user typed: webcal:// becomes https://; only public https addresses pass; $null = refused
+function Test-TourIcsUrl([string]$Url) {
+    $u = "$Url".Trim()
+    if ($u -match '^webcals?://') { $u = $u -replace '^webcals?://', 'https://' }
+    $uri = $null
+    if (-not [Uri]::TryCreate($u, [UriKind]::Absolute, [ref]$uri)) { return $null }
+    if ($uri.Scheme -ne 'https' -or $uri.UserInfo) { return $null }
+    $h = $uri.Host.ToLowerInvariant()
+    if ($h -eq 'localhost' -or $h -notmatch '\.' -or $h -match '\.(local|lan|internal|home|localhost)$') { return $null }
+    $ip = $null
+    if ([Net.IPAddress]::TryParse($h.Trim('[', ']'), [ref]$ip)) {
+        $b = $ip.GetAddressBytes()
+        if ($ip.AddressFamily -eq 'InterNetworkV6' -or $b[0] -in 0, 10, 127 -or ($b[0] -eq 169 -and $b[1] -eq 254) -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127)) { return $null }
+    }
+    $uri.AbsoluteUri
+}
+# the ICS address used for a game: the user's own calendar first, then a vetted official one; $null when neither
+function Get-TourIcsUrl([string]$Game) {
+    $own = "$($script:Backup.Custom["tour-ics-$Game"])"
+    if ($own) { return $own }
+    $s = Get-TourSource $Game
+    if ($s) { $s.Ics } else { $null }
+}
+# saves (or with an empty $Url removes) the user's calendar address for a game; throws on an address it refuses
+function Set-TourIcsUrl([string]$Game, [string]$Url) {
+    if (-not "$Url".Trim()) { [void]$script:Backup.Custom.Remove("tour-ics-$Game") }
+    else {
+        $n = Test-TourIcsUrl $Url
+        if (-not $n) { throw 'Use a public https:// (or webcal://) calendar address.' }
+        $script:Backup.Custom["tour-ics-$Game"] = $n
+    }
+    Save-Backup
+    $f = Get-TourCacheFile $Game 'ics'
+    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+}
+# where a game's fetched schedule is cached ($DataDir\tour-cache\<kind>-<game>.json)
+function Get-TourCacheFile([string]$Game, [string]$Kind = 'ics') { Join-Path (Join-Path $DataDir 'tour-cache') ("$Kind-" + ($Game -replace '[^a-z0-9_-]', '_') + '.json') }
+# Upcoming / Ongoing / Finished for a row (End $null = one-day event)
+function Get-TourStatus($Start, $End, [datetime]$Now = (Get-Date)) {
+    if ($null -eq $Start) { return 'Unknown' }
+    $e = if ($null -ne $End) { $End } else { $Start.Date.AddDays(1) }
+    if ($Now -lt $Start) { 'Upcoming' } elseif ($Now -lt $e) { 'Ongoing' } else { 'Finished' }
+}
+# Parses ICS text (RFC 5545) into schedule rows. Runs on the main thread and, rebuilt from its text, in the worker,
+# so it uses nothing outside itself. Keeps events that end within the last $KeepDays days up to a year ahead.
+# RRULE repeats are not expanded (only the first occurrence is listed); TZID uses Windows ids or a short IANA table.
+function ConvertFrom-TourIcs([string]$Text, [datetime]$Now = (Get-Date), [int]$KeepDays = 30, [hashtable]$TzMap = @{}, [int]$MaxRows = 300) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $unesc = { param($v) ($v -replace '\\[nN]', "`n" -replace '\\([,;\\])', '$1').Trim() }
+    $toDate = {
+        param($v, $prm)
+        $v = "$v".Trim(); $d = [datetime]::MinValue
+        if ($v -match '^\d{8}$') {
+            if ([datetime]::TryParseExact($v, 'yyyyMMdd', $inv, 'None', [ref]$d)) { return @{ T = $d; AllDay = $true } }
+            return $null
+        }
+        if ($v -notmatch '^(\d{8}T\d{6})(Z?)$') { return $null }
+        if (-not [datetime]::TryParseExact($Matches[1], "yyyyMMdd'T'HHmmss", $inv, 'None', [ref]$d)) { return $null }
+        if ($Matches[2] -eq 'Z') { return @{ T = [datetime]::SpecifyKind($d, 'Utc').ToLocalTime(); AllDay = $false } }
+        $tzid = "$($prm['TZID'])".Trim('"')
+        if ($tzid) {
+            $id = if ($TzMap.ContainsKey($tzid)) { $TzMap[$tzid] } else { $tzid }
+            try { $tz = [TimeZoneInfo]::FindSystemTimeZoneById($id); return @{ T = [TimeZoneInfo]::ConvertTime([datetime]::SpecifyKind($d, 'Unspecified'), $tz, [TimeZoneInfo]::Local); AllDay = $false } } catch { }
+        }
+        @{ T = [datetime]::SpecifyKind($d, 'Local'); AllDay = $false }   # floating time, or a zone Windows does not know
+    }
+    $unfolded = ($Text -replace "`r`n", "`n" -replace "`r", "`n") -replace "`n[ `t]", ''
+    $rows = New-Object Collections.Generic.List[object]
+    $ev = $null
+    foreach ($line in $unfolded -split "`n") {
+        if ($line -eq 'BEGIN:VEVENT') { $ev = @{}; continue }
+        if ($line -eq 'END:VEVENT') {
+            if ($ev -and $ev['DTSTART']) {
+                $s = & $toDate $ev['DTSTART'].V $ev['DTSTART'].P
+                if ($s) {
+                    $e = if ($ev['DTEND']) { & $toDate $ev['DTEND'].V $ev['DTEND'].P } else { $null }
+                    $end = if ($e) { if ($e.AllDay) { $e.T.AddSeconds(-1) } else { $e.T } } elseif ($s.AllDay) { $s.T.AddDays(1).AddSeconds(-1) } else { $null }
+                    $last = if ($null -ne $end) { $end } else { $s.T }
+                    if ($last -ge $Now.AddDays(-$KeepDays) -and $s.T -le $Now.AddDays(400)) {
+                        $desc = if ($ev['DESCRIPTION']) { & $unesc $ev['DESCRIPTION'].V } else { '' }
+                        $url = if ($ev['URL']) { "$($ev['URL'].V)".Trim() } elseif ($desc -match 'https://[^\s<>"]+') { $Matches[0] } else { '' }
+                        $tier = if ($ev['CATEGORIES']) { (& $unesc (("$($ev['CATEGORIES'].V)" -split '(?<!\\),')[0])) } elseif ($ev['X-LIQUIPEDIATOICAL-COMPETITION']) { & $unesc $ev['X-LIQUIPEDIATOICAL-COMPETITION'].V } else { '' }
+                        $prize = if ($desc -match '(?im)^\s*prize(?: ?pool)?\s*[:=]\s*(.+)$') { $Matches[1].Trim() } else { '' }
+                        $endCmp = if ($null -ne $end) { $end } else { $s.T.Date.AddDays(1) }
+                        $status = if ("$($ev['STATUS'].V)" -match '^CANCELL?ED$') { 'Cancelled' } elseif ($Now -lt $s.T) { 'Upcoming' } elseif ($Now -lt $endCmp) { 'Ongoing' } else { 'Finished' }
+                        $rows.Add([pscustomobject][ordered]@{
+                            Name = $(if ($ev['SUMMARY']) { & $unesc $ev['SUMMARY'].V } else { '(untitled)' })
+                            Tier = $tier; Start = $s.T; End = $end; Prize = $prize
+                            Location = $(if ($ev['LOCATION']) { & $unesc $ev['LOCATION'].V } else { '' })
+                            Status = $status; Url = $(if ($url -match '^https?://') { $url } else { '' }) })
+                    }
+                }
+            }
+            $ev = $null; continue
+        }
+        if ($null -eq $ev) { continue }
+        # NAME;PARAM=a;PARAM="b:c":VALUE  (the first colon outside quotes ends the name)
+        $m = [regex]::Match($line, '^([A-Za-z0-9-]+)((?:;[^:;"]+=(?:"[^"]*"|[^:;]*))*):(.*)$')
+        if (-not $m.Success) { continue }
+        $name = $m.Groups[1].Value.ToUpperInvariant()
+        if ($ev.ContainsKey($name)) { continue }   # first value wins (VALARM sub-blocks come later)
+        $prm = @{}
+        foreach ($p in [regex]::Matches($m.Groups[2].Value, ';([^=;]+)=("[^"]*"|[^;]*)')) { $prm[$p.Groups[1].Value.ToUpperInvariant()] = $p.Groups[2].Value }
+        $ev[$name] = @{ V = $m.Groups[3].Value; P = $prm }
+    }
+    @($rows | Sort-Object Start | Select-Object -First $MaxRows)
+}
+
+# Worker code: fetch (or reuse the 6 h disk cache), check it is a calendar, parse, cache. No app functions exist here:
+# the parser arrives as text. Returns one hashtable @{ Game; Url; Rows; Fetched; Error; FromCache } (a hashtable, because Get-WorkerResult unwraps to the base object and a [pscustomobject] would lose its properties); the rows are [pscustomobject].
+$script:TourIcsWorkerCode = @'
+param($Url, $CacheFile, $MaxAgeH, $Ua, $ParserText, $MaxBytes, $Force, $TzMap, $MaxRows, $Game)
+Set-Item -Path function:ConvertFrom-TourIcs -Value ([scriptblock]::Create($ParserText))
+$fromJson = {   # cached rows back to objects with real dates
+    param($c)
+    @(@($c.Rows) | Where-Object { $_ } | ForEach-Object {
+        [pscustomobject][ordered]@{ Name = "$($_.Name)"; Tier = "$($_.Tier)"
+            Start = $(if ($_.Start) { [datetime]::Parse($_.Start, $null, 'RoundtripKind').ToLocalTime() } else { $null })
+            End = $(if ($_.End) { [datetime]::Parse($_.End, $null, 'RoundtripKind').ToLocalTime() } else { $null })
+            Prize = "$($_.Prize)"; Location = "$($_.Location)"; Status = "$($_.Status)"; Url = "$($_.Url)" } })
+}
+$cache = $null
+if (Test-Path -LiteralPath $CacheFile) { try { $cache = [IO.File]::ReadAllText($CacheFile) | ConvertFrom-Json } catch { $cache = $null } }
+if ($cache -and "$($cache.Url)" -ne $Url) { $cache = $null }
+$cachedAt = if ($cache) { try { [datetime]::Parse($cache.Fetched, $null, 'RoundtripKind').ToLocalTime() } catch { $null } } else { $null }
+if (-not $Force -and $cachedAt -and ((Get-Date) - $cachedAt).TotalHours -lt $MaxAgeH) {
+    $rows = & $fromJson $cache
+    # statuses age: recompute them against now
+    foreach ($r in $rows) { if ($r.Status -ne 'Cancelled' -and $r.Start) { $e = if ($r.End) { $r.End } else { $r.Start.Date.AddDays(1) }; $r.Status = if ((Get-Date) -lt $r.Start) { 'Upcoming' } elseif ((Get-Date) -lt $e) { 'Ongoing' } else { 'Finished' } } }
+    return @{ Game = $Game; Url = $Url; Rows = $rows; Fetched = $cachedAt; Error = $null; FromCache = $true }
+}
+$err = $null; $text = $null
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent = $Ua; $req.Accept = 'text/calendar, text/plain;q=0.5'; $req.Timeout = 15000; $req.ReadWriteTimeout = 15000
+    $req.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+    $req.MaximumAutomaticRedirections = 5
+    $resp = $req.GetResponse()
+    try {
+        if ($resp.ResponseUri.Scheme -ne 'https') { throw 'The calendar address redirected to an unencrypted page.' }
+        $st = $resp.GetResponseStream(); $ms = New-Object IO.MemoryStream; $buf = New-Object byte[] 65536
+        while (($n = $st.Read($buf, 0, $buf.Length)) -gt 0) { $ms.Write($buf, 0, $n); if ($ms.Length -gt $MaxBytes) { throw 'The calendar file is larger than 2 MB.' } }
+        $text = [Text.Encoding]::UTF8.GetString($ms.ToArray())
+    } finally { $resp.Close() }
+    if ($text -notmatch '(?m)^BEGIN:VCALENDAR') { $text = $null; throw 'That address did not return a calendar (ICS) file.' }
+} catch {
+    $m = $_.Exception.Message
+    if ($_.Exception.InnerException) { $m = $_.Exception.InnerException.Message }
+    $err = if ($m -match '\(404\)') { 'The calendar was not found (404). The address may have changed.' } elseif ($m -match '\((401|403)\)') { 'The calendar is private or refused the request.' } elseif ($m -match 'timed out|remote name|connect') { 'Could not reach the calendar. Check your internet connection.' } else { $m }
+}
+if ($null -eq $text) {
+    if ($cache) { return @{ Game = $Game; Url = $Url; Rows = (& $fromJson $cache); Fetched = $cachedAt; Error = "$err Showing the copy from $($cachedAt.ToString('g'))."; FromCache = $true } }
+    return @{ Game = $Game; Url = $Url; Rows = @(); Fetched = $null; Error = $err; FromCache = $false }
+}
+$rows = @(ConvertFrom-TourIcs -Text $text -TzMap $TzMap -MaxRows $MaxRows)
+$now = Get-Date
+try {
+    $dir = Split-Path $CacheFile; if (-not (Test-Path $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    $save = [pscustomobject]@{ Url = $Url; Fetched = $now.ToUniversalTime().ToString('o')
+        Rows = @($rows | ForEach-Object { [pscustomobject][ordered]@{ Name = $_.Name; Tier = $_.Tier
+            Start = $(if ($_.Start) { $_.Start.ToUniversalTime().ToString('o') } else { $null }); End = $(if ($_.End) { $_.End.ToUniversalTime().ToString('o') } else { $null })
+            Prize = $_.Prize; Location = $_.Location; Status = $_.Status; Url = $_.Url } }) }
+    $tmp = "$CacheFile.tmp"
+    [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $save -Depth 4), (New-Object Text.UTF8Encoding $false))
+    if (Test-Path -LiteralPath $CacheFile) { [IO.File]::Replace($tmp, $CacheFile, [NullString]::Value) } else { [IO.File]::Move($tmp, $CacheFile) }
+} catch { }
+@{ Game = $Game; Url = $Url; Rows = $rows; Fetched = $now; Error = $(if (-not $rows.Count) { 'The calendar has no events in the coming year.' } else { $null }); FromCache = $false }
+'@
+
+# Same contract as the Liquipedia fetcher: $Done gets @{ Game; Source; SourceUrl; Fetched; Rows; Error } on the UI thread.
+# With no calendar for the game it answers at once with Rows empty, SourceUrl = the official page and a plain-English Error.
+function Start-TourIcsFetch([string]$Game, [scriptblock]$Done, [switch]$Force) {
+    $src = Get-TourSource $Game
+    $url = Get-TourIcsUrl $Game
+    if (-not $url) {
+        $why = if ($src -and $src.Official) { 'There is no calendar feed for this game. Open the official schedule page instead.' } elseif ($src) { 'There is no official competitive schedule for this game.' } else { 'Unknown game.' }
+        & $Done @{ Game = $Game; Source = 'Official site'; SourceUrl = $(if ($src) { $src.Official } else { $null }); Fetched = $null; Rows = @(); Error = $why }
+        return
+    }
+    # no closures (the app's functions are not visible from a GetNewClosure module): the callback waits in a table
+    # and the worker hands back Game and Url
+    if (-not $script:TourIcsPending) { $script:TourIcsPending = @{} }
+    $script:TourIcsPending[$Game] = $Done
+    Invoke-Worker $script:TourIcsWorkerCode @($url, (Get-TourCacheFile $Game 'ics'), $script:TourMaxAgeH, "ZeroDelay/$AppVersion (schedule calendar)",
+        ${function:ConvertFrom-TourIcs}.ToString(), $script:TourIcsMaxBytes, [bool]$Force, $script:TourTzMap, $script:TourIcsMaxRows, $Game) {
+        param($out, $errs)
+        $r = Get-WorkerResult $out
+        $g = if ($r) { "$($r.Game)" } else { $null }
+        if (-not $g) { $g = @($script:TourIcsPending.Keys) | Select-Object -First 1 }   # worker died: answer the oldest caller
+        $cb = $script:TourIcsPending[$g]; [void]$script:TourIcsPending.Remove($g)
+        $res = @{ Game = $g; Source = 'Calendar (ICS)'; SourceUrl = $(if ($r) { $r.Url } else { $null }); Fetched = $null; Rows = @(); Error = $null }
+        if ($r) { $res.Fetched = $r.Fetched; $res.Rows = @($r.Rows); $res.Error = $r.Error }
+        else { $res.Error = $(if (@($errs).Count) { "$(@($errs)[0])" } else { 'The calendar could not be read.' }) }
+        if ($cb) { & $cb $res }
+    }
+}
+
+# --- Esports tournaments (1.18): upcoming and ongoing events for other games, from Liquipedia's MediaWiki API.
+# Fortnite keeps Epic's own schedule page. Liquipedia's API terms (https://liquipedia.net/api-terms-of-use):
+# custom User-Agent with contact, gzip, at most 1 request / 2 s and action=parse at most 1 / 30 s, cache results,
+# credit Liquipedia (CC BY-SA 3.0). ZeroDelay sends at most ONE request per 30 s across all games and caches 6 h.
+# ids and wiki names are the same as $script:TourSources in r14-tour-helpers.ps1 (cs2, valorant, marvelrivals, overwatch, r6siege)
+$script:EsportsGames = [ordered]@{}
+foreach ($k in $script:TourSources.Keys) { $src = $script:TourSources[$k]; if ($k -ne 'fortnite' -and $src.Liquipedia) { $script:EsportsGames[$k] = @{ Name = $src.Name; Wiki = $src.Liquipedia } } }
+$script:LiquipediaBase      = 'https://liquipedia.net'
+$script:LiquipediaUserAgent = 'ZeroDelay/1.18 (https://github.com/CaluMerge-cpu/ZeroDelay)'
+$script:EsportsCacheHours   = 6       # a list younger than this is shown without asking Liquipedia again
+$script:EsportsGapSeconds   = 30      # global: one Liquipedia request per 30 s (the action=parse limit), all games together
+$script:EsportsRetryMinutes = 10      # after a failed fetch, that game is not retried for this long
+$script:EsportsForceMinutes = 15      # Refresh (-Force) skips the 6 h cache only when the list is older than this
+$script:EsportsDaysAhead    = 60      # upcoming = starts within this many days
+$script:EsportsDaysBack     = 120     # ongoing events that started up to this long ago are still found
+$script:EsportsMaxRows      = 40
+$script:EsportsAttribution  = 'Tournament data from Liquipedia (liquipedia.net), licensed under CC BY-SA 3.0. Changes: filtered to upcoming and ongoing events.'
+$script:EsportsLicenseUrl   = 'https://creativecommons.org/licenses/by-sa/3.0/'
+# shared with the worker runspace: the time of the last Liquipedia request (UTC), guarded by its SyncRoot
+$script:EsportsGate         = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue; Loaded = $false })
+$script:EsportsPending      = @{}     # game id -> ArrayList of Done callbacks waiting for the same fetch
+$script:EsportsFailedAt     = @{}     # game id -> UTC time of the last failed fetch
+$script:EsportsNextSlot     = $null   # UTC time from which the next queued request may go
+
+# supported games for the tournaments page: Id, Name (= Title, which r13-tour-ui.ps1 reads), Wiki, SourceUrl (Liquipedia's human tournaments portal)
+function Get-EsportsGames {
+    foreach ($k in $script:EsportsGames.Keys) {
+        $g = $script:EsportsGames[$k]
+        [pscustomobject]@{ Id = $k; Name = $g.Name; Title = $g.Name; Wiki = $g.Wiki; SourceUrl = "https://liquipedia.net/$($g.Wiki)/Portal:Tournaments" }
+    }
+}
+# the disk cache of one game: $DataDir\esports-<game>.json
+function Get-EsportsCacheFile([string]$Game) { Join-Path $DataDir "esports-$Game.json" }
+# the file that remembers the last Liquipedia request across restarts
+function Get-EsportsThrottleFile { Join-Path $DataDir 'esports-throttle.txt' }
+# the wikitext ZeroDelay asks Liquipedia to render: its own TournamentsList template (LPDB query), S/A/B tier, no qualifiers or showmatches
+function Get-EsportsQueryText([datetime]$Today = [datetime]::Today) {
+    $from = $Today.AddDays(-$script:EsportsDaysBack).ToString('yyyy-MM-dd'); $to = $Today.AddDays($script:EsportsDaysAhead).ToString('yyyy-MM-dd')
+    "{{TournamentsList|startdate=$from|enddate=$to|order=startdate desc|limit=100|tier1=1|tier2=2|tier3=3|excludeTiertype1=Qualifier|excludeTiertype2=Showmatch|showTier=true}}"
+}
+# the API URL for one wiki: a single action=parse of that text (title only sets the parser context)
+function Get-EsportsApiUrl([string]$Wiki, [datetime]$Today = [datetime]::Today) {
+    "$script:LiquipediaBase/$Wiki/api.php?action=parse&format=json&formatversion=2&contentmodel=wikitext&prop=text&disablelimitreport=1&disableeditsection=1&title=Portal:Tournaments&text=" + [Uri]::EscapeDataString((Get-EsportsQueryText $Today))
+}
+# "Jul 02–12, 2026" / "Oct 22 – Nov 01, 2026" / "Dec 28, 2026 – Jan 05, 2027" / "Nov 15, 2026" -> @{ Start; End } as 'yyyy-MM-dd' (or $null)
+function ConvertFrom-LpDateRange([string]$Text) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $t = ($Text -replace '[–—]', '-' -replace ' ', ' ' -replace '\s+', ' ').Trim()
+    $d = { param($m, $day, $y) $x = [datetime]::MinValue; if ([datetime]::TryParseExact("$m $day $y", 'MMM d yyyy', $inv, 'None', [ref]$x)) { $x.ToString('yyyy-MM-dd') } else { $null } }
+    if ($t -match '^([A-Za-z]{3})\w* (\d{1,2}), (\d{4}) ?- ?([A-Za-z]{3})\w* (\d{1,2}), (\d{4})$') { return @{ Start = (& $d $Matches[1] $Matches[2] $Matches[3]); End = (& $d $Matches[4] $Matches[5] $Matches[6]) } }
+    if ($t -match '^([A-Za-z]{3})\w* (\d{1,2}) ?- ?([A-Za-z]{3})\w* (\d{1,2}), (\d{4})$') { return @{ Start = (& $d $Matches[1] $Matches[2] $Matches[5]); End = (& $d $Matches[3] $Matches[4] $Matches[5]) } }
+    if ($t -match '^([A-Za-z]{3})\w* (\d{1,2}) ?- ?(\d{1,2}), (\d{4})$') { return @{ Start = (& $d $Matches[1] $Matches[2] $Matches[4]); End = (& $d $Matches[1] $Matches[3] $Matches[4]) } }
+    if ($t -match '^([A-Za-z]{3})\w* (\d{1,2}), (\d{4})$') { $s = & $d $Matches[1] $Matches[2] $Matches[3]; return @{ Start = $s; End = $s } }
+    @{ Start = $null; End = $null }
+}
+# plain text of an HTML fragment (tags removed, entities decoded, spaces collapsed)
+function ConvertFrom-LpHtmlText([string]$Html) {
+    $t = $Html -replace '<br\s*/?>', ', ' -replace '</span>\s*<span', '</span>, <span' -replace '<[^>]+>', ''
+    ([Net.WebUtility]::HtmlDecode($t) -replace ' ', ' ' -replace '\s+', ' ' -replace '^[\s,]+|[\s,]+$', '' -replace '(, )+', ', ').Trim()
+}
+# rows of Liquipedia's TournamentsList table (action=parse HTML): Name, Tier, Start, End, Prize, Location, Url (columns found by header text)
+function ConvertFrom-LpTournamentHtml([string]$Html) {
+    $hm = [regex]::Match($Html, '<tr class="table2(?:&#95;|_){2}row--head[^"]*">(.*?)</tr>', 'Singleline')
+    if (-not $hm.Success) { return @() }
+    $cols = @()
+    foreach ($th in [regex]::Matches($hm.Groups[1].Value, '<th([^>]*)>(.*?)</th>', 'Singleline')) {
+        $n = (ConvertFrom-LpHtmlText $th.Groups[2].Value).ToLower(); $span = 1
+        if ($th.Groups[1].Value -match 'colspan="(\d+)"') { $span = [int]$Matches[1] }
+        for ($i = 0; $i -lt $span; $i++) { $cols += $n }
+    }
+    $ix = @{}
+    for ($i = $cols.Count - 1; $i -ge 0; $i--) { $ix[$cols[$i]] = $i }    # first column of a name wins
+    $iTour = -1; for ($i = 0; $i -lt $cols.Count; $i++) { if ($cols[$i] -eq 'tournament') { $iTour = $i } }   # last 'tournament' column holds the link text
+    foreach ($tr in [regex]::Matches($Html, '<tr class="table2(?:&#95;|_){2}row--body[^"]*">(.*?)</tr>', 'Singleline')) {
+        $cells = @([regex]::Matches($tr.Groups[1].Value, '<td[^>]*>(.*?)</td>', 'Singleline') | ForEach-Object { $_.Groups[1].Value })
+        if ($iTour -lt 0 -or $cells.Count -le $iTour) { continue }
+        $cell = { param($name) if ($ix.ContainsKey($name) -and $ix[$name] -lt $cells.Count) { ConvertFrom-LpHtmlText $cells[$ix[$name]] } else { '' } }
+        $name = ConvertFrom-LpHtmlText $cells[$iTour]
+        $href = if ($cells[$iTour] -match '<a href="([^"]+)"') { [Net.WebUtility]::HtmlDecode($Matches[1]) } else { '' }
+        if (-not $name) { continue }
+        $dr = ConvertFrom-LpDateRange (& $cell 'date')
+        $prize = & $cell 'prize pool'
+        [pscustomobject]@{
+            Name = $name; Tier = (& $cell 'tier'); Start = $dr.Start; End = $dr.End
+            Prize = $(if ($prize -and $prize -ne '-') { $prize } else { $null })
+            Location = $(if (& $cell 'location') { & $cell 'location' } else { $null })
+            Status = $null
+            Url = $(if ($href -match '^https?://') { $href } elseif ($href) { "https://liquipedia.net$href" } else { $null })
+        }
+    }
+}
+# sets Status from today's date, keeps ongoing + upcoming (next $DaysAhead days), sorts ongoing first then by start, caps the count
+function Select-EsportsRows($Rows, [datetime]$Today = [datetime]::Today, [int]$DaysAhead = 60, [int]$Max = 40) {
+    $out = foreach ($r in @($Rows)) {
+        if ($null -eq $r -or -not $r.Start) { continue }
+        $s = [datetime]::ParseExact($r.Start, 'yyyy-MM-dd', $null); $e = if ($r.End) { [datetime]::ParseExact($r.End, 'yyyy-MM-dd', $null) } else { $s }
+        $st = if ($s -le $Today -and $e -ge $Today) { 'Ongoing' } elseif ($s -gt $Today -and $s -le $Today.AddDays($DaysAhead)) { 'Upcoming' } else { $null }
+        if (-not $st) { continue }
+        [pscustomobject]@{ Name = $r.Name; Tier = $r.Tier; Start = $r.Start; End = $r.End; Prize = $r.Prize; Location = $r.Location; Status = $st; Url = $r.Url }
+    }
+    @($out | Sort-Object @{ e = { if ($_.Status -eq 'Ongoing') { 0 } else { 1 } } }, Start, End, Name | Select-Object -First $Max)
+}
+# the worker's script: waits for the shared 30 s gap, makes the one request, parses, saves the cache, returns a hashtable envelope
+function Get-EsportsWorkerCode {
+    $fns = foreach ($n in 'ConvertFrom-LpDateRange', 'ConvertFrom-LpHtmlText', 'ConvertFrom-LpTournamentHtml', 'Select-EsportsRows') { "function $n {`n$((Get-Item "Function:$n").Definition)`n}" }
+@"
+param(`$Game, `$Url, `$Ua, `$Gate, `$GapSec, `$CacheFile, `$ThrottleFile, `$SourceUrl, `$DaysAhead, `$Max)
+`$ErrorActionPreference = 'Stop'
+$($fns -join "`n")
+`$res = @{ Game = `$Game; Source = 'Liquipedia'; SourceUrl = `$SourceUrl; Fetched = `$null; Rows = @(); Error = `$null; Cached = `$false }
+try {
+    [System.Threading.Monitor]::Enter(`$Gate.SyncRoot)
+    try {
+        `$wait = (`$Gate.Last.AddSeconds(`$GapSec) - [datetime]::UtcNow).TotalMilliseconds
+        if (`$wait -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Ceiling(`$wait)) }
+        `$Gate.Last = [datetime]::UtcNow
+        try { [IO.File]::WriteAllText(`$ThrottleFile, `$Gate.Last.ToString('o')) } catch {}
+    } finally { [System.Threading.Monitor]::Exit(`$Gate.SyncRoot) }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    `$rq = [Net.HttpWebRequest]::Create(`$Url)
+    `$rq.UserAgent = `$Ua; `$rq.Accept = 'application/json'
+    `$rq.AutomaticDecompression = [Net.DecompressionMethods]::GZip    # sends Accept-Encoding: gzip and inflates the reply
+    `$rq.Timeout = 20000; `$rq.ReadWriteTimeout = 20000
+    try { `$resp = `$rq.GetResponse() } catch {
+        `$wx = `$_.Exception; while (`$wx -and -not (`$wx -is [Net.WebException])) { `$wx = `$wx.InnerException }
+        if (-not `$wx) { throw }
+        `$code = if (`$wx.Response) { [int]`$wx.Response.StatusCode } else { 0 }
+        if (`$code -eq 429) { throw 'Liquipedia asked ZeroDelay to slow down. The list will be refreshed later.' }
+        if (`$code -ge 500) { throw "Liquipedia is not answering right now (HTTP `$code). Try again later." }
+        if (`$code) { throw "Liquipedia refused the request (HTTP `$code)." }
+        throw "Could not reach Liquipedia. Check your internet connection. (`$(`$wx.Message))"
+    }
+    try { `$sr = New-Object IO.StreamReader(`$resp.GetResponseStream(), [Text.Encoding]::UTF8); `$body = `$sr.ReadToEnd() } finally { `$resp.Close() }
+    `$j = try { `$body | ConvertFrom-Json } catch { throw 'Liquipedia sent a reply ZeroDelay could not read.' }
+    if (`$j.error) { throw "Liquipedia returned an error: `$(`$j.error.info)" }
+    `$html = `$j.parse.text
+    if (-not `$html) { throw 'Liquipedia sent an empty tournament list.' }
+    `$all = @(ConvertFrom-LpTournamentHtml `$html)
+    `$res.Rows = @(Select-EsportsRows `$all ([datetime]::Today) `$DaysAhead `$Max)
+    `$res.Fetched = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    `$json = ConvertTo-Json -Depth 5 -InputObject ([pscustomobject]@{ Game = `$Game; Source = 'Liquipedia'; SourceUrl = `$SourceUrl; Fetched = `$res.Fetched; Parsed = `$all.Count; Rows = @(`$res.Rows) })
+    `$tmp = "`$CacheFile.tmp"; [IO.File]::WriteAllText(`$tmp, `$json, (New-Object Text.UTF8Encoding(`$false)))
+    if (Test-Path `$CacheFile) { Remove-Item `$CacheFile -Force }; Move-Item `$tmp `$CacheFile -Force
+} catch {
+    `$res.Error = "`$(`$_.Exception.Message)"
+}
+`$res
+"@
+}
+# reads a game's cache file as @{ Fetched (UTC datetime); Data (the parsed JSON) }, or $null
+function Read-EsportsCache([string]$Game) {
+    $f = Get-EsportsCacheFile $Game
+    if (-not (Test-Path $f)) { return $null }
+    try {
+        $j = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+        $t = [datetime]::Parse($j.Fetched, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal')
+        @{ Fetched = $t; Data = $j }
+    } catch { $null }
+}
+# the envelope built from a cache read (statuses recomputed for today), with an optional Error
+function New-EsportsEnvelope([string]$Game, $Cache, [string]$ErrorText) {
+    $g = $script:EsportsGames[$Game]
+    $rows = if ($Cache) { @(Select-EsportsRows @($Cache.Data.Rows) ([datetime]::Today) $script:EsportsDaysAhead $script:EsportsMaxRows) } else { @() }
+    @{ Game = $Game; Source = 'Liquipedia'; SourceUrl = "https://liquipedia.net/$($g.Wiki)/Portal:Tournaments"
+       Fetched = $(if ($Cache) { $Cache.Fetched.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }); Rows = $rows
+       Error = $(if ($ErrorText) { $ErrorText } else { $null }); Cached = [bool]$Cache }
+}
+# loads the last request time from disk once (so a restart cannot send a request inside the 30 s gap)
+function Initialize-EsportsGate {
+    if ($script:EsportsGate.Loaded) { return }
+    $script:EsportsGate.Loaded = $true
+    try {
+        $t = [datetime]::Parse((Get-Content (Get-EsportsThrottleFile) -Raw -ErrorAction Stop).Trim(), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal')
+        if ($t -gt $script:EsportsGate.Last -and $t -le [datetime]::UtcNow.AddMinutes(1)) { $script:EsportsGate.Last = $t }
+    } catch {}
+}
+# milliseconds until the next Liquipedia request is allowed (0 = now); counts requests already waiting in line
+function Get-EsportsThrottleDelay {
+    Initialize-EsportsGate
+    $next = $script:EsportsGate.Last.AddSeconds($script:EsportsGapSeconds)
+    if ($script:EsportsNextSlot -and $script:EsportsNextSlot -gt $next) { $next = $script:EsportsNextSlot }
+    [int][Math]::Ceiling([Math]::Max(0.0, ($next - [datetime]::UtcNow).TotalMilliseconds))
+}
+# hands one game's request to the worker (the worker itself also waits for the gap, so queued jobs can never bunch up)
+function Invoke-EsportsRequest([string]$Game) {
+    $g = $script:EsportsGames[$Game]
+    if (-not (Test-Path $DataDir)) { [void](New-Item -ItemType Directory -Path $DataDir -Force) }
+    $args2 = @($Game, (Get-EsportsApiUrl $g.Wiki), $script:LiquipediaUserAgent, $script:EsportsGate, $script:EsportsGapSeconds,
+        (Get-EsportsCacheFile $Game), (Get-EsportsThrottleFile), "https://liquipedia.net/$($g.Wiki)/Portal:Tournaments", $script:EsportsDaysAhead, $script:EsportsMaxRows)
+    Invoke-Worker (Get-EsportsWorkerCode) $args2 ([scriptblock]::Create("param(`$out, `$errs) Complete-EsportsFetch '$Game' `$out `$errs"))
+}
+# worker Done (UI thread): on success the fresh envelope, else the stale cache with Error, else no rows with Error; calls every waiting Done
+function Complete-EsportsFetch([string]$Game, $out, $errs) {
+    $res = Get-WorkerResult $out
+    if ($res -is [hashtable] -and -not $res.Error) {
+        $script:EsportsFailedAt.Remove($Game); $result = $res
+    } else {
+        $why = if ($res -is [hashtable] -and $res.Error) { $res.Error } elseif (@($errs).Count) { "The tournament list could not be loaded ($(@($errs)[0]))." } else { 'The tournament list could not be loaded.' }
+        $script:EsportsFailedAt[$Game] = [datetime]::UtcNow
+        $result = New-EsportsEnvelope $Game (Read-EsportsCache $Game) $why
+    }
+    $waiting = $script:EsportsPending[$Game]; $script:EsportsPending.Remove($Game)
+    foreach ($d in @($waiting)) { if ($d) { try { & $d $result } catch { [Console]::Error.WriteLine("esports Done: $_") } } }
+}
+# Starts loading one game's list. A cache younger than 6 h (or a failure less than 10 min ago) answers at once:
+# $Done is called before this returns and the envelope is also returned. Otherwise the request goes to the worker,
+# at the next free 30 s slot, this returns $null and $Done is called later on the UI thread. -Force (the Refresh button)
+# ignores the 6 h cache when the saved list is older than 15 min; the 30 s throttle and the failure back-off still apply.
+# Envelope: @{ Game; Source = 'Liquipedia'; SourceUrl; Fetched = 'yyyy-MM-ddTHH:mm:ssZ' (UTC); Cached; Error = $null|'text';
+#   Rows = @([pscustomobject]@{ Name; Tier; Start; End ('yyyy-MM-dd' strings); Prize; Location; Status = 'Ongoing'|'Upcoming'; Url }) }
+function Start-EsportsFetch([string]$Game, [scriptblock]$Done, [switch]$Force) {
+    if (-not $script:EsportsGames.Contains($Game)) { throw "Unknown esports game '$Game'." }
+    $cache = Read-EsportsCache $Game
+    $now = [datetime]::UtcNow
+    $failed = $script:EsportsFailedAt[$Game]
+    $fresh = if ($Force) { $script:EsportsForceMinutes / 60.0 } else { $script:EsportsCacheHours }
+    $quick = if ($cache -and ($now - $cache.Fetched).TotalHours -lt $fresh) { New-EsportsEnvelope $Game $cache $null }
+             elseif ($failed -and ($now - $failed).TotalMinutes -lt $script:EsportsRetryMinutes) { New-EsportsEnvelope $Game $cache 'Liquipedia could not be reached a moment ago. ZeroDelay will try again in a few minutes.' }
+    if ($quick) { if ($Done) { & $Done $quick }; return $quick }
+    if ($script:EsportsPending.ContainsKey($Game)) { [void]$script:EsportsPending[$Game].Add($Done); return $null }
+    $script:EsportsPending[$Game] = New-Object Collections.ArrayList; [void]$script:EsportsPending[$Game].Add($Done)
+    $delay = Get-EsportsThrottleDelay
+    $script:EsportsNextSlot = [datetime]::UtcNow.AddMilliseconds($delay).AddSeconds($script:EsportsGapSeconds)
+    if ($delay -le 0) { try { Invoke-EsportsRequest $Game } catch { Complete-EsportsFetch $Game @() @($_.Exception.Message) }; return $null }
+    $tm = New-Object Windows.Threading.DispatcherTimer
+    $tm.Interval = [TimeSpan]::FromMilliseconds($delay); $tm.Tag = $Game
+    $tm.Add_Tick({ param($s, $e) $s.Stop(); $g = [string]$s.Tag; try { Invoke-EsportsRequest $g } catch { Complete-EsportsFetch $g @() @($_.Exception.Message) } })
+    $tm.Start()
+    $null
+}
+
+# =============================================================== Tournaments (1.18): one page for every game
+# Fortnite keeps Epic's own schedule (the Events page); the other games list ongoing and upcoming tournaments from the
+# esports sources (Start-EsportsFetch and friends), if this build has them.
+function Get-TourGames {
+    $list = @([pscustomobject]@{ Id = 'fortnite'; Title = 'Fortnite' })
+    foreach ($k in $script:TourSources.Keys) { if ($k -ne 'fortnite') { $list += [pscustomobject]@{ Id = $k; Title = "$($script:TourSources[$k].Name)" } } }
+    $list
+}
+function New-TournamentsPage {
+    $root = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
+  <WrapPanel x:Name='Picker' Margin='32,0,32,12'/>
+  <ContentControl x:Name='Host' Grid.Row='1'/>
+</Grid>
+"@)
+    $script:TourUi = @{ Root = $root; Picker = $root.FindName('Picker'); Host = $root.FindName('Host'); Views = @{} }
+    $pick = "$($script:Backup.Custom['tourgame'])"; if (-not $pick) { $pick = 'fortnite' }
+    if (-not (Get-TourGames | Where-Object { $_.Id -eq $pick })) { $pick = 'fortnite' }
+    [void](Show-TourGame $pick)
+    $script:PageRefresh['Tournaments'] = { if ($script:TourGame -eq 'fortnite' -and $script:PageRefresh['Events']) { & $script:PageRefresh['Events'] } }
+    $root
+}
+function Update-TourPicker {
+    $u = $script:TourUi; $u.Picker.Children.Clear()
+    foreach ($g in Get-TourGames) {
+        $on = $g.Id -eq $script:TourGame
+        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Padding='14,6' Margin='0,0,6,6' FontSize='13'><TextBlock Text='$(Esc $g.Title)'/></Button>")
+        $c.Background = ConvertTo-Brush $(if ($on) { '#0A84FF' } else { '#2C2C2E' })
+        $c.Content.Foreground = ConvertTo-Brush $(if ($on) { '#FDFDFD' } else { '#F5F5F7' })
+        $c.Tag = $g.Id; $c.Add_Click({ param($s, $e) Show-TourGame $s.Tag })
+        [void]$u.Picker.Children.Add($c)
+    }
+}
+function Show-TourGame([string]$Id) {
+    $u = $script:TourUi; if (-not $u) { return }
+    $script:TourGame = $Id; $script:Backup.Custom['tourgame'] = $Id
+    Update-TourPicker
+    if ($Id -eq 'fortnite') {
+        $u.Host.Content = Get-PageContent 'Events'
+        if ($script:PageRefresh['Events']) { & $script:PageRefresh['Events'] }
+        return
+    }
+    if (-not $u.Views.ContainsKey($Id)) { $u.Views[$Id] = New-EsportsView $Id }
+    $u.Host.Content = $u.Views[$Id].Root
+    Update-EsportsView $Id
+}
+function New-EsportsView([string]$Id) {
+    $title = "$((Get-TourGames | Where-Object { $_.Id -eq $Id } | Select-Object -First 1).Title)"
+    $sp = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='26,22' Margin='0,0,0,16'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text='$(Esc $title.ToUpper()) TOURNAMENTS' FontSize='28' FontWeight='Black'/>
+        <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,0'/>
+      </StackPanel>
+      <StackPanel Grid.Column='1' VerticalAlignment='Center' Orientation='Horizontal'>
+        <Button x:Name='Refresh' Style='{DynamicResource Btn}' Padding='12,7' Margin='0,0,8,0'><TextBlock Text='Refresh'/></Button>
+        <Button x:Name='Open' Style='{DynamicResource Btn}' Padding='12,7'><TextBlock Text='Open source page'/></Button>
+        <Button x:Name='Official' Style='{DynamicResource Btn}' Padding='12,7' Margin='8,0,0,0'><TextBlock Text='Official site'/></Button>
+      </StackPanel>
+    </Grid>
+  </Border>
+  <TextBlock Text='Your own calendar (optional): paste a public calendar link (https:// or webcal://) and its events are listed here.' FontSize='12' Foreground='#98989D' TextWrapping='Wrap' Margin='4,0,0,6'/>
+  <Grid Margin='0,0,0,12'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <TextBox x:Name='Ics' FontSize='12.5' Padding='10,7' VerticalContentAlignment='Center' Background='#2C2C2E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' ToolTip='Your own calendar for this game: paste a public https:// or webcal:// (ICS) address. Empty + Save removes it.'/>
+    <Button x:Name='IcsSave' Grid.Column='1' Style='{DynamicResource Btn}' Padding='12,7' Margin='8,0,0,0'><TextBlock Text='Add calendar'/></Button>
+  </Grid>
+  <StackPanel x:Name='List'/>
+  <TextBlock x:Name='Credit' FontSize='11.5' Foreground='#98989D' TextWrapping='Wrap' Margin='4,10,0,0'/>
+</StackPanel>
+"@)
+    $v = @{ Root = (New-PageScroll $sp); Sub = $sp.FindName('Sub'); List = $sp.FindName('List'); Credit = $sp.FindName('Credit'); Open = $sp.FindName('Open'); Refresh = $sp.FindName('Refresh')
+            Official = $sp.FindName('Official'); Ics = $sp.FindName('Ics'); IcsSave = $sp.FindName('IcsSave'); Data = $null; Busy = $false }
+    $v.Open.Tag = $Id; $v.Refresh.Tag = $Id; $v.Official.Tag = $Id; $v.IcsSave.Tag = $Id
+    $src = Get-TourSource $Id
+    if (-not ($src -and $src.Official)) { $v.Official.Visibility = 'Collapsed' }
+    if (-not ($src -and $src.Liquipedia)) { $v.Open.Visibility = 'Collapsed' }
+    $v.Ics.Text = "$($script:Backup.Custom["tour-ics-$Id"])"
+    $v.Open.Add_Click({ param($s, $e)
+        $d = $script:TourUi.Views[$s.Tag].Data; $w = (Get-TourSource $s.Tag).Liquipedia
+        $u = if ($d -and $d.SourceUrl -and $d.Source -eq 'Liquipedia') { $d.SourceUrl } elseif ($w) { "https://liquipedia.net/$w/Portal:Tournaments" } else { $null }
+        if ($u) { Open-WebPage $u } })
+    $v.Official.Add_Click({ param($s, $e) $o = (Get-TourSource $s.Tag).Official; if ($o) { Open-WebPage $o } })
+    $v.IcsSave.Add_Click({ param($s, $e)
+        $vv = $script:TourUi.Views[$s.Tag]
+        try { Set-TourIcsUrl $s.Tag $vv.Ics.Text; $vv.Ics.Text = "$($script:Backup.Custom["tour-ics-$($s.Tag)"])"; $vv.Data = $null; Update-EsportsView $s.Tag -Force }
+        catch { $vv.Sub.Text = $_.Exception.Message } })
+    $v.Refresh.Add_Click({ param($s, $e) $script:TourUi.Views[$s.Tag].Data = $null; Update-EsportsView $s.Tag -Force })
+    $v
+}
+function Update-EsportsView([string]$Id, [switch]$Force) {
+    $v = $script:TourUi.Views[$Id]; if (-not $v) { return }
+    if ($v.Data -and -not $Force) { Show-EsportsRows $Id; return }
+    if ($v.Busy) { return }
+    $v.Busy = $true; $v.Sub.Text = 'Loading tournaments...'
+    $done = {
+        param($r)
+        $id = "$($r.Game)"
+        $v = $script:TourUi.Views[$id]; if (-not $v) { return }
+        $v.Busy = $false
+        $v.Data = if ($r -is [hashtable]) { $r } else { @{ Rows = @(); Error = 'The tournament list could not be loaded.' } }
+        Show-EsportsRows $id
+    }
+    try {
+        if ((Get-TourIcsUrl $Id) -or -not $script:EsportsGames.Contains($Id)) { Start-TourIcsFetch $Id $done -Force:$Force }
+        else { [void](Start-EsportsFetch $Id $done -Force:$Force) }
+    } catch {
+        $v.Busy = $false; $v.Data = @{ Game = $Id; Rows = @(); Error = "The tournament list could not be loaded ($($_.Exception.Message))." }
+        Show-EsportsRows $Id
+    }
+}
+function Show-EsportsRows([string]$Id) {
+    $v = $script:TourUi.Views[$Id]; $d = $v.Data; if (-not $d) { return }
+    $v.List.Children.Clear()
+    $ea = { param($t) $x = Esc "$t"; if ($x.StartsWith('{')) { '{}' + $x } else { $x } }   # a leading { would start a XAML markup extension
+    $rows = @($d.Rows | Where-Object { $_ })
+    $when = if ($d.Fetched) { try { ' Updated ' + ([datetime]$d.Fetched).ToString('ddd d MMM, HH:mm') + '.' } catch { '' } } else { '' }
+    $v.Sub.Text = if ($rows.Count) { "$(@($rows | Where-Object { $_.Status -eq 'Ongoing' }).Count) ongoing and $(@($rows | Where-Object { $_.Status -eq 'Upcoming' }).Count) upcoming.$when Click one for brackets, teams and streams." }
+                  elseif ($d.Error) { "$($d.Error)" } else { "No ongoing or upcoming tournaments listed right now.$when" }
+    if ($d.Error -and $rows.Count) { $v.Sub.Text += " (Showing saved data: $($d.Error))" }
+    $v.Credit.Text = if ($d.Source -eq 'Liquipedia') { "$script:EsportsAttribution" } elseif ($d.Source -eq 'Official site') { "$((Get-TourSource $Id).Verdict)" } elseif ($d.Source) { "Tournament data from $($d.Source)." } else { '' }
+    foreach ($r in $rows) {
+        try {
+            $fmt = { param($x) if ($x) { try { ([datetime]$x).ToString('d MMM') } catch { "$x" } } else { '' } }
+            $dates = (@((& $fmt $r.Start), (& $fmt $r.End)) | Where-Object { $_ } | Select-Object -Unique) -join ' to '
+            $meta = (@($dates, "$($r.Prize)", "$($r.Location)") | Where-Object { $_ -and $_ -ne '' }) -join '   ·   '
+            $b = switch ("$($r.Status)") { 'Ongoing' { 'Live now', '#3330D158', '#30D158' } 'Upcoming' { 'Upcoming', '#330A84FF', '#0A84FF' } default { "$($r.Status)", '#2C2C2E', '#A1A1A6' } }
+            $row = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='20,14' Margin='0,0,0,10' Cursor='Hand'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock Text='$(& $ea $r.Name)' FontSize='15' FontWeight='SemiBold' TextWrapping='Wrap'/>
+      <TextBlock Text='$(& $ea $meta)' FontSize='12.5' Foreground='#A1A1A6' Margin='0,3,0,0' TextWrapping='Wrap'/>
+    </StackPanel>
+    <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+      $(if ($r.Tier) { "<Border CornerRadius='9' Padding='9,3' Margin='0,0,8,0' Background='#2C2C2E'><TextBlock Text='$(& $ea $r.Tier)' FontSize='11.5' Foreground='#D1D1D6'/></Border>" })
+      <Border CornerRadius='9' Padding='9,3' Background='$($b[1])'><TextBlock Text='$(& $ea $b[0])' FontSize='11.5' FontWeight='SemiBold' Foreground='$($b[2])'/></Border>
+    </StackPanel>
+  </Grid>
+</Border>
+"@)
+            $row.Tag = "$($r.Url)"
+            $row.Add_MouseLeftButtonUp({ param($s, $e) if ($s.Tag) { Open-WebPage $s.Tag } })
+            $row.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true }); $row.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false })
+            [void]$v.List.Children.Add($row)
+        } catch { [Console]::Error.WriteLine("tournament row skipped: $($_.Exception.Message)") }
+    }
+}
 function New-EventsPage {
     $chips = ($EventRegions.Keys | ForEach-Object { "<Button x:Name='R_$_' Content='$_' ToolTip='$($EventRegions[$_])' Cursor='Hand' Margin='0,0,6,6' Padding='12,5' FontSize='12.5'><Button.Template><ControlTemplate TargetType='Button'><Border CornerRadius='13' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='1' Padding='{TemplateBinding Padding}'><ContentPresenter/></Border></ControlTemplate></Button.Template></Button>" }) -join ''
     $tips = for ($i = 0; $i -lt $CompTips.Count; $i++) {
@@ -18048,8 +22672,8 @@ function Invoke-AppUninstallDirect($app) {
 # =============================================================== Trends
 # Match reports over time, one small chart per measure (never two scales on one chart), with markers where settings
 # changed or Fortnite / the graphics driver updated, so you can see what a change did.
-function Get-TrendReports {
-    if ($Snapshot -and $env:ZD_FAKE_MATCH) {
+function Get-TrendReports([string]$Game = 'fortnite') {
+    if ($Snapshot -and $env:ZD_FAKE_MATCH -and $Game -eq 'fortnite') {
         $rnd = New-Object Random 3; $t0 = (Get-Date).AddDays(-9)
         return @(for ($i = 0; $i -lt 14; $i++) {
             $boost = if ($i -ge 7) { 24 } else { 0 }
@@ -18059,7 +22683,7 @@ function Get-TrendReports {
                 PingAvg = 31 + $rnd.Next(0, 5); Jitter = 2 + $rnd.Next(0, 3); LossPct = 0 }
         })
     }
-    @(Get-MatchReports | Sort-Object { [datetime]$_.Start })
+    @(Get-GameReports $Game | Sort-Object { [datetime]$_.Start })
 }
 function Get-TrendEvents($reports) {
     $ev = @()
@@ -18176,6 +22800,7 @@ function New-TrendsPage {
       <StackPanel Margin='30,22,26,22'>
         <TextBlock Text='TRENDS' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='40' Foreground='#FFFFFF'/>
         <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,4,0,14'/>
+        <WrapPanel x:Name='Games' Margin='0,0,0,10'/>
         <WrapPanel x:Name='Tiles'/>
       </StackPanel>
     </Grid>
@@ -18185,7 +22810,7 @@ function New-TrendsPage {
   <Border x:Name='TableBox' Style='{DynamicResource Card}' Padding='18,14' Visibility='Collapsed'><StackPanel x:Name='Table'/></Border>
 </StackPanel>
 "@)
-    $g = @{}; foreach ($n in 'Hero', 'Sub', 'Tiles', 'Charts', 'TableBtn', 'TableBox', 'Table') { $g[$n] = $root.FindName($n) }
+    $g = @{}; foreach ($n in 'Hero', 'Sub', 'Games', 'Tiles', 'Charts', 'TableBtn', 'TableBox', 'Table') { $g[$n] = $root.FindName($n) }
     $script:TrendsUi = $g
     Set-RoundClip $g.Hero 22
     $g.TableBtn.Add_Click({ $tb = $script:TrendsUi.TableBox; $tb.Visibility = if ($tb.Visibility -eq 'Visible') { 'Collapsed' } else { 'Visible' }; $script:TrendsUi.TableBtn.Content = if ($tb.Visibility -eq 'Visible') { 'Hide the table' } else { 'Show as a table' } })
@@ -18195,10 +22820,14 @@ function New-TrendsPage {
 }
 function Update-TrendsPage {
     $g = $script:TrendsUi; if (-not $g) { return }
-    $reps = @(Get-TrendReports)
+    $games = @(Get-ReportGames)
+    $script:TrendGame = Select-ReportGame $script:TrendGame $games
+    Set-GameChips $g.Games $games $script:TrendGame { param($id) $script:TrendGame = $id; Update-TrendsPage }
+    $tg = $script:TrendGame; $fnT = $tg -eq 'fortnite'
+    $reps = @(Get-TrendReports $tg)
     $g.Charts.Children.Clear(); $g.Tiles.Children.Clear(); $g.Table.Children.Clear()
     if ($reps.Count -lt 2) {
-        $g.Sub.Text = "$(if ($reps.Count) { 'One match so far.' } else { 'No matches yet.' }) Play a few matches with ZeroDelay open (the tray is enough) and they show up here as lines over time. $(if (-not (Test-Path $PresentMonExe)) { 'For FPS, stutters and latency, download PresentMon once on the Benchmark page.' })"
+        $g.Sub.Text = "$(if ($reps.Count) { "One $(Get-SessionWord $tg) so far." } else { 'No matches yet.' }) Play a few matches with ZeroDelay open (the tray is enough) and they show up here as lines over time. $(if (-not (Test-Path $PresentMonExe)) { 'For FPS, stutters and latency, download PresentMon once on the Benchmark page.' })"
         $g.TableBtn.Visibility = 'Collapsed'; return
     }
     $g.TableBtn.Visibility = 'Visible'
@@ -18207,7 +22836,7 @@ function Update-TrendsPage {
     $num = { param($v) if ($null -eq $v -or "$v" -eq '') { $null } else { [double]$v } }
     $avg = @($reps | ForEach-Object { & $num $_.Fps.Avg }); $low = @($reps | ForEach-Object { & $num $_.Fps.Low1 })
     $stu = @($reps | ForEach-Object { & $num $_.StutterCount }); $lat = @($reps | ForEach-Object { & $num $_.Latency }); $png = @($reps | ForEach-Object { & $num $_.PingAvg })
-    $g.Sub.Text = "$($reps.Count) matches from $(([datetime]$reps[0].Start).ToString('d MMM')) to $(([datetime]$reps[-1].Start).ToString('d MMM')). Dashed lines mark tweak changes and updates: hover them to see what changed."
+    $g.Sub.Text = "$(if (-not $fnT) { "$(Get-GameTitle $tg): " })$($reps.Count) $(Get-SessionWord $tg 2) from $(([datetime]$reps[0].Start).ToString('d MMM')) to $(([datetime]$reps[-1].Start).ToString('d MMM')). Dashed lines mark tweak changes and updates: hover them to see what changed."
     # headline: the last few matches against the ones before
     $k = [Math]::Min(5, [Math]::Floor($reps.Count / 2))
     $tile = {
@@ -18226,15 +22855,15 @@ function Update-TrendsPage {
     }
     & $tile 'average FPS' $avg 'FPS' $false
     & $tile '1% low FPS' $low 'FPS' $false
-    & $tile 'stutters per match' $stu '' $true
+    & $tile "stutters per $(Get-SessionWord $tg)" $stu '' $true
     & $tile 'input latency' $lat 'ms' $true
     & $tile 'ping' $png 'ms' $true
-    if ($g.Tiles.Children.Count) { [void]$g.Tiles.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='Last $k matches compared with the $k before.' FontSize='11.5' Foreground='#8A8A94' VerticalAlignment='Bottom' Margin='0,0,0,8'/>")) }
+    if ($g.Tiles.Children.Count) { [void]$g.Tiles.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='Last $k $(Get-SessionWord $tg 2) compared with the $k before.' FontSize='11.5' Foreground='#8A8A94' VerticalAlignment='Bottom' Margin='0,0,0,8'/>")) }
     # small multiples, one measure each
     if (@($avg | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'FPS' @(@{ Name = 'Average'; Values = $avg; Color = $col.S1 }, @{ Name = '1% low'; Values = $low; Color = $col.S2 }) 'FPS' $reps $marks $false)) }
-    if (@($stu | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'Stutters per match' @(@{ Name = 'Stutters'; Values = $stu; Color = $col.S1 }) '' $reps $marks $true)) }
+    if (@($stu | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart "Stutters per $(Get-SessionWord $tg)" @(@{ Name = 'Stutters'; Values = $stu; Color = $col.S1 }) '' $reps $marks $true)) }
     if (@($lat | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart "Latency ($("$(@($reps | Where-Object { $_.LatencyKind } | Select-Object -Last 1).LatencyKind)" -replace '^input latency$', 'input-to-frame estimate'))" @(@{ Name = 'Latency'; Values = $lat; Color = $col.S1 }) 'ms' $reps $marks $true)) }
-    if (@($png | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'Ping to Epic''s servers' @(@{ Name = 'Ping'; Values = $png; Color = $col.S1 }) 'ms' $reps $marks $true)) }
+    if (@($png | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart $(if ($fnT) { 'Ping to Epic''s servers' } else { 'Ping' }) @(@{ Name = 'Ping'; Values = $png; Color = $col.S1 }) 'ms' $reps $marks $true)) }
     if (-not $g.Charts.Children.Count) { [void]$g.Charts.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='These matches have no frame or ping data yet. Download PresentMon on the Benchmark page for FPS, stutters and latency.' Foreground='#A1A1A6' TextWrapping='Wrap'/>")) }
     # the same numbers as a table
     $hdr = "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='170'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
@@ -18613,7 +23242,7 @@ function Update-Filter {
 }
 $ui.Search.Add_TextChanged({ Update-Filter })
 $script:NavButtons = @{}
-$NavTop = @('Home', 'Games', 'Tweaks', 'Checks', 'Tools')
+$NavTop = @('Home', 'Games', 'Events', 'Tweaks', 'Checks', 'Tools')
 $NavTools = @('ThisPC', 'Sync', 'Nvidia', 'Benchmark', 'Matches', 'Trends', 'Booster', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Debloat', 'Apps', 'Clean', 'Memory')
 $NavEnd = @('Settings')
 function Get-NavGroupOf([string]$Name) { if ($NavTop -contains $Name -or $NavEnd -contains $Name) { '' } elseif ($NavTools -contains $Name) { 'Tools' } else { 'Tweaks' } }
@@ -18906,14 +23535,18 @@ $script:UpdateTimer.Add_Tick({
 })
 if (-not $Snapshot) { $script:UpdateTimer.Start() }
 
-# match recorder: starts when Fortnite starts, builds the report when it closes
+# match recorder: starts when Fortnite (or another supported game) starts, builds the report when it closes.
+# One recording at a time: the game it follows is watched until it closes, other games wait for the next one.
 $script:MatchTimer = New-Object Windows.Threading.DispatcherTimer
 $script:MatchTimer.Interval = [TimeSpan]::FromSeconds(4)
 $script:MatchTimer.Add_Tick({
+    try { Update-Cs2GsiListener } catch {}
+    try { Update-RlStatsListener } catch {}
+    try { Update-DotaGsiListener } catch {}
+    try { Update-LolStatsPoller } catch {}
     if ($script:MatchAnalysis) { Complete-MatchReport }
-    $running = Test-FortniteRunning
-    if ($running -and -not $script:MatchRec -and -not $script:MatchAnalysis -and (Get-Setting 'matchreport' $true)) { Start-MatchRecorder }
-    elseif (-not $running -and $script:MatchRec) { Stop-MatchRecorder }
+    if ($script:MatchRec) { if (-not (Test-RecGameRunning $script:MatchRec)) { Stop-MatchRecorder } }
+    elseif (-not $script:MatchAnalysis -and (Get-Setting 'matchreport' $true)) { $run = Find-RunningGame; if ($run) { Start-MatchRecorder $run } }
 })
 if (-not $Snapshot) { $script:MatchTimer.Start() }
 
@@ -19116,6 +23749,10 @@ if (-not $Snapshot) {
     $script:ShowTimer.Start()
 }
 $window.Add_Closed({
+    try { Stop-Cs2GsiListener -Wait } catch {}
+    try { Stop-RlStatsListener -Wait } catch {}
+    try { Stop-DotaGsiListener -Wait } catch {}
+    try { Stop-LolStatsPoller -Wait } catch {}
     if ($script:PingMonJob) { Stop-PingMonitor }
     Save-Backup
     if ($script:TrayIcon) { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() }

@@ -10,7 +10,7 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Knows your PC**: on first start (and every few days) ZeroDelay scans the hardware, drivers, Windows and installed
   apps, and adapts its recommendations: laptops, streamers, Wi-Fi vs Ethernet, X3D and hybrid CPUs, GPU model.
   **Tools > This PC** shows everything it found and what it changed. Nothing is sent anywhere.
-- **Clean, simple design**: six places in the menu (Home, Games, Tweaks, Checks, Tools, Settings). Home shows your last
+- **Clean, simple design**: seven places in the menu (Home, Games, Tournaments, Tweaks, Checks, Tools, Settings). Home shows your last
   matches first, then your score with Boost now and Restore. Tweaks opens on the recommended ones with filter chips for
   the rest; Checks holds everything that only looks and reports; Tools holds the other pages as tiles.
 - **Live view on Home**: CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a
@@ -19,7 +19,13 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   PC, and a card that holds 0.5 ms while ZeroDelay runs and lets games see it.
 - **Games**: a page per game, with each game's own logo read from your installed copy. Pick a server from Fortnite's own list (or let ZeroDelay find the fastest), watch your
   route live (PC, router, provider, game server, each with its ping), press Start Game, and find every test for that
-  game in one tools panel.
+  game in one tools panel. 24 games: Fortnite, Counter-Strike 2, Valorant, Marvel Rivals, Overwatch 2, Rainbow Six
+  Siege X, Rematch, Where Winds Meet, eFootball, NBA 2K27, Undisputed, Rocket League, Apex Legends, THE FINALS, Call of
+  Duty, Battlefield 6, PUBG, League of Legends, Dota 2, Deadlock, GTA V (Enhanced and Legacy), Roblox and Escape from
+  Tarkov. Games with kernel anti-cheat only get settings their makers allow; every change can be undone.
+- **Your stats**: FPS, stutter and temperature trends for every game you play with ZeroDelay open, and match results
+  for Fortnite (replays), Counter-Strike 2 (Game State Integration), Rocket League (Stats API), Dota 2 (Game State
+  Integration) and League of Legends (Live Client Data), all through the games' own official local features.
 - **Boost**: your score (the recommended tweaks that are on, not an FPS promise), the parts of the PC it covers, your
   graphics driver, Boost now and Restore. A live status bar with CPU, GPU temperature and load, disk and memory sits at
   the bottom of every page and pauses while you play.
@@ -58,7 +64,9 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses
   update downloads (or does all of it automatically when Fortnite starts), then puts everything back when the match ends.
-- **Tournaments**: Epic's official competitive schedule inside ZeroDelay, opened on the region you play (read from
+- **Tournaments**: pick a game and see the tournaments that are live or coming up, with dates, prize money and tier
+  (from Liquipedia, CC BY-SA 3.0), a link to each game's official schedule, and room for your own calendar. For Fortnite,
+  Epic's official competitive schedule inside ZeroDelay, opened on the region you play (read from
   your Fortnite settings), with every cup's art, times in your PC's time zone, and each event's scoring, rules and
   prizes. Next to it: a ready check (ping to the region, Game Mode, Fortnite settings, two-factor sign-in) and
   competitive tips. Shown with Microsoft Edge WebView2, which comes with Windows 11.
