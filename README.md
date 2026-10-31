@@ -11,7 +11,9 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Clean, simple design**: a Home page with an Optimize button that lists what is still off so you choose what to switch on, folding menu groups, and frosted glass on Windows 11.
 - **Live view on Home**: CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a
   one-minute graph, plus the apps using the most CPU. It only measures while Home is open.
-- **Games**: a page per game. Pick a server from Fortnite's own list (or let ZeroDelay find the fastest), watch your
+- **Timer resolution**: a test that measures how precisely Windows wakes at the default timer, 1 ms and 0.5 ms on your
+  PC, and a card that holds 0.5 ms while ZeroDelay runs and lets games see it.
+- **Games**: a page per game, with each game's own logo read from your installed copy. Pick a server from Fortnite's own list (or let ZeroDelay find the fastest), watch your
   route live (PC, router, provider, game server, each with its ping), press Start Game, and find every test for that
   game in one tools panel.
 - **Boost**: your score (the recommended tweaks that are on, not an FPS promise), the parts of the PC it covers, your

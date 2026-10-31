@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.16.0'
+$AppVersion = '1.16.2'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -548,6 +548,58 @@ public static class ZdWatchdog {
             }
             try { System.IO.File.AppendAllText(logPath, "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window has not responded for " + Math.Round(secs) + " s. Step: " + step + "\r\n" + stack + "\r\n"); } catch { }
         }
+    }
+}
+// A file's own icon at a given size, as Explorer shows it (IShellItemImageFactory). Used for the game logos: they are
+// read from the games installed on this PC, never shipped with ZeroDelay.
+public static class ZdShellIcon {
+    [ComImport, Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItemImageFactory { [PreserveSig] int GetImage(SIZE size, int flags, out IntPtr phbm); }
+    [StructLayout(LayoutKind.Sequential)] struct SIZE { public int cx, cy; }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    static extern void SHCreateItemFromParsingName(string path, IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, [MarshalAs(UnmanagedType.Interface)] out IShellItemImageFactory item);
+    [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr h);
+    // an HBITMAP the caller frees with DeleteObject; IntPtr.Zero when the file has no icon
+    public static IntPtr Get(string path, int size) {
+        try {
+            IShellItemImageFactory f; SHCreateItemFromParsingName(path, IntPtr.Zero, typeof(IShellItemImageFactory).GUID, out f);
+            var sz = new SIZE(); sz.cx = size; sz.cy = size;
+            IntPtr hb; return f.GetImage(sz, 0x4 /* icon only */, out hb) == 0 ? hb : IntPtr.Zero;
+        } catch { return IntPtr.Zero; }
+    }
+}
+// Windows timer resolution (in 100 ns units): read it, hold a request for this process, and measure how precisely a
+// 1 ms sleep wakes up at each resolution (the test PC-Tuning recommends instead of assuming smaller is better).
+public static class ZdTimerRes {
+    [DllImport("ntdll.dll")] static extern int NtQueryTimerResolution(out uint coarsest, out uint finest, out uint current);
+    [DllImport("ntdll.dll")] static extern int NtSetTimerResolution(uint desired, bool set, out uint current);
+    static uint held;
+    // coarsest, finest and current resolution; empty on error
+    public static uint[] Query() { uint a, b, c; return NtQueryTimerResolution(out a, out b, out c) == 0 ? new uint[] { a, b, c } : new uint[0]; }
+    public static uint Held { get { return held; } }
+    public static uint Hold(uint res) { uint c; if (held != 0) NtSetTimerResolution(held, false, out c); NtSetTimerResolution(res, true, out c); held = res; return c; }
+    public static void Release() { uint c; if (held != 0) { NtSetTimerResolution(held, false, out c); held = 0; } }
+    // n sleeps of 1 ms: average, spread (standard deviation) and worst, in ms
+    public static double[] MeasureSleep(int n) {
+        double sum = 0, sq = 0, worst = 0; double f = System.Diagnostics.Stopwatch.Frequency;
+        System.Threading.Thread.Sleep(1);
+        for (int i = 0; i < n; i++) {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            System.Threading.Thread.Sleep(1);
+            double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / f;
+            sum += ms; sq += ms * ms; if (ms > worst) worst = ms;
+        }
+        double avg = sum / n;
+        return new double[] { avg, System.Math.Sqrt(System.Math.Max(0, sq / n - avg * avg)), worst };
+    }
+    // the same test with no request, at 1 ms and at 0.5 ms; this process's own hold is paused meanwhile
+    public static double[][] Compare(int n) {
+        uint keep = held, c; Release();
+        var none = MeasureSleep(n);
+        NtSetTimerResolution(10000, true, out c); var one = MeasureSleep(n); NtSetTimerResolution(10000, false, out c);
+        NtSetTimerResolution(5000, true, out c); var half = MeasureSleep(n); NtSetTimerResolution(5000, false, out c);
+        if (keep != 0) Hold(keep);
+        return new double[][] { none, one, half };
     }
 }
 public sealed class LiveSnap {
@@ -2642,6 +2694,35 @@ function Get-ControllerReport {
     } else { "Controller found: $names`nConnected over: cable or wireless adapter. That is the low-latency way; nothing to change." }
 }
 
+# --- Timer resolution: the test card measures a 1 ms sleep at each resolution (in the worker, about 1 s);
+#     the hold card keeps 0.5 ms while ZeroDelay runs (see Complete-Startup)
+function Start-TimerResTest {
+    if ($script:TimerTestBusy) { throw 'The timer test is already running.' }
+    $script:TimerTestBusy = $true
+    Invoke-Worker 'param($n) @{ Q = [ZdTimerRes]::Query(); R = [ZdTimerRes]::Compare($n) }' @(200) {
+        param($out, $errs)
+        $script:TimerTestBusy = $false
+        $v = Get-WorkerResult $out
+        if (-not ($v -is [hashtable]) -or -not $v.R) { Show-Toast 'The timer test could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-TimerResText $v.Q $v.R) 'Timer resolution' 'OK' 'Information')
+    }
+}
+function Get-TimerResText($q, $r) {
+    $ms = { param($v) '{0:0.###} ms' -f ([double]$v / 10000) }
+    $s = if (@($q).Count -eq 3) { "Windows' timer right now: $(& $ms $q[2]) (finest possible $(& $ms $q[1]); default $(& $ms $q[0]) when no app asks for more).`n`n" } else { '' }
+    $s += "How long a 1 ms sleep really took (200 tries each):`n"
+    $names = 'No request (Windows default)', 'Timer at 1 ms', 'Timer at 0.5 ms'
+    for ($i = 0; $i -lt 3; $i++) { $s += "- $($names[$i]): {0:0.000} ms on average, spread {1:0.000} ms, worst {2:0.00} ms`n" -f $r[$i][0], $r[$i][1], $r[$i][2] }
+    # closer to 1 ms and steadier is better: distance from 1 ms plus the spread
+    $one = [Math]::Abs($r[1][0] - 1) + $r[1][1]; $half = [Math]::Abs($r[2][0] - 1) + $r[2][1]
+    $s += "`n"
+    $s += if ($one - $half -ge 0.1) { "0.5 ms is clearly steadier on this PC ({0:0.00} ms closer to an exact 1 ms wake). The Hold 0.5 ms timer resolution card is worth trying; check your match reports before and after." -f ($one - $half) }
+          elseif ($one - $half -gt 0.02) { 'On this PC 0.5 ms is only a little steadier than 1 ms, which Fortnite already asks for itself. Holding 0.5 ms is optional: expect no visible difference.' }
+          else { 'On this PC 0.5 ms is no better than 1 ms, which Fortnite already asks for itself. Leave the Hold 0.5 ms timer resolution card off.' }
+    $g = "$(Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests')" -eq '1'
+    $s += "`n`nNote: on Windows 11 a timer request only reaches games when global timer requests are on (they are $(if ($g) { 'on' } else { 'off' }) here). The Hold card turns them on for you."
+    $s
+}
 # --- Helpers for research round 6 (1.15)
 
 # --- Research round 7 (1.15): Fortnite log reports (fnlog): match bottleneck, audio path, Epic Quality Assets
@@ -8696,6 +8777,24 @@ $Tweaks = @(
        }
        Off   = { $p = $script:Backup.Custom[$t.Id]; if ($p -and (powercfg /list | Where-Object { $_ -match $p })) { powercfg /setactive $p }; $script:Backup.Custom.Remove($t.Id) } }
 
+    @{ Id = 'timerres-test'; Cat = 'System'; Icon = [char]0xE916; Action = 'Test'; Lat = $true
+       Title = 'Test your timer resolution'
+       Desc  = 'Measures how precisely Windows wakes a 1 ms sleep with no timer request, at 1 ms and at 0.5 ms (about a second), and says which is steadiest on this PC. Smaller is not always better, so measure before holding a resolution.'
+       Warn  = ''
+       Run   = { Start-TimerResTest; 'Measuring the timer...' } }
+
+    @{ Id = 'timerres-hold'; Cat = 'System'; Icon = [char]0xE916; Rec = $false; Lat = $true; Badge = 'restart'
+       Title = 'Hold 0.5 ms timer resolution'
+       Desc  = 'Keeps Windows'' timer at 0.5 ms while ZeroDelay runs (also in the tray) and lets games see it: Windows 11 otherwise keeps timer requests per app. Fortnite already asks for 1 ms; 0.5 ms makes frame caps and waits a little more even on some PCs and changes nothing on others.'
+       Warn  = 'The timer test shows no gain on your PC, or you play on battery: it costs a little power. Needs a restart the first time.'
+       Test  = { [bool]$script:Backup.Custom['timerhold'] -and "$(Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests')" -eq '1' }
+       On    = {
+           Set-RegTracked $t.Id 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests' 1
+           $script:Backup.Custom['timerhold'] = $true
+           [void][ZdTimerRes]::Hold(5000)
+       }
+       Off   = { Restore-RegTweak $t.Id; $script:Backup.Custom.Remove('timerhold'); [ZdTimerRes]::Release() } }
+
     @{ Id = 'interference'; Cat = 'System'; Icon = [char]0xE9F9; Action = 'Check'; Lat = $true
        Title = 'Find overlays and boosters that interfere'
        Desc  = 'Looks for running overlays (Discord, Overwolf, RivaTuner, Medal) that hook into Fortnite, and other boosters (Razer Cortex, Process Lasso) that switch power plans behind ZeroDelay''s back.'
@@ -13509,6 +13608,19 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.16.2' = @(
+        @{ T = 'Timer resolution'; D = 'A test that measures how precisely Windows wakes at the default timer, 1 ms and 0.5 ms on your PC, and a card that holds 0.5 ms while ZeroDelay runs and lets games see it. Smaller is not always better, so the test tells you whether it helps here.' }
+        @{ T = 'Real game logos'; D = 'The Fortnite and Counter-Strike 2 tiles and game pages show each game''s own logo, read from the game installed on your PC (nothing is copied into ZeroDelay). Games that are not installed keep ZeroDelay''s artwork.' }
+        @{ T = 'Games'; D = 'A library of the games ZeroDelay optimizes. Each game has its own page: pick a server from Fortnite''s real list or let ZeroDelay find the fastest, watch your route live (your PC, router, provider and the game server, each with its ping), and press Start Game. A tools panel collects every test for that game.' }
+        @{ T = 'Boost'; D = 'One page with your score, the parts of the PC it covers, your graphics driver, Boost now and Restore. The score is honest: it counts the recommended tweaks that are on, it is not an FPS promise.' }
+        @{ T = 'Live status bar'; D = 'CPU, graphics card temperature and load, disk and memory at the bottom of every page. It pauses while you play with ZeroDelay in the background, so it costs your game nothing.' }
+    )
+    '1.16.1' = @(
+        @{ T = 'Real game logos'; D = 'The Fortnite and Counter-Strike 2 tiles and game pages show each game''s own logo, read from the game installed on your PC (nothing is copied into ZeroDelay). Games that are not installed keep ZeroDelay''s artwork.' }
+        @{ T = 'Games'; D = 'A library of the games ZeroDelay optimizes. Each game has its own page: pick a server from Fortnite''s real list or let ZeroDelay find the fastest, watch your route live (your PC, router, provider and the game server, each with its ping), and press Start Game. A tools panel collects every test for that game.' }
+        @{ T = 'Boost'; D = 'One page with your score, the parts of the PC it covers, your graphics driver, Boost now and Restore. The score is honest: it counts the recommended tweaks that are on, it is not an FPS promise.' }
+        @{ T = 'Live status bar'; D = 'CPU, graphics card temperature and load, disk and memory at the bottom of every page. It pauses while you play with ZeroDelay in the background, so it costs your game nothing.' }
+    )
     '1.16.0' = @(
         @{ T = 'Games'; D = 'A library of the games ZeroDelay optimizes. Each game has its own page: pick a server from Fortnite''s real list or let ZeroDelay find the fastest, watch your route live (your PC, router, provider and the game server, each with its ping), and press Start Game. A tools panel collects every test for that game.' }
         @{ T = 'Boost'; D = 'One page with your score, the parts of the PC it covers, your graphics driver, Boost now and Restore. The score is honest: it counts the recommended tweaks that are on, it is not an FPS promise.' }
@@ -15806,21 +15918,39 @@ function Start-LiveTimer {
 # =============================================================== Games library, game page and Boost (1.16)
 # Games ZeroDelay can really optimize. The tiles use ZeroDelay's own artwork: the publishers' cover art is theirs.
 $GameDefs = @(
-    @{ Id = 'fortnite'; Title = 'Fortnite'; Sub = 'Epic Games'; Proc = 'FortniteClient-Win64-Shipping'; From = '#6A2BE0'; To = '#1C7CFF'; Glyph = [char]0xE7FC
+    @{ Id = 'fortnite'; Title = 'Fortnite'; Sub = 'Epic Games'; Proc = 'FortniteClient-Win64-Shipping'; From = '#1B78E0'; To = '#5FD0FF'; Glyph = [char]0xE7FC
        Installed = { [bool]$script:FortniteExe }
+       IconFile = { $script:FortniteExe }
        Launch = { Start-FortniteGame }
        Tools = @(@{ Id = 'fn-subping'; Kind = 'Network' }, @{ Id = 'fn-qoslog'; Kind = 'Network' }, @{ Id = 'fn-matchdc'; Kind = 'Network' }, @{ Id = 'fn-linetest'; Kind = 'Network' },
                  @{ Id = 'fn-routecheck'; Kind = 'Network' }, @{ Id = 'fn-pingtruth'; Kind = 'Network' }, @{ Id = 'fn-epicstatus'; Kind = 'Network' },
                  @{ Id = 'fn-bottleneck'; Kind = 'FPS' }, @{ Id = 'fn-presentmode'; Kind = 'FPS' }, @{ Id = 'fn-latencytest'; Kind = 'FPS' }, @{ Id = 'fn-gpubound'; Kind = 'FPS' },
                  @{ Id = 'fn-hitchreport'; Kind = 'FPS' }, @{ Id = 'fn-renderercheck'; Kind = 'FPS' },
                  @{ Id = 'fn-crashcheck'; Kind = 'Repair' }, @{ Id = 'pack-scan'; Kind = 'Repair' }, @{ Id = 'fn-engineini'; Kind = 'Repair' }) }
-    @{ Id = 'cs2'; Title = 'Counter-Strike 2'; Sub = 'Steam'; Proc = 'cs2'; From = '#E08A2E'; To = '#3A2010'; Glyph = [char]0xE7FC
+    @{ Id = 'cs2'; Title = 'Counter-Strike 2'; Sub = 'Steam'; Proc = 'cs2'; From = '#F2A21A'; To = '#26367C'; Glyph = [char]0xE7FC
        Installed = { Test-Cs2Installed }
+       IconFile = { $d = Get-Cs2Dir; if ($d) { Join-Path $d 'game\bin\win64\cs2.exe' } }
        Launch = { Start-Process 'steam://rungameid/730'; 'Launching Counter-Strike 2 through Steam.' }
        Tools = @(@{ Id = 'cs-regionping'; Kind = 'Network' }, @{ Id = 'cs-netadvice'; Kind = 'Network' }, @{ Id = 'lanjitter'; Kind = 'Network' },
                  @{ Id = 'cs-launchcheck'; Kind = 'FPS' }, @{ Id = 'cs-shaderwarm'; Kind = 'FPS' }, @{ Id = 'cs-sens'; Kind = 'FPS' },
                  @{ Id = 'cs-install'; Kind = 'Repair' }, @{ Id = 'pack-scan'; Kind = 'Repair' }) }
 )
+# the game's own logo from its installed .exe (256 px), or $null when the game is not installed
+function Get-GameLogo($g) {
+    if (-not $script:GameLogos) { $script:GameLogos = @{} }
+    if ($script:GameLogos.ContainsKey($g.Id)) { return $script:GameLogos[$g.Id] }
+    $img = $null
+    $file = try { & $g.IconFile } catch { $null }
+    if ($file -and (Test-Path -LiteralPath $file)) {
+        $hb = [ZdShellIcon]::Get($file, 256)
+        if ($hb -ne [IntPtr]::Zero) {
+            try { $img = [Windows.Interop.Imaging]::CreateBitmapSourceFromHBitmap($hb, [IntPtr]::Zero, [Windows.Int32Rect]::Empty, [Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions()); $img.Freeze() }
+            catch { $img = $null } finally { [void][ZdShellIcon]::DeleteObject($hb) }
+        }
+    }
+    $script:GameLogos[$g.Id] = $img
+    $img
+}
 # servers you can measure on the game page: Fortnite's own datacenter list (other games: none yet)
 function Get-GameServers($g) {
     if ($g.Id -ne 'fortnite') { return @() }
@@ -15871,6 +16001,7 @@ while (-not $sync.Stop) {
     if ($sync.Retarget) { $sync.Retarget = $false; $hist.Clear(); $sync.Sent = 0; $sync.Lost = 0; $sync.SrvMs = -1; $sync.Jitter = -1 }
     $sync.GwMs = P $sync.Gw
     $sync.IspMs = P $sync.Isp
+    $sync.Rounds = [int]$sync.Rounds + 1
     if ($sync.Target) {
         $ms = P $sync.Target; $sync.Sent = [int]$sync.Sent + 1
         if ($ms -lt 0) { $sync.Lost = [int]$sync.Lost + 1 } else { $hist.Add($ms); if ($hist.Count -gt 30) { $hist.RemoveAt(0) } }
@@ -15909,8 +16040,11 @@ function New-GameTile($g) {
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Width='220' Height='290' CornerRadius='16' Margin='0,0,18,18' Cursor='Hand'>
   <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,1'><GradientStop Color='$($g.From)' Offset='0'/><GradientStop Color='$($g.To)' Offset='1'/></LinearGradientBrush></Border.Background>
   <Grid ClipToBounds='True'>
-    <TextBlock Text='$('&#x{0:X};' -f [int]$g.Glyph)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='170' Foreground='#26FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-6,-44,0'/>
-    <TextBlock Text='$(Esc $g.Title.ToUpper())' FontSize='29' FontWeight='Black' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
+    <TextBlock x:Name='Glyph' Text='$('&#x{0:X};' -f [int]$g.Glyph)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='170' Foreground='#26FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-6,-44,0'/>
+    <TextBlock x:Name='Big' Text='$(Esc $g.Title.ToUpper())' FontSize='29' FontWeight='Black' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
+    <Border x:Name='Logo' Width='124' Height='124' CornerRadius='28' HorizontalAlignment='Center' VerticalAlignment='Top' Margin='0,52,0,0' Visibility='Collapsed'>
+      <Border.Effect><DropShadowEffect BlurRadius='28' ShadowDepth='6' Direction='270' Opacity='0.45' Color='Black'/></Border.Effect>
+    </Border>
     <Border VerticalAlignment='Bottom' Background='#8C0B0B10' CornerRadius='0,0,16,16' Padding='16,12'>
       <Grid>
         <StackPanel>
@@ -15924,6 +16058,11 @@ function New-GameTile($g) {
 </Border>
 "@)
     $ok = try { [bool](& $g.Installed) } catch { $false }
+    $logo = Get-GameLogo $g
+    if ($logo) {
+        $lb = $b.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
+        $b.FindName('Big').Visibility = 'Collapsed'; $b.FindName('Glyph').Visibility = 'Collapsed'
+    }
     $badge = $b.FindName('Badge'); $bt = $b.FindName('BadgeText')
     $bt.Text = if ($ok) { 'Installed' } else { 'Not found' }
     $badge.Background = ConvertTo-Brush $(if ($ok) { '#4D1F8F4E' } else { '#40FDFDFD' })
@@ -15951,12 +16090,17 @@ function New-GamesPage {
       <Border x:Name='Hero' CornerRadius='18' Padding='26,22' Margin='0,0,0,16'>
         <Grid>
           <TextBlock x:Name='HeroGlyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Center' Margin='0,-30,-10,-30'/>
-          <StackPanel>
+          <StackPanel Orientation='Horizontal'>
+          <Border x:Name='HeroLogo' Width='96' Height='96' CornerRadius='22' Margin='0,0,20,0' VerticalAlignment='Center' Visibility='Collapsed'>
+            <Border.Effect><DropShadowEffect BlurRadius='22' ShadowDepth='4' Direction='270' Opacity='0.4' Color='Black'/></Border.Effect>
+          </Border>
+          <StackPanel VerticalAlignment='Center'>
             <TextBlock x:Name='HeroTitle' FontSize='38' FontWeight='Black' Foreground='#FFFDFDFD'/>
             <WrapPanel Margin='0,12,0,0'>
               <Border x:Name='GmChip' CornerRadius='12' Padding='12,5' Margin='0,0,8,0' Background='#33FDFDFD'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
               <Border CornerRadius='12' Padding='12,5' Background='#33FDFDFD'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
             </WrapPanel>
+          </StackPanel>
           </StackPanel>
         </Grid>
       </Border>
@@ -16020,7 +16164,7 @@ function New-GamesPage {
 </Grid>
 "@)
     $h = @{ Root = $root }
-    foreach ($n in 'Library', 'Tiles', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
+    foreach ($n in 'Library', 'Tiles', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroLogo', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
                    'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList') { $h[$n] = $root.FindName($n) }
     $script:GamesUi = $h
     foreach ($g in $GameDefs) { [void]$h.Tiles.Children.Add((New-GameTile $g)) }
@@ -16079,6 +16223,9 @@ function Show-GameDetail($g) {
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.To)), 1))
     $h.Hero.Background = $grad
     $h.HeroTitle.Text = $g.Title.ToUpper(); $h.HeroGlyph.Text = [string]$g.Glyph
+    $logo = Get-GameLogo $g
+    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible'; $h.HeroGlyph.Visibility = 'Collapsed' }
+    else { $h.HeroLogo.Visibility = 'Collapsed'; $h.HeroGlyph.Visibility = 'Visible' }
     $h.Nodes[0].Children[1].Text = 'This PC'; $h.Nodes[1].Children[1].Text = 'Your router'; $h.Nodes[2].Children[1].Text = 'Internet provider'
     # server list: automatic first, then every server by region
     $h.ServerList.Children.Clear()
@@ -16157,7 +16304,7 @@ function Update-GameDetailTick {
     $fmt = { param($v) if ($null -eq $v -or [int]$v -lt 0) { 'no reply' } elseif ([int]$v -eq 0) { '<1 ms' } else { "$v ms" } }
     $h.Nodes[0].Children[2].Text = 'you'
     $h.Nodes[1].Children[2].Text = if ($s.Gw) { & $fmt $s.GwMs } else { 'finding...' }
-    $h.Nodes[2].Children[2].Text = if ($s.Isp -and [int]$s.IspMs -lt 0 -and [int]$s.Sent -ge 3) { 'hidden' } elseif ($s.Isp) { & $fmt $s.IspMs } elseif ([int]$s.Sent -ge 3) { 'hidden' } else { 'finding...' }
+    $h.Nodes[2].Children[2].Text = if ([int]$s.Rounds -ge 3 -and (-not $s.Isp -or [int]$s.IspMs -lt 0)) { 'hidden' } elseif ($s.Isp) { & $fmt $s.IspMs } else { 'finding...' }
     if (-not $script:GameServer) { $h.Nodes[3].Children[1].Text = if ($s.AutoName) { "$($s.AutoName) (auto)" } else { 'Game server' } }
     $h.Nodes[3].Children[2].Text = if ($s.Target) { & $fmt $s.SrvMs } elseif ($script:GameServers.Count) { 'measuring...' } else { 'see tools' }
     $h.PingVal.Text = if ([int]$s.SrvMs -ge 0 -and $s.Target) { "$($s.SrvMs)" } else { '-' }
@@ -16167,7 +16314,7 @@ function Update-GameDetailTick {
     $h.RouteNote.Text = if ($s.Target -and [int]$s.Sent -ge 5 -and [int]$s.Lost -eq [int]$s.Sent -and $prov -match 'Google') { 'This server is on Google Cloud, which does not answer ping. Your matches still run normally; pick an Amazon (AWS) server to watch a live number, or use Where your matches ran in the tools.' }
         elseif ([int]$s.GwMs -gt 5) { 'Your router answers slowly (over 5 ms). On a cable that points to a busy or weak router; on Wi-Fi it is normal. The Network tab has a router test.' }
         elseif ($s.Isp -and [int]$s.IspMs -ge 0 -and [int]$s.SrvMs -ge 0 -and ([int]$s.SrvMs - [int]$s.IspMs) -gt 60) { 'Most of the delay is after your provider: the distance to the server. A closer server helps more than any setting.' }
-        elseif ([int]$s.Sent -ge 3 -and [int]$s.IspMs -lt 0) { 'Your provider''s routers do not answer ping (many providers hide them), so only your router and the game server are measured. Each is pinged once a second while this page is open.' }
+        elseif ([int]$s.Rounds -ge 3 -and (-not $s.Isp -or [int]$s.IspMs -lt 0)) { 'Your provider''s routers do not answer ping (many providers hide them), so only your router and the game server are measured. Each is pinged once a second while this page is open.' }
         else { 'Each stop is pinged once a second while this page is open. Delay that appears at a stop is added there.' }
 }
 function Update-GameTools {
@@ -18694,6 +18841,7 @@ $window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringI
 Update-GameModeUi
 if (-not $Snapshot -or $env:ZD_SNAPWAIT) { New-StatusStrip; Start-LiveTimer }
 function Complete-Startup {
+if (-not $Snapshot -and $script:Backup.Custom['timerhold']) { try { [void][ZdTimerRes]::Hold(5000) } catch {} }
     [ZdWatchdog]::Step = 'Complete-Startup'
 $script:SysProfile = if ($Snapshot -and $env:ZD_SCANPC) { $null } else { Get-SavedProfile }
 if ($script:SysProfile) { Set-ProfileTailoring } else { Set-GpuTailoring }
