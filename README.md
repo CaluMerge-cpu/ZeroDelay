@@ -11,6 +11,12 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Clean, simple design**: a Home page with an Optimize button that lists what is still off so you choose what to switch on, folding menu groups, and frosted glass on Windows 11.
 - **Live view on Home**: CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a
   one-minute graph, plus the apps using the most CPU. It only measures while Home is open.
+- **Games**: a page per game. Pick a server from Fortnite's own list (or let ZeroDelay find the fastest), watch your
+  route live (PC, router, provider, game server, each with its ping), press Start Game, and find every test for that
+  game in one tools panel.
+- **Boost**: your score (the recommended tweaks that are on, not an FPS promise), the parts of the PC it covers, your
+  graphics driver, Boost now and Restore. A live status bar with CPU, GPU temperature and load, disk and memory sits at
+  the bottom of every page and pauses while you play.
 - **Creator tab** for Premiere Pro, After Effects, Photoshop, Media Encoder and OBS: auto-save hitches, Adobe RAM
   reserve, Multi-Frame Rendering, Adobe apps on the dedicated GPU, OBS priority, staying awake during renders, and
   Adobe cache cleanup. Each setting is changed one value at a time, only while the app is closed.

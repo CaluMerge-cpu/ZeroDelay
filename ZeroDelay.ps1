@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.15.1'
+$AppVersion = '1.16.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -594,6 +594,7 @@ public static class LiveStats {
     static readonly Dictionary<string, Queue<double>> hist = new Dictionary<string, Queue<double>>();
     public static volatile LiveSnap Latest = new LiveSnap();
     public static int OwnPid = Process.GetCurrentProcess().Id;
+    public static volatile bool WantProcs = true;   // the busiest-apps list (Home only)
     public static string LastError = "";
     public static double LastMs;   // how long the last sample took
 
@@ -683,7 +684,7 @@ public static class LiveStats {
             if (s.Disk < 0) SampleDisks(s);
             SampleNvidia(s);
             SampleNet(s);
-            if (tick % 2 == 1) SampleProcs(s); else { var p = Latest; s.TopName = p.TopName; s.TopCpu = p.TopCpu; s.TopMb = p.TopMb; }
+            if (WantProcs && tick % 2 == 1) SampleProcs(s); else { var p = Latest; s.TopName = p.TopName; s.TopCpu = p.TopCpu; s.TopMb = p.TopMb; }
             Push("cpu", s.Cpu); Push("mem", s.Mem); Push("gpu", s.Gpu); Push("disk", s.Disk); Push("net", s.NetDown);
             Latest = s;
         } catch (Exception e) { LastError = e.Message; }
@@ -10479,9 +10480,10 @@ if ($script:Glass) {
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
       <!-- soft colour glows behind the pages; they drift slowly (see Start-AmbientGlow) -->
-      <Grid x:Name="Ambient" Grid.RowSpan="3" IsHitTestVisible="False" ClipToBounds="True">
+      <Grid x:Name="Ambient" Grid.RowSpan="4" IsHitTestVisible="False" ClipToBounds="True">
         <Ellipse x:Name="Glow1" Width="760" Height="760" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="-220,-380,0,0">
           <Ellipse.Fill><RadialGradientBrush><GradientStop Color="#5C0A84FF" Offset="0"/><GradientStop Color="#1F0A84FF" Offset="0.55"/><GradientStop Color="#000A84FF" Offset="1"/></RadialGradientBrush></Ellipse.Fill>
         </Ellipse>
@@ -10587,6 +10589,10 @@ if ($script:Glass) {
         <WrapPanel x:Name="Cards" Margin="14,14,14,14"/>
       </ScrollViewer>
       <ContentControl x:Name="PageHost" Grid.Row="2" Visibility="Collapsed"/>
+      <Grid Grid.Row="3" Margin="32,2,26,12">
+        <TextBlock x:Name="StripNote" FontSize="11" Foreground="#98989D" VerticalAlignment="Center"/>
+        <StackPanel x:Name="StripItems" Orientation="Horizontal" HorizontalAlignment="Right"/>
+      </Grid>
 
       <Grid x:Name="Toast" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,28" Visibility="Collapsed">
         <Border CornerRadius="14" Background="#3A3A3D">
@@ -10706,7 +10712,7 @@ $ui = @{}
 foreach ($n in 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
             'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon',
-            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet') { $ui[$n] = $window.FindName($n) }
+            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
     restart  = @{ Color = '#0A84FF'; Label = 'Needs restart'; Tip = 'Takes effect after you restart the PC.' }
@@ -11535,6 +11541,8 @@ function Start-PingTest($btn) {
 # ---------------------------------------------------------- navigation ----
 $Categories = @(
     @{ Name = 'Home';       Icon = [char]0xE80F; Title = 'Home'; Page = 'Home' }
+    @{ Name = 'Games';      Icon = [char]0xE7FC; Title = 'Games'; Page = 'Games' }
+    @{ Name = 'Boost';      Icon = [char]0xE945; Title = 'Boost'; Page = 'Boost' }
     @{ Name = 'All';        Icon = [char]0xE80F; Title = 'All optimizations' }
     @{ Name = 'Active';     Icon = [char]0xE73E; Title = 'Active tweaks'; Page = 'Active' }
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
@@ -13501,6 +13509,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.16.0' = @(
+        @{ T = 'Games'; D = 'A library of the games ZeroDelay optimizes. Each game has its own page: pick a server from Fortnite''s real list or let ZeroDelay find the fastest, watch your route live (your PC, router, provider and the game server, each with its ping), and press Start Game. A tools panel collects every test for that game.' }
+        @{ T = 'Boost'; D = 'One page with your score, the parts of the PC it covers, your graphics driver, Boost now and Restore. The score is honest: it counts the recommended tweaks that are on, it is not an FPS promise.' }
+        @{ T = 'Live status bar'; D = 'CPU, graphics card temperature and load, disk and memory at the bottom of every page. It pauses while you play with ZeroDelay in the background, so it costs your game nothing.' }
+    )
     '1.15.1' = @(
         @{ T = 'Fixed: ZeroDelay froze or would not open'; D = 'Running as administrator, ZeroDelay could re-check all 300+ cards on its own window thread for 20 s or more: at start-up, after Optimize, presets, pause/resume and Restore all. It now checks in the background, the check itself is three times faster, and a freeze detector writes to crash.log if the window ever stops responding.' }
         @{ T = 'What limits your FPS'; D = 'Reads the summary Fortnite writes after every match and says whether your processor, your graphics card or a frame cap held you back, with the settings that help in your rendering mode.' }
@@ -14457,6 +14470,7 @@ function Complete-StateRefresh {
         Update-RestartBar
         Update-PauseCard
         if ($script:HomeUi) { Update-HomePage }
+        if ($script:BoostUi) { Update-BoostPage }
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
         if ($script:StateAgain) { $script:StateAgain = $false; Clear-ReadCache; Start-StateRefresh $null }
 }
@@ -15777,12 +15791,534 @@ function Start-LiveTimer {
     $script:LiveTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
     $script:LiveTimer.Add_Tick({
         try {
-            $show = $script:CurrentCat.Name -eq 'Home' -and -not $ui.Search.Text -and $window.IsVisible -and $window.WindowState -ne 'Minimized'
-            if (-not $show) { [LiveStats]::Stop(); return }
-            [LiveStats]::Start(); Update-LiveTiles
+            $vis = $window.IsVisible -and $window.WindowState -ne 'Minimized'
+            # a game in front and ZeroDelay behind it: measure nothing, so ZeroDelay costs the game nothing
+            $gaming = $vis -and -not $window.IsActive -and ((Test-FortniteRunning) -or [bool](Get-Process cs2 -ErrorAction SilentlyContinue))
+            if (-not $vis -or $gaming) { [LiveStats]::Stop(); if ($gaming) { Update-StatusStrip $true }; return }
+            $onHome = $script:CurrentCat.Name -eq 'Home' -and -not $ui.Search.Text
+            [LiveStats]::WantProcs = $onHome
+            [LiveStats]::Start(); Update-StatusStrip $false
+            if ($onHome) { Update-LiveTiles }
         } catch { $script:LiveTimer.Stop(); [LiveStats]::Stop(); Write-CrashLog $_.Exception 'live tiles' }
     })
     $script:LiveTimer.Start()
+}
+# =============================================================== Games library, game page and Boost (1.16)
+# Games ZeroDelay can really optimize. The tiles use ZeroDelay's own artwork: the publishers' cover art is theirs.
+$GameDefs = @(
+    @{ Id = 'fortnite'; Title = 'Fortnite'; Sub = 'Epic Games'; Proc = 'FortniteClient-Win64-Shipping'; From = '#6A2BE0'; To = '#1C7CFF'; Glyph = [char]0xE7FC
+       Installed = { [bool]$script:FortniteExe }
+       Launch = { Start-FortniteGame }
+       Tools = @(@{ Id = 'fn-subping'; Kind = 'Network' }, @{ Id = 'fn-qoslog'; Kind = 'Network' }, @{ Id = 'fn-matchdc'; Kind = 'Network' }, @{ Id = 'fn-linetest'; Kind = 'Network' },
+                 @{ Id = 'fn-routecheck'; Kind = 'Network' }, @{ Id = 'fn-pingtruth'; Kind = 'Network' }, @{ Id = 'fn-epicstatus'; Kind = 'Network' },
+                 @{ Id = 'fn-bottleneck'; Kind = 'FPS' }, @{ Id = 'fn-presentmode'; Kind = 'FPS' }, @{ Id = 'fn-latencytest'; Kind = 'FPS' }, @{ Id = 'fn-gpubound'; Kind = 'FPS' },
+                 @{ Id = 'fn-hitchreport'; Kind = 'FPS' }, @{ Id = 'fn-renderercheck'; Kind = 'FPS' },
+                 @{ Id = 'fn-crashcheck'; Kind = 'Repair' }, @{ Id = 'pack-scan'; Kind = 'Repair' }, @{ Id = 'fn-engineini'; Kind = 'Repair' }) }
+    @{ Id = 'cs2'; Title = 'Counter-Strike 2'; Sub = 'Steam'; Proc = 'cs2'; From = '#E08A2E'; To = '#3A2010'; Glyph = [char]0xE7FC
+       Installed = { Test-Cs2Installed }
+       Launch = { Start-Process 'steam://rungameid/730'; 'Launching Counter-Strike 2 through Steam.' }
+       Tools = @(@{ Id = 'cs-regionping'; Kind = 'Network' }, @{ Id = 'cs-netadvice'; Kind = 'Network' }, @{ Id = 'lanjitter'; Kind = 'Network' },
+                 @{ Id = 'cs-launchcheck'; Kind = 'FPS' }, @{ Id = 'cs-shaderwarm'; Kind = 'FPS' }, @{ Id = 'cs-sens'; Kind = 'FPS' },
+                 @{ Id = 'cs-install'; Kind = 'Repair' }, @{ Id = 'pack-scan'; Kind = 'Repair' }) }
+)
+# servers you can measure on the game page: Fortnite's own datacenter list (other games: none yet)
+function Get-GameServers($g) {
+    if ($g.Id -ne 'fortnite') { return @() }
+    @(Get-FnDatacenters | Where-Object { $_.Visible -and @($_.Ips).Count } | ForEach-Object {
+        [pscustomobject]@{ Name = "$($_.City)"; Region = "$($_.GameRegion)"; Prov = "$($_.Prov)"; Ip = @($_.Ips)[0] } })
+}
+
+# --- Route monitor: pings the router, the provider's first router and the game server once a second in its own
+#     PowerShell, only while a game page is on screen. Results go to a shared table the page reads.
+$RouteMonCode = @'
+param($sync)
+$ping = New-Object System.Net.NetworkInformation.Ping
+function P($ip) { if (-not $ip) { return -1 }; try { $r = $ping.Send($ip, 900); if ($r.Status -eq 'Success') { [int]$r.RoundtripTime } else { -1 } } catch { -1 } }
+function Test-Private($ip) {
+    $b = ([Net.IPAddress]::Parse($ip)).GetAddressBytes()
+    ($b[0] -eq 10) -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) -or ($b[0] -eq 169 -and $b[1] -eq 254)
+}
+try {
+    # the router: the IPv4 gateway of a connected adapter
+    foreach ($n in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($n.OperationalStatus -ne 'Up' -or $sync.Gw) { continue }
+        foreach ($gw in $n.GetIPProperties().GatewayAddresses) { $a = $gw.Address; if ($a.AddressFamily -eq 'InterNetwork' -and "$a" -ne '0.0.0.0') { $sync.Gw = "$a"; break } }
+    }
+    # the provider: the first public address on the way out (TTL steps, like tracert)
+    $opt = New-Object Net.NetworkInformation.PingOptions; $buf = New-Object byte[] 32
+    for ($ttl = 1; $ttl -le 8 -and -not $sync.Stop; $ttl++) {
+        $opt.Ttl = $ttl
+        try { $r = $ping.Send('1.1.1.1', 900, $buf, $opt) } catch { continue }
+        if (-not $r.Address) { continue }
+        $a = "$($r.Address)"
+        if ($a -ne '1.1.1.1' -and -not (Test-Private $a)) { $sync.Isp = $a; break }
+        if ($r.Status -eq 'Success') { break }
+    }
+} catch {}
+# automatic: the fastest of the candidate servers (two pings each)
+if ($sync.Auto -and $sync.Candidates) {
+    $best = $null; $bestMs = 99999
+    foreach ($c in $sync.Candidates) {
+        if ($sync.Stop) { break }
+        $a = P $c.Ip; $b = P $c.Ip; $v = @($a, $b | Where-Object { $_ -ge 0 })
+        if ($v.Count) { $m = ($v | Measure-Object -Minimum).Minimum; if ($m -lt $bestMs) { $bestMs = $m; $best = $c } }
+    }
+    if ($best -and $sync.Auto) { $sync.Target = $best.Ip; $sync.AutoName = $best.Name; $sync.AutoProv = $best.Prov }
+}
+$hist = New-Object Collections.Generic.List[int]
+while (-not $sync.Stop) {
+    $t0 = [Environment]::TickCount
+    if ($sync.Retarget) { $sync.Retarget = $false; $hist.Clear(); $sync.Sent = 0; $sync.Lost = 0; $sync.SrvMs = -1; $sync.Jitter = -1 }
+    $sync.GwMs = P $sync.Gw
+    $sync.IspMs = P $sync.Isp
+    if ($sync.Target) {
+        $ms = P $sync.Target; $sync.Sent = [int]$sync.Sent + 1
+        if ($ms -lt 0) { $sync.Lost = [int]$sync.Lost + 1 } else { $hist.Add($ms); if ($hist.Count -gt 30) { $hist.RemoveAt(0) } }
+        $sync.SrvMs = $ms
+        if ($hist.Count -ge 2) { $j = 0; for ($i = 1; $i -lt $hist.Count; $i++) { $j += [Math]::Abs($hist[$i] - $hist[$i - 1]) }; $sync.Jitter = [Math]::Round($j / ($hist.Count - 1), 1) }
+    }
+    $sync.Beat = [DateTime]::UtcNow.Ticks
+    $wait = 1000 - ([Environment]::TickCount - $t0); if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+}
+'@
+function Start-RouteMonitor([string]$Target, $Candidates) {
+    Stop-RouteMonitor
+    $sync = [hashtable]::Synchronized(@{ Stop = $false; Target = $Target; Auto = (-not $Target); Candidates = @($Candidates); Sent = 0; Lost = 0; SrvMs = -1; GwMs = -1; IspMs = -1; Jitter = -1 })
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($RouteMonCode).AddArgument($sync)
+    $script:RouteMon = @{ Sync = $sync; PS = $ps; RS = $rs; Handle = $ps.BeginInvoke() }
+}
+# asks the monitor to stop; it finishes its current second and is cleaned up by the page timer
+function Stop-RouteMonitor {
+    $m = $script:RouteMon; if (-not $m) { return }
+    $m.Sync.Stop = $true; $script:RouteMon = $null
+    if (-not $script:RouteMonOld) { $script:RouteMonOld = New-Object Collections.ArrayList }
+    [void]$script:RouteMonOld.Add($m)
+}
+function Clear-RouteMonitors {
+    if (-not $script:RouteMonOld) { return }
+    foreach ($m in @($script:RouteMonOld)) {
+        if ($m.Handle.IsCompleted) { try { [void]$m.PS.EndInvoke($m.Handle) } catch {}; $m.PS.Dispose(); $m.RS.Dispose(); $script:RouteMonOld.Remove($m) }
+    }
+}
+
+# --- Games page: the library, and one page per game (server, live route, Start Game, tools)
+function New-GameTile($g) {
+    $b = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Width='220' Height='290' CornerRadius='16' Margin='0,0,18,18' Cursor='Hand'>
+  <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,1'><GradientStop Color='$($g.From)' Offset='0'/><GradientStop Color='$($g.To)' Offset='1'/></LinearGradientBrush></Border.Background>
+  <Grid ClipToBounds='True'>
+    <TextBlock Text='$('&#x{0:X};' -f [int]$g.Glyph)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='170' Foreground='#26FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-6,-44,0'/>
+    <TextBlock Text='$(Esc $g.Title.ToUpper())' FontSize='29' FontWeight='Black' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
+    <Border VerticalAlignment='Bottom' Background='#8C0B0B10' CornerRadius='0,0,16,16' Padding='16,12'>
+      <Grid>
+        <StackPanel>
+          <TextBlock Text='$(Esc $g.Title)' FontSize='14' FontWeight='SemiBold' Foreground='#FFFDFDFD'/>
+          <TextBlock Text='$(Esc $g.Sub)' FontSize='12' Foreground='#B3FDFDFD'/>
+        </StackPanel>
+        <Border x:Name='Badge' HorizontalAlignment='Right' VerticalAlignment='Center' CornerRadius='8' Padding='8,3'><TextBlock x:Name='BadgeText' FontSize='11' FontWeight='SemiBold'/></Border>
+      </Grid>
+    </Border>
+  </Grid>
+</Border>
+"@)
+    $ok = try { [bool](& $g.Installed) } catch { $false }
+    $badge = $b.FindName('Badge'); $bt = $b.FindName('BadgeText')
+    $bt.Text = if ($ok) { 'Installed' } else { 'Not found' }
+    $badge.Background = ConvertTo-Brush $(if ($ok) { '#4D1F8F4E' } else { '#40FDFDFD' })
+    $bt.Foreground = ConvertTo-Brush $(if ($ok) { '#FF7CF0A8' } else { '#FFFDFDFD' })
+    $b.Tag = $g
+    $b.RenderTransform = New-Object Windows.Media.TranslateTransform
+    $b.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -4 180 } })
+    $b.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
+    $b.Add_MouseLeftButtonUp({ param($s, $e) Show-GameDetail $s.Tag })
+    $b
+}
+function New-GamesPage {
+    $root = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1180' HorizontalAlignment='Left'>
+  <StackPanel x:Name='Library'>
+    <TextBlock Text='Pick a game to see its server, your live route and the tools for it. ZeroDelay adds games when it can optimize them for real, not just list them.' FontSize='13' Foreground='#A1A1A6' TextWrapping='Wrap' MaxWidth='760' HorizontalAlignment='Left' Margin='0,0,0,18'/>
+    <WrapPanel x:Name='Tiles'/>
+  </StackPanel>
+  <Grid x:Name='Detail' Visibility='Collapsed'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='320'/></Grid.ColumnDefinitions>
+    <StackPanel Margin='0,0,18,0'>
+      <Button x:Name='Back' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='10,6' Margin='0,0,0,14'>
+        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72B;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' Margin='0,1,8,0'/><TextBlock Text='All games'/></StackPanel>
+      </Button>
+      <Border x:Name='Hero' CornerRadius='18' Padding='26,22' Margin='0,0,0,16'>
+        <Grid>
+          <TextBlock x:Name='HeroGlyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Center' Margin='0,-30,-10,-30'/>
+          <StackPanel>
+            <TextBlock x:Name='HeroTitle' FontSize='38' FontWeight='Black' Foreground='#FFFDFDFD'/>
+            <WrapPanel Margin='0,12,0,0'>
+              <Border x:Name='GmChip' CornerRadius='12' Padding='12,5' Margin='0,0,8,0' Background='#33FDFDFD'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
+              <Border CornerRadius='12' Padding='12,5' Background='#33FDFDFD'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
+            </WrapPanel>
+          </StackPanel>
+        </Grid>
+      </Border>
+      <Border Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+          <StackPanel>
+            <TextBlock Text='GAME SERVER' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+            <Button x:Name='ServerBtn' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='12,8' Margin='0,8,0,0'>
+              <StackPanel Orientation='Horizontal'><TextBlock x:Name='ServerText' Text='Automatic'/><TextBlock Text='&#xE70D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Margin='10,3,0,0'/></StackPanel>
+            </Button>
+            <Popup x:Name='ServerPop' PlacementTarget='{Binding ElementName=ServerBtn}' Placement='Bottom' VerticalOffset='6' StaysOpen='False' AllowsTransparency='True' PopupAnimation='Fade'>
+              <Border CornerRadius='12' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' Padding='6' Margin='0,0,10,12'>
+                <ScrollViewer Style='{DynamicResource OverlayScroll}' MaxHeight='360' VerticalScrollBarVisibility='Auto'><StackPanel x:Name='ServerList' MinWidth='280'/></ScrollViewer>
+              </Border>
+            </Popup>
+            <TextBlock x:Name='ServerHint' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,10,0,0' MaxWidth='420' HorizontalAlignment='Left'/>
+          </StackPanel>
+          <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+            <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+            <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+            <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+          </StackPanel>
+        </Grid>
+      </Border>
+      <Border Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,18'>
+        <StackPanel>
+          <TextBlock Text='YOUR ROUTE, LIVE' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+          <Grid x:Name='Route' Margin='0,16,0,0'>
+            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+            <Border Grid.ColumnSpan='4' Height='2' Background='#3A3A3C' VerticalAlignment='Top' Margin='60,21,60,0'/>
+          </Grid>
+          <TextBlock x:Name='RouteNote' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,14,0,0'/>
+        </StackPanel>
+      </Border>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+        <Button x:Name='Play' Cursor='Hand' Width='260' Height='58'>
+          <Button.Template>
+            <ControlTemplate TargetType='Button'>
+              <Border x:Name='Bg' CornerRadius='29'>
+                <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,0'><GradientStop Color='#FF4BF0BA' Offset='0'/><GradientStop Color='#FF22CF93' Offset='1'/></LinearGradientBrush></Border.Background>
+                <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
+              </Border>
+              <ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Bg' Property='Opacity' Value='0.88'/></Trigger></ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Button.Template>
+          <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='#FF06281C' Margin='0,2,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='18' FontWeight='SemiBold' Foreground='#FF06281C'/></StackPanel>
+        </Button>
+        <TextBlock x:Name='PlayNote' Grid.Column='1' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' VerticalAlignment='Center' Margin='18,0,0,0'/>
+      </Grid>
+    </StackPanel>
+    <Border Grid.Column='1' Style='{DynamicResource Card}' Padding='18,16' VerticalAlignment='Top'>
+      <StackPanel>
+        <TextBlock Text='Game tools' FontSize='15' FontWeight='SemiBold'/>
+        <WrapPanel x:Name='ToolChips' Margin='0,12,0,8'/>
+        <StackPanel x:Name='ToolList'/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Grid>
+"@)
+    $h = @{ Root = $root }
+    foreach ($n in 'Library', 'Tiles', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
+                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList') { $h[$n] = $root.FindName($n) }
+    $script:GamesUi = $h
+    foreach ($g in $GameDefs) { [void]$h.Tiles.Children.Add((New-GameTile $g)) }
+    # the four route stops: this PC, the router, the provider, the game server
+    $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
+        $n = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' HorizontalAlignment='Center'>
+  <Border Width='44' Height='44' CornerRadius='22' Background='#2C2C2E' BorderBrush='#48484A' BorderThickness='1' HorizontalAlignment='Center'>
+    <TextBlock FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' HorizontalAlignment='Center' VerticalAlignment='Center' Foreground='#0A84FF'/>
+  </Border>
+  <TextBlock FontSize='12.5' FontWeight='SemiBold' HorizontalAlignment='Center' Margin='0,8,0,0' TextTrimming='CharacterEllipsis' MaxWidth='150'/>
+  <TextBlock FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center' Margin='0,2,0,0' Typography.NumeralAlignment='Tabular'/>
+</StackPanel>
+"@)
+        [Windows.Controls.Grid]::SetColumn($n, $i); [void]$h.Route.Children.Add($n)
+        $n.Children[0].Child.Text = @([char]0xE7F8, [char]0xE839, [char]0xE774, [char]0xE968)[$i]
+        $n })
+    $h.Back.Add_Click({ Hide-GameDetail })
+    $h.ServerBtn.Add_Click({ $script:GamesUi.ServerPop.IsOpen = $true })
+    $h.Play.Add_Click({
+        $g = $script:GameSel; if (-not $g) { return }
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        try {
+            $running = [bool](Get-Process $g.Proc -ErrorAction SilentlyContinue)
+            $msg = if ($g.Id -eq 'fortnite') { $m = if (Test-ZDGameMode) { '' } else { Enable-ZDGameMode }; if ($running) { "$m Fortnite is already running." } else { "$m $(& $g.Launch)" } }
+                   else { if ($running) { "$($g.Title) is already running." } else { & $g.Launch } }
+            Show-Toast "$msg".Trim() '#30D158'
+        } catch { Show-Toast $_.Exception.Message '#FF9F0A' }
+        $window.Cursor = $null
+        Update-GameModeUi; Update-GameDetail
+    })
+    # tool filter chips
+    foreach ($k in 'All', 'Network', 'FPS', 'Repair') {
+        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$k' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
+        $c.Tag = $k; $c.Add_Click({ param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools })
+        [void]$h.ToolChips.Children.Add($c)
+    }
+    $script:GameToolKind = 'All'
+    if (-not $script:GamesTimer) {
+        $script:GamesTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:GamesTimer.Interval = [TimeSpan]::FromSeconds(1)
+        $script:GamesTimer.Add_Tick({ try { Update-GameDetailTick } catch { $script:GamesTimer.Stop(); Stop-RouteMonitor; Write-CrashLog $_.Exception 'game page' } })
+        $script:GamesTimer.Start()
+    }
+    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail } }
+    if ($env:ZD_GAME) { $g0 = $GameDefs | Where-Object { $_.Id -eq $env:ZD_GAME } | Select-Object -First 1; if ($g0) { Show-GameDetail $g0 } }
+    New-PageScroll $root
+}
+function Show-GameDetail($g) {
+    $h = $script:GamesUi; if (-not $h) { return }
+    $script:GameSel = $g
+    $h.Library.Visibility = 'Collapsed'; $h.Detail.Visibility = 'Visible'
+    $ui.PageTitle.Text = $g.Title
+    $grad = New-Object Windows.Media.LinearGradientBrush; $grad.StartPoint = '0,0'; $grad.EndPoint = '1,1'
+    $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.From)), 0))
+    $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.To)), 1))
+    $h.Hero.Background = $grad
+    $h.HeroTitle.Text = $g.Title.ToUpper(); $h.HeroGlyph.Text = [string]$g.Glyph
+    $h.Nodes[0].Children[1].Text = 'This PC'; $h.Nodes[1].Children[1].Text = 'Your router'; $h.Nodes[2].Children[1].Text = 'Internet provider'
+    # server list: automatic first, then every server by region
+    $h.ServerList.Children.Clear()
+    $servers = @(Get-GameServers $g)
+    $script:GameServers = $servers
+    $add = {
+        param($label, $sub, $item)
+        $b = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Background='Transparent' HorizontalContentAlignment='Left' Padding='12,7' Margin='0,0,0,1'><StackPanel><TextBlock Text='$(Esc $label)' FontSize='13'/><TextBlock Text='$(Esc $sub)' FontSize='11' Foreground='#98989D'/></StackPanel></Button>")
+        $b.Tag = $item
+        $b.Add_Click({ param($s, $e) $script:GamesUi.ServerPop.IsOpen = $false; Select-GameServer $s.Tag })
+        [void]$script:GamesUi.ServerList.Children.Add($b)
+    }
+    if ($servers.Count) {
+        & $add 'Automatic' 'The fastest server in your region, measured now' $null
+        foreach ($grp in ($servers | Group-Object Region)) {
+            $hd = New-Object Windows.Controls.TextBlock; $hd.Text = $grp.Name.ToUpper(); $hd.FontSize = 10.5; $hd.FontWeight = 'SemiBold'; $hd.Foreground = ConvertTo-Brush '#98989D'; $hd.Margin = '12,10,0,4'
+            [void]$h.ServerList.Children.Add($hd)
+            foreach ($s in $grp.Group) { & $add $s.Name $(if ($s.Prov) { $s.Prov } else { $s.Ip }) $s }
+        }
+        $h.ServerBtn.IsEnabled = $true
+    } else { $h.ServerBtn.IsEnabled = $false }
+    $saved = $script:Backup.Custom["gameserver_$($g.Id)"]
+    $pick = if ($saved) { $servers | Where-Object { $_.Name -eq $saved } | Select-Object -First 1 } else { $null }
+    Select-GameServer $pick
+    Update-GameTools
+    Update-GameDetail
+    if ($script:Anim) { Show-Animated $h.Detail 12 260 }
+}
+function Hide-GameDetail {
+    $h = $script:GamesUi; $script:GameSel = $null; Stop-RouteMonitor
+    $h.Detail.Visibility = 'Collapsed'; $h.Library.Visibility = 'Visible'
+    $ui.PageTitle.Text = $script:CurrentCat.Title
+    if ($script:Anim) { Show-Animated $h.Library 12 260 }
+}
+# $null = automatic (the fastest server in the region you play)
+function Select-GameServer($s) {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g) { return }
+    $script:GameServer = $s
+    if ($s) { $script:Backup.Custom["gameserver_$($g.Id)"] = $s.Name } else { $script:Backup.Custom.Remove("gameserver_$($g.Id)") }
+    $h.ServerText.Text = if ($s) { "$($s.Name) · $($s.Region)" } elseif ($script:GameServers.Count) { 'Automatic' } else { 'Not available for this game yet' }
+    $h.Nodes[3].Children[1].Text = if ($s) { $s.Name } else { 'Game server' }
+    $h.ServerHint.Text = if ($g.Id -ne 'fortnite') { 'ZeroDelay does not have this game''s server list yet: the tools on the right ping its servers.' }
+        elseif ($s) { "To play there: in Fortnite open Settings > Game and set Matchmaking Region to $($s.Region) and Subregion Preference to $($s.Name). ZeroDelay measures; Fortnite picks the server." }
+        else { 'Finds the fastest server in the region you play. ZeroDelay measures the route; Fortnite still picks the server, so set the same city in its Subregion Preference.' }
+    $myRegion = Get-PlayRegionName
+    $cand = @($script:GameServers | Where-Object { $_.Region -eq $myRegion }); if (-not $cand.Count) { $cand = @($script:GameServers | Select-Object -First 8) }
+    if ($script:RouteMon) { Stop-RouteMonitor }
+    $script:RouteWant = @{ Target = $(if ($s) { $s.Ip } else { $null }); Candidates = $cand }
+}
+function Update-GameDetail {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h) { return }
+    $gm = Test-ZDGameMode
+    $h.GmChipText.Text = if ($gm) { 'Game Mode on' } else { 'Game Mode off' }
+    $h.GmChip.Background = ConvertTo-Brush $(if ($gm) { '#5530D158' } else { '#33FDFDFD' })
+    $p = Get-Process $g.Proc -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($p) {
+        $span = try { (Get-Date) - $p.StartTime } catch { $null }
+        $h.RunText.Text = if ($span) { 'Running · {0:00}:{1:00}:{2:00}' -f [int][Math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds } else { 'Running' }
+        $h.PlayText.Text = if ($g.Id -eq 'fortnite' -and -not $gm) { 'Start Game Mode' } else { 'Playing' }
+    } else {
+        $h.RunText.Text = 'Not running'
+        $h.PlayText.Text = 'Start Game'
+    }
+    $h.PlayNote.Text = if ($g.Id -eq 'fortnite') { 'Turns Game Mode on (background apps closed, match power settings) and launches Fortnite through the Epic Games Launcher.' } else { "Launches $($g.Title). Game Mode is built for Fortnite; the tweaks on the CS2 tab apply to this game." }
+}
+# once a second while a game page is on screen: keeps the route monitor running and shows its numbers
+function Update-GameDetailTick {
+    Clear-RouteMonitors
+    $h = $script:GamesUi; $g = $script:GameSel
+    $show = $g -and $h -and $script:CurrentCat.Name -eq 'Games' -and -not $ui.Search.Text -and $window.IsVisible -and $window.WindowState -ne 'Minimized'
+    if (-not $show) { Stop-RouteMonitor; return }
+    if (-not $script:RouteMon -and $script:RouteWant) { Start-RouteMonitor $script:RouteWant.Target $script:RouteWant.Candidates }
+    Update-GameDetail
+    $m = $script:RouteMon; if (-not $m) { return }
+    $s = $m.Sync
+    $fmt = { param($v) if ($null -eq $v -or [int]$v -lt 0) { 'no reply' } elseif ([int]$v -eq 0) { '<1 ms' } else { "$v ms" } }
+    $h.Nodes[0].Children[2].Text = 'you'
+    $h.Nodes[1].Children[2].Text = if ($s.Gw) { & $fmt $s.GwMs } else { 'finding...' }
+    $h.Nodes[2].Children[2].Text = if ($s.Isp -and [int]$s.IspMs -lt 0 -and [int]$s.Sent -ge 3) { 'hidden' } elseif ($s.Isp) { & $fmt $s.IspMs } elseif ([int]$s.Sent -ge 3) { 'hidden' } else { 'finding...' }
+    if (-not $script:GameServer) { $h.Nodes[3].Children[1].Text = if ($s.AutoName) { "$($s.AutoName) (auto)" } else { 'Game server' } }
+    $h.Nodes[3].Children[2].Text = if ($s.Target) { & $fmt $s.SrvMs } elseif ($script:GameServers.Count) { 'measuring...' } else { 'see tools' }
+    $h.PingVal.Text = if ([int]$s.SrvMs -ge 0 -and $s.Target) { "$($s.SrvMs)" } else { '-' }
+    $h.LossVal.Text = if ([int]$s.Sent -ge 5) { '{0:0.#}' -f (100.0 * [int]$s.Lost / [int]$s.Sent) } else { '-' }
+    $h.JitVal.Text = if ([double]$s.Jitter -ge 0) { '{0:0.#}' -f [double]$s.Jitter } else { '-' }
+    $prov = if ($script:GameServer) { $script:GameServer.Prov } else { $s.AutoProv }
+    $h.RouteNote.Text = if ($s.Target -and [int]$s.Sent -ge 5 -and [int]$s.Lost -eq [int]$s.Sent -and $prov -match 'Google') { 'This server is on Google Cloud, which does not answer ping. Your matches still run normally; pick an Amazon (AWS) server to watch a live number, or use Where your matches ran in the tools.' }
+        elseif ([int]$s.GwMs -gt 5) { 'Your router answers slowly (over 5 ms). On a cable that points to a busy or weak router; on Wi-Fi it is normal. The Network tab has a router test.' }
+        elseif ($s.Isp -and [int]$s.IspMs -ge 0 -and [int]$s.SrvMs -ge 0 -and ([int]$s.SrvMs - [int]$s.IspMs) -gt 60) { 'Most of the delay is after your provider: the distance to the server. A closer server helps more than any setting.' }
+        elseif ([int]$s.Sent -ge 3 -and [int]$s.IspMs -lt 0) { 'Your provider''s routers do not answer ping (many providers hide them), so only your router and the game server are measured. Each is pinged once a second while this page is open.' }
+        else { 'Each stop is pinged once a second while this page is open. Delay that appears at a stop is added there.' }
+}
+function Update-GameTools {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g) { return }
+    $h.ToolList.Children.Clear()
+    foreach ($c in $h.ToolChips.Children) { $c.Background = ConvertTo-Brush $(if ($c.Tag -eq $script:GameToolKind) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($c.Tag -eq $script:GameToolKind) { '#FDFDFD' } else { '#F5F5F7' }) }
+    foreach ($tool in $g.Tools) {
+        if ($script:GameToolKind -ne 'All' -and $tool.Kind -ne $script:GameToolKind) { continue }
+        $t = $Tweaks | Where-Object { $_.Id -eq $tool.Id } | Select-Object -First 1
+        if (-not $t -or $t.Hidden) { continue }
+        $desc = "$($t.Desc)"; if ($desc.Length -gt 90) { $desc = $desc.Substring(0, 87).TrimEnd() + '...' }
+        $row = [ZdTheme]::Parse(@"
+<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Background='Transparent' HorizontalContentAlignment='Stretch' Padding='8,8' Margin='0,0,0,2'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Border Width='32' Height='32' CornerRadius='9' Background='#2C2C2E' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$t.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <StackPanel Grid.Column='1' Margin='10,0,6,0'>
+      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>
+      <TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/>
+    </StackPanel>
+    <TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#98989D' VerticalAlignment='Center'/>
+  </Grid>
+</Button>
+"@)
+        $row.Tag = $t
+        $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
+        [void]$h.ToolList.Children.Add($row)
+    }
+    if (-not $h.ToolList.Children.Count) { $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'No tools of this kind for this game yet.'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'; $tb.FontSize = 12; [void]$h.ToolList.Children.Add($tb) }
+}
+
+# --- Boost page: how much of the recommended setup is on, the parts of the PC it covers, Boost now and Restore
+$BoostAreas = @(
+    @{ Title = 'Processor and power'; Icon = [char]0xE950; Cats = @('Power', 'System'); Nav = 'Power' }
+    @{ Title = 'Graphics'; Icon = [char]0xE7F4; Cats = @('Graphics', 'Fortnite'); Nav = 'Graphics' }
+    @{ Title = 'Network'; Icon = [char]0xE839; Cats = @('Network'); Nav = 'Network' }
+    @{ Title = 'Background apps'; Icon = [char]0xE895; Cats = @('Background', 'Services', 'Startup', 'Vendor'); Nav = 'Background' }
+    @{ Title = 'Input and audio'; Icon = [char]0xE962; Cats = @('Input'); Nav = 'Input' }
+)
+function New-BoostPage {
+    $root = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1120' HorizontalAlignment='Left'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='380'/></Grid.ColumnDefinitions>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='28' Margin='0,0,18,0' VerticalAlignment='Top'>
+    <StackPanel HorizontalAlignment='Center'>
+      <Grid Width='250' Height='250' Margin='0,8,0,0'>
+        <Ellipse Stroke='#3A3A3C' StrokeThickness='16'/>
+        <Ellipse x:Name='Ring' StrokeThickness='16' StrokeDashCap='Round' RenderTransformOrigin='0.5,0.5'>
+          <Ellipse.RenderTransform><RotateTransform Angle='-90'/></Ellipse.RenderTransform>
+        </Ellipse>
+        <StackPanel VerticalAlignment='Center' HorizontalAlignment='Center'>
+          <TextBlock x:Name='Pct' Text='0%' FontSize='54' FontWeight='Bold' HorizontalAlignment='Center' Typography.NumeralAlignment='Tabular'/>
+          <TextBlock Text='of the recommended setup is on' FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center'/>
+        </StackPanel>
+      </Grid>
+      <TextBlock x:Name='Headline' FontSize='18' FontWeight='SemiBold' HorizontalAlignment='Center' Margin='0,22,0,0' TextAlignment='Center' TextWrapping='Wrap' MaxWidth='420'/>
+      <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#A1A1A6' HorizontalAlignment='Center' TextAlignment='Center' TextWrapping='Wrap' MaxWidth='440' Margin='0,6,0,0'/>
+      <StackPanel Orientation='Horizontal' HorizontalAlignment='Center' Margin='0,20,0,0'>
+        <Button x:Name='Go' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='26,11' FontSize='14' Margin='0,0,10,0'>
+          <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,8,0'/><TextBlock x:Name='GoText' Text='Boost now'/></StackPanel>
+        </Button>
+        <Button x:Name='Undo' Style='{DynamicResource Btn}' Padding='20,11' FontSize='14'>
+          <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE7A7;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,8,0'/><TextBlock Text='Restore'/></StackPanel>
+        </Button>
+      </StackPanel>
+      <Grid Margin='0,22,0,0' HorizontalAlignment='Center'>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <ToggleButton x:Name='Auto' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
+        <TextBlock Grid.Column='1' Text='Turn Game Mode on by itself when Fortnite starts' FontSize='12.5' VerticalAlignment='Center' Margin='10,0,0,0'/>
+      </Grid>
+      <TextBlock Text='The number is honest: it counts the recommended tweaks that fit this PC and are on. It is not an FPS promise; your real gains show in the match reports and the benchmark.' FontSize='11.5' Foreground='#98989D' TextWrapping='Wrap' TextAlignment='Center' MaxWidth='440' Margin='0,18,0,0'/>
+    </StackPanel>
+  </Border>
+  <StackPanel x:Name='Areas' Grid.Column='1'/>
+</Grid>
+"@)
+    $h = @{ Root = $root }
+    foreach ($n in 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'Areas') { $h[$n] = $root.FindName($n) }
+    $script:BoostUi = $h
+    $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
+    $h.Undo.Add_Click({ $ui.RestoreAll.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
+    $h.Auto.Add_Click({ param($s, $e) $p = Get-GameModePrefs; $p['auto'] = [bool]$s.IsChecked; $script:Backup.Custom['gamemodeprefs'] = $p; Save-Backup; Show-Toast $(if ($s.IsChecked) { 'Game Mode turns on by itself when Fortnite starts.' } else { 'Game Mode only turns on when you start it.' }) '#30D158' })
+    $h.Tiles = @{}
+    foreach ($a in $BoostAreas + @(@{ Title = 'Graphics driver'; Icon = [char]0xE7F8; Cats = @(); Nav = 'Nvidia'; Driver = $true })) {
+        $tile = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='18,14' Margin='0,0,0,12' Cursor='Hand'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Border Width='40' Height='40' CornerRadius='11' Background='#2C2C2E'><TextBlock Text='$('&#x{0:X};' -f [int][char]$a.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <StackPanel Grid.Column='1' Margin='14,0,8,0' VerticalAlignment='Center'>
+      <TextBlock Text='$(Esc $a.Title)' FontSize='14' FontWeight='SemiBold'/>
+      <TextBlock FontSize='12' Foreground='#A1A1A6' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/>
+    </StackPanel>
+    <TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#98989D' VerticalAlignment='Center'/>
+  </Grid>
+</Border>
+"@)
+        $tile.Tag = $a
+        $tile.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag.Nav })
+        $tile.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true })
+        $tile.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false })
+        [void]$h.Areas.Children.Add($tile)
+        $h.Tiles[$a.Title] = $tile
+    }
+    $script:PageRefresh['Boost'] = { Update-BoostPage }
+    Update-BoostPage
+    New-PageScroll $root
+}
+function Update-BoostPage {
+    $h = $script:BoostUi; if (-not $h) { return }
+    $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State -and -not $_.Hidden })
+    $on = @($rec | Where-Object { $_.State }).Count
+    $pct = if ($rec.Count) { [int][Math]::Round(100 * $on / $rec.Count) } else { 100 }
+    $h.Pct.Text = "$pct%"
+    $circ = [Math]::PI * (250 - 16) / 16
+    $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(($circ * $pct / 100), 1000))
+    $col = if ($pct -ge 90) { '#30D158' } elseif ($pct -ge 60) { '#FFD60A' } else { '#FF9F0A' }
+    $h.Ring.Stroke = ConvertTo-Brush $col; $h.Ring.Effect = New-Glow $h.Ring.Stroke.Color 26 0.6
+    $left = $rec.Count - $on
+    $h.Headline.Text = if ($left -gt 0) { "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off" } else { 'Everything recommended is on' }
+    $h.Sub.Text = if ($left -gt 0) { 'Boost now shows the list and you pick what to switch on. A restore point comes first; Restore undoes everything.' } else { 'ZeroDelay keeps watching and tells you if another program changes something back.' }
+    $h.Go.IsEnabled = $left -gt 0; $h.GoText.Text = if ($left -gt 0) { 'Boost now' } else { 'All set' }
+    $h.Auto.IsChecked = [bool](Get-GameModePrefs)['auto']
+    foreach ($a in $BoostAreas) {
+        $r = @($rec | Where-Object { $a.Cats -contains $_.Cat }); $o = @($r | Where-Object { $_.State }).Count
+        $h.Tiles[$a.Title].Child.Children[1].Children[1].Text = if ($r.Count) { "$o of $($r.Count) recommended on" } else { 'Nothing recommended for this PC' }
+    }
+    $d = try { Get-NvDriverInfo } catch { $null }
+    $h.Tiles['Graphics driver'].Child.Children[1].Children[1].Text = if ($d -and $d.Latest -and $d.Installed -ne $d.Latest) { "$($d.Installed) installed, $($d.Latest) available" }
+        elseif ($d) { "NVIDIA $($d.Installed)$(if ($d.Latest) { ', the latest' })" } else { 'See This PC for your driver' }
+}
+
+# --- Status strip at the bottom of every page: live load and temperatures (from [LiveStats])
+function New-StatusStrip {
+    $script:StripUi = @{}
+    foreach ($k in @(@('cpu', 'CPU'), @('gput', 'GPU temp'), @('gpu', 'GPU'), @('disk', 'Disk'), @('mem', 'Memory'))) {
+        $sp = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='18,0,0,0'><TextBlock Text='-' FontSize='13' FontWeight='SemiBold' HorizontalAlignment='Center' Typography.NumeralAlignment='Tabular'/><TextBlock Text='$($k[1])' FontSize='10.5' Foreground='#98989D' HorizontalAlignment='Center'/></StackPanel>")
+        [void]$ui.StripItems.Children.Add($sp); $script:StripUi[$k[0]] = $sp.Children[0]
+    }
+    $script:StripUi.Note = $ui.StripNote
+}
+function Update-StatusStrip([bool]$Paused) {
+    $u = $script:StripUi; if (-not $u) { return }
+    $s = [LiveStats]::Latest
+    $u.cpu.Text = if ($s.Cpu -ge 0) { "$([int]$s.Cpu)%" } else { '-' }
+    $u.gput.Text = if ($s.GpuTemp -ge 0) { "$([int]$s.GpuTemp)$([char]0x00B0)C" } else { '-' }
+    $u.gpu.Text = if ($s.Gpu -ge 0) { "$([int]$s.Gpu)%" } else { '-' }
+    $u.disk.Text = if ($s.Disk -ge 0) { "$([int]$s.Disk)%" } else { '-' }
+    $u.mem.Text = if ($s.Mem -ge 0) { "$([int]$s.Mem)%" } else { '-' }
+    $u.Note.Text = if ($Paused) { 'Paused while you play' } else { '' }
+    $ui.StripItems.Opacity = if ($Paused) { 0.5 } else { 1 }
 }
 function New-HomePage {
     $root = [ZdTheme]::Parse(@"
@@ -17719,7 +18255,7 @@ function Update-Filter {
 }
 $ui.Search.Add_TextChanged({ Update-Filter })
 $script:NavButtons = @{}
-$NavTop = @('Home', 'GameMode', 'Events', 'Health')
+$NavTop = @('Home', 'Games', 'Boost', 'GameMode', 'Events', 'Health')
 $NavTools = @('ThisPC', 'Sync', 'Nvidia', 'Benchmark', 'Matches', 'Trends', 'Booster', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Debloat', 'Apps', 'Clean', 'Memory')
 $NavEnd = @('Settings')
 function Get-NavGroupOf([string]$Name) { if ($NavTop -contains $Name -or $NavEnd -contains $Name) { '' } elseif ($NavTools -contains $Name) { 'Tools' } else { 'Tweaks' } }
@@ -18156,6 +18692,7 @@ Set-NavGroupOpen (Get-NavGroupOf $startName) $true
 $script:NavButtons[$startName].IsChecked = $true
 $window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringIntoView() })
 Update-GameModeUi
+if (-not $Snapshot -or $env:ZD_SNAPWAIT) { New-StatusStrip; Start-LiveTimer }
 function Complete-Startup {
     [ZdWatchdog]::Step = 'Complete-Startup'
 $script:SysProfile = if ($Snapshot -and $env:ZD_SCANPC) { $null } else { Get-SavedProfile }
