@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.15.0'
+$AppVersion = '1.15.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -512,6 +512,44 @@ using System.Threading;
 // Live load for the Home page: CPU, memory, GPU, disk, network and the busiest apps.
 // Samples once a second on a thread-pool timer (never on the UI thread) and only while Start() is in effect.
 // Counters are added by their English names (PdhAddEnglishCounter), so it works on every Windows language.
+// Freeze detector: a background thread watches a heartbeat the UI thread sends every second. If the UI thread stops for
+// 20 s, it writes the UI thread's call stack and the current step to crash.log once, so a frozen window can be explained.
+public static class ZdWatchdog {
+    static Thread ui, watcher; static long lastBeat; static string logPath = "", version = "";
+    static volatile string step = "starting"; static volatile bool dumped, frozen;
+    public static string Step { get { return step; } set { step = value ?? ""; } }
+    public static void Beat() {
+        long was = Interlocked.Exchange(ref lastBeat, DateTime.UtcNow.Ticks);
+        if (frozen) {
+            frozen = false;
+            try { System.IO.File.AppendAllText(logPath, "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window is responding again after " + Math.Round((DateTime.UtcNow.Ticks - was) / 1e7) + " s.\r\n\r\n"); } catch { }
+        }
+    }
+    public static void Start(string path, string ver) {
+        if (watcher != null) return;
+        ui = Thread.CurrentThread; logPath = path; version = ver; Beat();
+        watcher = new Thread(Loop); watcher.IsBackground = true; watcher.Name = "ZeroDelay watchdog"; watcher.Start();
+    }
+    static void Loop() {
+        while (true) {
+            Thread.Sleep(2000);
+            double secs = (DateTime.UtcNow.Ticks - Interlocked.Read(ref lastBeat)) / 1e7;
+            if (secs < 20 || frozen) continue;
+            frozen = true;
+            string stack = "(stack already written once this session)";
+            if (!dumped) {
+                dumped = true;
+                try {
+#pragma warning disable 618
+                    ui.Suspend();
+                    try { stack = new StackTrace(ui, false).ToString(); } finally { ui.Resume(); }
+#pragma warning restore 618
+                } catch (Exception e) { stack = "stack unavailable: " + e.Message; }
+            }
+            try { System.IO.File.AppendAllText(logPath, "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window has not responded for " + Math.Round(secs) + " s. Step: " + step + "\r\n" + stack + "\r\n"); } catch { }
+        }
+    }
+}
 public sealed class LiveSnap {
     public double Cpu = -1, CpuGhz = -1, Mem = -1, MemUsedGb = -1, MemTotalGb = -1;
     public double Gpu = -1, GpuTemp = -1, GpuMhz = -1, VramGb = -1, VramTotalGb = -1;
@@ -1334,7 +1372,18 @@ function Set-FnLaunchArgsEnabled([string]$Value) {
 
 # --- Several services in one card (vendor software): Svcs = @( @{ N = 'name'; D = defaultStart } ). Only the services
 #     that exist on this PC are touched; each one's start type is saved before it changes.
-function Get-SvcSetPresent($t) { @($t.Svcs | Where-Object { Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.N)" }) }
+# whether a Windows service is registered. One read of the Services key, reused for 15 s: Test-Path on a service key makes
+# PowerShell list all ~800 services first, which made a full refresh take over 20 s as administrator
+function Test-SvcKey([string]$Name) {
+    if (-not $script:SvcKeyCache -or ((Get-Date) - $script:SvcKeyAt).TotalSeconds -gt 15) {
+        $set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services')
+        if ($k) { try { foreach ($n in $k.GetSubKeyNames()) { [void]$set.Add($n) } } finally { $k.Close() } }
+        $script:SvcKeyCache = $set; $script:SvcKeyAt = Get-Date
+    }
+    $script:SvcKeyCache.Contains($Name)
+}
+function Get-SvcSetPresent($t) { @($t.Svcs | Where-Object { Test-SvcKey $_.N }) }
 function Test-SvcSet($t) {
     $present = Get-SvcSetPresent $t
     if (-not $present.Count) { return $null }
@@ -1471,7 +1520,7 @@ function New-SvcTweak([string]$Id, [string]$Svc, [int]$Default, [string]$Title, 
        Title = $Title; Desc = $Desc; Warn = $Warn
        Reg   = @( @{ P = "HKLM:\SYSTEM\CurrentControlSet\Services\$Svc"; N = 'Start'; V = 4; D = $Default; M = $Default } )
        After = { Sync-Service $t.Svc }
-       Requires = { [bool](Get-Service -Name $t.Svc -ErrorAction SilentlyContinue) -or (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($t.Svc)") } }
+       Requires = { Test-SvcKey $t.Svc } }
 }
 
 # --- Startup apps: one card per Run-key entry / Startup-folder shortcut, toggled like Task Manager does.
@@ -1760,7 +1809,7 @@ function Invoke-Preset($t) {
     if (Test-NvAvailable) { Set-NvLod ([int]$t.Preset['NvLod']) }
     elseif ([int]$t.Preset['NvLod'] -gt 0) { $extra = ' Texture blur skipped: it needs an NVIDIA graphics card.' }
     Save-Backup
-    Update-All
+    Update-AllAsync
     $script:Backup.Custom['lastpreset'] = @{ Title = $t.Title; Values = $t.Preset }
     Save-Backup
     Add-History "Preset: $($t.Title)" 'preset' $null
@@ -1778,7 +1827,7 @@ function Undo-Presets {
     Set-Content -Path $IniPath -Value $lines -Encoding UTF8
     if ($script:Backup.Custom.ContainsKey('nvlod')) { Restore-NvLod }
     $script:Backup.Custom.Remove('presets'); $script:Backup.Custom.Remove('lastpreset'); Save-Backup
-    Update-All
+    Update-AllAsync
     'Your graphics settings from before the presets are back.'
 }
 
@@ -1922,6 +1971,7 @@ function Get-ZeroDelayPlanGuid {
     if ($line -and $line -match $GuidRx) { $Matches[0] } else { $null }
 }
 function Enable-ZDGameMode {
+    [ZdWatchdog]::Step = 'Enable-ZDGameMode'
     if (Test-ZDGameMode) { return 'Game Mode is already on.' }
     $prefs = Get-GameModePrefs
     $state = @{ Started = (Get-Date).ToString('o'); SawFortnite = (Test-FortniteRunning); Done = @(); ClosedCount = 0; FreedMb = 0 }
@@ -9162,7 +9212,7 @@ $Tweaks = @(
        Run   = { Start-BackgroundReport 'Get-WinUpdateReport'; 'Checking the Windows build...' } }
 
     @{ Id = 'gameinput-dup'; Cat = 'Input'; Icon = [char]0xE7FC; Action = 'Check'
-       Requires = { Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\GameInputSvc' }
+       Requires = { Test-SvcKey 'GameInputSvc' }
        Title = 'Two GameInput versions installed?'
        Desc  = 'Since September 2025, FPS drops and crackling audio a few minutes after touching a controller were traced to two Microsoft GameInput versions installed side by side. This finds the duplicate and shows which one to remove. The GameInput service itself is never disabled.'
        Warn  = ''
@@ -9198,7 +9248,7 @@ $Tweaks = @(
        Run   = { Start-BackgroundReport 'Get-KernelDriverToolsReport'; 'Looking for sensor drivers and pollers...' } }
 
     @{ Id = 'inpoutx64-off'; Cat = 'System'; Icon = [char]0xE83D; Rec = $false; Badge = 'restart'
-       Requires = { Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\inpoutx64' }
+       Requires = { Test-SvcKey 'inpoutx64' }
        Title = 'Stop the inpoutx64 driver loading'
        Desc  = 'Microsoft''s own workaround (release health, August 2026) for games that hang, close silently or reboot the PC when the inpoutx64 port I/O driver from RGB or fan software is present (ARC Raiders, THE FINALS and other Easy Anti-Cheat games). Sets the driver to disabled; your Start value is backed up.'
        Warn  = 'A fan or RGB tool that needs it (FanControl, older OpenRGB, some MSI and ASRock utilities) loses its sensors or lighting control. Microsoft states its investigation shows no unintended behaviour from disabling it.'
@@ -9597,7 +9647,7 @@ function Disable-NvTweak($t) {
 
 function Invoke-TweakTest($t) {
     try {
-        if ($t.Svc -and -not (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$($t.Svc)")) { return $null }
+        if ($t.Svc -and -not (Test-SvcKey $t.Svc)) { return $null }
         if ($t.Requires -and -not (& $t.Requires)) { return $null }
         if ($t.Test) { $r = & $t.Test } elseif ($t.Reg) { $r = Test-RegTweak $t } elseif ($t.Ini) { $r = Test-IniTweak $t }
         elseif ($t.Power) { $r = Test-PowerTweak $t } elseif ($t.Dx) { $r = Test-DxTweak $t } elseif ($t.Tasks) { $r = Test-TaskTweak $t }
@@ -11326,6 +11376,7 @@ function New-GameModePanel($t) {
     $panel
 }
 function Update-GameModeUi {
+    [ZdWatchdog]::Step = 'Update-GameModeUi'
     if ($script:GmUi) { Update-GameModePage }
     $on = Test-ZDGameMode
     $mint = [ZdTheme]::Brush('#30D158')
@@ -11409,9 +11460,18 @@ function Update-RestartBar {
 }
 
 function Update-All {
+    [ZdWatchdog]::Step = 'Update-All'
     Clear-ReadCache
     $script:CurrentNvLod = if (Test-NvAvailable) { Get-NvLod } else { $null }
     foreach ($t in $Tweaks) { Update-Card $t }; Update-Summary
+}
+# Re-reads every card in the background workers and applies the results here, so the window never stalls on the
+# 300+ checks (20 s or more as administrator). One refresh at a time; a request during one runs once more after it.
+function Update-AllAsync {
+    if (-not $script:Worker) { Update-All; return }
+    if ($script:StateLeft -gt 0) { $script:StateAgain = $true; return }
+    Clear-ReadCache
+    Start-StateRefresh $null
 }
 
 function Switch-Tweak($t, [bool]$enable) {
@@ -12077,6 +12137,7 @@ function Repair-Drift($items) {
     "Re-applied $ok setting$(if ($ok -ne 1) { 's' })." + $(if ($failed) { " Could not: $($failed -join ', ')." } else { '' })
 }
 function Invoke-DriftCheck {
+    [ZdWatchdog]::Step = 'Invoke-DriftCheck'
     if ($script:DriftBusy) { return }
     $script:DriftBusy = $true
     try {
@@ -12949,7 +13010,7 @@ function Invoke-Profile($prof, [bool]$Strict) {
             if ($prof.FpsCap) { try { $l = Get-Content $IniPath; Set-Content $IniPath (Set-IniValue $l 'FrameRateLimit' $prof.FpsCap) -Encoding UTF8 } catch { $failed += 'FPS cap' } }
         }
     }
-    Save-Backup; Update-All
+    Save-Backup; Update-AllAsync
     Add-History "Profile applied: $($prof.Name)" 'profile' $null
     "Profile '$($prof.Name)' applied: $ok change$(if ($ok -ne 1) { 's' })." + $note + $(if ($failed) { " Skipped: $($failed -join ', ')." } else { '' })
 }
@@ -13128,7 +13189,7 @@ function Invoke-Wizard {
     if ($laptop) { $gm['plan'] = $false }
     $script:Backup.Custom['gamemodeprefs'] = $gm
     $script:Backup.Custom['wizarddone'] = $true
-    Save-Backup; Update-All
+    Save-Backup; Update-AllAsync
     Add-History 'Setup wizard finished' 'wizard' $null
     $ui.Wizard.Visibility = 'Collapsed'
     Show-Toast ("All set: $($msg -join ', '). " + $(if ($rp -like 'Restore point created*') { 'A restore point was made first.' } elseif ($rp -like 'Could not*') { "No restore point was made. $rp" } else { '' })) $(if ($rp -like 'Could not*') { '#FF9F0A' } else { '#30D158' })
@@ -13440,6 +13501,14 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.15.1' = @(
+        @{ T = 'Fixed: ZeroDelay froze or would not open'; D = 'Running as administrator, ZeroDelay could re-check all 300+ cards on its own window thread for 20 s or more: at start-up, after Optimize, presets, pause/resume and Restore all. It now checks in the background, the check itself is three times faster, and a freeze detector writes to crash.log if the window ever stops responding.' }
+        @{ T = 'What limits your FPS'; D = 'Reads the summary Fortnite writes after every match and says whether your processor, your graphics card or a frame cap held you back, with the settings that help in your rendering mode.' }
+        @{ T = 'Where your matches really ran'; D = 'Fortnite''s own server list and region test, the server of every match (Amazon or Google Cloud), and whether your provider routes worse to one of them. The subregion ping card works again and uses the game''s real servers.' }
+        @{ T = 'Present mode and latency tests'; D = 'Intel PresentMon (downloaded only when you allow it, hash-checked) shows whether Fortnite gets the direct-to-screen mode and measures your PC latency, with a before/after comparison.' }
+        @{ T = 'Repairs for tweak-pack leftovers'; D = 'Finds boot settings that stop Easy Anti-Cheat, processor and memory limits, UAC off, GPU crash recovery off, broken restore points, Windows Update or Defender off and fake boost values on Fortnite. Each card shows only when the problem exists.' }
+        @{ T = 'Honest corrections'; D = 'Grass, shading, textures, DLSS and frame generation do nothing in Performance mode (Epic''s profile overrides them), and Windows pointer precision and key repeat do not reach Fortnite in a match. Those cards now say so.' }
+    )
     '1.15.0' = @(
         @{ T = 'What limits your FPS'; D = 'Reads the summary Fortnite writes after every match and says whether your processor, your graphics card or a frame cap held you back, with the settings that help in your rendering mode.' }
         @{ T = 'Where your matches really ran'; D = 'Fortnite''s own server list and region test, the server of every match (Amazon or Google Cloud), and whether your provider routes worse to one of them. The subregion ping card works again and uses the game''s real servers.' }
@@ -13812,6 +13881,7 @@ function Get-UpdateVersions {
     @{ Fortnite = $fn; Driver = $drv; Gpu = "$($gpu.Name)" }
 }
 function Invoke-UpdateCheck {
+    [ZdWatchdog]::Step = 'Invoke-UpdateCheck'
     if ($script:UpdateBusy -or $Snapshot) { return }
     $script:UpdateBusy = $true
     Invoke-Worker 'Get-UpdateVersions' @() {
@@ -13846,11 +13916,14 @@ function Get-MatchPingHost {
     if ($h) { $h.Host } else { $null }
 }
 function Start-MatchRecorder {
+    [ZdWatchdog]::Step = 'Start-MatchRecorder'
     Invoke-UpdateCheck
     $rec = @{ Start = Get-Date; Csv = $null; Pm = $null }
     if ((Test-Path $PresentMonExe) -and -not ($script:BenchProc -and -not $script:BenchProc.HasExited)) {
         $rec.Csv = Join-Path $ToolsDir "match-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+        # at most one hour per recording: a Fortnite left open for hours otherwise grew one file to 800 MB+
         $pmArgs = @('--process_name', $FortniteExeName, '--output_file', "`"$($rec.Csv)`"", '--terminate_on_proc_exit',
+                    '--timed', '3600', '--terminate_after_timed',
                     '--no_console_stats', '--stop_existing_session', '--session_name', 'ZeroDelayMatch')
         try { $rec.Pm = Start-Process $PresentMonExe -ArgumentList $pmArgs -WindowStyle Hidden -PassThru } catch { $rec.Csv = $null }
     }
@@ -13877,6 +13950,7 @@ function Stop-MatchRecorder {
 }
 # Runs on the match timer until the report is built, so nothing here blocks the window.
 function Complete-MatchReport {
+    [ZdWatchdog]::Step = 'Complete-MatchReport'
     $a = $script:MatchAnalysis
     if ($a.Phase -eq 'pm') {
         if ($a.Rec.Pm -and -not $a.Rec.Pm.HasExited) {
@@ -14371,6 +14445,7 @@ function Start-StateRefresh([scriptblock]$Then) {
     }
 }
 function Complete-StateRefresh {
+    [ZdWatchdog]::Step = 'Complete-StateRefresh'
         $res = $script:StateParts
         if (-not $script:StateFail -and $res.Count -gt 1) {
             $script:CurrentNvLod = $res.__nvlod
@@ -14378,10 +14453,12 @@ function Complete-StateRefresh {
             Update-Summary
         } else { Update-All }    # worker failed: do it here
         if ($script:EventsUi) { Update-EventsReady }
-        Test-AfterBoot; Update-RestartBar
+        if (-not $script:FirstRefreshDone) { $script:FirstRefreshDone = $true; Test-AfterBoot; Invoke-UpdateCheck }
+        Update-RestartBar
         Update-PauseCard
-        Invoke-UpdateCheck
+        if ($script:HomeUi) { Update-HomePage }
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
+        if ($script:StateAgain) { $script:StateAgain = $false; Clear-ReadCache; Start-StateRefresh $null }
 }
 function Format-Size([double]$Bytes) {
     if ($Bytes -ge 1GB) { '{0:N1} GB' -f ($Bytes / 1GB) } elseif ($Bytes -ge 1MB) { '{0:N0} MB' -f ($Bytes / 1MB) } elseif ($Bytes -gt 0) { '{0:N0} KB' -f [Math]::Max(1, $Bytes / 1KB) } else { '0 MB' }
@@ -15359,6 +15436,7 @@ $ProfileScan = {
 function Get-SavedProfile { if (Test-Path $ProfileFile) { try { Get-Content $ProfileFile -Raw | ConvertFrom-Json } catch { $null } } else { $null } }
 function Get-MainGpu($p) { $g = @($p.Gpus | Where-Object { -not $_.Integrated }); if ($g) { $g[0] } else { @($p.Gpus)[0] } }
 function Start-ProfileScan([switch]$Quiet) {
+    [ZdWatchdog]::Step = 'Start-ProfileScan'
     if ($script:ProfileScanning) { return }
     $script:ProfileScanning = $true; $script:ProfileQuiet = [bool]$Quiet
     if ($script:PcUi) { $script:PcUi.Status.Text = 'Scanning this PC: hardware, drivers, Windows and installed apps...'; $script:PcUi.Rescan.IsEnabled = $false }
@@ -17811,11 +17889,11 @@ function Invoke-ApplyTweaks($pick) {
     foreach ($t in @($pick)) {
         try { Invoke-TweakOn $t; $ok++ } catch { $failed += $t.Title }
     }
-    Update-All
+    Update-AllAsync
     $window.Cursor = $null
     $msg = "Switched on $ok tweak$(if ($ok -ne 1) { 's' })."
     if ($failed) { $msg += " Skipped: $($failed -join ', ')." }
-    if ($Tweaks | Where-Object { $_.Badge -eq 'restart' -and $_.State }) { $msg += ' Restart your PC to finish.' }
+    if (@($pick) | Where-Object { $_.Badge -eq 'restart' -and $failed -notcontains $_.Title }) { $msg += ' Restart your PC to finish.' }
     Show-Toast $msg $(if ($failed) { '#FF9F0A' } else { '#30D158' })
     if ($script:HomeUi) { Update-HomePage }
 }
@@ -17998,7 +18076,7 @@ function Suspend-AllTweaks {
     $script:Backup.Custom['paused'] = @{ Ids = $done; Time = (Get-Date).ToString('o') }
     Save-Backup
     Add-History "Paused all tweaks ($($done.Count))" 'pause' $null
-    Update-All
+    Update-AllAsync
     $window.Cursor = $null
     Update-PauseCard
     Show-Toast "Paused: $($done.Count) tweaks are off.$(if ($failed) { " Could not switch off: $($failed -join ', ')." })" $(if ($failed) { '#FF9F0A' } else { '#30D158' })
@@ -18011,7 +18089,7 @@ function Resume-AllTweaks {
     foreach ($id in $ids) { $t = Find-Tweak $id; if (-not $t -or -not $t.Toggle -or $t.State -eq $true) { continue }; try { Invoke-TweakOn $t; $ok++ } catch { $failed += $t.Title } }
     $script:Backup.Custom.Remove('paused'); Save-Backup
     Add-History "Resumed all tweaks ($ok)" 'resume' $null
-    Update-All
+    Update-AllAsync
     $window.Cursor = $null
     Update-PauseCard
     Show-Toast "Back on: $ok tweak$(if ($ok -ne 1) { 's' }).$(if ($failed) { " Could not switch on: $($failed -join ', ')." })" $(if ($failed) { '#FF9F0A' } else { '#30D158' })
@@ -18030,7 +18108,7 @@ $ui.RestoreAll.Add_Click({
         if ($null -ne $h.Value) { [void][NvDrs]::Set($NvProfile, [uint32]0x00DD48FB, [uint32]$h.Value) } else { [void][NvDrs]::Delete($NvProfile, [uint32]0x00DD48FB) }
         $script:Backup.Custom.Remove('nvrtxhdr'); Save-Backup
     }
-    Update-All
+    Update-AllAsync
     $window.Cursor = $null
     $script:Backup.Custom.Remove('paused'); Save-Backup; Update-PauseCard
     if ($failed) { Show-Toast "Restored, except: $($failed -join ', ')." '#FF9F0A' }
@@ -18079,6 +18157,7 @@ $script:NavButtons[$startName].IsChecked = $true
 $window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringIntoView() })
 Update-GameModeUi
 function Complete-Startup {
+    [ZdWatchdog]::Step = 'Complete-Startup'
 $script:SysProfile = if ($Snapshot -and $env:ZD_SCANPC) { $null } else { Get-SavedProfile }
 if ($script:SysProfile) { Set-ProfileTailoring } else { Set-GpuTailoring }
 if (-not $Snapshot -and (Get-Setting 'keepawake' $false)) { Start-RenderWatch }
@@ -18161,6 +18240,7 @@ $window.Add_Closed({
 $window.Add_ContentRendered({ Close-Splash; [void]$window.Activate() })
 $script:StartupDone = $false
 function Show-AfterStartup {
+    [ZdWatchdog]::Step = 'Show-AfterStartup'
     if ($script:StartupDone) { return }
     $script:StartupDone = $true
     if ($script:StartupGuard) { $script:StartupGuard.Stop() }
@@ -18179,7 +18259,7 @@ function Show-AfterStartup {
 # never leave someone staring at the loading screen: after 30 s check here instead
 $script:StartupGuard = New-Object Windows.Threading.DispatcherTimer
 $script:StartupGuard.Interval = [TimeSpan]::FromSeconds(30)
-$script:StartupGuard.Add_Tick({ $script:StartupGuard.Stop(); if (-not $script:StartupDone) { Update-All; Show-AfterStartup } })
+$script:StartupGuard.Add_Tick({ $script:StartupGuard.Stop(); if (-not $script:StartupDone) { Show-AfterStartup; Show-Toast 'Still checking some of your settings in the background. The cards fill in when it finishes.' '#0A84FF' } })
 $script:StartupGuard.Start()
 # --- Crash guard. The app runs its own message loop, so an error that escapes any button or timer handler would end
 #     the loop and the window would just vanish. It is logged to crash.log instead, and ZeroDelay keeps running.
@@ -18204,6 +18284,14 @@ $window.Dispatcher.Add_UnhandledException({
     }
 })
 [AppDomain]::CurrentDomain.add_UnhandledException({ param($s, $e) Write-CrashLog $e.ExceptionObject 'fatal' })
+if (-not $Snapshot) {
+    $script:BeatTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:BeatTimer.Interval = [TimeSpan]::FromSeconds(1)
+    $script:BeatTimer.Add_Tick({ [ZdWatchdog]::Beat() })
+    $script:BeatTimer.Start()
+    [ZdWatchdog]::Step = 'message loop started'
+    [ZdWatchdog]::Start($CrashLog, $AppVersion)
+}
 try { [Windows.Threading.Dispatcher]::Run() } catch { Write-CrashLog $_.Exception 'message loop'; throw }
 if ($script:Relaunch) {
     try { $script:AppMutex.ReleaseMutex(); $script:AppMutex.Dispose() } catch {}
