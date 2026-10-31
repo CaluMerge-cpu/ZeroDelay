@@ -17,7 +17,8 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   one-minute graph, plus the apps using the most CPU. It only measures while Home is open.
 - **Timer resolution**: a test that measures how precisely Windows wakes at the default timer, 1 ms and 0.5 ms on your
   PC, and a card that holds 0.5 ms while ZeroDelay runs and lets games see it.
-- **Games**: a page per game, with each game's own logo read from your installed copy. Pick a server from Fortnite's own list (or let ZeroDelay find the fastest), watch your
+- **Games**: a page per game, with the icon from your installed copy or, for games you do not have, the game's official
+  Steam art (fetched once from Steam's public store and kept on your PC). Pick a server from Fortnite's own list (or let ZeroDelay find the fastest), watch your
   route live (PC, router, provider, game server, each with its ping), press Start Game, and find every test for that
   game in one tools panel. 24 games: Fortnite, Counter-Strike 2, Valorant, Marvel Rivals, Overwatch 2, Rainbow Six
   Siege X, Rematch, Where Winds Meet, eFootball, NBA 2K27, Undisputed, Rocket League, Apex Legends, THE FINALS, Call of

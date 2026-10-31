@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.18.0'
+$AppVersion = '1.18.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -12151,7 +12151,7 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
     $dlg = [ZdTheme]::Parse(@"
 <Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Title='$(Esc $Title)' Width='480' SizeToContent='Height' WindowStyle='None' AllowsTransparency='True' Background='Transparent'
-        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='Segoe UI' Opacity='0'>
+        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='Segoe UI'>
   <Grid Margin='24'>
     <Border CornerRadius='20' Background='#2C2C2F'>
       <Border.Effect><DropShadowEffect BlurRadius='40' ShadowDepth='10' Direction='270' Opacity='0.6' Color='Black'/></Border.Effect>
@@ -12193,14 +12193,18 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
         elseif ($e.Key -eq 'Return') { $script:DlgResult = $script:DlgMain; $s.Close() }
     })
     $dlg.Add_MouseLeftButtonDown({ param($s, $e) try { $s.DragMove() } catch {} })
+    # the dialog is visible from the start and the fade is only decoration: a dialog that stayed transparent would still
+    # block the app (it is modal) and look like a frozen window
     $dlg.Add_Loaded({ param($s, $e)
-        $s.FindName("B_$script:DlgMain").Focus() | Out-Null
+        try { $f = $s.FindName("B_$script:DlgMain"); if ($f) { [void]$f.Focus() } } catch {}
         if ($script:Anim) {
-            $s.BeginAnimation([Windows.UIElement]::OpacityProperty, (New-Object Windows.Media.Animation.DoubleAnimation 0, 1, ([Windows.Duration][TimeSpan]::FromMilliseconds(160))))
-            $c = $s.FindName('Card'); $tt = New-Object Windows.Media.ScaleTransform 0.96, 0.96; $c.RenderTransformOrigin = '0.5,0.5'; $c.RenderTransform = $tt
-            $a = New-Object Windows.Media.Animation.DoubleAnimation 0.96, 1, ([Windows.Duration][TimeSpan]::FromMilliseconds(220)); $a.EasingFunction = New-Ease
-            $tt.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $a); $tt.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $a)
-        } else { $s.Opacity = 1 }
+            try {
+                $s.BeginAnimation([Windows.UIElement]::OpacityProperty, (New-Object Windows.Media.Animation.DoubleAnimation 0, 1, ([Windows.Duration][TimeSpan]::FromMilliseconds(160))))
+                $c = $s.FindName('Card'); $tt = New-Object Windows.Media.ScaleTransform 0.96, 0.96; $c.RenderTransformOrigin = '0.5,0.5'; $c.RenderTransform = $tt
+                $a = New-Object Windows.Media.Animation.DoubleAnimation 0.96, 1, ([Windows.Duration][TimeSpan]::FromMilliseconds(220)); $a.EasingFunction = New-Ease
+                $tt.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $a); $tt.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $a)
+            } catch { $s.BeginAnimation([Windows.UIElement]::OpacityProperty, $null) }
+        }
     })
     if ($window -and $window.IsVisible) { $dlg.Owner = $window; $dlg.WindowStartupLocation = 'CenterOwner' } else { $dlg.WindowStartupLocation = 'CenterScreen'; $dlg.Topmost = $true }
     # dim the app behind the question
@@ -14704,6 +14708,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.18.1' = @(
+        @{ T = 'Game logos'; D = 'Every game on the Games page shows its official art, also when it is not installed: ZeroDelay asks Steam''s public store for it once and keeps it on your PC. Installed games keep the icon from your own copy. Long names no longer run under the Not found badge.' }
+        @{ T = 'Fixed: a frozen window after clicking a game tool'; D = 'Clicking a check in a game''s tools panel could leave ZeroDelay dimmed and stuck behind an invisible answer window. Answer windows now always show.' }
+        @{ T = 'Fixed: checks that read Fortnite''s logs'; D = 'What limits your FPS and other checks that read Fortnite''s logs in the background could fail with Could not read Fortnite''s logs. They work again.' }
+    )
     '1.18.0' = @(
         @{ T = '22 more games'; D = 'Valorant, Marvel Rivals, Overwatch 2, Rainbow Six Siege X, Rematch, Where Winds Meet, eFootball, NBA 2K27, Undisputed, Rocket League, Apex Legends, THE FINALS, Call of Duty, Battlefield 6, PUBG, League of Legends, Dota 2, Deadlock, GTA V (Enhanced and Legacy), Roblox and Escape from Tarkov, each with its own page, logo and tweaks. Games with kernel anti-cheat only get settings their makers allow, and every change can be undone.' }
         @{ T = 'Tournaments'; D = 'A new place in the menu. Pick a game and see the tournaments that are live now or coming up, with dates, prize money and tier, from Liquipedia. Every game links to its official schedule, and you can add your own calendar for any game.' }
@@ -15648,7 +15657,8 @@ function Start-WorkerNext {
         $job = $script:WorkerQueue[0]; $script:WorkerQueue.RemoveAt(0)
         $ps = [powershell]::Create(); $ps.RunspacePool = $script:Worker
         # each run gets its own read cache: the three PowerShells must not share one
-        $code = if ($job.Code -match '^\s*param\([^)]*\)') { $job.Code.Insert($Matches[0].Length, "`n`$global:ReadCache = @{}") } else { "`$global:ReadCache = @{}`n" + $job.Code }
+        #   (on its own line after param(): one-line jobs such as 'param($fn) @{ ... }' continue on the next line)
+        $code = if ($job.Code -match '^\s*param\([^)]*\)') { $job.Code.Insert($Matches[0].Length, "`n`$global:ReadCache = @{}`n") } else { "`$global:ReadCache = @{}`n" + $job.Code }
         [void]$ps.AddScript($code); foreach ($a in $job.Args) { [void]$ps.AddArgument($a) }
         [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $job.Done })
     }
@@ -17776,9 +17786,12 @@ function Get-GameplayStats([string]$Game, [scriptblock]$OnUpdate) {
 }
 
 
-# a hand-edited stats record with text where a number belongs is skipped instead of breaking the whole list
-function Test-ZdRecordNumbers($r) { foreach ($p in $r.PSObject.Properties) { if ($p.Value -is [string] -and $p.Name -in 'Kills','Deaths','Assists','Mvps','Score','HsKills','Damage','Rounds','RoundsWon','RoundsLost','Goals','Saves','Shots','Demos','Touches','TeamGoals','OppGoals','PlaylistId','Level','LastHits','Denies','Gpm','Xpm','NetWorth','Seconds','CS','Gold') { $n = 0.0; if (-not [double]::TryParse($p.Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $false } } }; $true }
-
+# a hand-edited stats record with text where a number belongs is skipped instead of breaking the whole list
+
+function Test-ZdRecordNumbers($r) { foreach ($p in $r.PSObject.Properties) { if ($p.Value -is [string] -and $p.Name -in 'Kills','Deaths','Assists','Mvps','Score','HsKills','Damage','Rounds','RoundsWon','RoundsLost','Goals','Saves','Shots','Demos','Touches','TeamGoals','OppGoals','PlaylistId','Level','LastHits','Denies','Gpm','Xpm','NetWorth','Seconds','CS','Gold') { $n = 0.0; if (-not [double]::TryParse($p.Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $false } } }; $true }
+
+
+
 # --- CS2 match stats (1.18): Valve's Game State Integration (GSI) -> local listener -> cs2-matches.json
 # CS2 reads every game\csgo\cfg\gamestate_integration_*.cfg at start and POSTs JSON game state to its "uri" while you play.
 # Official Valve feature (also used by Logitech G HUB, Medal, HUD makers): no game files, no injection, no VAC risk.
@@ -20002,6 +20015,79 @@ function Clear-RouteMonitors {
     }
 }
 
+# --- Game art (1.18.1): a game that gives no icon (not installed here) shows its official Steam library art. It is
+#     fetched once in the background from Steam's public store API (no account, no key) into $DataDir\art and never
+#     bundled with ZeroDelay. Valorant and League of Legends are not on Steam and keep ZeroDelay's own tile.
+$GameSteamIds = @{ cs2 = '730'; fortnite = $null }
+function Get-GameSteamId($g) {
+    if ($GameSteamIds.ContainsKey($g.Id)) { return $GameSteamIds[$g.Id] }
+    $f = $GameFind[$g.Id]; if ($f -and $f.Steam) { "$($f.Steam)" } else { $null }
+}
+function Get-GameArtFile([string]$AppId, [string]$Kind) { Join-Path (Join-Path $DataDir 'art') "$AppId-$Kind.jpg" }
+function Get-GameArt($g, [string]$Kind = 'capsule') {
+    $id = Get-GameSteamId $g; if (-not $id) { return $null }
+    if (-not $script:GameArt) { $script:GameArt = @{} }
+    $k = "$id-$Kind"; if ($script:GameArt[$k]) { return $script:GameArt[$k] }
+    $f = Get-GameArtFile $id $Kind; if (-not (Test-Path -LiteralPath $f)) { return $null }
+    $img = $null
+    try { $img = New-Object Windows.Media.Imaging.BitmapImage; $img.BeginInit(); $img.CacheOption = 'OnLoad'; $img.DecodePixelWidth = 600; $img.UriSource = New-Object Uri $f; $img.EndInit(); $img.Freeze() } catch { $img = $null }
+    $script:GameArt[$k] = $img; $img
+}
+function Set-GameTileArt($tile) {
+    $img = Get-GameArt $tile.Tag 'capsule'; if (-not $img) { return }
+    $ib = New-Object Windows.Media.ImageBrush $img; $ib.Stretch = 'UniformToFill'; $ib.AlignmentY = 'Top'; $ib.Freeze()
+    $tile.Background = $ib
+    foreach ($n in 'Big', 'Glyph', 'Logo') { $tile.FindName($n).Visibility = 'Collapsed' }
+    $tile.FindName('Bar').Background = ConvertTo-Brush '#E00B0B10'   # busy art behind the title: a darker bar keeps it readable
+}
+$GameArtWorkerCode = @'
+param($Ids, $Dir)
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$got = @(); $err = $null
+try {
+    [void](New-Item -ItemType Directory -Path $Dir -Force)
+    $q = @{ ids = @($Ids | ForEach-Object { @{ appid = [int]$_ } }); context = @{ language = 'english'; country_code = 'US' }; data_request = @{ include_assets = $true } } | ConvertTo-Json -Depth 5 -Compress
+    $wc = New-Object Net.WebClient; $wc.Headers['User-Agent'] = 'ZeroDelay'; $wc.Encoding = [Text.Encoding]::UTF8
+    $r = $wc.DownloadString('https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=' + [Uri]::EscapeDataString($q)) | ConvertFrom-Json
+    foreach ($it in @($r.response.store_items)) {
+        $a = $it.assets; if (-not $a -or -not $a.asset_url_format) { continue }
+        foreach ($kind in @(@('capsule', $a.library_capsule), @('header', $a.header))) {
+            if (-not $kind[1]) { continue }
+            $url = 'https://shared.cloudflare.steamstatic.com/store_item_assets/' + $a.asset_url_format.Replace('${FILENAME}', $kind[1])
+            $tmp = Join-Path $Dir "$($it.appid)-$($kind[0]).part"; $dst = Join-Path $Dir "$($it.appid)-$($kind[0]).jpg"
+            try {
+                $bytes = $wc.DownloadData($url)
+                # a JPEG of a sensible size only (2 KB to 4 MB)
+                if ($bytes.Length -gt 2048 -and $bytes.Length -lt 4MB -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xD8) {
+                    [IO.File]::WriteAllBytes($tmp, $bytes); Move-Item -LiteralPath $tmp -Destination $dst -Force; $got += "$($it.appid)-$($kind[0])"
+                }
+            } catch { $err = $_.Exception.Message }
+        }
+    }
+} catch { $err = $_.Exception.Message }
+@{ Got = $got; Error = $err }
+'@
+# asks Steam for the art the library is missing, at most once a day per game; tiles update when it arrives
+function Start-GameArtFetch {
+    if ($script:GameArtBusy) { return }
+    if (-not $script:GameArtTried) { $script:GameArtTried = @{} }
+    $ids = @(@(foreach ($g in $GameDefs) {
+        $id = Get-GameSteamId $g; if (-not $id) { continue }
+        if ((Test-Path -LiteralPath (Get-GameArtFile $id 'capsule')) -and (Test-Path -LiteralPath (Get-GameArtFile $id 'header'))) { continue }
+        if ($script:GameArtTried[$id] -and ((Get-Date) - $script:GameArtTried[$id]).TotalHours -lt 24) { continue }
+        $script:GameArtTried[$id] = Get-Date; $id
+    }) | Select-Object -Unique)
+    if (-not $ids.Count) { return }
+    $script:GameArtBusy = $true
+    Invoke-Worker $GameArtWorkerCode @([string[]]$ids, (Join-Path $DataDir 'art')) {
+        param($out, $errs)
+        $script:GameArtBusy = $false
+        $r = Get-WorkerResult $out; if (-not $r -or -not @($r.Got).Count) { return }
+        $u = $script:GamesUi; if (-not $u) { return }
+        foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) { if (-not (Get-GameLogo $t.Tag)) { Set-GameTileArt $t } }
+    }
+}
+
 # --- Games page: the library, and one page per game (server, live route, Start Game, tools)
 function New-GameTile($g) {
     $b = [ZdTheme]::Parse(@"
@@ -20013,13 +20099,14 @@ function New-GameTile($g) {
     <Border x:Name='Logo' Width='124' Height='124' CornerRadius='28' HorizontalAlignment='Center' VerticalAlignment='Top' Margin='0,52,0,0' Visibility='Collapsed'>
       <Border.Effect><DropShadowEffect BlurRadius='28' ShadowDepth='6' Direction='270' Opacity='0.45' Color='Black'/></Border.Effect>
     </Border>
-    <Border VerticalAlignment='Bottom' Background='#8C0B0B10' CornerRadius='0,0,16,16' Padding='16,12'>
+    <Border x:Name='Bar' VerticalAlignment='Bottom' Background='#8C0B0B10' CornerRadius='0,0,16,16' Padding='16,12'>
       <Grid>
-        <StackPanel>
-          <TextBlock Text='$(Esc $g.Title)' FontSize='14' FontWeight='SemiBold' Foreground='#FFFDFDFD'/>
-          <TextBlock Text='$(Esc $g.Sub)' FontSize='12' Foreground='#B3FDFDFD'/>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel Margin='0,0,8,0'>
+          <TextBlock Text='$(Esc $g.Title)' FontSize='14' FontWeight='SemiBold' Foreground='#FFFDFDFD' TextTrimming='CharacterEllipsis' ToolTip='$(Esc $g.Title)'/>
+          <TextBlock Text='$(Esc $g.Sub)' FontSize='12' Foreground='#B3FDFDFD' TextTrimming='CharacterEllipsis'/>
         </StackPanel>
-        <Border x:Name='Badge' HorizontalAlignment='Right' VerticalAlignment='Center' CornerRadius='8' Padding='8,3'><TextBlock x:Name='BadgeText' FontSize='11' FontWeight='SemiBold'/></Border>
+        <Border x:Name='Badge' Grid.Column='1' HorizontalAlignment='Right' VerticalAlignment='Center' CornerRadius='8' Padding='8,3'><TextBlock x:Name='BadgeText' FontSize='11' FontWeight='SemiBold'/></Border>
       </Grid>
     </Border>
   </Grid>
@@ -20033,6 +20120,8 @@ function New-GameTile($g) {
         $lb = $b.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
         $b.FindName('Big').Visibility = 'Collapsed'; $b.FindName('Glyph').Visibility = 'Collapsed'
     }
+    $b.Tag = $g
+    if (-not $logo) { Set-GameTileArt $b }
     $badge = $b.FindName('Badge'); $bt = $b.FindName('BadgeText')
     $bt.Text = if ($ok) { 'Installed' } else { 'Not found' }
     $badge.Background = ConvertTo-Brush $(if ($ok) { '#4D1F8F4E' } else { '#40FDFDFD' })
@@ -20146,6 +20235,7 @@ function New-GamesPage {
         if ($tile.Tag.InstalledNow) { [void]$h.Tiles.Children.Add($tile) } else { [void]$h.MoreTiles.Children.Add($tile) }
     }
     if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
+    Start-GameArtFetch
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
         $n = [ZdTheme]::Parse(@"
@@ -20197,7 +20287,12 @@ function Show-GameDetail($g) {
     $h.Hero.Background = $grad
     $h.HeroTitle.Text = $g.Title.ToUpper(); $h.HeroGlyph.Text = [string]$g.Glyph
     $logo = Get-GameLogo $g
-    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible'; $h.HeroGlyph.Visibility = 'Collapsed' }
+    $art = if ($logo) { $null } else { Get-GameArt $g 'header' }
+    if ($logo) { $h.HeroLogo.Width = 96; $h.HeroLogo.CornerRadius = 22; $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible'; $h.HeroGlyph.Visibility = 'Collapsed' }
+    elseif ($art) {
+        $ib = New-Object Windows.Media.ImageBrush $art; $ib.Stretch = 'UniformToFill'
+        $h.HeroLogo.Width = 205; $h.HeroLogo.CornerRadius = 14; $h.HeroLogo.Background = $ib; $h.HeroLogo.Visibility = 'Visible'; $h.HeroGlyph.Visibility = 'Collapsed'
+    }
     else { $h.HeroLogo.Visibility = 'Collapsed'; $h.HeroGlyph.Visibility = 'Visible' }
     $h.Nodes[0].Children[1].Text = 'This PC'; $h.Nodes[1].Children[1].Text = 'Your router'; $h.Nodes[2].Children[1].Text = 'Internet provider'
     # server list: automatic first, then every server by region
