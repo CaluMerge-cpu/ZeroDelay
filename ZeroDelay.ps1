@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.18.1'
+$AppVersion = '1.19.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -2005,8 +2005,8 @@ $GameModeSteps = [ordered]@{
     updates  = @{ Name = 'Pause Windows Update downloads';             Default = $true }
     dns      = @{ Name = 'Flush DNS cache';                            Default = $true }
     nvreplay = @{ Name = 'Pause NVIDIA Instant Replay (no clips)';    Default = $false }
-    auto     = @{ Name = 'Turn on when Fortnite starts';               Default = $true }
-    autooff  = @{ Name = 'Turn off when Fortnite closes';              Default = $true }
+    auto     = @{ Name = 'Turn on when a game starts';                 Default = $true }
+    autooff  = @{ Name = 'Turn off when the game closes';              Default = $true }
 }
 # Apps that stay open but drop to Below Normal priority while Game Mode is on.
 $GameModeLowPriority = 'Discord', 'Steam', 'steamwebhelper', 'EpicGamesLauncher', 'EpicWebHelper', 'Spotify', 'msedge', 'chrome', 'opera',
@@ -2115,6 +2115,637 @@ function Disable-ZDGameMode {
     Add-History 'Game Mode turned off' 'gamemode' $null
     Update-GameModeUi
     if ($back) { "Game Mode off. Restored: $($back -join ', ')." } else { 'Game Mode off.' }
+}
+
+# r19-auto (ZeroDelay 1.19): automatic Game Mode and tweaks for every game.
+# Merge notes and anchors: r19-auto-notes.md. Everything here is new code; the hooks replace the Fortnite-only watcher.
+#
+# What it does, in plain words:
+#   - the 4 s watcher ($script:GmTimer) calls Invoke-GameAutoTick: one Find-RunningGame (one Get-Process) per tick
+#   - when a supported game starts and "Game Mode starts with <game>" is on for it, Game Mode turns on and the toast
+#     names the game; when that game closes and 'autooff' is on, Game Mode turns off
+#   - per game, opt-in: its recommended cards that are still off are switched on when it starts; cards that edit the
+#     game's own files wait until it closes; what ZeroDelay switched on is put back when the game closes
+#   - the Game Mode state file gets Game = <id> (SawFortnite is still written and still read, so old files work)
+#   - the tweak record lives in its own file (game-auto.json) so it survives a restart and a hand-made Game Mode stop
+
+# ---------------------------------------------------------------- state files and small helpers
+# place next to: $GameModeFile = Join-Path $DataDir 'game-mode.json'
+$GameAutoFile = Join-Path $DataDir 'game-auto.json'   # tweaks ZeroDelay switched on for a running game, per game id
+
+# a value of a map that may be a hashtable (fresh) or a pscustomobject (read back from backup-v2.json)
+function Get-MapValue($Map, [string]$Key) {
+    if ($null -eq $Map) { return $null }
+    if ($Map -is [hashtable]) { if ($Map.ContainsKey($Key)) { $Map[$Key] } else { $null } }
+    else { $p = $Map.PSObject.Properties[$Key]; if ($p) { $p.Value } else { $null } }
+}
+# the same map as a hashtable, so it can be written to
+function ConvertTo-Map($Map) {
+    $h = @{}
+    if ($null -eq $Map) { return $h }
+    if ($Map -is [hashtable]) { foreach ($k in $Map.Keys) { $h["$k"] = $Map[$k] } }
+    else { foreach ($p in $Map.PSObject.Properties) { $h[$p.Name] = $p.Value } }
+    $h
+}
+# the tweak category a game's page shows (Cat, or the two original games' areas)
+function Get-GameCat($g) { if ($g.Cat) { "$($g.Cat)" } else { @{ fortnite = 'Fortnite'; cs2 = 'CS2' }["$($g.Id)"] } }
+# a card that edits the game's own settings files: refuses while the game runs, so it waits until the game closes
+function Test-GameFileCard($t) { [bool]($t.GameIni -or $t.GameKv -or $t.GameFb -or $t.GameJson -or $t.GameXml -or $t.Ini) }
+# the recommended switches of a game that are off right now (State is the last test result; never-tested cards are skipped)
+function Get-GameAutoCards($g) {
+    $cat = Get-GameCat $g; if (-not $cat) { return @() }
+    @($Tweaks | Where-Object { $_.Cat -eq $cat -and $_.Rec -and $_.Toggle -and -not $_.Hidden -and $_.State -eq $false })
+}
+# id of the supported game that runs now, or $null (one Get-Process)
+function Get-RunningGameId { $r = Find-RunningGame; if ($r) { "$($r.Def.Id)" } else { $null } }
+
+# ---------------------------------------------------------------- preferences
+# Game Mode starts with this game: the per-game choice, else the global 'auto' pref (so existing users keep their behaviour)
+function Get-GameAutoPref([string]$Id, $Global) {
+    $v = Get-MapValue $script:Backup.Custom['gameauto'] $Id
+    if ($null -ne $v) { return [bool]$v }
+    if ($null -eq $Global) { $Global = (Get-GameModePrefs).auto }
+    [bool]$Global
+}
+function Set-GameAutoPref([string]$Id, [bool]$On) {
+    $m = ConvertTo-Map $script:Backup.Custom['gameauto']; $m[$Id] = $On
+    $script:Backup.Custom['gameauto'] = $m; Save-Backup
+}
+# the global switch: every game follows it again (per-game choices are cleared, the toast says so)
+function Set-GameModeAutoAll([bool]$On) {
+    $p = Get-GameModePrefs; $p['auto'] = $On; $script:Backup.Custom['gamemodeprefs'] = $p
+    $script:Backup.Custom.Remove('gameauto')
+    Save-Backup
+}
+# true when at least one game would start Game Mode by itself
+function Test-GameAutoAny {
+    $glob = (Get-GameModePrefs).auto
+    foreach ($g in $GameDefs) { if (Get-GameAutoPref $g.Id $glob) { return $true } }
+    $false
+}
+# "Apply this game's tweaks when it starts" and its two options. On = the feature (default off),
+# Later = also change its settings files after it closes (default on), Back = put the tweaks back when it closes (default on)
+function Get-GameTweakPrefs([string]$Id) {
+    $p = @{ On = $false; Later = $true; Back = $true }
+    $saved = Get-MapValue $script:Backup.Custom['gametweaks'] $Id
+    if ($null -ne $saved) { foreach ($k in @($p.Keys)) { $v = Get-MapValue $saved $k; if ($null -ne $v) { $p[$k] = [bool]$v } } }
+    $p
+}
+function Set-GameTweakPref([string]$Id, [string]$Key, [bool]$Value) {
+    $all = ConvertTo-Map $script:Backup.Custom['gametweaks']
+    $p = Get-GameTweakPrefs $Id; $p[$Key] = $Value; $all[$Id] = $p
+    $script:Backup.Custom['gametweaks'] = $all; Save-Backup
+}
+
+# ---------------------------------------------------------------- Game Mode state file: which game it saw
+function Read-GmState { try { Get-Content $GameModeFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null } }
+function Write-GmState($st) { $st | ConvertTo-Json -Depth 5 | Set-Content $GameModeFile -Encoding UTF8 }
+# the game the state file saw running: Game (1.19) or, from an older file, SawFortnite = Fortnite
+function Get-GmStateGame($st) {
+    if ($null -eq $st) { return $null }
+    $g = $st.PSObject.Properties['Game']
+    if ($g -and $g.Value) { return "$($g.Value)" }
+    if ($st.SawFortnite) { 'fortnite' } else { $null }
+}
+# remembers the game (SawFortnite is kept in step for anything that still reads it)
+function Set-GmStateGame($st, [string]$Id) {
+    if ($null -eq $st) { return }
+    $st | Add-Member -NotePropertyName Game -NotePropertyValue $(if ($Id) { $Id } else { $null }) -Force
+    $st | Add-Member -NotePropertyName SawFortnite -NotePropertyValue ($Id -eq 'fortnite') -Force
+    Write-GmState $st
+}
+# you switched Game Mode off by hand while a game runs: the watcher leaves it off until that game closes
+function Suspend-GameModeAuto {
+    $id = Get-RunningGameId
+    if ($id) { $script:GmSuppress = $true; $script:GmSuppressGame = $id }
+}
+# sidebar text: 'On · Rocket League running', 'On', 'Auto-starts with games' or 'Off' (no process lookup: uses the last tick)
+function Get-GameModeStatusText {
+    if (Test-ZDGameMode) { if ($script:GmRunning) { "On · $(Get-GameTitle $script:GmRunning) running" } else { 'On' } }
+    elseif (Test-GameAutoAny) { 'Auto-starts with games' } else { 'Off' }
+}
+
+# ---------------------------------------------------------------- tweaks switched on for a running game (game-auto.json)
+# @{ <game id> = @{ Started; On = @(card ids switched on); Later = @(file cards waiting for the game to close); Failed = @() } }
+function Read-GameAutoState {
+    $h = @{}
+    if (-not (Test-Path $GameAutoFile)) { return $h }
+    try { $raw = Get-Content $GameAutoFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { return $h }
+    foreach ($p in $raw.PSObject.Properties) {
+        $e = $p.Value
+        $h[$p.Name] = @{ Started = "$($e.Started)"; On = @($e.On | Where-Object { $_ }); Later = @($e.Later | Where-Object { $_ }); Failed = @($e.Failed | Where-Object { $_ }) }
+    }
+    $h
+}
+function Save-GameAutoState {
+    if ($Snapshot) { return }
+    if ($script:GameAutoState.Count) { $script:GameAutoState | ConvertTo-Json -Depth 4 | Set-Content $GameAutoFile -Encoding UTF8 }
+    else { Remove-Item $GameAutoFile -Force -ErrorAction SilentlyContinue }
+}
+# at start-up: reads the record (a game may have been running when ZeroDelay closed) and the empty watcher memory
+function Initialize-GameAuto {
+    $script:GmSuppress = $false; $script:GmSuppressGame = $null; $script:GmRunning = $null
+    $script:GameAutoState = Read-GameAutoState
+}
+function Get-TweakById([string]$Id) { $Tweaks | Where-Object { $_.Id -eq $Id } | Select-Object -First 1 }
+# 'tweak' / 'tweaks'
+function Get-TweakWord([int]$n) { if ($n -eq 1) { 'tweak' } else { 'tweaks' } }
+
+# the game just started: switch on its recommended cards that are off; file cards wait. Returns the toast text.
+function Start-GameAutoTweaks($g) {
+    $pf = Get-GameTweakPrefs $g.Id
+    $rec = @{ Started = (Get-Date).ToString('o'); On = @(); Later = @(); Failed = @() }
+    $ok = 0; $bad = 0
+    foreach ($t in Get-GameAutoCards $g) {
+        if (Test-GameFileCard $t) { if ($pf.Later) { $rec.Later += "$($t.Id)" }; continue }
+        try { Switch-Tweak $t $true } catch {}   # Switch-Tweak reports its own errors; the card's state tells us what happened
+        if ($t.State -eq $true) { $rec.On += "$($t.Id)"; $ok++ } else { $rec.Failed += "$($t.Id)"; $bad++ }
+    }
+    $script:GameAutoState["$($g.Id)"] = $rec
+    Save-GameAutoState
+    $parts = @("$ok $(Get-TweakWord $ok) applied")
+    if ($bad) { $parts += "$bad could not" }
+    $txt = ($parts -join ', ') + '.'
+    if ($rec.Later.Count) { $txt += " $($rec.Later.Count) that change its settings files wait until it closes." }
+    $txt
+}
+# the game closed: apply the file cards that waited (if wanted), put back what was switched on (if wanted). Returns the toast text.
+function Complete-GameAutoTweaks([string]$Id) {
+    $rec = $script:GameAutoState[$Id]; if (-not $rec) { return '' }
+    $pf = Get-GameTweakPrefs $Id
+    $later = 0; $back = 0; $bad = 0
+    if ($pf.Later) {
+        foreach ($cid in @($rec.Later)) {
+            $t = Get-TweakById $cid; if (-not $t) { continue }
+            if ($t.State -eq $false) { try { Switch-Tweak $t $true } catch {} }
+            if ($t.State -eq $true) { $later++ } else { $bad++ }
+        }
+    }
+    if ($pf.Back) {
+        foreach ($cid in @($rec.On)) {
+            $t = Get-TweakById $cid; if (-not $t) { continue }
+            if ($t.State -eq $false) { $back++; continue }   # you already switched it off by hand
+            try { Switch-Tweak $t $false } catch {}
+            if ($t.State -eq $false) { $back++ } else { $bad++ }
+        }
+    }
+    $script:GameAutoState.Remove($Id)
+    Save-GameAutoState
+    $parts = @()
+    if ($later) { $parts += "$later $(Get-TweakWord $later) applied for next time" }
+    if ($back) { $parts += "$back put back" }
+    if ($bad) { $parts += "$bad could not" }
+    if ($parts.Count) { ($parts -join ', ') + '.' } else { '' }
+}
+
+# ---------------------------------------------------------------- the watcher tick (every 4 s)
+function Invoke-GameAutoTick {
+    [ZdWatchdog]::Step = 'Invoke-GameAutoTick'
+    try {
+        $run = Find-RunningGame                       # the one process lookup of this tick
+        $id = if ($run) { "$($run.Def.Id)" } else { $null }
+        $script:GmRunning = $id
+        if (-not $id -or $id -ne $script:GmSuppressGame) { $script:GmSuppress = $false; $script:GmSuppressGame = $null }
+        $prefs = Get-GameModePrefs
+        $closed = [ordered]@{}                        # game id => messages about it closing
+        $started = @()
+        # Game Mode: off when the game it saw closed, on when a game it should follow starts
+        if (Test-ZDGameMode) {
+            $st = Read-GmState
+            $seen = Get-GmStateGame $st
+            if ($seen -and $seen -ne $id) {
+                if ($prefs.autooff) { $closed[$seen] = @(Disable-ZDGameMode) }
+                else { Set-GmStateGame $st $null }
+            } elseif ($id -and -not $seen) { Set-GmStateGame $st $id }
+        }
+        if ($id -and -not $script:GmSuppress -and -not (Test-ZDGameMode) -and (Get-GameAutoPref $id $prefs.auto)) {
+            $msg = Enable-ZDGameMode
+            if (Test-ZDGameMode) { Set-GmStateGame (Read-GmState) $id }
+            $started += $msg
+        }
+        # tweaks: first the games that closed, then the one that started
+        if ($null -eq $script:GameAutoState) { $script:GameAutoState = Read-GameAutoState }
+        foreach ($gid in @($script:GameAutoState.Keys)) {
+            if ($gid -eq $id) { continue }
+            $m = Complete-GameAutoTweaks $gid
+            if ($m) { if (-not $closed.Contains($gid)) { $closed[$gid] = @() }; $closed[$gid] += $m }
+        }
+        if ($id -and -not $script:GameAutoState.ContainsKey($id) -and (Get-GameTweakPrefs $id).On) { $started += Start-GameAutoTweaks $run.Def }
+        $lines = @()
+        foreach ($gid in $closed.Keys) { $lines += "$(Get-GameTitle $gid) closed. $($closed[$gid] -join ' ')" }
+        if ($started.Count) { $lines += "$($run.Def.Title) started. $($started -join ' ')" }
+        if ($lines.Count) { $txt = $lines -join '  '; Show-Toast $txt $(if ($txt -match 'could not') { '#FF9F0A' } else { '#30D158' }) }
+    } catch { Show-Toast "Game watcher: $($_.Exception.Message)" '#FF9F0A' }
+    Update-GameModeUi
+}
+
+# ---------------------------------------------------------------- read-only summary for the game page
+function Get-GameAutoSummary($g) {
+    $gm = Get-GameAutoPref $g.Id
+    $pf = Get-GameTweakPrefs $g.Id
+    $off = (Get-GameModePrefs).autooff
+    $n = @(Get-GameAutoCards $g).Count
+    $title = "$($g.Title)"
+    if (-not $gm -and -not $pf.On) { return "Nothing happens by itself when $title launches." }
+    $what = @()
+    if ($gm) { $what += 'Game Mode' }
+    if ($pf.On) { $what += $(if ($n) { "$n $(Get-TweakWord $n)" } else { 'its tweaks (all on already)' }) }
+    $s = "Starts $($what -join ' and ') when $title launches"
+    $after = @()
+    if ($gm -and $off) { $after += 'turns Game Mode off' }
+    if ($pf.On -and $pf.Back) { $after += 'puts the tweaks back' }
+    if ($after.Count) { $s += "; $($after -join ' and ') after." } else { $s += '.' }
+    $s
+}
+
+# ---------------------------------------------------------------- game page switches (WPF; wired once after $script:GamesUi = $h)
+# text that must not sit in the XAML (apostrophes), set here
+function Initialize-GameAutoUi($h) {
+    if (-not $h.AutoGm) { return }
+    $h.AutoGm.Add_Click({ param($s, $e)
+        $g = $script:GameSel; if (-not $g) { return }
+        Set-GameAutoPref $g.Id ([bool]$s.IsChecked)
+        Update-GameAutoUi; Update-GameModeUi
+        Show-Toast $(if ($s.IsChecked) { "Game Mode turns on by itself when $($g.Title) starts." } else { "Game Mode no longer starts with $($g.Title)." }) '#30D158'
+    })
+    $h.AutoTw.Add_Click({ param($s, $e)
+        $g = $script:GameSel; if (-not $g) { return }
+        Set-GameTweakPref $g.Id 'On' ([bool]$s.IsChecked)
+        Update-GameAutoUi
+        Show-Toast $(if ($s.IsChecked) { "ZeroDelay switches on $($g.Title)'s recommended tweaks when it starts." } else { "$($g.Title)'s tweaks stay as they are when it starts." }) '#30D158'
+    })
+    $h.AutoLater.Add_Click({ param($s, $e) $g = $script:GameSel; if ($g) { Set-GameTweakPref $g.Id 'Later' ([bool]$s.IsChecked); Update-GameAutoUi } })
+    $h.AutoBack.Add_Click({ param($s, $e) $g = $script:GameSel; if ($g) { Set-GameTweakPref $g.Id 'Back' ([bool]$s.IsChecked); Update-GameAutoUi } })
+}
+# called from Show-GameDetail (after Update-GameTools) and after a switch changes
+function Update-GameAutoUi {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.AutoGm) { return }
+    $pf = Get-GameTweakPrefs $g.Id
+    $h.AutoGm.IsChecked = Get-GameAutoPref $g.Id
+    $h.AutoGmText.Text = 'Auto-start'
+    $h.AutoTw.IsChecked = [bool]$pf.On
+    $h.AutoLater.IsChecked = [bool]$pf.Later
+    $h.AutoBack.IsChecked = [bool]$pf.Back
+    $h.AutoOpts.Visibility = if ($pf.On) { 'Visible' } else { 'Collapsed' }
+    $h.AutoSum.Text = Get-GameAutoSummary $g
+}
+# hero chip text: which game Game Mode follows (replaces the two-word 'Game Mode on/off')
+function Get-GameModeChipText($g) {
+    if (Test-ZDGameMode) { if ($script:GmRunning) { "Game Mode on · $(Get-GameTitle $script:GmRunning) running" } else { 'Game Mode on' } }
+    elseif (Get-GameAutoPref $g.Id) { "Game Mode starts with $($g.Title)" } else { 'Game Mode off' }
+}
+
+# r19 (1.19): per-game presets (Competitive / Balanced / Off) on every game page, and Export / Import settings on the
+# Settings page. Functions and script-scope constants only; nothing runs when this file is loaded.
+# Needs from the app: $Tweaks, $GameDefs, $GameModeSteps, $AppVersion, $script:Backup, Save-Backup, Switch-Tweak,
+# Get-GameDef, Get-GameProcNames, Get-GameModePrefs, Show-Toast, Show-ZdDialog, Esc, ConvertTo-Brush, [ZdTheme]::Parse.
+
+# ======================================================== per-game presets ===
+$script:PresetNames = @('Competitive', 'Balanced', 'Off')
+# PC-wide categories whose recommended latency cards join a game's Competitive preset
+$script:PresetSysCats = @('Graphics', 'Network', 'Input', 'Power')
+# what a saved preset record looks like: $script:Backup.Custom['preset:<game id>'] = @{ Name; On = @(ids ZeroDelay switched on); Wait = @(ids still to do); Time }
+
+# the tweak category of a game: Cat, or Fortnite / CS2 by id, or (1.18 round-1 games, which have no Cat) the category
+# whose Requires is "Test-GameInstalled '<id>'"
+function Get-PresetGameCat($g) {
+    if ($g.Cat) { return "$($g.Cat)" }
+    $m = @{ fortnite = 'Fortnite'; cs2 = 'CS2' }["$($g.Id)"]; if ($m) { return $m }
+    if (-not $script:GameCatCache) { $script:GameCatCache = @{} }
+    if (-not $script:GameCatCache.ContainsKey("$($g.Id)")) {
+        $hit = $Categories | Where-Object { $_.Requires -and "$($_.Requires)" -match "Test-GameInstalled '$([regex]::Escape("$($g.Id)"))'" } | Select-Object -First 1
+        $script:GameCatCache["$($g.Id)"] = if ($hit) { "$($hit.Name)" } else { $null }
+    }
+    $script:GameCatCache["$($g.Id)"]
+}
+
+# the cards a preset switches on for a game, in $Tweaks order, each once.
+# Balanced = the game's recommended switches. Competitive = those, plus the game's latency switches and the recommended
+# latency switches of the PC-wide categories (graphics, network, input, power).
+function Get-PresetCards($g, [string]$Preset) {
+    if ($Preset -notin 'Competitive', 'Balanced') { return @() }
+    $cat = Get-PresetGameCat $g
+    $out = New-Object Collections.ArrayList; $seen = @{}
+    foreach ($t in $Tweaks) {
+        if (-not $t.Toggle -or $t.Hidden -or $seen.ContainsKey($t.Id)) { continue }
+        $own = $cat -and $t.Cat -eq $cat
+        $take = ($own -and $t.Rec)
+        if (-not $take -and $Preset -eq 'Competitive') {
+            $take = ($own -and $t.Lat) -or ($script:PresetSysCats -contains $t.Cat -and $t.Lat -and $t.Rec)
+        }
+        if ($take) { $seen[$t.Id] = $true; [void]$out.Add($t) }
+    }
+    @($out)
+}
+
+# a card that edits the game's own settings file refuses while the game runs (the game rewrites the file on exit)
+function Test-PresetCardNeedsClosedGame($t) {
+    [bool]($t['GameIni'] -or $t['GameKv'] -or $t['GameFb'] -or $t['GameJson'] -or $t['GameXml'] -or $t['Ini'] -or $t['Cs'])
+}
+# the game a card belongs to (its category's game, or the game named in its settings-file data), or $null for PC cards
+function Get-CardGame($t) {
+    foreach ($g in $GameDefs) { if ((Get-PresetGameCat $g) -eq $t.Cat) { return $g } }
+    foreach ($p in 'GameIni', 'GameKv', 'GameFb', 'GameJson', 'GameXml') { $e = @($t[$p]) | Select-Object -First 1; if ($e -and $e.Game) { $d = Get-GameDef "$($e.Game)"; if ($d) { return $d } } }
+    if ($t['Ini']) { return (Get-GameDef 'fortnite') }
+    if ($t['Cs']) { return (Get-GameDef 'cs2') }
+    $null
+}
+# one Get-Process for the game's process names ($GameFind has no Fortnite or CS2 entry, so this uses $GameDefs.Proc)
+function Test-PresetGameRunning($g) {
+    if (-not $g) { return $false }
+    $names = @(Get-GameProcNames $g); if (-not $names.Count) { return $false }
+    [bool](Get-Process -Name $names -ErrorAction SilentlyContinue)
+}
+
+function Get-PresetRecord($g) {
+    $r = $script:Backup.Custom["preset:$($g.Id)"]; if (-not $r) { return $null }
+    # saved JSON comes back as a pscustomobject; work on a hashtable
+    @{ Name = "$($r.Name)"; On = @($r.On | Where-Object { $_ } | ForEach-Object { "$_" }); Wait = @($r.Wait | Where-Object { $_ } | ForEach-Object { "$_" }); Time = "$($r.Time)" }
+}
+function Set-PresetRecord($g, $Record) {
+    $key = "preset:$($g.Id)"
+    if ($Record -and ($Record.On.Count -or $Record.Wait.Count)) { $Record.Time = (Get-Date).ToString('o'); $script:Backup.Custom[$key] = $Record }
+    else { $script:Backup.Custom.Remove($key) }
+    Save-Backup
+}
+
+# which preset is on, read from the cards themselves: 'Competitive' when every available Competitive card is on,
+# else 'Balanced' when every available Balanced card is on, else 'Off'. Cards this PC cannot use (State $null) do not count.
+function Get-PresetState($g) {
+    $rec = Get-PresetRecord $g
+    foreach ($name in 'Competitive', 'Balanced') {
+        $cards = @(Get-PresetCards $g $name | Where-Object { $null -ne $_.State })
+        if (-not $cards.Count) { continue }
+        if (@($cards | Where-Object { $_.State -ne $true }).Count) { continue }
+        # Competitive adds nothing to Balanced for a few games: then the saved name decides between the two
+        if ($name -eq 'Competitive' -and $rec -and $rec.Name -eq 'Balanced' -and (Get-PresetCards $g 'Competitive').Count -eq (Get-PresetCards $g 'Balanced').Count) { continue }
+        return $name
+    }
+    'Off'
+}
+
+# switches the cards of a list on (or off), each through Switch-Tweak; game-file cards wait while the game runs.
+# Returns @{ On; Restart; Failed; NotAvail; Wait = @(ids); Done = @(ids switched) }.
+function Invoke-PresetCards($g, $Cards, [bool]$Enable) {
+    $r = @{ On = 0; Restart = 0; Failed = 0; NotAvail = 0; Wait = @(); Done = @() }
+    $running = Test-PresetGameRunning $g
+    foreach ($t in @($Cards)) {
+        if ($null -eq $t.State) { $r.NotAvail++; continue }                       # not available on this PC
+        if ($running -and (Test-PresetCardNeedsClosedGame $t)) { $r.Wait += $t.Id; continue }
+        Switch-Tweak $t $Enable                                                  # reports its own errors in a toast; State tells us the outcome
+        if ($t.State -eq $Enable) {
+            $r.Done += $t.Id
+            if ($Enable -and $t.Badge -in 'restart', 'signout') { $r.Restart++ } else { $r.On++ }
+        } else { $r.Failed++ }
+    }
+    $r
+}
+function Get-PresetSummary([string]$Lead, $r, [bool]$Enable, [string]$GameTitle) {
+    $parts = @()
+    if ($r.On) { $parts += "$($r.On) $(if ($Enable) { 'on' } else { 'off' })" }
+    if ($r.Restart) { $parts += "$($r.Restart) need a restart" }
+    if (@($r.Wait).Count) { $parts += "$(@($r.Wait).Count) waiting for $GameTitle to close" }
+    if ($r.Failed) { $parts += "$($r.Failed) could not" }
+    if (-not $parts.Count) { $parts += $(if ($r.NotAvail) { 'nothing to change on this PC' } else { 'nothing to change' }) }
+    "${Lead}: $($parts -join ', ')."
+}
+
+# applies a preset to a game: switches on the cards that are off, remembers which ones were ours, defers game-file
+# cards while the game runs. 'Off' undoes exactly the cards ZeroDelay switched on for this game, nothing else.
+function Invoke-GamePreset($g, [string]$Preset) {
+    if ($Preset -eq 'Off') { return Undo-GamePreset $g }
+    $rec = Get-PresetRecord $g; if (-not $rec) { $rec = @{ Name = $Preset; On = @(); Wait = @() } }
+    $todo = @(Get-PresetCards $g $Preset | Where-Object { $_.State -ne $true })   # a card the user already had on is not ours
+    $r = Invoke-PresetCards $g $todo $true
+    $rec.Name = $Preset
+    $rec.On = @(@($rec.On) + $r.Done | Select-Object -Unique)
+    $rec.Wait = @($r.Wait)
+    Set-PresetRecord $g $rec
+    $r.Text = Get-PresetSummary $Preset $r $true $g.Title
+    Show-Toast $r.Text $(if ($r.Failed) { '#FF9F0A' } else { '#30D158' })
+    $r
+}
+function Undo-GamePreset($g) {
+    $rec = Get-PresetRecord $g
+    $r = @{ On = 0; Restart = 0; Failed = 0; NotAvail = 0; Wait = @(); Done = @() }
+    if ($rec) {
+        $ours = @(foreach ($id in @($rec.On)) { $Tweaks | Where-Object { $_.Id -eq $id -and $_.Toggle } | Select-Object -First 1 })
+        $r = Invoke-PresetCards $g @($ours | Where-Object { $_.State -eq $true }) $false   # already off by hand: nothing to do, drop it
+        $keep = @($r.Wait)
+        $rec.Name = 'Off'; $rec.On = $keep; $rec.Wait = $keep
+    }
+    Set-PresetRecord $g $rec
+    $r.Text = Get-PresetSummary 'Preset off' $r $false $g.Title
+    Show-Toast $r.Text $(if ($r.Failed) { '#FF9F0A' } else { '#30D158' })
+    $r
+}
+
+# watcher hook (MatchTimer tick, every 4 s): finishes presets whose game-file cards waited for the game to close
+function Update-PresetWait {
+    $keys = @($script:Backup.Custom.Keys | Where-Object { "$_" -like 'preset:*' })
+    foreach ($k in $keys) {
+        $g = Get-GameDef ("$k" -replace '^preset:'); if (-not $g) { continue }
+        $rec = Get-PresetRecord $g; if (-not $rec -or -not $rec.Wait.Count) { continue }
+        if (Test-PresetGameRunning $g) { continue }
+        $enable = $rec.Name -ne 'Off'
+        $cards = @(foreach ($id in $rec.Wait) { $Tweaks | Where-Object { $_.Id -eq $id -and $_.Toggle } | Select-Object -First 1 })
+        $r = Invoke-PresetCards $g $cards $enable
+        if ($enable) { $rec.On = @(@($rec.On) + $r.Done | Select-Object -Unique); $rec.Wait = @($r.Wait) }
+        else { $rec.On = @($r.Wait); $rec.Wait = @($r.Wait) }
+        Set-PresetRecord $g $rec
+        Show-Toast "$($g.Title) closed. $(Get-PresetSummary $(if ($enable) { $rec.Name } else { 'Preset off' }) $r $enable $g.Title)" $(if ($r.Failed) { '#FF9F0A' } else { '#30D158' })
+        if ($script:GameSel -and $script:GameSel.Id -eq $g.Id) { Update-PresetChips; Update-GameTools }
+    }
+}
+
+# the three chips on the game page; rebuilt only when what they show changes (Update-GameDetail calls this every second)
+function Update-PresetChips {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.PresetChips) { return }
+    $state = Get-PresetState $g
+    $rec = Get-PresetRecord $g
+    $waiting = if ($rec -and $rec.Wait.Count) { $rec.Wait.Count } else { 0 }
+    $n = @(Get-PresetCards $g 'Balanced' | Where-Object { $null -ne $_.State }).Count
+    $sig = "$state|$waiting|$n|$(if ($rec) { $rec.Name })"
+    if ($h.PresetSig -eq $sig) { return }
+    $h.PresetSig = $sig
+    $h.PresetChips.Children.Clear()
+    if (-not $n) {
+        $h.PresetChips.Visibility = 'Collapsed'
+        $h.PresetNote.Text = "No recommended settings for $($g.Title) on this PC yet."
+        return
+    }
+    $h.PresetChips.Visibility = 'Visible'
+    foreach ($name in $script:PresetNames) {
+        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$name' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
+        $c.Tag = $name
+        $c.Add_Click({ param($s, $e)
+            $g = $script:GameSel; if (-not $g) { return }
+            $window.Cursor = [Windows.Input.Cursors]::Wait
+            try { [void](Invoke-GamePreset $g $s.Tag) } catch { Show-Toast "$($s.Tag): $($_.Exception.Message)" '#FF9F0A' }
+            $window.Cursor = $null
+            Update-PresetChips; Update-GameTools
+        })
+        $sel = $name -eq $state
+        $c.Background = ConvertTo-Brush $(if ($sel) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($sel) { '#FDFDFD' } else { '#F5F5F7' })
+        [void]$h.PresetChips.Children.Add($c)
+    }
+    $h.PresetNote.Text = if ($waiting) { "Waiting for $($g.Title) to close: $waiting setting$(if ($waiting -ne 1) { 's' }) of $($rec.Name) will be applied then." }
+        elseif ($state -eq 'Off') { "Balanced switches on the $n recommended setting$(if ($n -ne 1) { 's' }) for $($g.Title). Competitive adds every latency setting. Off undoes only what a preset switched on." }
+        else { "$state is on. Off undoes only what the preset switched on; settings you turned on yourself stay." }
+}
+
+# ======================================================== settings backup ===
+$script:SettingsFileVersion = 1
+# preferences that travel to another PC. Everything else in $script:Backup.Custom is a backup of this PC's own
+# values (original registry, file and driver settings, per-card originals, logs, measurements, tokens) and stays here.
+$script:ExportPrefKeys = @('accent', 'autofix', 'autoupdate', 'closetotray', 'eventsregion', 'pingregion', 'glass', 'matchreport', 'sessionprefs',
+                           'theme', 'tourgame', 'trustedboosters', 'wizarddone', 'traytipshown', 'nvsyncmode', 'sens', 'rl-statsapi-rec', 'gameauto', 'gametweaks')
+$script:ExportPrefPrefixes = @('gameserver_', 'nav_', 'tour-ics-', 'preset:')
+function Test-ExportPrefKey([string]$Key) {
+    if ($script:ExportPrefKeys -contains $Key) { return $true }
+    foreach ($p in $script:ExportPrefPrefixes) { if ($Key.StartsWith($p)) { return $true } }
+    $false
+}
+# true when a value (or anything inside it) looks like a secret: a token, key, password or e-mail address
+function Test-ValueHasSecret($v, [int]$Depth = 0) {
+    if ($null -eq $v -or $Depth -gt 6) { return $false }
+    if ($v -is [string]) { return [bool]($v -match '(?i)token|secret|passw|api[-_]?key|[\w.+-]+@[\w-]+\.[\w.]+') }
+    if ($v -is [System.Collections.IDictionary]) { foreach ($k in @($v.Keys)) { if ("$k" -match '(?i)token|secret|passw' -or (Test-ValueHasSecret $v[$k] ($Depth + 1))) { return $true } }; return $false }
+    if ($v -is [System.Collections.IEnumerable]) { foreach ($i in @($v)) { if (Test-ValueHasSecret $i ($Depth + 1)) { return $true } }; return $false }
+    if ($v.PSObject -and $v.PSObject.Properties -and $v -isnot [ValueType]) { foreach ($p in $v.PSObject.Properties) { if ($p.Name -match '(?i)token|secret|passw' -or (Test-ValueHasSecret $p.Value ($Depth + 1))) { return $true } } }
+    $false
+}
+# what Export writes: preferences, Game Mode prefs, the ids of the cards that are on, the app version. Nothing else.
+function Get-ZdSettingsExport {
+    $custom = [ordered]@{}
+    foreach ($k in @($script:Backup.Custom.Keys | Sort-Object)) {
+        if (-not (Test-ExportPrefKey "$k")) { continue }
+        $v = $script:Backup.Custom[$k]
+        if ($null -eq $v -or $v -is [scriptblock] -or (Test-ValueHasSecret $v)) { continue }
+        $custom["$k"] = $v
+    }
+    $prefs = Get-GameModePrefs
+    $gm = [ordered]@{}; foreach ($k in @($prefs.Keys | Sort-Object)) { $gm["$k"] = [bool]$prefs[$k] }
+    [ordered]@{
+        App = 'ZeroDelay'; Kind = 'settings'; Version = $script:SettingsFileVersion; AppVersion = "$AppVersion"; Exported = (Get-Date).ToString('o')
+        Custom = $custom
+        GameMode = $gm
+        CardsOn = @($Tweaks | Where-Object { $_.Toggle -and $_.State -eq $true } | ForEach-Object { "$($_.Id)" })
+    }
+}
+function Write-ZdSettingsFile([string]$Path) {
+    $d = Get-ZdSettingsExport
+    $d | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+    @{ Prefs = $d.Custom.Count; Cards = @($d.CardsOn).Count; Path = $Path }
+}
+function Export-ZdSettings {
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Title = 'Save ZeroDelay settings'
+    $dlg.Filter = 'ZeroDelay settings (*.json)|*.json'
+    $dlg.FileName = "ZeroDelay-settings-$(Get-Date -Format 'yyyy-MM-dd').json"
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('Desktop')
+    if (-not $dlg.ShowDialog($window)) { return }
+    try {
+        $r = Write-ZdSettingsFile $dlg.FileName
+        $what = "$($r.Prefs) preference$(if ($r.Prefs -ne 1) { 's' }) and $($r.Cards) card$(if ($r.Cards -ne 1) { 's' }) on"
+        Show-Toast "Settings saved: $what, in $([IO.Path]::GetFileName($r.Path)). No match data, logs or backups of game files are in it." '#30D158'
+    } catch { Show-Toast "Could not save the settings: $($_.Exception.Message)" '#FF9F0A' }
+}
+
+# reads and checks a settings file; throws a plain-English message when it is not one ZeroDelay can use
+function Read-ZdSettingsFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { throw 'The file was not found.' }
+    $len = (Get-Item -LiteralPath $Path).Length
+    if ($len -gt 2MB) { throw 'This file is too big to be a ZeroDelay settings file (over 2 MB).' }
+    if ($len -lt 2) { throw 'The file is empty.' }
+    $j = try { Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { throw 'This is not a ZeroDelay settings file (not valid JSON).' }
+    if (-not $j -or $j -is [array] -or $j -is [string] -or $j -is [ValueType]) { throw 'This is not a ZeroDelay settings file.' }
+    if ("$($j.App)" -ne 'ZeroDelay' -or "$($j.Kind)" -ne 'settings') { throw 'This is not a ZeroDelay settings file.' }
+    $ver = 0; if (-not [int]::TryParse("$($j.Version)", [ref]$ver) -or $ver -lt 1) { throw 'This settings file has no valid version number.' }
+    if ($ver -gt $script:SettingsFileVersion) { throw "This file was saved by a newer ZeroDelay (settings format $ver). Update ZeroDelay first." }
+    if ($null -ne $j.Custom -and ($j.Custom -isnot [System.Management.Automation.PSCustomObject])) { throw 'This settings file is damaged (the preferences part is not a list of settings).' }
+    if ($null -ne $j.GameMode -and ($j.GameMode -isnot [System.Management.Automation.PSCustomObject])) { throw 'This settings file is damaged (the Game Mode part is wrong).' }
+    if ($null -ne $j.CardsOn -and -not ($j.CardsOn -is [array] -or $j.CardsOn -is [string])) { throw 'This settings file is damaged (the list of cards is wrong).' }
+    $j
+}
+# what an import would do, before anything changes: prefs to set, cards to switch on, and what is skipped and why
+function Get-ZdImportPlan($Data) {
+    $plan = @{ Prefs = [ordered]@{}; GameMode = $null; Cards = @(); AlreadyOn = @(); Unknown = @(); NotAvail = @(); Running = @(); Secret = @(); Skipped = @() }
+    if ($Data.Custom) {
+        foreach ($p in $Data.Custom.PSObject.Properties) {
+            if (-not (Test-ExportPrefKey $p.Name) -or $null -eq $p.Value) { $plan.Skipped += $p.Name; continue }   # not a preference: another PC's backups
+            if ((Test-ValueHasSecret $p.Value) -or (Test-ValueHasSecret $p.Name)) { $plan.Secret += $p.Name; continue }
+            $plan.Prefs[$p.Name] = $p.Value
+        }
+    }
+    if ($Data.GameMode) {
+        $gm = @{}
+        foreach ($p in $Data.GameMode.PSObject.Properties) { if ($GameModeSteps.Contains($p.Name)) { $gm[$p.Name] = [bool]$p.Value } }
+        if ($gm.Count) { $plan.GameMode = $gm }
+    }
+    foreach ($id in @($Data.CardsOn | Where-Object { $_ } | ForEach-Object { "$_" } | Select-Object -Unique)) {
+        $t = $Tweaks | Where-Object { $_.Id -eq $id -and $_.Toggle } | Select-Object -First 1
+        if (-not $t) { $plan.Unknown += $id; continue }
+        if ($t.State -eq $true) { $plan.AlreadyOn += $id; continue }
+        $req = $true; if ($t.Requires) { $req = try { [bool](& $t.Requires) } catch { $false } }
+        if (-not $req -or $t.Hidden -or $null -eq $t.State) { $plan.NotAvail += $id; continue }
+        if ((Test-PresetCardNeedsClosedGame $t) -and (Test-PresetGameRunning (Get-CardGame $t))) { $plan.Running += $id; continue }
+        $plan.Cards += $t
+    }
+    $plan
+}
+function Get-ZdImportText($Data, $Plan) {
+    $when = try { ([datetime]$Data.Exported).ToString('d MMM yyyy, HH:mm') } catch { 'an unknown date' }
+    $lines = @("Saved by ZeroDelay $($Data.AppVersion) on $when.", '')
+    $np = $Plan.Prefs.Count + $(if ($Plan.GameMode) { 1 } else { 0 })
+    $lines += "- $np preference$(if ($np -ne 1) { 's' }) will be set$(if ($Plan.GameMode) { ' (including Game Mode)' })."
+    $names = @($Plan.Cards | ForEach-Object { $_.Title })
+    $list = if ($names.Count) { ': ' + (($names | Select-Object -First 6) -join ', ') + $(if ($names.Count -gt 6) { " and $($names.Count - 6) more" }) } else { '' }
+    $lines += "- $($Plan.Cards.Count) card$(if ($Plan.Cards.Count -ne 1) { 's' }) will be switched on$list."
+    if ($Plan.AlreadyOn.Count) { $lines += "- $($Plan.AlreadyOn.Count) already on." }
+    if ($Plan.Running.Count) { $lines += "- $($Plan.Running.Count) skipped while the game is running (apply again after closing it)." }
+    if ($Plan.NotAvail.Count) { $lines += "- $($Plan.NotAvail.Count) not available on this PC." }
+    if ($Plan.Unknown.Count) { $lines += "- $($Plan.Unknown.Count) card$(if ($Plan.Unknown.Count -ne 1) { 's' }) unknown to this version." }
+    if ($Plan.Skipped.Count) { $lines += "- $($Plan.Skipped.Count) entr$(if ($Plan.Skipped.Count -ne 1) { 'ies' } else { 'y' }) left out (not a preference)." }
+    if ($Plan.Secret.Count) { $lines += "- $($Plan.Secret.Count) left out (looked like a password or token)." }
+    $lines += ''; $lines += 'Nothing is switched off.'
+    $lines -join "`n"
+}
+# applies a plan: prefs into $script:Backup.Custom, cards on through Switch-Tweak. Returns counts.
+function Invoke-ZdImport($Plan) {
+    $r = @{ Prefs = 0; On = 0; Restart = 0; Failed = 0; Running = @($Plan.Running).Count; NotAvail = @($Plan.NotAvail).Count; Unknown = @($Plan.Unknown).Count }
+    foreach ($k in @($Plan.Prefs.Keys)) { $script:Backup.Custom[$k] = $Plan.Prefs[$k]; $r.Prefs++ }
+    if ($Plan.GameMode) { $p = Get-GameModePrefs; foreach ($k in $Plan.GameMode.Keys) { $p[$k] = [bool]$Plan.GameMode[$k] }; $script:Backup.Custom['gamemodeprefs'] = $p; $r.Prefs++ }
+    Save-Backup
+    foreach ($t in @($Plan.Cards)) {
+        Switch-Tweak $t $true
+        if ($t.State -eq $true) { if ($t.Badge -in 'restart', 'signout') { $r.Restart++ } else { $r.On++ } } else { $r.Failed++ }
+    }
+    $parts = @("$($r.Prefs) preference$(if ($r.Prefs -ne 1) { 's' })", "$($r.On) card$(if ($r.On -ne 1) { 's' }) on")
+    if ($r.Restart) { $parts += "$($r.Restart) need a restart" }
+    if ($r.Running) { $parts += "$($r.Running) skipped while a game runs" }
+    if ($r.NotAvail) { $parts += "$($r.NotAvail) not available on this PC" }
+    if ($r.Failed) { $parts += "$($r.Failed) could not" }
+    $r.Text = "Settings imported: $($parts -join ', ')."
+    $r
+}
+function Import-ZdSettings {
+    $dlg = New-Object Microsoft.Win32.OpenFileDialog
+    $dlg.Title = 'Open ZeroDelay settings'
+    $dlg.Filter = 'ZeroDelay settings (*.json)|*.json|All files (*.*)|*.*'
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('Desktop')
+    if (-not $dlg.ShowDialog($window)) { return }
+    try { $data = Read-ZdSettingsFile $dlg.FileName } catch { Show-ZdDialog $_.Exception.Message 'Import settings' 'OK' 'Warning'; return }
+    $plan = Get-ZdImportPlan $data
+    if ((Show-ZdDialog (Get-ZdImportText $data $plan) 'Import these settings?' 'OKCancel' 'Question') -ne 'OK') { return }
+    $window.Cursor = [Windows.Input.Cursors]::Wait
+    try {
+        $r = Invoke-ZdImport $plan
+        if (Get-Command Update-AppearanceUi -ErrorAction SilentlyContinue) { Update-AppearanceUi }
+        if (Get-Command Update-GameModeUi -ErrorAction SilentlyContinue) { Update-GameModeUi }
+        Show-Toast $r.Text $(if ($r.Failed) { '#FF9F0A' } else { '#30D158' })
+    } catch { Show-Toast "Could not import the settings: $($_.Exception.Message)" '#FF9F0A' }
+    $window.Cursor = $null
 }
 
 function Get-CpuName {
@@ -6829,7 +7460,7 @@ $Tweaks = @(
        Title = 'ZeroDelay Game Mode'
        Desc  = 'One switch for match time. Pick what it does below; everything is put back when you turn it off.'
        Warn  = ''
-       Run   = { if (Test-ZDGameMode) { if (Test-FortniteRunning) { $script:GmSuppress = $true }; Disable-ZDGameMode } else { Enable-ZDGameMode } } }
+       Run   = { if (Test-ZDGameMode) { Suspend-GameModeAuto; Disable-ZDGameMode } else { Enable-ZDGameMode } } }
 
     @{ Id = 'gamesession'; Cat = 'GameMode'; Icon = [char]0xE711; Picker = $true; Lat = $true; Extra = 'session'
        Title = 'Apps Game Mode closes'
@@ -12539,7 +13170,7 @@ function Update-GameModeUi {
     $on = Test-ZDGameMode
     $mint = [ZdTheme]::Brush('#30D158')
     $ui.GmSwitch.IsChecked = $on
-    $ui.GmStatus.Text = if ($on) { if (Test-FortniteRunning) { 'On · Fortnite running' } else { 'On' } } elseif ((Get-GameModePrefs).auto) { 'Auto-starts with Fortnite' } else { 'Off' }
+    $ui.GmStatus.Text = Get-GameModeStatusText
     $ui.GmStatus.Foreground = if ($on) { $mint } else { [ZdTheme]::Brush('#A1A1A6') }
     $ui.GmPanel.ClearValue([Windows.Controls.Border]::BorderBrushProperty)
     $t = $Tweaks | Where-Object { $_.Id -eq 'gm-main' } | Select-Object -First 1
@@ -12782,6 +13413,8 @@ $Categories = @(
        Note = 'One scan for the problems that cost you the most. Fix them one by one or all at once.' }
     @{ Name = 'Benchmark';  Icon = [char]0xE9D9; Title = 'Benchmark'; Page = 'Benchmark'
        Note = 'Measure real FPS, 1% lows and latency in Fortnite, then compare before and after a change.' }
+    @{ Name = 'Prove';      Icon = [char]0xE9D9; Title = 'Before and after'; Page = 'Prove'
+          Note = 'Record two minutes of any game as it is, switch the recommended tweaks on, record again: both runs side by side, with a verdict that only counts a difference bigger than the noise of two runs.' }
     @{ Name = 'Trends';     Icon = [char]0xE9D2; Title = 'Trends'; Page = 'Trends'
        Note = 'Your matches over time, per game: did the changes help? Lines mark when tweaks changed and when Fortnite or the graphics driver updated.' }
     @{ Name = 'Matches';    Icon = [char]0xE7FC; Title = 'Match reports'; Page = 'Matches'
@@ -13511,6 +14144,670 @@ function New-BenchmarkPage {
     Update-BenchmarkPage
     New-PageScroll $root
 }
+# --- Prove it: before and after (1.19). One page, three steps: record two minutes of the running game as it is, boost,
+#     record two minutes again, then a side-by-side with an honest verdict. Frame times come from PresentMon (when it is
+#     downloaded, hash-checked and ZeroDelay runs elevated); ping, GPU heat and CPU load come from a small sampler and
+#     [LiveStats]. Results are saved under $DataDir\prove and the last ten are listed on the page.
+$ProveDir = Join-Path $DataDir 'prove'
+$ProveSeconds = 120          # one run; both runs of a session always use the same length
+$ProveWindowMs = 10000       # the fast series (average FPS, GPU, CPU): one value per 10 s
+$ProveSlowWindowMs = 30000   # the slow series (1% low, stutters, ping spikes, loss): one value per 30 s
+$ProveKeep = 30              # saved result files kept on disk; the page lists the newest 10
+
+# ---------------------------------------------------------------- pure measurement
+function Get-ProveMean([double[]]$v) { if (-not $v -or -not $v.Count) { return $null }; $s = 0.0; foreach ($x in $v) { $s += $x }; $s / $v.Count }
+# sample standard deviation (n - 1); $null below two values
+function Get-ProveSd([double[]]$v) {
+    if (-not $v -or $v.Count -lt 2) { return $null }
+    $m = Get-ProveMean $v; $s = 0.0; foreach ($x in $v) { $s += ($x - $m) * ($x - $m) }
+    [Math]::Sqrt($s / ($v.Count - 1))
+}
+# "1% low" = FPS of the slowest 1% of frames averaged (the common definition)
+function Get-ProveLow1([double[]]$Ft) {
+    if (-not $Ft -or -not $Ft.Count) { return $null }
+    $s = [double[]]$Ft.Clone(); [Array]::Sort($s)
+    $k = [Math]::Max(1, [int][Math]::Ceiling($s.Count * 0.01)); $sum = 0.0
+    for ($i = $s.Count - $k; $i -lt $s.Count; $i++) { $sum += $s[$i] }
+    1000.0 / ($sum / $k)
+}
+# frame times (ms) -> average FPS, 1% low, stutters per minute, and the per-window series the noise rule needs.
+# $null when there are too few frames to say anything (under 300, or under a quarter of the expected run).
+function Measure-ProveFrames([double[]]$Ft) {
+    if (-not $Ft -or $Ft.Count -lt 300) { return $null }
+    $n = $Ft.Count; $total = 0.0; foreach ($v in $Ft) { $total += $v }
+    $sorted = [double[]]$Ft.Clone(); [Array]::Sort($sorted)
+    $med = $sorted[[int]($n / 2)]
+    # a stutter: one frame far slower than the typical frame (2.5x the median, or 12 ms more); hitches under 1 s apart count once
+    $thr = [Math]::Max($med * 2.5, $med + 12)
+    $fpsWin = New-Object Collections.Generic.List[double]; $lowWin = New-Object Collections.Generic.List[double]; $stutWin = New-Object Collections.Generic.List[double]
+    $cum = 0.0; $lastStut = -1e9; $stut = 0
+    $wStart = 0.0; $wCount = 0; $wSum = 0.0
+    $sStart = 0.0; $sFrames = New-Object Collections.Generic.List[double]; $sStut = 0
+    foreach ($v in $Ft) {
+        if ($v -gt $thr) { if ($cum - $lastStut -gt 1000) { $stut++; $sStut++ }; $lastStut = $cum }
+        $cum += $v; $wCount++; $wSum += $v; $sFrames.Add($v)
+        if ($cum - $wStart -ge $ProveWindowMs) { $fpsWin.Add(1000.0 * $wCount / $wSum); $wStart = $cum; $wCount = 0; $wSum = 0.0 }
+        if ($cum - $sStart -ge $ProveSlowWindowMs) { $lowWin.Add((Get-ProveLow1 $sFrames.ToArray())); $stutWin.Add($sStut / (($cum - $sStart) / 60000.0)); $sStart = $cum; $sFrames.Clear(); $sStut = 0 }
+    }
+    # a leftover part-window counts when it holds at least half a window
+    if ($wCount -and ($cum - $wStart) -ge $ProveWindowMs / 2) { $fpsWin.Add(1000.0 * $wCount / $wSum) }
+    if ($sFrames.Count -and ($cum - $sStart) -ge $ProveSlowWindowMs / 2) { $lowWin.Add((Get-ProveLow1 $sFrames.ToArray())); $stutWin.Add($sStut / (($cum - $sStart) / 60000.0)) }
+    @{ Avg = [Math]::Round(1000.0 * $n / $total, 1); Low1 = [Math]::Round((Get-ProveLow1 $Ft), 1); StutPerMin = [Math]::Round($stut / ($total / 60000.0), 2)
+       Frames = $n; Minutes = [Math]::Round($total / 60000.0, 2); AvgSeries = @($fpsWin); Low1Series = @($lowWin); StutSeries = @($stutWin) }
+}
+# the frame-time column of a PresentMon CSV (2.x "FrameTime", 1.x "MsBetweenPresents") -> Measure-ProveFrames; $null when unreadable
+function Measure-ProveCsv([string]$Csv) {
+    if (-not $Csv -or -not (Test-Path -LiteralPath $Csv)) { return $null }
+    $inv = [Globalization.CultureInfo]::InvariantCulture; $ns = [Globalization.NumberStyles]::Float
+    $ft = New-Object Collections.Generic.List[double]
+    $fs = [IO.File]::Open($Csv, 'Open', 'Read', 'ReadWrite'); $sr = New-Object IO.StreamReader $fs
+    try {
+        $head = $sr.ReadLine(); if (-not $head) { return $null }
+        $cols = @($head.Split(',') | ForEach-Object { $_.Trim() }); $cFt = -1
+        foreach ($nm in 'MsBetweenPresents', 'FrameTime') { $i = [Array]::IndexOf($cols, $nm); if ($i -ge 0) { $cFt = $i; break } }
+        if ($cFt -lt 0) { return $null }
+        while ($null -ne ($line = $sr.ReadLine())) {
+            $f = $line.Split(','); $v = 0.0
+            # frames over a second are alt-tabs and pauses, not gameplay
+            if ($f.Count -gt $cFt -and [double]::TryParse($f[$cFt], $ns, $inv, [ref]$v) -and $v -gt 0 -and $v -lt 1000) { $ft.Add($v) }
+        }
+    } finally { $sr.Dispose() }
+    Measure-ProveFrames $ft.ToArray()
+}
+# one ping a second (-1 = no answer) -> average, spikes per minute, loss %, and the per-30 s series
+function Measure-ProvePings([int[]]$Pings) {
+    $all = @($Pings); $ok = @($all | Where-Object { $_ -ge 0 })
+    if (-not $all.Count) { return @{ Avg = $null; Spikes = $null; LossPct = $null; Sent = 0; Lost = 0; AvgSeries = @(); SpikeSeries = @(); LossSeries = @() } }
+    $lost = $all.Count - $ok.Count
+    $avg = $null; $spikeThr = $null
+    if ($ok.Count) {
+        $s = [int[]]@($ok); [Array]::Sort($s); $med = $s[[int]($s.Count / 2)]
+        # a spike: a reply far above the usual one (half again as long, or 25 ms more)
+        $spikeThr = [Math]::Max($med * 1.5, $med + 25)
+        $avg = Get-ProveMean ([double[]]$ok)
+    }
+    $win = [int]($ProveSlowWindowMs / 1000)
+    $avgS = New-Object Collections.Generic.List[double]; $spS = New-Object Collections.Generic.List[double]; $lossS = New-Object Collections.Generic.List[double]
+    for ($i = 0; $i -lt $all.Count; $i += $win) {
+        $chunk = @($all[$i..([Math]::Min($all.Count, $i + $win) - 1)])
+        if ($chunk.Count -lt $win / 2) { break }
+        $good = @($chunk | Where-Object { $_ -ge 0 })
+        if ($good.Count) { $avgS.Add((Get-ProveMean ([double[]]$good))) }
+        $spS.Add(@($good | Where-Object { $_ -gt $spikeThr }).Count / ($chunk.Count / 60.0))
+        $lossS.Add(100.0 * ($chunk.Count - $good.Count) / $chunk.Count)
+    }
+    $spikes = if ($null -ne $spikeThr) { @($ok | Where-Object { $_ -gt $spikeThr }).Count } else { 0 }
+    @{ Avg = $(if ($null -ne $avg) { [Math]::Round($avg, 1) } else { $null }); Spikes = [Math]::Round($spikes / ($all.Count / 60.0), 2); LossPct = [Math]::Round(100.0 * $lost / $all.Count, 2)
+       Sent = $all.Count; Lost = $lost; AvgSeries = @($avgS); SpikeSeries = @($spS); LossSeries = @($lossS) }
+}
+# one sample a second (GPU temperature or CPU load) -> average and a per-10 s series
+function Measure-ProveSeries([double[]]$V) {
+    $v = @($V | Where-Object { $null -ne $_ })
+    if (-not $v.Count) { return @{ Avg = $null; Series = @() } }
+    $win = [int]($ProveWindowMs / 1000); $out = New-Object Collections.Generic.List[double]
+    for ($i = 0; $i -lt $v.Count; $i += $win) { $chunk = @($v[$i..([Math]::Min($v.Count, $i + $win) - 1)]); if ($chunk.Count -ge $win / 2) { $out.Add((Get-ProveMean ([double[]]$chunk))) } }
+    @{ Avg = [Math]::Round((Get-ProveMean ([double[]]$v)), 1); Series = @($out) }
+}
+
+# ---------------------------------------------------------------- comparison and verdict (pure)
+# Noise rule: a metric has changed only when |after - before| is bigger than ALL of (a) twice the pooled standard error
+# of the two runs' own windows, sqrt(sd_a^2/n_a + sd_b^2/n_b), (b) 3% of the before value, (c) a small floor in the
+# metric's own unit (1 FPS, 0.5 stutters/min, 1 ms, 0.5 spikes/min, 0.5 points of loss, 1 degree, 2 points of CPU).
+# Fewer than two windows on either side = the noise is unknown = never a gain.
+$ProveMetrics = @(
+    @{ Key = 'FpsAvg';  Label = 'Average FPS';            Unit = 'FPS'; Lower = $false; Floor = 1;   Dec = 0; Get = { param($r) $r.Fps.Avg };        Series = { param($r) $r.Fps.AvgSeries } }
+    @{ Key = 'Low1';    Label = '1% low FPS';             Unit = 'FPS'; Lower = $false; Floor = 1;   Dec = 0; Get = { param($r) $r.Fps.Low1 };       Series = { param($r) $r.Fps.Low1Series } }
+    @{ Key = 'Stut';    Label = 'Stutters per minute';    Unit = '';    Lower = $true;  Floor = 0.5; Dec = 1; Get = { param($r) $r.Fps.StutPerMin }; Series = { param($r) $r.Fps.StutSeries } }
+    @{ Key = 'Ping';    Label = 'Ping';                   Unit = 'ms';  Lower = $true;  Floor = 1;   Dec = 0; Get = { param($r) $r.Ping.Avg };       Series = { param($r) $r.Ping.AvgSeries } }
+    @{ Key = 'Spikes';  Label = 'Ping spikes per minute'; Unit = '';    Lower = $true;  Floor = 0.5; Dec = 1; Get = { param($r) $r.Ping.Spikes };    Series = { param($r) $r.Ping.SpikeSeries } }
+    @{ Key = 'Loss';    Label = 'Packet loss';            Unit = '%';   Lower = $true;  Floor = 0.5; Dec = 1; Get = { param($r) $r.Ping.LossPct };   Series = { param($r) $r.Ping.LossSeries } }
+    @{ Key = 'GpuTemp'; Label = 'GPU temperature';        Unit = [string][char]0x00B0 + 'C'; Lower = $true; Floor = 1; Dec = 0; Get = { param($r) $r.Gpu.Avg }; Series = { param($r) $r.Gpu.Series } }
+    @{ Key = 'Cpu';     Label = 'CPU load';               Unit = '%';   Lower = $true;  Floor = 2;   Dec = 0; Get = { param($r) $r.Cpu.Avg };        Series = { param($r) $r.Cpu.Series } }
+)
+function Format-ProveNumber($v, [int]$Dec = 0) { if ($null -eq $v) { '-' } else { ([double]$v).ToString($(if ($Dec -gt 0) { "0.$('#' * $Dec)" } else { '0' }), [Globalization.CultureInfo]::InvariantCulture) } }
+# one metric of two runs -> a row with Before, After, Delta, the noise threshold and the plain-words verdict
+function Compare-ProveMetric($M, $A, $B) {
+    $va = try { & $M.Get $A } catch { $null }; $vb = try { & $M.Get $B } catch { $null }
+    $row = [pscustomobject]@{ Key = $M.Key; Label = $M.Label; Unit = $M.Unit; LowerBetter = [bool]$M.Lower; Dec = [int]$M.Dec; Before = $null; After = $null
+                              Delta = $null; DeltaPct = $null; Noise = $null; Real = $false; Better = $null; Text = 'not measured' }
+    if ($null -eq $va -or $null -eq $vb) { if ($null -ne $va) { $row.Before = [double]$va }; if ($null -ne $vb) { $row.After = [double]$vb }; return $row }
+    $row.Before = [double]$va; $row.After = [double]$vb; $row.Delta = [Math]::Round($row.After - $row.Before, 2)
+    if ($row.Before -ne 0) { $row.DeltaPct = [Math]::Round(100.0 * $row.Delta / [Math]::Abs($row.Before), 1) }
+    $sa = @(); $sb = @()
+    try { $sa = @(& $M.Series $A | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ }) } catch {}
+    try { $sb = @(& $M.Series $B | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ }) } catch {}
+    if ($sa.Count -lt 2 -or $sb.Count -lt 2) { $row.Text = 'not enough data to tell'; return $row }
+    $sdA = Get-ProveSd $sa; $sdB = Get-ProveSd $sb
+    $se = [Math]::Sqrt($sdA * $sdA / $sa.Count + $sdB * $sdB / $sb.Count)
+    $row.Noise = [Math]::Round([Math]::Max([Math]::Max(2 * $se, 0.03 * [Math]::Abs($row.Before)), [double]$M.Floor), 3)
+    $row.Real = [Math]::Abs($row.Delta) -gt $row.Noise
+    if ($row.Real) { $row.Better = if ($M.Lower) { $row.Delta -lt 0 } else { $row.Delta -gt 0 }; $row.Text = if ($row.Better) { 'better' } else { 'worse' } }
+    else { $row.Text = 'no measurable change' }
+    $row
+}
+function Join-ProveList([string[]]$Items) {
+    $x = @($Items | Where-Object { $_ })
+    if (-not $x.Count) { '' } elseif ($x.Count -eq 1) { $x[0] } else { ($x[0..($x.Count - 2)] -join ', ') + ' and ' + $x[-1] }
+}
+# the headline: Better / Worse / Mixed / No measurable change / Nothing measured. Only rows that beat the noise are named.
+function Get-ProveVerdict($Rows) {
+    $rows = @($Rows)
+    $measured = @($rows | Where-Object { $null -ne $_.Before -and $null -ne $_.After })
+    if (-not $measured.Count) { return @{ Kind = 'nodata'; Head = 'Nothing could be measured.'; Detail = 'Neither run has numbers to compare. Check that the game stayed on screen for the whole run.' } }
+    $better = @($measured | Where-Object { $_.Real -and $_.Better }); $worse = @($measured | Where-Object { $_.Real -and -not $_.Better })
+    $same = @($measured | Where-Object { -not $_.Real -and $_.Text -eq 'no measurable change' })
+    $thin = @($measured | Where-Object { $_.Text -eq 'not enough data to tell' })
+    # 'Average FPS' -> 'average FPS'; acronyms ('GPU temperature', 'CPU load') and '1% low FPS' stay as they are
+    $lc = { param($s) if ("$s" -cmatch '^[A-Z][a-z]') { "$s".Substring(0, 1).ToLower() + "$s".Substring(1) } else { "$s" } }
+    $sameTxt = if ($same.Count) { "No measurable change in $(Join-ProveList @($same | ForEach-Object { & $lc $_.Label }))." } else { '' }
+    $thinTxt = if ($thin.Count) { " Too little data to judge $(Join-ProveList @($thin | ForEach-Object { & $lc $_.Label }))." } else { '' }
+    if (-not $better.Count -and -not $worse.Count) {
+        return @{ Kind = 'same'; Head = 'No measurable change.'; Detail = "The two runs differ less than each run differs from itself, so nothing here counts as a gain or a loss.$thinTxt" }
+    }
+    $bTxt = Join-ProveList @($better | ForEach-Object { "$(& $lc $_.Label) $(Format-ProveDelta $_)" })
+    $wTxt = Join-ProveList @($worse | ForEach-Object { "$(& $lc $_.Label) $(Format-ProveDelta $_)" })
+    if ($better.Count -and -not $worse.Count) { return @{ Kind = 'better'; Head = "Better: $bTxt."; Detail = "$sameTxt$thinTxt".Trim() } }
+    if ($worse.Count -and -not $better.Count) { return @{ Kind = 'worse'; Head = "Worse: $wTxt."; Detail = "$sameTxt$thinTxt".Trim() } }
+    @{ Kind = 'mixed'; Head = "Mixed: better $bTxt; worse $wTxt."; Detail = "$sameTxt$thinTxt".Trim() }
+}
+# "+11%" for rates, "-4 ms" for the rest
+function Format-ProveDelta($Row) {
+    if ($null -eq $Row.Delta) { return '' }
+    $sign = if ($Row.Delta -gt 0) { '+' } else { '-' }
+    if ($Row.Key -in 'FpsAvg', 'Low1' -and $null -ne $Row.DeltaPct) { return "$sign$([Math]::Abs($Row.DeltaPct).ToString('0', [Globalization.CultureInfo]::InvariantCulture))%" }
+    "$sign$(Format-ProveNumber ([Math]::Abs($Row.Delta)) $Row.Dec)$(if ($Row.Unit) { " $($Row.Unit)" })".TrimEnd()
+}
+# pure: two runs of the same game and length -> rows + verdict. Throws in plain words when they cannot be compared.
+function Compare-ProveRuns($A, $B) {
+    if (-not $A -or -not $B) { throw 'Both runs are needed: record before and after.' }
+    if ("$($A.Game)" -ne "$($B.Game)") { throw "These runs are from different games ($($A.Title) and $($B.Title)). Record both in the same game." }
+    if ([int]$A.Seconds -ne [int]$B.Seconds) { throw "The two runs are not the same length ($($A.Seconds) s and $($B.Seconds) s), so they cannot be compared fairly." }
+    $rows = @(foreach ($m in $ProveMetrics) { Compare-ProveMetric $m $A $B })
+    $notes = @()
+    foreach ($pair in @(@('before', $A), @('after', $B))) { if (-not $pair[1].Fps -and $pair[1].FpsNote) { $notes += "FPS not measured $($pair[0]): $($pair[1].FpsNote)" } }
+    if ($A.Ping -and $B.Ping -and $A.Ping.Target -and $B.Ping.Target -and "$($A.Ping.Target)" -ne "$($B.Ping.Target)") {
+        $notes += "The two runs pinged different places ($($A.Ping.Label) and $($B.Ping.Label)), so the ping rows are not a fair pair."
+    }
+    @{ Game = "$($A.Game)"; Title = "$($A.Title)"; Seconds = [int]$A.Seconds; Rows = $rows; Verdict = (Get-ProveVerdict $rows); Notes = $notes
+       Rule = 'A change counts only when it is bigger than twice the two runs'' pooled standard error, bigger than 3% of the before value, and bigger than a small floor in its own unit.' }
+}
+# plain text the user can paste anywhere
+function Get-ProveShareText($Saved) {
+    $cmp = $Saved.Result; $when = try { ([datetime]$Saved.Time).ToString('d MMM yyyy, HH:mm') } catch { "$($Saved.Time)" }
+    $mins = [Math]::Round([int]$Saved.Seconds / 60.0, 1)
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.AppendLine("ZeroDelay before and after: $($Saved.Title), two runs of $mins min, $when")
+    [void]$sb.AppendLine(('{0,-24}{1,10}{2,10}{3,12}  {4}' -f 'What', 'Before', 'After', 'Change', 'Verdict'))
+    foreach ($r in @($cmp.Rows)) {
+        $u = if ($r.Unit) { " $($r.Unit)" } else { '' }
+        $bef = "$(Format-ProveNumber $r.Before $r.Dec)$(if ($null -ne $r.Before) { $u })"; $aft = "$(Format-ProveNumber $r.After $r.Dec)$(if ($null -ne $r.After) { $u })"
+        [void]$sb.AppendLine(('{0,-24}{1,10}{2,10}{3,12}  {4}' -f $r.Label, $bef, $aft, (Format-ProveDelta $r), $r.Text))
+    }
+    [void]$sb.AppendLine("Verdict: $($cmp.Verdict.Head) $($cmp.Verdict.Detail)".TrimEnd())
+    $app = @($Saved.Applied | Where-Object { $_ })
+    [void]$sb.AppendLine($(if ($app.Count) { "Switched on between the runs: $(Join-ProveList $app)." } else { 'Nothing was switched on by ZeroDelay between the runs.' }))
+    foreach ($n in @($cmp.Notes)) { [void]$sb.AppendLine($n) }
+    [void]$sb.AppendLine("Rule: $($cmp.Rule)")
+    $sb.ToString().TrimEnd()
+}
+
+# ---------------------------------------------------------------- saved results
+function Save-ProveResult($Before, $After, $Cmp, [string[]]$Applied) {
+    New-Item -ItemType Directory -Force $ProveDir | Out-Null
+    $t = Get-Date
+    $saved = @{ Version = 1; Time = $t.ToString('o'); Game = "$($Before.Game)"; Title = "$($Before.Title)"; Seconds = [int]$Before.Seconds; Before = $Before; After = $After; Result = $Cmp; Applied = @($Applied | Where-Object { $_ }) }
+    $file = Join-Path $ProveDir "$($t.ToString('yyyyMMdd-HHmmss'))-$($saved.Game).json"
+    $saved | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $file -Encoding UTF8
+    Get-ChildItem $ProveDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -Skip $ProveKeep | Remove-Item -Force -ErrorAction SilentlyContinue
+    $saved.File = $file
+    $saved
+}
+# newest first
+function Get-ProveResults([int]$Max = 10) {
+    if (-not (Test-Path $ProveDir)) { return @() }
+    @(Get-ChildItem $ProveDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -First $Max | ForEach-Object {
+        $f = $_.FullName; try { Get-Content -LiteralPath $f -Raw | ConvertFrom-Json | Add-Member -NotePropertyName File -NotePropertyValue $f -PassThru -Force } catch {} })
+}
+
+# ---------------------------------------------------------------- Boost between the runs
+# which recommended cards can go on while the game runs: no game-file engines (they refuse while the game runs), nothing
+# that needs a restart or sign-out, no driver profile (it takes effect when the game restarts). Those are listed, not promised.
+function Get-ProveApplyPlan {
+    $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and -not $_.Hidden -and $_.State -eq $false })
+    $now = @(); $later = @()
+    foreach ($t in $rec) {
+        if ($t.GameIni -or $t.GameKv -or $t.GameFb -or $t.GameJson -or $t.GameXml -or $t.Ini) { $later += @{ T = $t; Why = 'changes a game file: close the game first' } }
+        elseif ($t.Badge -eq 'restart') { $later += @{ T = $t; Why = 'needs a PC restart' } }
+        elseif ($t.Badge -eq 'signout') { $later += @{ T = $t; Why = 'needs a sign-out' } }
+        elseif ($t.Nv) { $later += @{ T = $t; Why = 'driver profile: takes effect when the game restarts' } }
+        else { $now += $t }
+    }
+    @{ Now = $now; Later = $later }
+}
+function Get-ProveApplied { $p = $script:Backup.Custom['prove']; if ($p -and $p.Applied) { @($p.Applied | Where-Object { $_ }) } else { @() } }
+# switches on every recommended card that works while the game runs; their ids go to Backup.Custom['prove'] so Undo can put them back
+function Apply-RecommendedNow {
+    $plan = Get-ProveApplyPlan
+    $done = @(); $failed = @()
+    foreach ($t in $plan.Now) {
+        try { Invoke-TweakOn $t; try { Update-Card $t } catch {}; $done += $t.Id } catch { $failed += "$($t.Title): $($_.Exception.Message)" }
+    }
+    Clear-ReadCache
+    if ($done.Count) {
+        $script:Backup.Custom['prove'] = @{ Applied = @(@(Get-ProveApplied) + $done | Select-Object -Unique); Time = (Get-Date).ToString('o') }
+        Save-Backup
+    }
+    try { Update-Summary } catch {}
+    @{ Done = $done; Failed = $failed; Later = $plan.Later }
+}
+# puts back exactly the cards Apply-RecommendedNow switched on
+function Undo-ProveApplied {
+    $n = 0; $errs = @()
+    foreach ($id in Get-ProveApplied) {
+        $t = Find-Tweak $id; if (-not $t) { continue }
+        try { Invoke-TweakOff $t; try { Update-Card $t } catch {}; $n++ } catch { $errs += "$($t.Title): $($_.Exception.Message)" }
+    }
+    if ($script:Backup.Custom.ContainsKey('prove')) { $script:Backup.Custom.Remove('prove'); Save-Backup }
+    Clear-ReadCache
+    try { Update-Summary } catch {}
+    @{ Undone = $n; Failed = $errs }
+}
+
+# ---------------------------------------------------------------- recorder
+# ping sampler: one ping a second to the target in its own PowerShell. No target = the provider's first router (TTL steps,
+# like the route monitor), else the router. -1 in the list means no answer.
+$ProveSamplerCode = @'
+param($sync)
+$ping = New-Object System.Net.NetworkInformation.Ping
+function P($ip) { if (-not $ip) { return -1 }; try { $r = $ping.Send($ip, 900); if ($r.Status -eq 'Success') { [int]$r.RoundtripTime } else { -1 } } catch { -1 } }
+function Test-Private($ip) {
+    $b = ([Net.IPAddress]::Parse($ip)).GetAddressBytes()
+    ($b[0] -eq 10) -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) -or ($b[0] -eq 169 -and $b[1] -eq 254)
+}
+if (-not $sync.Target) {
+    try {
+        $gw = $null
+        foreach ($n in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($n.OperationalStatus -ne 'Up' -or $gw) { continue }
+            foreach ($g in $n.GetIPProperties().GatewayAddresses) { $a = $g.Address; if ($a.AddressFamily -eq 'InterNetwork' -and "$a" -ne '0.0.0.0') { $gw = "$a"; break } }
+        }
+        $opt = New-Object System.Net.NetworkInformation.PingOptions; $buf = New-Object byte[] 32
+        for ($ttl = 1; $ttl -le 8 -and -not $sync.Stop -and -not $sync.Target; $ttl++) {
+            $opt.Ttl = $ttl
+            try { $r = $ping.Send('1.1.1.1', 900, $buf, $opt) } catch { continue }
+            if (-not $r.Address) { continue }
+            $a = "$($r.Address)"
+            if ($a -ne '1.1.1.1' -and -not (Test-Private $a)) { $sync.Target = $a; $sync.Label = 'your internet provider' }
+            elseif ($r.Status -eq 'Success') { break }
+        }
+        if (-not $sync.Target -and $gw) { $sync.Target = $gw; $sync.Label = 'your router' }
+    } catch {}
+}
+while (-not $sync.Stop) {
+    $t0 = [Environment]::TickCount
+    $ms = P $sync.Target
+    $sync.Sent = [int]$sync.Sent + 1; if ($ms -lt 0) { $sync.Lost = [int]$sync.Lost + 1 }
+    [void]$sync.Pings.Add($ms)
+    $wait = 1000 - ([Environment]::TickCount - $t0); if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+}
+'@
+# where to ping: the server picked on the game's page, else Epic's ping host for your Fortnite region, else the game's own
+# ping host; nothing = the sampler finds the provider hop itself
+function Get-ProvePingTarget($gd) {
+    $saved = $script:Backup.Custom["gameserver_$($gd.Id)"]
+    if ($saved) { $s = @(Get-GameServers $gd) | Where-Object { $_.Name -eq $saved } | Select-Object -First 1; if ($s -and $s.Ip) { return @{ Host = "$($s.Ip)"; Label = "the $($s.Name) server" } } }
+    if ($gd.Id -eq 'fortnite') { $h = try { Get-MatchPingHost } catch { $null }; if ($h) { return @{ Host = "$h"; Label = "Fortnite's $($script:MatchPingRegion) servers" } } }
+    if ($gd.PingHost) { return @{ Host = "$($gd.PingHost)"; Label = "$($gd.Title)'s servers" } }
+    @{ Host = $null; Label = 'your internet provider' }
+}
+# CPU load and GPU temperature right now, from the status strip's sampler ($null when it has no number)
+function Get-ProveLiveSample {
+    $s = if ('LiveStats' -as [type]) { [LiveStats]::Latest } else { $null }
+    @{ Cpu = $(if ($s -and $s.Cpu -ge 0) { [Math]::Round([double]$s.Cpu, 1) } else { $null }); GpuTemp = $(if ($s -and $s.GpuTemp -ge 0) { [Math]::Round([double]$s.GpuTemp, 1) } else { $null }) }
+}
+function Play-ProveSound([string]$Kind) { try { if ($Kind -eq 'start') { [System.Media.SystemSounds]::Asterisk.Play() } else { [System.Media.SystemSounds]::Exclamation.Play() } } catch {} }
+# why there will be no FPS column, or $null when PresentMon can record
+function Get-ProveFpsBlocker {
+    if (-not (Test-Path -LiteralPath $PresentMonExe)) { return 'FPS needs PresentMon: download it on the Benchmark page. Ping, GPU heat and CPU load are still recorded.' }
+    if (-not (Test-PresentMonReady)) { return 'FPS needs PresentMon, and the copy in ZeroDelay''s folder is not Intel''s 2.6.0 release: download it again on the Benchmark page.' }
+    if (-not (Test-ZdElevated)) { return 'FPS needs ZeroDelay to run as administrator (frame times come through Windows event tracing). Ping, GPU heat and CPU load are still recorded.' }
+    $null
+}
+function Get-ProvePmArgs([string]$Proc, [string]$Csv, [int]$Seconds) {
+    @('--process_name', "$Proc.exe", '--output_file', "`"$Csv`"", '--timed', "$Seconds", '--terminate_after_timed', '--no_console_stats', '--stop_existing_session', '--session_name', 'ZeroDelayProve')
+}
+function Start-ProvePresentMon([string]$Proc, [string]$Csv, [int]$Seconds) { Start-Process $PresentMonExe -ArgumentList (Get-ProvePmArgs $Proc $Csv $Seconds) -WindowStyle Hidden -PassThru }
+# the two timers live only when there is a WPF dispatcher (tests call the tick functions themselves)
+function Ensure-ProveTimers {
+    if ($script:ProveTimer -or -not ('Windows.Threading.DispatcherTimer' -as [type])) { return }
+    $script:ProveCountTimer = New-Object Windows.Threading.DispatcherTimer; $script:ProveCountTimer.Interval = [TimeSpan]::FromSeconds(1)
+    $script:ProveCountTimer.Add_Tick({ Step-ProveCountdown })
+    $script:ProveTimer = New-Object Windows.Threading.DispatcherTimer; $script:ProveTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:ProveTimer.Add_Tick({ Watch-ProveRecording })
+}
+# finished samplers are disposed here, never while they may still be in their last second
+function Clear-ProveSamplers {
+    if (-not $script:ProveOld) { return }
+    foreach ($m in @($script:ProveOld)) { if ($m.Handle.IsCompleted) { try { [void]$m.PS.EndInvoke($m.Handle) } catch {}; try { $m.PS.Dispose(); $m.RS.Dispose() } catch {}; $script:ProveOld.Remove($m) } }
+}
+function Retire-ProveSampler($rec) {
+    if (-not $rec -or -not $rec.PS) { return }
+    $rec.Sync.Stop = $true
+    if (-not $script:ProveOld) { $script:ProveOld = New-Object Collections.ArrayList }
+    [void]$script:ProveOld.Add(@{ PS = $rec.PS; RS = $rec.RS; Handle = $rec.Handle })
+}
+# $script:Prove = the session: Game (def), Proc, Seconds, Phase (idle|countdown|recording|done), Step (before|after), Runs, Count, Rec, Result, Saved, Error
+function New-ProveSession($Run) {
+    @{ Game = $Run.Def; Proc = $Run.Proc; Seconds = [int]$ProveSeconds; Phase = 'idle'; Step = 'before'; Runs = @{ before = $null; after = $null }; Count = 0; Rec = $null; Result = $null; Saved = $null; Error = $null }
+}
+# Record button: 5 s countdown, then the run. 'before' starts a new session; 'after' must be the same game.
+function Start-ProveCountdown([string]$Step) {
+    $run = Find-RunningGame
+    if (-not $run) { Show-Toast 'Start a game first, then press Record while you are playing.' '#FF9F0A'; return $false }
+    $p = $script:Prove
+    if ($p -and $p.Phase -in 'countdown', 'recording') { return $false }
+    if ($Step -eq 'before' -or -not $p) { $p = New-ProveSession $run; $script:Prove = $p }
+    elseif ("$($p.Game.Id)" -ne "$($run.Def.Id)") { Show-Toast "The first run was $($p.Game.Title) and this is $($run.Def.Title). Record both in the same game." '#FF9F0A'; return $false }
+    if ($Step -eq 'after' -and -not $p.Runs.before) { Show-Toast 'Record the first run (as it is now) before this one.' '#FF9F0A'; return $false }
+    $p.Step = $Step; $p.Phase = 'countdown'; $p.Count = 5; $p.Proc = $run.Proc; $p.Error = $null
+    Ensure-ProveTimers
+    if ($script:ProveCountTimer) { $script:ProveCountTimer.Start() }
+    Update-ProvePage
+    $true
+}
+# one second of the countdown
+function Step-ProveCountdown {
+    $p = $script:Prove
+    if (-not $p -or $p.Phase -ne 'countdown') { if ($script:ProveCountTimer) { $script:ProveCountTimer.Stop() }; return }
+    $p.Count--
+    if ($p.Count -le 0) { if ($script:ProveCountTimer) { $script:ProveCountTimer.Stop() }; Start-ProveRecording } else { Update-ProvePage }
+}
+function Start-ProveRecording {
+    $p = $script:Prove; if (-not $p -or $p.Phase -eq 'recording') { return }
+    if (-not (Get-Process -Name $p.Proc -ErrorAction SilentlyContinue)) { $p.Phase = $(if ($p.Runs.before) { 'done' } else { 'idle' }); Show-Toast "$($p.Game.Title) is not running any more." '#FF9F0A'; Update-ProvePage; return }
+    Clear-ProveSamplers
+    $rec = @{ Start = Get-Date; Csv = $null; Pm = $null; FpsNote = (Get-ProveFpsBlocker); Live = New-Object Collections.ArrayList; LastLive = -1 }
+    if (-not $rec.FpsNote) {
+        New-Item -ItemType Directory -Force $ToolsDir | Out-Null
+        $rec.Csv = Join-Path $ToolsDir "prove-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+        try { $rec.Pm = Start-ProvePresentMon $p.Proc $rec.Csv $p.Seconds } catch { $rec.Csv = $null; $rec.FpsNote = "PresentMon could not start: $($_.Exception.Message)" }
+    }
+    $tgt = Get-ProvePingTarget $p.Game
+    $sync = [hashtable]::Synchronized(@{ Stop = $false; Target = $tgt.Host; Label = $tgt.Label; Sent = 0; Lost = 0; Pings = [Collections.ArrayList]::Synchronized((New-Object Collections.ArrayList)) })
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open(); $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($ProveSamplerCode).AddArgument($sync)
+    $rec.Sync = $sync; $rec.PS = $ps; $rec.RS = $rs; $rec.Handle = $ps.BeginInvoke()
+    $rec.End = $rec.Start.AddSeconds($p.Seconds)
+    $p.Rec = $rec; $p.Phase = 'recording'
+    Play-ProveSound 'start'
+    Ensure-ProveTimers
+    if ($script:ProveTimer) { $script:ProveTimer.Start() }
+    Update-ProvePage
+}
+# every half second while recording: a live sample a second, the game still there?, and the end of the run
+function Watch-ProveRecording {
+    $p = $script:Prove
+    if (-not $p -or $p.Phase -ne 'recording') { if ($script:ProveTimer) { $script:ProveTimer.Stop() }; return }
+    $r = $p.Rec; $now = Get-Date
+    $sec = [int][Math]::Floor(($now - $r.Start).TotalSeconds)
+    if ($sec -ne $r.LastLive) {
+        $r.LastLive = $sec; [void]$r.Live.Add((Get-ProveLiveSample))
+        if ($sec % 5 -eq 0 -and -not (Get-Process -Name $p.Proc -ErrorAction SilentlyContinue)) { Stop-ProveRecording "$($p.Game.Title) closed, so this run was dropped. Start it again and record once more." '#FF9F0A'; return }
+    }
+    if ($now -lt $r.End) { Update-ProvePage; return }
+    # PresentMon ends by itself at --timed; give it 15 s to flush, then stop it
+    if ($r.Pm -and -not $r.Pm.HasExited) { if ($now -lt $r.End.AddSeconds(15)) { Update-ProvePage; return }; try { $r.Pm.Kill() } catch {} }
+    Complete-ProveRecording
+}
+# cancels the current countdown or run; nothing is kept from it
+function Stop-ProveRecording([string]$Msg, [string]$Color = '#A1A1A6') {
+    if ($script:ProveTimer) { $script:ProveTimer.Stop() }; if ($script:ProveCountTimer) { $script:ProveCountTimer.Stop() }
+    $p = $script:Prove; if (-not $p) { return }
+    $r = $p.Rec
+    if ($r) {
+        if ($r.Pm -and -not $r.Pm.HasExited) { try { $r.Pm.Kill() } catch {} }
+        Retire-ProveSampler $r
+        if ($r.Csv) { Remove-Item -LiteralPath $r.Csv -Force -ErrorAction SilentlyContinue }
+    }
+    $p.Rec = $null; $p.Phase = $(if ($p.Runs.before) { 'done' } else { 'idle' })
+    if ($Msg) { Show-Toast $Msg $Color }
+    Update-ProvePage
+}
+function New-ProveRun($p, $r) {
+    $fps = $null; $note = $r.FpsNote
+    if ($r.Csv) {
+        try { $fps = Measure-ProveCsv $r.Csv } catch { $fps = $null; $note = "PresentMon's file could not be read: $($_.Exception.Message)" }
+        if (-not $fps -and -not $note) { $note = 'PresentMon saw too few frames from the game. Was it on screen for the whole run?' }
+    }
+    $pings = [int[]]@($r.Sync.Pings | ForEach-Object { [int]$_ })
+    $live = @($r.Live)
+    $ping = Measure-ProvePings $pings; $ping.Target = "$($r.Sync.Target)"; $ping.Label = "$($r.Sync.Label)"
+    @{ Game = "$($p.Game.Id)"; Title = "$($p.Game.Title)"; Seconds = [int]$p.Seconds; Start = $r.Start.ToString('o'); End = (Get-Date).ToString('o')
+       Fps = $fps; FpsNote = $note; Ping = $ping
+       Gpu = (Measure-ProveSeries ([double[]]@($live | ForEach-Object { $_.GpuTemp } | Where-Object { $null -ne $_ })))
+       Cpu = (Measure-ProveSeries ([double[]]@($live | ForEach-Object { $_.Cpu } | Where-Object { $null -ne $_ }))) }
+}
+function Complete-ProveRecording {
+    $p = $script:Prove; $r = $p.Rec
+    if ($script:ProveTimer) { $script:ProveTimer.Stop() }
+    $r.Sync.Stop = $true
+    $run = New-ProveRun $p $r
+    Retire-ProveSampler $r
+    if ($r.Csv) { Remove-Item -LiteralPath $r.Csv -Force -ErrorAction SilentlyContinue }
+    $p.Runs[$p.Step] = $run; $p.Rec = $null; $p.Phase = 'done'
+    Play-ProveSound 'end'
+    if ($p.Step -eq 'after' -and $p.Runs.before) {
+        try {
+            $p.Result = Compare-ProveRuns $p.Runs.before $p.Runs.after
+            $applied = @(Get-ProveApplied | ForEach-Object { $t = Find-Tweak $_; if ($t) { "$($t.Title)" } })
+            $p.Saved = Save-ProveResult $p.Runs.before $p.Runs.after $p.Result $applied
+            try { Add-History "Before and after: $($p.Game.Title) - $($p.Result.Verdict.Head)" 'prove' $null } catch {}
+            Show-Toast "Before and after is ready. $($p.Result.Verdict.Head)" $(switch ($p.Result.Verdict.Kind) { 'better' { '#30D158' } 'worse' { '#FF453A' } default { '#0A84FF' } })
+        } catch { $p.Error = $_.Exception.Message; Show-Toast $p.Error '#FF9F0A' }
+    } else { Show-Toast "First run saved. Now boost (step 2), then record again (step 3)." '#30D158' }
+    Update-ProvePage
+}
+
+# ---------------------------------------------------------------- the page
+function New-ProvePage {
+    $root = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='26,22' Margin='0,0,0,16'>
+    <StackPanel>
+      <TextBlock Text='Before and after' FontSize='22' FontWeight='Bold'/>
+      <TextBlock FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,0' MaxWidth='860' HorizontalAlignment='Left'
+                 Text='Record two minutes of your game as it is, switch the recommended tweaks on, record two minutes again. Both runs side by side, and a difference only counts when it is bigger than the noise of two runs.'/>
+      <TextBlock x:Name='GameLine' FontSize='13' FontWeight='SemiBold' Margin='0,12,0,0' TextWrapping='Wrap'/>
+      <TextBlock x:Name='FpsLine' FontSize='12' Foreground='#FF9F0A' Margin='0,4,0,0' TextWrapping='Wrap' MaxWidth='860' HorizontalAlignment='Left'/>
+    </StackPanel>
+  </Border>
+  <Grid Margin='0,0,0,16'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+    <Border Style='{DynamicResource Card}' Padding='20,18' Margin='0,0,8,0'>
+      <StackPanel>
+        <TextBlock Text='1  Record as it is now' FontSize='15' FontWeight='SemiBold'/>
+        <TextBlock Text='Get into a match first, not the lobby. Play normally until the sound tells you it is done.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,10' MinHeight='34'/>
+        <Button x:Name='Rec1' Content='Record 2 minutes' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Left'/>
+        <TextBlock x:Name='St1' FontSize='12.5' Margin='0,10,0,0' TextWrapping='Wrap'/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Column='1' Style='{DynamicResource Card}' Padding='20,18' Margin='8,0,8,0'>
+      <StackPanel>
+        <TextBlock Text='2  Boost' FontSize='15' FontWeight='SemiBold'/>
+        <TextBlock Text='Switch on the recommended tweaks that work while the game runs, or pick them one by one. Undo puts them back.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,10' MinHeight='34'/>
+        <WrapPanel>
+          <Button x:Name='Apply' Content='Switch on recommended' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='0,0,6,6'/>
+          <Button x:Name='Pick' Content='Pick from the list' Style='{DynamicResource Btn}' Margin='0,0,6,6'/>
+          <Button x:Name='Undo' Content='Undo' Style='{DynamicResource Btn}' Margin='0,0,0,6'/>
+        </WrapPanel>
+        <TextBlock x:Name='St2' FontSize='12.5' Margin='0,4,0,0' TextWrapping='Wrap'/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Column='2' Style='{DynamicResource Card}' Padding='20,18' Margin='8,0,0,0'>
+      <StackPanel>
+        <TextBlock Text='3  Record again' FontSize='15' FontWeight='SemiBold'/>
+        <TextBlock Text='Same game, same length, and the same kind of play as the first run for a fair pair.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,10' MinHeight='34'/>
+        <Button x:Name='Rec2' Content='Record 2 minutes' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Left'/>
+        <TextBlock x:Name='St3' FontSize='12.5' Margin='0,10,0,0' TextWrapping='Wrap'/>
+      </StackPanel>
+    </Border>
+  </Grid>
+  <StackPanel Orientation='Horizontal' Margin='0,0,0,16'>
+    <Button x:Name='Cancel' Content='Stop recording' Style='{DynamicResource Btn}' Margin='0,0,8,0' Visibility='Collapsed'/>
+    <Button x:Name='Reset' Content='Start over' Style='{DynamicResource Btn}' Visibility='Collapsed'/>
+  </StackPanel>
+  <Border x:Name='ResultBox' Style='{DynamicResource Card}' CornerRadius='16' Padding='22,18' Margin='0,0,0,16' Visibility='Collapsed'>
+    <StackPanel>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel>
+          <TextBlock x:Name='ResHead' FontSize='17' FontWeight='SemiBold' TextWrapping='Wrap'/>
+          <TextBlock x:Name='ResDetail' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,0' MaxWidth='760' HorizontalAlignment='Left'/>
+        </StackPanel>
+        <Button x:Name='Share' Grid.Column='1' Content='Copy as text' Style='{DynamicResource Btn}' VerticalAlignment='Top' Margin='12,0,0,0'/>
+      </Grid>
+      <StackPanel x:Name='Rows' Margin='0,14,0,0'/>
+      <TextBlock x:Name='ResNotes' FontSize='11.5' Foreground='#98989D' TextWrapping='Wrap' Margin='0,10,0,0'/>
+    </StackPanel>
+  </Border>
+  <Border Style='{DynamicResource Card}' CornerRadius='16' Padding='22,18' Margin='0,0,0,16'>
+    <StackPanel>
+      <TextBlock Text='Past results' FontSize='15' FontWeight='SemiBold'/>
+      <StackPanel x:Name='Past' Margin='0,10,0,0'/>
+    </StackPanel>
+  </Border>
+</StackPanel>
+"@)
+    $h = @{ Root = $root }
+    foreach ($n in 'GameLine', 'FpsLine', 'Rec1', 'St1', 'Apply', 'Pick', 'Undo', 'St2', 'Rec2', 'St3', 'Cancel', 'Reset', 'ResultBox', 'ResHead', 'ResDetail', 'Share', 'Rows', 'ResNotes', 'Past') { $h[$n] = $root.FindName($n) }
+    $script:ProveUi = $h
+    $h.Rec1.Add_Click({ [void](Start-ProveCountdown 'before') })
+    $h.Rec2.Add_Click({ [void](Start-ProveCountdown 'after') })
+    $h.Cancel.Add_Click({ Stop-ProveRecording 'Recording stopped. Nothing from it was kept.' })
+    $h.Reset.Add_Click({ Stop-ProveRecording; $script:Prove = $null; Update-ProvePage })
+    $h.Apply.Add_Click({
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        try {
+            $r = Apply-RecommendedNow
+            $msg = if ($r.Done.Count) { "$($r.Done.Count) tweak$(if ($r.Done.Count -ne 1) { 's' }) switched on. Now record again (step 3)." } else { 'Everything recommended that works while the game runs is already on.' }
+            Show-Toast $msg $(if ($r.Failed.Count) { '#FF9F0A' } else { '#30D158' })
+        } catch { Show-Toast $_.Exception.Message '#FF9F0A' } finally { $window.Cursor = $null }
+        Update-ProvePage
+    })
+    $h.Pick.Add_Click({ if (Get-Command Show-OptimizeChooser -ErrorAction SilentlyContinue) { Show-OptimizeChooser } else { Select-NavPage 'Tweaks' } })
+    $h.Undo.Add_Click({
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        try { $r = Undo-ProveApplied; Show-Toast $(if ($r.Undone) { "$($r.Undone) tweak$(if ($r.Undone -ne 1) { 's' }) put back." } else { 'Nothing to undo: ZeroDelay switched nothing on here.' }) '#30D158' }
+        catch { Show-Toast $_.Exception.Message '#FF9F0A' } finally { $window.Cursor = $null }
+        Update-ProvePage
+    })
+    $h.Share.Add_Click({ $p = $script:Prove; if ($p -and $p.Saved) { Copy-ProveShare $p.Saved } })
+    $script:PageRefresh['Prove'] = { Update-ProvePage }
+    Update-ProvePage
+    New-PageScroll $root
+}
+function Copy-ProveShare($Saved) {
+    try { [Windows.Clipboard]::SetText((Get-ProveShareText $Saved)); Show-Toast 'Copied. Paste it anywhere.' '#30D158' } catch { Show-Toast "Could not copy: $($_.Exception.Message)" '#FF9F0A' }
+}
+# one line about a finished run
+function Get-ProveRunSummary($run) {
+    $bits = @()
+    if ($run.Fps) { $bits += "$(Format-ProveNumber $run.Fps.Avg) FPS, 1% low $(Format-ProveNumber $run.Fps.Low1), $(Format-ProveNumber $run.Fps.StutPerMin 1) stutters/min" } else { $bits += 'no FPS' }
+    if ($run.Ping -and $null -ne $run.Ping.Avg) { $bits += "ping $(Format-ProveNumber $run.Ping.Avg) ms, loss $(Format-ProveNumber $run.Ping.LossPct 1)%" }
+    if ($run.Gpu -and $null -ne $run.Gpu.Avg) { $bits += "GPU $(Format-ProveNumber $run.Gpu.Avg)$([char]0x00B0)C" }
+    if ($run.Cpu -and $null -ne $run.Cpu.Avg) { $bits += "CPU $(Format-ProveNumber $run.Cpu.Avg)%" }
+    "Done: " + ($bits -join ', ') + '.'
+}
+function Update-ProvePage {
+    $h = $script:ProveUi; if (-not $h) { return }
+    $p = $script:Prove
+    $busy = $p -and $p.Phase -in 'countdown', 'recording'
+    $run = if ($busy) { $null } else { Find-RunningGame }
+    $h.GameLine.Text = if ($busy) { "$($p.Game.Title) is being recorded." } elseif ($run) { "$($run.Def.Title) is running: you can record." } else { 'No supported game is running. Start one and get into a match, then come back here.' }
+    $h.GameLine.Foreground = ConvertTo-Brush $(if ($busy -or $run) { '#30D158' } else { '#A1A1A6' })
+    $blocker = Get-ProveFpsBlocker
+    $h.FpsLine.Text = if ($blocker) { $blocker } else { '' }
+    $h.FpsLine.Visibility = if ($blocker) { 'Visible' } else { 'Collapsed' }
+    # step 1 and 3
+    $live = { param($step)
+        if ($p.Phase -eq 'countdown' -and $p.Step -eq $step) { "Recording in $($p.Count) s..." }
+        elseif ($p.Phase -eq 'recording' -and $p.Step -eq $step) { "Recording... $([Math]::Max(0, [int]($p.Rec.End - (Get-Date)).TotalSeconds)) s left" } else { $null } }
+    $h.St1.Text = if (-not $p) { '' } elseif (& $live 'before') { & $live 'before' } elseif ($p.Runs.before) { Get-ProveRunSummary $p.Runs.before } else { '' }
+    $h.St3.Text = if (-not $p) { '' } elseif (& $live 'after') { & $live 'after' } elseif ($p.Runs.after) { Get-ProveRunSummary $p.Runs.after } else { '' }
+    $h.St1.Foreground = ConvertTo-Brush $(if ($p -and $p.Runs.before -and -not (& $live 'before')) { '#30D158' } else { '#F5F5F7' })
+    $h.St3.Foreground = ConvertTo-Brush $(if ($p -and $p.Runs.after -and -not (& $live 'after')) { '#30D158' } else { '#F5F5F7' })
+    $h.Rec1.IsEnabled = -not $busy -and [bool]$run
+    $h.Rec1.Content = if ($p -and $p.Runs.before) { 'Record the first run again' } else { 'Record 2 minutes' }
+    $h.Rec2.IsEnabled = -not $busy -and [bool]$run -and $p -and $p.Runs.before
+    $h.Rec2.Content = if ($p -and $p.Runs.after) { 'Record again' } else { 'Record 2 minutes' }
+    # step 2
+    $plan = Get-ProveApplyPlan; $applied = @(Get-ProveApplied)
+    $parts = @()
+    if ($applied.Count) { $parts += "On since the first run: $(Join-ProveList @($applied | ForEach-Object { $t = Find-Tweak $_; if ($t) { $t.Title } else { $_ } }))." }
+    if ($plan.Now.Count) { $parts += "$($plan.Now.Count) recommended tweak$(if ($plan.Now.Count -ne 1) { 's' }) can go on now." }
+    elseif (-not $applied.Count) { $parts += 'Everything recommended that works while the game runs is already on.' }
+    if ($plan.Later.Count) { $parts += "Not now, by hand later: $(Join-ProveList @($plan.Later | ForEach-Object { "$($_.T.Title) ($($_.Why))" }))." }
+    $h.St2.Text = $parts -join ' '
+    $h.Apply.IsEnabled = -not $busy -and $plan.Now.Count -gt 0
+    $h.Undo.IsEnabled = -not $busy -and $applied.Count -gt 0
+    $h.Pick.IsEnabled = -not $busy
+    $h.Cancel.Visibility = if ($busy) { 'Visible' } else { 'Collapsed' }
+    $h.Reset.Visibility = if ($p -and -not $busy) { 'Visible' } else { 'Collapsed' }
+    # result
+    if ($p -and $p.Result) {
+        $v = $p.Result.Verdict
+        $h.ResHead.Text = $v.Head; $h.ResDetail.Text = $v.Detail
+        $h.ResHead.Foreground = ConvertTo-Brush $(switch ($v.Kind) { 'better' { '#30D158' } 'worse' { '#FF453A' } 'mixed' { '#FF9F0A' } default { '#F5F5F7' } })
+        $h.Rows.Children.Clear(); [void]$h.Rows.Children.Add((New-ProveRowsPanel $p.Result))
+        $h.ResNotes.Text = (@($p.Result.Notes) + @("Rule: $($p.Result.Rule)")) -join "`n"
+        $h.ResultBox.Visibility = 'Visible'
+    } elseif ($p -and $p.Error) { $h.ResHead.Text = $p.Error; $h.ResDetail.Text = ''; $h.Rows.Children.Clear(); $h.ResNotes.Text = ''; $h.ResHead.Foreground = ConvertTo-Brush '#FF9F0A'; $h.ResultBox.Visibility = 'Visible' }
+    else { $h.ResultBox.Visibility = 'Collapsed' }
+    # past results (newest first)
+    $h.Past.Children.Clear()
+    $past = @(Get-ProveResults 10)
+    if (-not $past.Count) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Nothing yet. Your finished before-and-after pairs appear here.'; $tb.FontSize = 12.5; $tb.Foreground = ConvertTo-Brush '#A1A1A6'
+        [void]$h.Past.Children.Add($tb)
+    }
+    foreach ($s in $past) {
+        $when = try { ([datetime]$s.Time).ToString('d MMM yyyy, HH:mm') } catch { '' }
+        $kind = "$($s.Result.Verdict.Kind)"
+        $col = switch ($kind) { 'better' { '#30D158' } 'worse' { '#FF453A' } 'mixed' { '#FF9F0A' } default { '#A1A1A6' } }
+        $row = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Margin='0,0,0,8'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+  <StackPanel>
+    <TextBlock Text='$(Esc "$($s.Title)  ·  $when")' FontSize='13' FontWeight='SemiBold'/>
+    <TextBlock Text='$(Esc "$($s.Result.Verdict.Head)")' FontSize='12.5' Foreground='$col' TextWrapping='Wrap' Margin='0,2,0,0'/>
+  </StackPanel>
+  <Button x:Name='ShareOld' Grid.Column='1' Content='Copy as text' Style='{DynamicResource Btn}' Padding='12,6' FontSize='12' VerticalAlignment='Center' Margin='12,0,0,0'/>
+</Grid>
+"@)
+        $b = $row.FindName('ShareOld'); $b.Tag = $s; $b.Add_Click({ param($sender, $e) Copy-ProveShare $sender.Tag })
+        [void]$h.Past.Children.Add($row)
+    }
+}
+# the side-by-side table: metric, before, after, change, verdict
+function New-ProveRowsPanel($Cmp) {
+    $cols = "<Grid.ColumnDefinitions><ColumnDefinition Width='190'/><ColumnDefinition Width='110'/><ColumnDefinition Width='110'/><ColumnDefinition Width='130'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>"
+    $x = foreach ($r in @($Cmp.Rows)) {
+        $u = if ($r.Unit) { " $($r.Unit)" } else { '' }
+        $c = if (-not $r.Real) { '#A1A1A6' } elseif ($r.Better) { '#30D158' } else { '#FF453A' }
+        # FPS rows show the percent and the frames: "+11% (+15.2)"
+        $delta = if ($null -eq $r.Delta) { '-' } else { "$(Format-ProveDelta $r)$(if ($r.Key -in 'FpsAvg', 'Low1') { " ($(if ($r.Delta -ge 0) { '+' })$(Format-ProveNumber $r.Delta 1))" })" }
+        "<Grid Margin='0,0,0,6'>$cols" +
+        "<TextBlock Text='$(Esc $r.Label)' FontSize='13' FontWeight='SemiBold'/>" +
+        "<TextBlock Grid.Column='1' Text='$(Esc "$(Format-ProveNumber $r.Before $r.Dec)$(if ($null -ne $r.Before) { $u })")' FontSize='12.5' Typography.NumeralAlignment='Tabular'/>" +
+        "<TextBlock Grid.Column='2' Text='$(Esc "$(Format-ProveNumber $r.After $r.Dec)$(if ($null -ne $r.After) { $u })")' FontSize='12.5' Typography.NumeralAlignment='Tabular'/>" +
+        "<TextBlock Grid.Column='3' Text='$(Esc $delta)' FontSize='12.5' Foreground='$c' Typography.NumeralAlignment='Tabular'/>" +
+        "<TextBlock Grid.Column='4' Text='$(Esc $r.Text)' FontSize='12.5' Foreground='$c' TextWrapping='Wrap'/></Grid>"
+    }
+    $hc = { param($i, $t) "<TextBlock Grid.Column='$i' Text='$t' FontSize='11' Foreground='#98989D'/>" }
+    $head = "<Grid Margin='0,0,0,8'>$cols$(& $hc 0 'What')$(& $hc 1 'Before')$(& $hc 2 'After')$(& $hc 3 'Change')$(& $hc 4 'Verdict')</Grid>"
+    [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>$head$($x -join '')</StackPanel>")
+}
+
 # ---------------------------------------------------------------- A/B test with a replay
 # tweaks that work while Fortnite runs (no game-file, driver-profile or restart changes)
 function Get-ABTweaks {
@@ -14413,6 +15710,7 @@ function New-SettingsPage {
         @{ Key = 'autofix';    Title = 'Automatically re-apply settings other programs change'; Desc = 'Instead of showing the orange bar, ZeroDelay quietly puts your settings back and tells you.' }
         @{ Key = 'matchreport'; Title = 'Match reports'; Desc = 'Watches quietly while Fortnite or another supported game runs (one at a time) and shows what got in the way when you close it (Tools > Match reports, Trends and the game''s page). Uses about 1% of one CPU core.' }
         @{ Key = 'autoupdate'; Title = 'Check for new versions'; Desc = 'Asks GitHub when ZeroDelay starts and every 6 hours whether a newer version is out. Nothing is downloaded or installed unless you choose to.' }
+        @{ Key = 'gmauto';     Title = 'Game Mode starts with any game'; Desc = 'When a game ZeroDelay knows starts, Game Mode turns on by itself and the message says which game. Each game page can say no for that one game.' }
     )
     $xr = ($rows | ForEach-Object {
         "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'><Grid>" +
@@ -14480,6 +15778,19 @@ function New-SettingsPage {
     </StackPanel>
   </Border>
   <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text='Settings backup' FontSize='14' FontWeight='SemiBold'/>
+        <TextBlock Text='Save your preferences, presets, calendars and the list of tweaks that are on to one file, or bring them back on this or another PC. No match data, logs or backups of game files are included.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/>
+      </StackPanel>
+      <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+        <Button x:Name='SetExport' Content='Export settings' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
+        <Button x:Name='SetImport' Content='Import settings' Style='{DynamicResource Btn}'/>
+      </StackPanel>
+    </Grid>
+  </Border>
+  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
     <StackPanel>
       <TextBlock Text='More' FontSize='14' FontWeight='SemiBold'/>
       <StackPanel Orientation='Horizontal' Margin='0,12,0,0'>
@@ -14492,7 +15803,7 @@ function New-SettingsPage {
 </StackPanel>
 "@)
     $st = @{}; foreach ($n in 'S_pause', 'PauseText', 'S_closetotray', 'S_autofix', 'S_autoupdate', 'S_startup', 'S_matchreport', 'UpdReport', 'Wizard', 'Folder', 'About', 'T_dark', 'T_light', 'T_system', 'Swatches', 'ThemeNote', 'ThemeApply', 'S_glass',
-                              'VerTitle', 'UpdStatus', 'UpdCheck', 'UpdGet', 'UpdRepo') { $st[$n] = $root.FindName($n) }
+                              'VerTitle', 'UpdStatus', 'UpdCheck', 'UpdGet', 'UpdRepo', 'S_gmauto', 'SetExport', 'SetImport') { $st[$n] = $root.FindName($n) }
     $script:PauseUi = $st
     if ($script:PageRefresh['Settings']) { $prev = $script:PageRefresh['Settings']; $script:PageRefresh['Settings'] = { & $prev; Update-PauseCard }.GetNewClosure() } else { $script:PageRefresh['Settings'] = { Update-PauseCard } }
     $st.S_pause.Add_Click({ param($s, $e) if ($s.IsChecked) { Resume-AllTweaks } else { Suspend-AllTweaks } })
@@ -14504,6 +15815,8 @@ function New-SettingsPage {
     $st.S_autofix.Add_Click({ param($s, $e) $script:Backup.Custom['autofix'] = [bool]$s.IsChecked; Save-Backup })
     $st.Wizard.Add_Click({ Show-Wizard })
     $st.Folder.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$DataDir`"" })
+    $st.SetExport.Add_Click({ Export-ZdSettings })
+    $st.SetImport.Add_Click({ Import-ZdSettings })
     $st.About.Text = "ZeroDelay $AppVersion  ·  app: $PSCommandPath  ·  data and backups: $DataDir"
     $st.S_matchreport.IsChecked = [bool](Get-Setting 'matchreport' $true)
     $st.S_matchreport.Add_Click({ param($s, $e) $script:Backup.Custom['matchreport'] = [bool]$s.IsChecked; Save-Backup })
@@ -14516,6 +15829,11 @@ function New-SettingsPage {
         } catch { $s.IsChecked = [bool](Get-StartupTask); Show-Toast "Could not change this: $($_.Exception.Message)" '#FF9F0A' }
     })
     $st.UpdReport.Add_Click({ Open-ProblemReport })
+    $st.S_gmauto.IsChecked = [bool](Get-GameModePrefs).auto
+    $st.S_gmauto.Add_Click({ param($s, $e)
+        Set-GameModeAutoAll ([bool]$s.IsChecked); Update-GameModeUi
+        Show-Toast $(if ($s.IsChecked) { 'Game Mode turns on by itself when any game starts. Each game page can still say no.' } else { 'Game Mode only turns on when you start it, or for the games you switch on on their pages.' }) '#30D158'
+    })
     $st.S_autoupdate.IsChecked = [bool](Get-Setting 'autoupdate' $true)
     $st.S_autoupdate.Add_Click({ param($s, $e)
         $script:Backup.Custom['autoupdate'] = [bool]$s.IsChecked; Save-Backup
@@ -14708,6 +16026,14 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.19.0' = @(
+        @{ T = 'Game Mode for every game'; D = 'Game Mode now starts by itself with any game ZeroDelay knows, not only Fortnite, and turns off when that game closes. The sidebar and the message say which game. Switch it off for one game on its page, or for all games in Settings.' }
+        @{ T = 'A game''s tweaks, applied when it starts'; D = 'On a game''s page, choose to have its recommended tweaks switched on when the game starts and put back when it closes. Tweaks that change the game''s own settings files wait until it has closed. Everything ZeroDelay changes is listed in History and undone the same way.' }
+        @{ T = 'Live ping to the server you are in'; D = 'While you play, every game''s page finds the server you are actually connected to and pings it live, with its city and provider (Frankfurt · AWS, Valve, ...). ZeroDelay reads only Windows'' own network trace: no driver, nothing touches the game. Servers that do not answer ping are said so, and your side of the route is still measured.' }
+        @{ T = 'Prove it: before and after'; D = 'A new tool for any game. Record two minutes as it is, switch the recommended tweaks on, record two minutes again, and see both side by side: FPS, 1% low, stutters, ping, packet loss, GPU heat and CPU load. The verdict only calls a difference real when it is bigger than the noise of two runs, so it never promises a gain that is not there.' }
+        @{ T = 'A preset for every game'; D = 'Each game page has three chips. Balanced switches on the game''s recommended settings, Competitive adds every latency setting for the game and your PC, Off undoes only what the preset switched on. Settings that need the game closed are applied when you close it.' }
+        @{ T = 'Export and import your settings'; D = 'Settings > Settings backup saves your preferences, presets, calendars and the list of tweaks that are on to one file, and brings them back on this or another PC. The file holds no match data, logs, game-file backups or tokens, and importing never switches anything off.' }
+    )
     '1.18.1' = @(
         @{ T = 'Game logos'; D = 'Every game on the Games page shows its official art, also when it is not installed: ZeroDelay asks Steam''s public store for it once and keeps it on your PC. Installed games keep the icon from your own copy. Long names no longer run under the Not found badge.' }
         @{ T = 'Fixed: a frozen window after clicking a game tool'; D = 'Clicking a check in a game''s tools panel could leave ZeroDelay dimmed and stuck behind an invisible answer window. Answer windows now always show.' }
@@ -15215,6 +16541,7 @@ function Complete-MatchReport {
     if ($script:MatchUi) { Update-MatchesPage }
     if (($a.Rec.End - $a.Rec.Start).TotalMinutes -lt 2) { return }   # too short to say anything useful
     $r = New-MatchReport $a.Rec.Start $a.Rec.End $frames @($a.Rec.Sync.Samples) $a.Rec.Game
+    Add-MatchReportServer $r $a.Rec
     Save-MatchReport $r
     $fnRec = (Get-ReportGame $r) -eq 'fortnite'
     if (-not $fnRec) { $script:MatchGame = $r.Game; $script:TrendGame = $r.Game }
@@ -20015,6 +21342,382 @@ function Clear-RouteMonitors {
     }
 }
 
+# --- Live game server (1.19): the address the running game is talking to right now, for every supported game.
+#     Source 1 (every game): Windows' own network trace. The Microsoft-Windows-Kernel-Network ETW provider reports one event
+#     per packet with the owning process id, the remote address, the port and the size; nothing else (no payload). ZeroDelay
+#     is a passive listener of that trace: no driver, no handle to the game, nothing injected, so kernel anti-cheats see
+#     nothing. Needs administrator rights, which ZeroDelay has.
+#     Source 2 (Fortnite only, when the trace is not available): the current FortniteGame.log (Browse / Close lines).
+#     Otherwise the page honestly says "not visible". The address stays on this PC: the UI shows city and provider, the
+#     IP only in a tooltip, and reports keep the city text only.
+$ZdNetTraceSrc = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+// real-time ETW consumer of Microsoft-Windows-Kernel-Network: packets per process and remote endpoint in 2-second buckets
+public static class ZdNetTrace {
+    const string Session = "ZeroDelayNet";
+    static Guid Provider = new Guid("7DD42A49-5329-4832-8DFD-43D979153A88");   // not readonly: EnableTraceEx2 takes it by ref
+    const uint WNODE_FLAG_TRACED_GUID = 0x00020000, EVENT_TRACE_REAL_TIME_MODE = 0x00000100;
+    const uint PROCESS_TRACE_MODE_REAL_TIME = 0x00000100, PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000;
+    const uint EVENT_TRACE_CONTROL_STOP = 1, EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1;
+    const int NameSpace = 1024;
+    public static bool SwapPorts = true;   // the kernel writes ports in network byte order (TraceEvent's kernel parser swaps them too)
+    public static int Pid;                 // 0 = count every process
+    public static long Events, Ignored;
+    public static string LastError = "";
+    public static bool Running { get { return handle != 0 && thread != null && thread.IsAlive; } }
+
+    [StructLayout(LayoutKind.Sequential)] struct WNODE_HEADER { public uint BufferSize; public uint ProviderId; public ulong HistoricalContext; public long TimeStamp; public Guid Guid; public uint ClientContext; public uint Flags; }
+    [StructLayout(LayoutKind.Sequential)] struct EVENT_TRACE_PROPERTIES {
+        public WNODE_HEADER Wnode; public uint BufferSize; public uint MinimumBuffers; public uint MaximumBuffers; public uint MaximumFileSize; public uint LogFileMode; public uint FlushTimer;
+        public uint EnableFlags; public int AgeLimit; public uint NumberOfBuffers; public uint FreeBuffers; public uint EventsLost; public uint BuffersWritten; public uint LogBuffersLost;
+        public uint RealTimeBuffersLost; public IntPtr LoggerThreadId; public uint LogFileNameOffset; public uint LoggerNameOffset; }
+    [StructLayout(LayoutKind.Sequential)] struct EVENT_TRACE_HEADER {
+        public ushort Size; public ushort FieldTypeFlags; public uint Version; public uint ThreadId; public uint ProcessId; public long TimeStamp; public Guid Guid; public ulong ProcessorTime; }
+    [StructLayout(LayoutKind.Sequential)] struct EVENT_TRACE {
+        public EVENT_TRACE_HEADER Header; public uint InstanceId; public uint ParentInstanceId; public Guid ParentGuid; public IntPtr MofData; public uint MofLength; public uint ClientContext; }
+    [StructLayout(LayoutKind.Sequential)] struct TRACE_LOGFILE_HEADER {
+        public uint BufferSize; public uint Version; public uint ProviderVersion; public uint NumberOfProcessors; public long EndTime; public uint TimerResolution; public uint MaximumFileSize;
+        public uint LogFileMode; public uint BuffersWritten; public Guid LogInstanceGuid; public IntPtr LoggerName; public IntPtr LogFileName;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 172)] public byte[] TimeZone; public long BootTime; public long PerfFreq; public long StartTime; public uint ReservedFlags; public uint BuffersLost; }
+    [StructLayout(LayoutKind.Sequential)] struct EVENT_TRACE_LOGFILE {
+        public IntPtr LogFileName; public IntPtr LoggerName; public long CurrentTime; public uint BuffersRead; public uint ProcessTraceMode; public EVENT_TRACE CurrentEvent;
+        public TRACE_LOGFILE_HEADER LogfileHeader; public IntPtr BufferCallback; public uint BufferSize; public uint Filled; public uint EventsLost; public IntPtr EventRecordCallback;
+        public uint IsKernelTrace; public IntPtr Context; }
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] delegate void EventRecordCallback(IntPtr rec);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "StartTraceW")] static extern int StartTrace(out ulong h, string name, IntPtr props);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "ControlTraceW")] static extern int ControlTrace(ulong h, string name, IntPtr props, uint code);
+    [DllImport("advapi32.dll")] static extern int EnableTraceEx2(ulong h, ref Guid p, uint code, byte level, ulong any, ulong all, uint timeout, IntPtr prm);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "OpenTraceW", SetLastError = true)] static extern ulong OpenTrace(ref EVENT_TRACE_LOGFILE log);
+    [DllImport("advapi32.dll")] static extern int ProcessTrace(ulong[] h, uint count, IntPtr start, IntPtr end);
+    [DllImport("advapi32.dll")] static extern int CloseTrace(ulong h);
+
+    class Entry { public uint Ip; public int Port; public bool Udp; public int[] Sent = new int[2], Recv = new int[2]; public long[] Bytes = new long[2]; public long[] Stamp = new long[2]; public int LastTick; }
+    static readonly Dictionary<int, Dictionary<ulong, Entry>> map = new Dictionary<int, Dictionary<ulong, Entry>>();
+    static ulong handle, trace; static Thread thread; static EventRecordCallback callback; static IntPtr nameBuf;
+
+    public static int SizeOfLogfile() { return Marshal.SizeOf(typeof(EVENT_TRACE_LOGFILE)); }   // 0x1C0 on x64: a layout check for the tests
+    public static int SizeOfProps() { return Marshal.SizeOf(typeof(EVENT_TRACE_PROPERTIES)); }
+    static IntPtr NewProps() {
+        int head = SizeOfProps(), size = head + 2 * NameSpace;
+        IntPtr p = Marshal.AllocHGlobal(size);
+        for (int i = 0; i < size; i += 8) Marshal.WriteInt64(p, i, 0);
+        var props = new EVENT_TRACE_PROPERTIES();
+        props.Wnode.BufferSize = (uint)size; props.Wnode.Flags = WNODE_FLAG_TRACED_GUID; props.Wnode.ClientContext = 1;
+        props.BufferSize = 64; props.MinimumBuffers = 8; props.MaximumBuffers = 32; props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE; props.FlushTimer = 1;
+        props.LoggerNameOffset = (uint)head; props.LogFileNameOffset = (uint)(head + NameSpace);
+        Marshal.StructureToPtr(props, p, false);
+        return p;
+    }
+    // stops a session of our name left behind by an earlier ZeroDelay (ETW sessions outlive their process); 0 = stopped, 4201 = none
+    public static int StopStale() { IntPtr p = NewProps(); try { return ControlTrace(0, Session, p, EVENT_TRACE_CONTROL_STOP); } finally { Marshal.FreeHGlobal(p); } }
+    public static bool Start(int pid) {
+        Stop();
+        Pid = pid; Events = 0; Ignored = 0; LastError = "";
+        lock (map) map.Clear();
+        IntPtr props = NewProps();
+        try {
+            int rc = StartTrace(out handle, Session, props);
+            if (rc == 183) { StopStale(); Marshal.FreeHGlobal(props); props = NewProps(); rc = StartTrace(out handle, Session, props); }
+            if (rc != 0) { handle = 0; LastError = "StartTrace " + rc; return false; }
+            rc = EnableTraceEx2(handle, ref Provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER, 5, 0x10, 0, 0, IntPtr.Zero);   // 0x10 = IPv4 (TCP and UDP)
+            if (rc != 0) { LastError = "EnableTraceEx2 " + rc; StopStale(); handle = 0; return false; }
+            if (nameBuf == IntPtr.Zero) nameBuf = Marshal.StringToHGlobalUni(Session);
+            var log = new EVENT_TRACE_LOGFILE();
+            log.LoggerName = nameBuf; log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+            callback = new EventRecordCallback(OnEvent); log.EventRecordCallback = Marshal.GetFunctionPointerForDelegate(callback);
+            trace = OpenTrace(ref log);
+            if (trace == ulong.MaxValue || trace == 0) { LastError = "OpenTrace " + Marshal.GetLastWin32Error(); trace = 0; StopStale(); handle = 0; return false; }
+            thread = new Thread(Pump); thread.IsBackground = true; thread.Name = "ZdNetTrace"; thread.Start();
+            return true;
+        } finally { Marshal.FreeHGlobal(props); }
+    }
+    static void Pump() { ulong[] h = { trace }; int rc = ProcessTrace(h, 1, IntPtr.Zero, IntPtr.Zero); if (rc != 0 && rc != 1223) LastError = "ProcessTrace " + rc; }
+    public static void Stop() {
+        if (handle != 0) { StopStale(); handle = 0; }
+        if (trace != 0) { CloseTrace(trace); trace = 0; }
+        if (thread != null) { thread.Join(3000); thread = null; }
+    }
+    static void OnEvent(IntPtr rec) {
+        try { Handle(Marshal.ReadInt16(rec, 40), Marshal.ReadIntPtr(rec, 96), (ushort)Marshal.ReadInt16(rec, 86)); } catch { }
+    }
+    // EVENT_RECORD payload of the send/receive events: PID u32, size u32, daddr, saddr, dport u16, sport u16 (IPv4)
+    public static void Handle(int id, IntPtr d, int len) {
+        bool udp = id == 42 || id == 43, tcp = id == 10 || id == 11;
+        if ((!udp && !tcp) || len < 20) return;
+        Events++;
+        int pid = Marshal.ReadInt32(d, 0);
+        if (Pid != 0 && pid != Pid) { Ignored++; return; }
+        int size = Marshal.ReadInt32(d, 4);
+        uint daddr = (uint)Marshal.ReadInt32(d, 8), saddr = (uint)Marshal.ReadInt32(d, 12);
+        int dport = (ushort)Marshal.ReadInt16(d, 16), sport = (ushort)Marshal.ReadInt16(d, 18);
+        if (SwapPorts) { dport = ((dport << 8) | (dport >> 8)) & 0xFFFF; sport = ((sport << 8) | (sport >> 8)) & 0xFFFF; }
+        bool send = id == 42 || id == 10;
+        if (send) Record(pid, daddr, dport, udp, true, size);
+        else RecordRecv(pid, daddr, dport, saddr, sport, udp, size);
+    }
+    public static void Inject(int pid, string ip, int port, bool udp, bool send, int size) {   // tests: the same bookkeeping without a trace
+        uint a = ToNum(ip);
+        if (send) Record(pid, a, port, udp, true, size); else RecordRecv(pid, 0, 0, a, port, udp, size);
+    }
+    static uint ToNum(string ip) { var b = System.Net.IPAddress.Parse(ip).GetAddressBytes(); return (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)); }
+    static string ToIp(uint a) { return (a & 0xFF) + "." + ((a >> 8) & 0xFF) + "." + ((a >> 16) & 0xFF) + "." + ((a >> 24) & 0xFF); }
+    static ulong Key(uint ip, int port, bool udp) { return ((ulong)ip << 32) | ((ulong)(uint)port << 1) | (udp ? 1UL : 0UL); }
+    // a received packet belongs to the endpoint we already send to (either address order), else it is a receive-only entry
+    static void RecordRecv(int pid, uint daddr, int dport, uint saddr, int sport, bool udp, int size) {
+        lock (map) {
+            Dictionary<ulong, Entry> m;
+            if (map.TryGetValue(pid, out m)) {
+                if (m.ContainsKey(Key(saddr, sport, udp))) { Record(pid, saddr, sport, udp, false, size); return; }
+                if (daddr != 0 && m.ContainsKey(Key(daddr, dport, udp))) { Record(pid, daddr, dport, udp, false, size); return; }
+            }
+        }
+        Record(pid, saddr, sport, udp, false, size);
+    }
+    static void Record(int pid, uint ip, int port, bool udp, bool send, int size) {
+        int tick = Environment.TickCount; long stamp = (long)(uint)tick / 2000; int slot = (int)(stamp & 1);
+        lock (map) {
+            Dictionary<ulong, Entry> m;
+            if (!map.TryGetValue(pid, out m)) { if (map.Count > 64) return; m = new Dictionary<ulong, Entry>(); map[pid] = m; }
+            Entry e; ulong k = Key(ip, port, udp);
+            if (!m.TryGetValue(k, out e)) { if (m.Count > 2000) return; e = new Entry(); e.Ip = ip; e.Port = port; e.Udp = udp; m[k] = e; }
+            if (e.Stamp[slot] != stamp) { e.Stamp[slot] = stamp; e.Sent[slot] = 0; e.Recv[slot] = 0; e.Bytes[slot] = 0; }
+            if (send) e.Sent[slot]++; else e.Recv[slot]++;
+            e.Bytes[slot] += size; e.LastTick = tick;
+        }
+    }
+    // the process's remote endpoints over the last 2-4 seconds, busiest first: "ip|port|udp|sent|recv|bytes|ageMs"
+    public static string[] Snapshot(int pid) {
+        int tick = Environment.TickCount; long now = (long)(uint)tick / 2000;
+        var rows = new List<KeyValuePair<int, string>>();
+        lock (map) {
+            Dictionary<ulong, Entry> m;
+            if (!map.TryGetValue(pid, out m)) return new string[0];
+            var dead = new List<ulong>();
+            foreach (var kv in m) {
+                Entry e = kv.Value;
+                if (tick - e.LastTick > 60000) { dead.Add(kv.Key); continue; }
+                int sent = 0, recv = 0; long bytes = 0;
+                for (int s = 0; s < 2; s++) if (e.Stamp[s] == now || e.Stamp[s] == now - 1) { sent += e.Sent[s]; recv += e.Recv[s]; bytes += e.Bytes[s]; }
+                if (sent + recv == 0) continue;
+                rows.Add(new KeyValuePair<int, string>(sent + recv, ToIp(e.Ip) + "|" + e.Port + "|" + (e.Udp ? 1 : 0) + "|" + sent + "|" + recv + "|" + bytes + "|" + (tick - e.LastTick)));
+            }
+            foreach (var k in dead) m.Remove(k);
+        }
+        rows.Sort((a, b) => b.Key.CompareTo(a.Key));
+        var o = new string[Math.Min(rows.Count, 12)];
+        for (int i = 0; i < o.Length; i++) o[i] = rows[i].Value;
+        return o;
+    }
+    public static int Count(int pid) { lock (map) { Dictionary<ulong, Entry> m; return map.TryGetValue(pid, out m) ? m.Count : 0; } }
+}
+'@
+$script:LiveSrv = @{ Pid = 0; Ep = $null; Hold = 0; Off = $false; Why = ''; Compiling = $false; Fails = 0; Names = @{}; Asked = @{}; LogLen = -1; LogEp = $null }
+# games whose online mode connects players to each other: the busiest address is another player, not a server
+$LivePeerGames = @('gtav', 'gtavlegacy')
+# provider from a reverse-DNS name when the address is not in the AWS / Google Cloud lists
+$LiveHostNames = @{ 'valve.net' = 'Valve'; 'steamcontent.com' = 'Valve'; 'i3d.net' = 'i3D'; 'gcore.lu' = 'Gcore'; 'g-core.net' = 'Gcore'; 'riotgames.com' = 'Riot Games'; 'blizzard.com' = 'Blizzard'
+                   'ea.com' = 'EA'; 'azure.com' = 'Microsoft Azure'; 'cloudapp.net' = 'Microsoft Azure'; 'cloudapp.azure.com' = 'Microsoft Azure'; 'linode.com' = 'Akamai'; 'akamai.com' = 'Akamai'; 'ovh.net' = 'OVH'
+                   'hetzner.com' = 'Hetzner'; 'your-server.de' = 'Hetzner'; 'datapacket.com' = 'DataPacket'; 'zenlayer.com' = 'Zenlayer'; 'roblox.com' = 'Roblox'; 'rbxcdn.com' = 'Roblox'; 'epicgames.com' = 'Epic Games'
+                   'ubisoft.com' = 'Ubisoft'; 'ubi.com' = 'Ubisoft'; 'netease.com' = 'NetEase'; 'tencent.com' = 'Tencent'; 'playfab.com' = 'Microsoft Azure'; 'multiplay.co.uk' = 'Unity Multiplay'; 'multiplay.com' = 'Unity Multiplay'
+                   'nitrado.net' = 'Nitrado'; 'vultr.com' = 'Vultr'; 'choopa.net' = 'Vultr'; 'digitalocean.com' = 'DigitalOcean'; 'oracle.com' = 'Oracle Cloud'; 'oraclecloud.com' = 'Oracle Cloud'; 'servers.com' = 'Servers.com' }
+function Test-PublicIp([string]$Ip) {
+    $a = $null; if (-not [Net.IPAddress]::TryParse($Ip, [ref]$a) -or $a.AddressFamily -ne 'InterNetwork') { return $false }
+    $b = $a.GetAddressBytes()
+    if ($b[0] -in 0, 10, 127 -or $b[0] -ge 224) { return $false }
+    -not (($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) -or ($b[0] -eq 169 -and $b[1] -eq 254))
+}
+# starts (or keeps) the network trace for the game's process. $false while the C# compiles in the background, or when
+# Windows refused (not administrator): then only the log fallbacks are used, and nothing is retried every two seconds.
+function Start-GameNetTrace([int]$ProcId) {
+    $L = $script:LiveSrv
+    if ($L.Off -or $ProcId -le 0) { return $false }
+    if ($L.Fake) { return $true }   # tests: counters filled by Inject, no trace session
+    if (-not ('ZdNetTrace' -as [type])) {
+        if (-not $L.Compiling) {
+            $L.Compiling = $true
+            Invoke-Worker 'param($src) try { if (-not (''ZdNetTrace'' -as [type])) { Add-Type -TypeDefinition $src -ErrorAction Stop }; @{ Ok = $true } } catch { @{ Ok = $false; Err = "$($_.Exception.Message)" } }' @($ZdNetTraceSrc) {
+                param($out, $errs)
+                $script:LiveSrv.Compiling = $false
+                $r = Get-WorkerResult $out
+                if (-not ($r -is [hashtable]) -or -not $r.Ok) { $script:LiveSrv.Off = $true; $script:LiveSrv.Why = "compile: $(if ($r) { $r.Err } else { $errs -join '; ' })" }
+            }
+        }
+        return $false
+    }
+    if ([ZdNetTrace]::Running -and [ZdNetTrace]::Pid -eq $ProcId) { return $true }
+    if ($L.Pid -eq $ProcId -and $L.Fails -ge 2) { $L.Off = $true; $L.Why = "trace stopped by itself: $([ZdNetTrace]::LastError)"; return $false }   # started fine twice, died at once: give up
+    $ok = [ZdNetTrace]::Start($ProcId)
+    if ($ok) { if ($L.Pid -eq $ProcId) { $L.Fails++ } else { $L.Fails = 0 }; $L.Pid = $ProcId }
+    else { $L.Off = $true; $L.Why = [ZdNetTrace]::LastError; $L.Pid = 0 }
+    $ok
+}
+function Stop-GameNetTrace { if ('ZdNetTrace' -as [type]) { try { [ZdNetTrace]::Stop() } catch {} }; $script:LiveSrv.Pid = 0 }
+# match timer: the trace runs only while the game it follows runs
+function Update-GameNetTraceIdle { $p = $script:LiveSrv.Pid; if ($p -and -not (Get-Process -Id $p -ErrorAction SilentlyContinue)) { Stop-GameNetTrace; $script:LiveSrv.Ep = $null } }
+# the server among the process's endpoints: public address, UDP first, traffic both ways many times a second; never DNS,
+# time or web. Sticky: the current server stays while it still carries 40% of the busiest one's packets.
+function Select-GameEndpoint($Rows) {
+    $cand = @(foreach ($r in @($Rows)) {
+        $f = "$r" -split '\|'; if ($f.Count -lt 6) { continue }
+        $ip = $f[0]; $port = [int]$f[1]; $udp = $f[2] -eq '1'; $sent = [int]$f[3]; $recv = [int]$f[4]
+        if (-not (Test-PublicIp $ip)) { continue }
+        if ($port -in 53, 123, 5353, 1900) { continue }
+        if (-not $udp -and $port -in 80, 443, 8080) { continue }
+        if ($sent -lt 4 -or $recv -lt 1) { continue }
+        @{ Ip = $ip; Port = $port; Udp = $udp; Sent = $sent; Recv = $recv; Pk = $sent + $recv }
+    })
+    if (-not $cand.Count) { return $null }
+    $u = @($cand | Where-Object { $_.Udp }); if ($u.Count) { $cand = $u }
+    $best = $cand | Sort-Object { $_.Pk } -Descending | Select-Object -First 1
+    $cur = $script:LiveSrv.Ep
+    if ($cur -and $cur.Source -eq 'etw') { $same = $cand | Where-Object { $_.Ip -eq $cur.Ip -and $_.Port -eq $cur.Port } | Select-Object -First 1; if ($same -and $same.Pk -ge 0.4 * $best.Pk) { $best = $same } }
+    @{ Ip = $best.Ip; Port = $best.Port; Source = 'etw'; Proto = $(if ($best.Udp) { 'UDP' } else { 'TCP' }); Pk = $best.Pk }
+}
+# Fortnite's log: the last 'Browse: ip:port/...' is the match server; a later 'Browse: /Game/Maps/Frontend' (lobby) or
+# 'UNetConnection::Close ... RemoteAddr: ip:port' of that same server means the match is over
+function Get-FnLiveServerFromText([string]$t) {
+    $cur = $null
+    foreach ($x in [regex]::Matches($t, '(?m)^\[[\d.\-:]+\]\[[\s\d]+\]LogNet: (?:Browse: (?:(\d+\.\d+\.\d+\.\d+):(\d+)/|/Game/Maps/Frontend)|UNetConnection::Close: \[UNetConnection\] RemoteAddr: (\d+\.\d+\.\d+\.\d+):(\d+))')) {
+        if ($x.Groups[1].Success) { $cur = @{ Ip = $x.Groups[1].Value; Port = [int]$x.Groups[2].Value; Source = 'log'; Proto = 'UDP' } }
+        elseif ($x.Groups[3].Success) { if ($cur -and $cur.Ip -eq $x.Groups[3].Value -and $cur.Port -eq [int]$x.Groups[4].Value) { $cur = $null } }
+        else { $cur = $null }
+    }
+    $cur
+}
+# the tail of a log that the game keeps open for writing (shared read; never the whole 25 MB file)
+function Read-ZdLogTail([string]$Path, [int]$Bytes = 524288) {
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try { if ($fs.Length -gt $Bytes) { [void]$fs.Seek(-$Bytes, 'End') }; (New-Object IO.StreamReader $fs).ReadToEnd() } finally { $fs.Close() }
+    } catch { '' }
+}
+function Get-FnLiveServer {
+    $p = Join-Path $FnSaved 'Logs\FortniteGame.log'
+    $f = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue; if (-not $f) { return $null }
+    if ($f.Length -eq $script:LiveSrv.LogLen) { return $script:LiveSrv.LogEp }   # nothing new since the last read
+    $script:LiveSrv.LogLen = $f.Length
+    $script:LiveSrv.LogEp = Get-FnLiveServerFromText (Read-ZdLogTail $p)
+    $script:LiveSrv.LogEp
+}
+# worker: city and provider of an address. AWS / Google Cloud published ranges first (cached 7 days by the match tools),
+# then the reverse-DNS name's domain. Nothing but the one address leaves the PC (a DNS question).
+$LiveNameCode = @'
+$city = ''; $prov = ''
+$c = Get-ZdCloudRanges $cache $true
+if ($c -and @($c.Aws).Count) {
+    $r = Find-ZdRange (New-ZdRangeIndex $c) $ip
+    if ($r) {
+        $prov = $r.Prov; $loc = "$($r.Loc)"
+        $city = $cityMap["$prov|$loc"]
+        if (-not $city -and $prov -eq 'AWS' -and $loc -match '-([a-z]{3})-\d+[a-z]?$' -and $metro[$Matches[1]]) { $city = $metro[$Matches[1]] }
+        if (-not $city) { $city = $loc }
+    }
+}
+$host1 = ''
+if (-not $prov) {
+    try { $host1 = ([Net.Dns]::GetHostEntry($ip)).HostName } catch { $host1 = '' }
+    if ($host1 -and $host1 -ne $ip) {
+        $labels = $host1.ToLower() -split '\.'
+        for ($n = 2; $n -le 3 -and $n -le $labels.Count -and -not $prov; $n++) { $dom = ($labels[($labels.Count - $n)..($labels.Count - 1)]) -join '.'; if ($hosts[$dom]) { $prov = $hosts[$dom] } }
+        if (-not $prov -and $labels.Count -ge 2) { $prov = ($labels[($labels.Count - 2)..($labels.Count - 1)]) -join '.' }
+    }
+}
+@{ Ip = $ip; City = "$city"; Prov = "$prov"; Host = "$host1" }
+'@
+function Get-GameServerName([string]$Ip) {
+    $n = $script:LiveSrv.Names[$Ip]
+    if ($n) { return $n }
+    if (-not $script:LiveSrv.Asked[$Ip]) {
+        $script:LiveSrv.Asked[$Ip] = $true
+        $code = Join-WorkerCode 'param($ip, $cache, $cityMap, $metro, $hosts)' $LiveNameCode @($CloudRangeWorkerCode)
+        Invoke-Worker $code @($Ip, (Get-CloudRangesPath), $CloudCity, $AwsMetro, $LiveHostNames) {
+            param($out, $errs)
+            $r = Get-WorkerResult $out
+            if ($r -is [hashtable] -and $r.Ip) {
+                $r.Text = if ($r.City -and $r.Prov) { "$($r.City) · $($r.Prov)" } elseif ($r.City) { $r.City } elseif ($r.Prov) { $r.Prov } else { '' }
+                $script:LiveSrv.Names[$r.Ip] = $r
+            } else { $script:LiveSrv.Asked.Remove($Ip) }
+        }
+    }
+    $script:LiveSrv.Names[$Ip]   # usually $null until the worker answers
+}
+# @{ Ip; Port; Proto; Source ('etw' | 'log'); Name ('Frankfurt · AWS', '' while unknown); City; Prov } of the server the game
+# talks to right now, or $null (game closed, or nothing visible). Cheap enough for every two seconds: one process lookup
+# by name and a read of the trace's counters; the name lookup runs once per new address in the background.
+function Get-GameServerEndpoint($g) {
+    $L = $script:LiveSrv
+    if (-not $g) { return $null }
+    $p = Get-Process -Name (Get-GameProcNames $g) -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { if ($L.Pid) { Stop-GameNetTrace }; $L.Ep = $null; $L.Hold = 0; return $null }
+    $ep = $null
+    if (Start-GameNetTrace $p.Id) { $ep = Select-GameEndpoint ([ZdNetTrace]::Snapshot($p.Id)) }
+    if (-not $ep -and $g.Id -eq 'fortnite') { $ep = Get-FnLiveServer }
+    # a short lull (loading screen, the first seconds of the trace) must not flicker the page: the last server holds 10 s
+    if ($ep) { $L.Ep = $ep; $L.Hold = 0 }
+    elseif ($L.Ep) { $L.Hold++; if ($L.Hold -gt 5 -or $L.Ep.Source -eq 'log') { $L.Ep = $null } }
+    $r = $L.Ep
+    if ($r) { $n = Get-GameServerName $r.Ip; $r.Name = $(if ($n) { "$($n.Text)" } else { '' }); $r.City = $(if ($n) { "$($n.City)" } else { '' }); $r.Prov = $(if ($n) { "$($n.Prov)" } else { '' }) }
+    $r
+}
+# what the page calls the fourth stop
+function Get-GameServerLabel($g, $Ep) {
+    if (-not $Ep) { return 'Game server' }
+    if ($g -and $LivePeerGames -contains $g.Id) { return $(if ($Ep.Name) { "Other player · $($Ep.Name)" } else { 'Other player' }) }
+    if ($Ep.Name) { $Ep.Name } else { 'Game server (live)' }
+}
+# Update-GameDetailTick hook, after its RouteNote line: $g = the game shown, $h = $script:GamesUi, $s = $script:RouteMon.Sync.
+# While the game runs and no server was picked by hand, the live server becomes the monitor's target (Retarget, no
+# restart); when the game stops the monitor goes back to the page's own choice.
+function Update-GameLiveServer($g, $h, $s) {
+    $script:LiveTick = 1 + [int]$script:LiveTick
+    if ($script:LiveTick % 2 -eq 0) { $script:LiveEp = Get-GameServerEndpoint $g }
+    $ep = $script:LiveEp
+    $peer = $LivePeerGames -contains $g.Id
+    if ($ep -and -not $script:GameServer) {
+        if ($s.Target -ne $ep.Ip) { $s.Target = $ep.Ip; $s.Auto = $false; $s.AutoName = $null; $s.AutoProv = $null; $s.Retarget = $true; $script:LiveTarget = $ep.Ip }
+        $h.Nodes[3].Children[1].Text = Get-GameServerLabel $g $ep
+        $h.Nodes[3].ToolTip = "$($ep.Ip):$($ep.Port) ($($ep.Proto)), $(if ($ep.Source -eq 'log') { "from $($g.Title)'s own log" } else { "from Windows' network trace" }). This address stays on your PC."
+        $who = if ($ep.Name) { $ep.Name } elseif ($peer) { 'another player' } else { 'the server' }
+        $dead = $s.Target -eq $ep.Ip -and [int]$s.Sent -ge 5 -and [int]$s.Lost -eq [int]$s.Sent
+        $found = if ($peer) { 'Found the player your PC talks to most' } else { "Server found ($who)" }
+        $h.RouteNote.Text = if ($dead) { "$found, but it does not answer ping, as many game servers do not. Your side of the route (PC, router, provider) is measured; the game's own network stats have the server's ping." }
+            elseif ($peer) { "$($g.Title) connects players to each other: this is the player your PC talks to most right now ($who). Each stop is pinged once a second." }
+            else { "Live: $($g.Title) is talking to $who right now, found from Windows' own network trace. Each stop is pinged once a second while this page is open." }
+    } elseif ($ep) {
+        # the user picked a server to measure: say where the match really runs, keep the pick
+        $h.Nodes[3].ToolTip = $null
+        if ($ep.Name) { $h.RouteNote.Text = "You are playing on $($ep.Name) right now. This card measures the server you picked; choose Automatic to follow the live one." }
+    } elseif ($script:LiveTarget) {
+        # the game closed or its server went quiet: back to the page's own target (the tick restarts the monitor)
+        $script:LiveTarget = $null
+        $h.Nodes[3].ToolTip = $null
+        $h.Nodes[3].Children[1].Text = if ($script:GameServer) { $script:GameServer.Name } else { 'Game server' }
+        Stop-RouteMonitor
+    }
+}
+# match timer hook (while a recording runs): remembers the servers the session ran on, city text only
+function Update-MatchRecServer {
+    $rec = $script:MatchRec; if (-not $rec) { return }
+    $ep = Get-GameServerEndpoint (Get-GameDef $rec.Game)
+    if (-not $ep) { return }
+    if (-not $rec.Servers) { $rec.Servers = New-Object Collections.ArrayList }
+    $txt = if ($ep.Name) { $ep.Name } else { '' }
+    if ($rec.Servers.Count -and $rec.Servers[$rec.Servers.Count - 1].Ip -eq $ep.Ip) { if ($txt) { $rec.Servers[$rec.Servers.Count - 1].Text = $txt }; return }
+    if ($rec.Servers.Count -lt 20) { [void]$rec.Servers.Add(@{ Ip = $ep.Ip; Text = $txt; At = (Get-Date).ToString('o') }) }
+}
+# Complete-MatchReport hook, right after New-MatchReport: the report gets the cities (never the addresses)
+function Add-MatchReportServer($r, $rec) {
+    if (-not $rec -or -not $rec.Servers -or -not $rec.Servers.Count) { return }
+    $cities = @($rec.Servers | ForEach-Object { "$($_.Text)" } | Where-Object { $_ } | Select-Object -Unique)
+    $r | Add-Member -NotePropertyName ServerCity -NotePropertyValue $(if ($cities.Count) { $cities[-1] } else { $null }) -Force
+    $r | Add-Member -NotePropertyName Servers -NotePropertyValue $cities -Force
+    $r | Add-Member -NotePropertyName ServerChanges -NotePropertyValue ([int]$rec.Servers.Count - 1) -Force
+}
+
 # --- Game art (1.18.1): a game that gives no icon (not installed here) shows its official Steam library art. It is
 #     fetched once in the background from Steam's public store API (no account, no key) into $DataDir\art and never
 #     bundled with ZeroDelay. Valorant and League of Legends are not on Steam and keep ZeroDelay's own tile.
@@ -20160,11 +21863,35 @@ function New-GamesPage {
             <TextBlock x:Name='HeroTitle' FontSize='38' FontWeight='Black' Foreground='#FFFDFDFD'/>
             <WrapPanel Margin='0,12,0,0'>
               <Border x:Name='GmChip' CornerRadius='12' Padding='12,5' Margin='0,0,8,0' Background='#33FDFDFD'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
+              <Border x:Name='AutoChip' CornerRadius='12' Padding='10,3,12,3' Margin='0,0,8,0' Background='#33FDFDFD'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
               <Border CornerRadius='12' Padding='12,5' Background='#33FDFDFD'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
             </WrapPanel>
           </StackPanel>
           </StackPanel>
         </Grid>
+      </Border>
+      <Border x:Name='AutoCard' Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
+        <StackPanel>
+          <TextBlock Text='WHEN THIS GAME STARTS' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+          <TextBlock x:Name='AutoSum' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,12'/>
+          <Grid Margin='0,0,0,8'>
+            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+            <StackPanel><TextBlock Text='Apply its tweaks when it starts' FontSize='13' FontWeight='SemiBold'/><TextBlock Text='Switches on the recommended tweaks for this game that are still off. Changes to its settings files wait until the game closes.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,20,0'/></StackPanel>
+            <ToggleButton x:Name='AutoTw' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
+          </Grid>
+          <StackPanel x:Name='AutoOpts' Margin='16,0,0,0' Visibility='Collapsed'>
+            <Grid Margin='0,0,0,8'>
+              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+              <TextBlock Text='Also change its settings files after it closes' FontSize='12.5' VerticalAlignment='Center'/>
+              <ToggleButton x:Name='AutoLater' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
+            </Grid>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+              <TextBlock Text='Put the tweaks back when the game closes' FontSize='12.5' VerticalAlignment='Center'/>
+              <ToggleButton x:Name='AutoBack' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
+            </Grid>
+          </StackPanel>
+        </StackPanel>
       </Border>
       <Border x:Name='ServerCard' Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
         <Grid>
@@ -20218,6 +21945,9 @@ function New-GamesPage {
     </StackPanel>
     <Border Grid.Column='1' Style='{DynamicResource Card}' Padding='18,16' VerticalAlignment='Top'>
       <StackPanel>
+        <TextBlock Text='Preset' FontSize='15' FontWeight='SemiBold'/>
+        <WrapPanel x:Name='PresetChips' Margin='0,12,0,4'/>
+        <TextBlock x:Name='PresetNote' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,0,0,16'/>
         <TextBlock Text='Game tools' FontSize='15' FontWeight='SemiBold'/>
         <WrapPanel x:Name='ToolChips' Margin='0,12,0,8'/>
         <StackPanel x:Name='ToolList'/>
@@ -20228,8 +21958,9 @@ function New-GamesPage {
 "@)
     $h = @{ Root = $root }
     foreach ($n in 'Library', 'Tiles', 'MoreHead', 'MoreSub', 'MoreTiles', 'ServerCard', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroLogo', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
-                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats') { $h[$n] = $root.FindName($n) }
+                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats', 'AutoChip', 'AutoGm', 'AutoGmText', 'AutoCard', 'AutoSum', 'AutoTw', 'AutoOpts', 'AutoLater', 'AutoBack', 'PresetChips', 'PresetNote') { $h[$n] = $root.FindName($n) }
     $script:GamesUi = $h
+    Initialize-GameAutoUi $h
     foreach ($g in $GameDefs) {
         $tile = New-GameTile $g
         if ($tile.Tag.InstalledNow) { [void]$h.Tiles.Children.Add($tile) } else { [void]$h.MoreTiles.Children.Add($tile) }
@@ -20320,6 +22051,8 @@ function Show-GameDetail($g) {
     $pick = if ($saved) { $servers | Where-Object { $_.Name -eq $saved } | Select-Object -First 1 } else { $null }
     Select-GameServer $pick
     Update-GameTools
+    $h.PresetSig = $null; Update-PresetChips
+    Update-GameAutoUi
     Update-GameDetail
     Update-GameStats
     if ($script:Anim) { Show-Animated $h.Detail 12 260 }
@@ -20337,7 +22070,7 @@ function Select-GameServer($s) {
     if ($s) { $script:Backup.Custom["gameserver_$($g.Id)"] = $s.Name } else { $script:Backup.Custom.Remove("gameserver_$($g.Id)") }
     $h.ServerText.Text = if ($s) { "$($s.Name) · $($s.Region)" } elseif ($script:GameServers.Count) { 'Automatic' } else { 'Not available for this game yet' }
     $h.Nodes[3].Children[1].Text = if ($s) { $s.Name } else { 'Game server' }
-    $h.ServerHint.Text = if ($g.Id -ne 'fortnite') { 'ZeroDelay does not have this game''s server list yet: the tools on the right ping its servers.' }
+    $h.ServerHint.Text = if ($g.Id -ne 'fortnite') { 'While you play, ZeroDelay finds the server you are on and pings it live; there is no server list to pick from for this game.' }
         elseif ($s) { "To play there: in Fortnite open Settings > Game and set Matchmaking Region to $($s.Region) and Subregion Preference to $($s.Name). ZeroDelay measures; Fortnite picks the server." }
         else { 'Finds the fastest server in the region you play. ZeroDelay measures the route; Fortnite still picks the server, so set the same city in its Subregion Preference.' }
     $myRegion = Get-PlayRegionName
@@ -20348,7 +22081,7 @@ function Select-GameServer($s) {
 function Update-GameDetail {
     $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h) { return }
     $gm = Test-ZDGameMode
-    $h.GmChipText.Text = if ($gm) { 'Game Mode on' } else { 'Game Mode off' }
+    $h.GmChipText.Text = Get-GameModeChipText $g
     $h.GmChip.Background = ConvertTo-Brush $(if ($gm) { '#5530D158' } else { '#33FDFDFD' })
     $inst = try { [bool](& $g.Installed) } catch { $false }
     $h.Play.IsEnabled = $inst; $h.Play.Opacity = $(if ($inst) { 1 } else { 0.45 })
@@ -20376,6 +22109,7 @@ function Update-GameDetailTick {
     if (-not $show) { Stop-RouteMonitor; return }
     if (-not $script:RouteMon -and $script:RouteWant) { Start-RouteMonitor $script:RouteWant.Target $script:RouteWant.Candidates }
     Update-GameDetail
+    Update-PresetChips
     $m = $script:RouteMon; if (-not $m) { return }
     $s = $m.Sync
     $fmt = { param($v) if ($null -eq $v -or [int]$v -lt 0) { 'no reply' } elseif ([int]$v -eq 0) { '<1 ms' } else { "$v ms" } }
@@ -20394,6 +22128,7 @@ function Update-GameDetailTick {
         elseif ($s.Isp -and [int]$s.IspMs -ge 0 -and [int]$s.SrvMs -ge 0 -and ([int]$s.SrvMs - [int]$s.IspMs) -gt 60) { 'Most of the delay is after your provider: the distance to the server. A closer server helps more than any setting.' }
         elseif ([int]$s.Rounds -ge 3 -and (-not $s.Isp -or [int]$s.IspMs -lt 0)) { 'Your provider''s routers do not answer ping (many providers hide them), so only your router and the game server are measured. Each is pinged once a second while this page is open.' }
         else { 'Each stop is pinged once a second while this page is open. Delay that appears at a stop is added there.' }
+    Update-GameLiveServer $g $h $s
 }
 function Update-GameTools {
     $g = $script:GameSel; $h = $script:GamesUi; if (-not $g) { return }
@@ -20442,7 +22177,7 @@ function Update-GameTools {
         if ($isSwitch) {
             $sw = $row.FindName('Sw'); $sw.Tag = $t
             $sw.IsChecked = [bool]$t.State; $sw.IsEnabled = $inst -and $null -ne $t.State
-            $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools })
+            $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools; Update-PresetChips })
         } else {
             $row.Tag = $t
             $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
@@ -20866,6 +22601,7 @@ $ToolInfo = [ordered]@{
     'Matches'  = 'A report after every match: FPS, stutters, ping, and what got in the way.'
     'Trends'   = 'How your matches change over days, and after each change you make.'
     'Benchmark' = 'Measure FPS and frame times before and after a change.'
+    'Prove' = 'Prove it: two minutes before, boost, two minutes after, and an honest side-by-side for any game.'
     'Active'   = 'Everything ZeroDelay has switched on, when, and a switch to undo each one.'
     'ThisPC'   = 'Your hardware, drivers and Windows, and how ZeroDelay adapted to them.'
     'Nvidia'   = 'G-SYNC, V-Sync, Reflex and frame-cap check with one-click presets.'
@@ -20914,8 +22650,8 @@ $GmStepInfo = [ordered]@{
     updates  = @{ Icon = 0xE896; Tint = '#30B0C7'; Desc = 'Windows Update stops downloading until you are done.' }
     dns      = @{ Icon = 0xE968; Tint = '#34C759'; Desc = 'Clears stale server addresses before you queue.' }
     nvreplay = @{ Icon = 0xE714; Tint = '#76B900'; Desc = 'Stops NVIDIA background recording. Leave off if you want clips.' }
-    auto     = @{ Icon = 0xE768; Tint = '#2EE6A6'; Desc = 'Game Mode starts by itself when Fortnite opens.' }
-    autooff  = @{ Icon = 0xE71A; Tint = '#FF6482'; Desc = 'Everything goes back when Fortnite closes.' }
+    auto     = @{ Icon = 0xE768; Tint = '#2EE6A6'; Desc = 'Game Mode starts by itself when a game you play opens. Each game page can say no.' }
+    autooff  = @{ Icon = 0xE71A; Tint = '#FF6482'; Desc = 'Everything goes back when the game closes.' }
 }
 # icons for the apps Game Mode closes: from the running process, Settings > Apps, or the app's known exe
 function Get-ExeIconSource([string]$Path) {
@@ -21100,14 +22836,14 @@ function New-GameModePage {
     }
     $g.Start.Add_Click({
         $window.Cursor = [Windows.Input.Cursors]::Wait
-        if (Test-ZDGameMode) { $msg = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true } }
+        if (Test-ZDGameMode) { $msg = Disable-ZDGameMode; Suspend-GameModeAuto }
         else { $msg = Enable-ZDGameMode; $msg = "$msg $(Start-FortniteGame)" }
         $window.Cursor = $null
         Show-Toast $msg '#30D158'; Update-GameModeUi
     })
     $g.Power.Add_Click({
         $window.Cursor = [Windows.Input.Cursors]::Wait
-        $msg = if (Test-ZDGameMode) { $m = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true }; $m } else { Enable-ZDGameMode }
+        $msg = if (Test-ZDGameMode) { $m = Disable-ZDGameMode; Suspend-GameModeAuto; $m } else { Enable-ZDGameMode }
         $window.Cursor = $null
         Show-Toast $msg '#30D158'; Update-GameModeUi
     })
@@ -23521,29 +25257,17 @@ $script:SessionTimer.Add_Tick({
 })
 if ((Test-GameSession) -and -not (Test-ZDGameMode)) { $script:SessionTimer.Start() }
 
-# Game Mode watcher: turns on when Fortnite starts and off when it closes (while ZeroDelay is open).
-$script:GmSuppress = $false   # set when you switch Game Mode off by hand during a match
+# Game Mode watcher: turns on when a game you play starts and off when it closes (while ZeroDelay is open); also applies
+# and puts back a game's tweaks when you asked for that on its page. One process lookup per tick (Invoke-GameAutoTick).
+Initialize-GameAuto   # $script:GmSuppress (set when you switch Game Mode off by hand during a game), the tweak record
 $script:GmTimer = New-Object Windows.Threading.DispatcherTimer
 $script:GmTimer.Interval = [TimeSpan]::FromSeconds(4)
-$script:GmTimer.Add_Tick({
-    $prefs = Get-GameModePrefs
-    $running = Test-FortniteRunning
-    if (-not $running) { $script:GmSuppress = $false }
-    if (Test-ZDGameMode) {
-        $st = Get-Content $GameModeFile -Raw | ConvertFrom-Json
-        if ($running -and -not $st.SawFortnite) { $st.SawFortnite = $true; $st | ConvertTo-Json -Depth 5 | Set-Content $GameModeFile -Encoding UTF8 }
-        elseif (-not $running -and $st.SawFortnite -and $prefs.autooff) { Show-Toast "Fortnite closed. $(Disable-ZDGameMode)" '#30D158' }
-    } elseif ($running -and $prefs.auto -and -not $script:GmSuppress) {
-        $msg = Enable-ZDGameMode
-        Show-Toast "Fortnite started. $msg" '#30D158'
-    }
-    Update-GameModeUi
-})
+$script:GmTimer.Add_Tick({ Invoke-GameAutoTick })
 if (-not $Snapshot) { $script:GmTimer.Start() }   # never auto-start Game Mode from a dev render
 
 $ui.GmSwitch.Add_Click({
     $window.Cursor = [Windows.Input.Cursors]::Wait
-    if ($ui.GmSwitch.IsChecked) { $msg = Enable-ZDGameMode } else { $msg = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true } }
+    if ($ui.GmSwitch.IsChecked) { $msg = Enable-ZDGameMode } else { $msg = Disable-ZDGameMode; Suspend-GameModeAuto }
     $window.Cursor = $null
     Show-Toast $msg '#30D158'
 })
@@ -23639,8 +25363,10 @@ $script:MatchTimer.Add_Tick({
     try { Update-RlStatsListener } catch {}
     try { Update-DotaGsiListener } catch {}
     try { Update-LolStatsPoller } catch {}
+    try { Update-PresetWait } catch {}
     if ($script:MatchAnalysis) { Complete-MatchReport }
     if ($script:MatchRec) { if (-not (Test-RecGameRunning $script:MatchRec)) { Stop-MatchRecorder } }
+    try { Update-GameNetTraceIdle; if ($script:MatchRec) { Update-MatchRecServer } } catch {}
     elseif (-not $script:MatchAnalysis -and (Get-Setting 'matchreport' $true)) { $run = Find-RunningGame; if ($run) { Start-MatchRecorder $run } }
 })
 if (-not $Snapshot) { $script:MatchTimer.Start() }
@@ -23848,6 +25574,8 @@ $window.Add_Closed({
     try { Stop-RlStatsListener -Wait } catch {}
     try { Stop-DotaGsiListener -Wait } catch {}
     try { Stop-LolStatsPoller -Wait } catch {}
+    try { Stop-GameNetTrace } catch {}
+    try { Stop-ProveRecording } catch {}
     if ($script:PingMonJob) { Stop-PingMonitor }
     Save-Backup
     if ($script:TrayIcon) { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() }

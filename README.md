@@ -61,6 +61,15 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   Fortnite gets the direct-to-screen mode, and PC latency with a before/after comparison.
 - **Repairs for tweak-pack leftovers**: boot settings that stop Easy Anti-Cheat, processor and memory limits, UAC off,
   GPU crash recovery off, broken restore points, Windows Update or Defender off. Each card shows only when the problem exists.
+- **Game Mode for every game**: starts by itself with any supported game and turns off when it closes (per-game
+  switch on each game page, a global one in Settings); optionally applies the game's recommended tweaks at launch and
+  puts them back at close. Each game page also has a Competitive / Balanced / Off preset.
+- **Live server ping**: while you play, the game page finds the server you are connected to through Windows' own
+  network trace (no driver, nothing touches the game) and pings it, with its city and provider.
+- **Before and after**: record two minutes, boost, record two minutes, and an honest side-by-side verdict that only
+  counts a difference bigger than the noise of two runs.
+- **Settings backup**: export and import your preferences, presets and the list of tweaks that are on (no match data,
+  logs, game-file backups or tokens).
 - **Game Mode**: a booster-style dashboard with a Start Game button (turns Game Mode on and launches Fortnite), a
   session timer, live ping, CPU, GPU and memory numbers, and every boost step and app in one panel. It closes or pauses
   background apps, switches to the ZeroDelay power plan, lowers background priority, silences notifications and pauses
