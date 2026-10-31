@@ -3,6 +3,8 @@
 A free, open-source Windows app that lowers input delay and stutter in Fortnite. Every change is shown as a card with
 an on/off switch, explained in plain words, backed up before it is applied, and can be undone at any time.
 
+**Website and download:** https://calumerge-cpu.github.io/ZeroDelay/
+
 ## Features
 
 - **Knows your PC**: on first start (and every few days) ZeroDelay scans the hardware, drivers, Windows and installed
