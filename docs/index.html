@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZeroDelay — less input delay, no placebo</title>
+<meta name="description" content="ZeroDelay is a free, open-source Windows optimizer for Fortnite, Counter-Strike 2 and more. Every tweak is explained, measured and can be undone.">
+<meta property="og:title" content="ZeroDelay">
+<meta property="og:description" content="A free Windows optimizer for Fortnite and Counter-Strike 2. Every tweak explained, measured and reversible.">
+<meta property="og:image" content="img/home.jpg">
+<meta name="theme-color" content="#07080a">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bg" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i></div>
+<div class="grain" aria-hidden="true"></div>
+
+<header class="nav-wrap">
+  <nav class="nav glass">
+    <a class="brand" href="#top" aria-label="ZeroDelay home">
+      <span class="mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.2 2.5 5 13.6h5.6l-1.1 7.9L18 10.2h-5.7z"/></svg></span>
+      ZeroDelay
+    </a>
+    <div class="links">
+      <a href="#what">What it does</a>
+      <a href="#games">Games</a>
+      <a href="#install">Install</a>
+      <a href="#faq">FAQ</a>
+      <a href="#changes">Changes</a>
+    </div>
+    <a class="gh" href="https://github.com/CaluMerge-cpu/ZeroDelay" rel="noopener">GitHub</a>
+  </nav>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <p class="eyebrow"><span>Free</span><span>Open source</span><span>Windows 10 and 11</span></p>
+    <h1>Less input delay.<br><em>No placebo.</em></h1>
+    <p class="lede">ZeroDelay tunes Windows, your graphics driver and your games for lower input delay, steadier frames and cleaner ping. Every change says what it does, when not to use it, and comes back with one click.</p>
+    <div class="cta">
+      <a class="btn primary" id="dl" href="https://github.com/CaluMerge-cpu/ZeroDelay/releases/latest/download/ZeroDelay-Setup.exe">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16"/></svg>
+        Download for Windows
+      </a>
+      <a class="btn ghost" href="#install">How to install</a>
+    </div>
+    <p class="meta"><span id="ver">Latest version</span><span id="size"></span><span id="date"></span></p>
+    <p class="hash" id="hashrow" hidden><span>SHA-256</span><code id="hash"></code><button id="copy" type="button">Copy</button></p>
+    <figure class="shot hero-shot glass">
+      <img src="img/fortnite.jpg" width="1380" height="842" alt="ZeroDelay's Fortnite page: the game's logo, the live route from your PC to the game server, Start Game and the game's tools">
+    </figure>
+  </section>
+
+  <section id="what" class="principles">
+    <div class="card glass reveal">
+      <h3>Measured, not guessed</h3>
+      <p>Each tweak is backed by a vendor document or a published measurement. When tests showed four popular tweaks did nothing, they lost their "recommended" tag and now say so.</p>
+    </div>
+    <div class="card glass reveal">
+      <h3>Everything comes back</h3>
+      <p>The original value is saved before anything changes. Switch a card off, or press Restore, and your PC is as it was. A Windows restore point comes first.</p>
+    </div>
+    <div class="card glass reveal">
+      <h3>Anti-cheat stays untouched</h3>
+      <p>No injecting, no game files, no memory reading. ZeroDelay only changes settings you could change yourself, so it is safe with Easy Anti-Cheat, VAC and the rest.</p>
+    </div>
+  </section>
+
+  <section class="feature reveal">
+    <div class="copy">
+      <p class="kicker">Home</p>
+      <h2>Your results first</h2>
+      <p>The first thing you see is what your last matches were really like: ping, packet loss, FPS and stutters, read from your own games. Below it, how much of the recommended setup is on, and live load for your processor, memory, graphics card, disk and internet.</p>
+    </div>
+    <figure class="shot glass"><img loading="lazy" src="img/home.jpg" width="1380" height="842" alt="Home page with match results and live tiles"></figure>
+  </section>
+
+  <section class="feature flip reveal">
+    <div class="copy">
+      <p class="kicker">Games</p>
+      <h2>A page for every game</h2>
+      <p>Pick a server from Fortnite's own server list, watch your route live from your PC to your router, your provider and the game server, then press Start Game. Each game has its settings and checks in one panel next to it.</p>
+    </div>
+    <figure class="shot glass"><img loading="lazy" src="img/games.jpg" width="1380" height="842" alt="The Games library with Fortnite and Counter-Strike 2"></figure>
+  </section>
+
+  <section class="feature reveal">
+    <div class="copy">
+      <p class="kicker">Tweaks</p>
+      <h2>300 tweaks, shown a few at a time</h2>
+      <p>You start with the recommended ones for your PC. Filters show input delay and ping, what is switched on, what is new, or one area at a time: Fortnite, graphics, network, power and more. Every card has a plain title and a line on when not to use it.</p>
+    </div>
+    <figure class="shot glass"><img loading="lazy" src="img/tweaks.jpg" width="1380" height="842" alt="Tweaks page filtered to network tweaks"></figure>
+  </section>
+
+  <section class="feature flip reveal">
+    <div class="copy">
+      <p class="kicker">Checks</p>
+      <h2>Find what is really holding you back</h2>
+      <p>Checks only look and report. What limited your FPS last match, whether your memory runs at its rated speed, whether your graphics card has all its PCIe lanes, where your matches were hosted, and leftovers from other tweak packs that break anti-cheat.</p>
+    </div>
+    <figure class="shot glass"><img loading="lazy" src="img/checks.jpg" width="1380" height="842" alt="Checks page"></figure>
+  </section>
+
+  <section class="feature reveal">
+    <div class="copy">
+      <p class="kicker">Tools</p>
+      <h2>The rest of the toolbox</h2>
+      <p>Game Mode closes background apps while you play and puts them back afterwards. Match reports after every game, trends over weeks, a benchmark, a sensitivity converter, a mouse polling test, cleanup and debloat that only remove what you pick.</p>
+    </div>
+    <figure class="shot glass"><img loading="lazy" src="img/tools.jpg" width="1380" height="842" alt="Tools page"></figure>
+  </section>
+
+  <section id="games" class="games reveal">
+    <h2>Supported games</h2>
+    <p class="sub">Full pages with settings, checks and live route today. More are being added.</p>
+    <ul class="game-list">
+      <li class="glass on"><b>Fortnite</b><span>Settings, server list, match stats</span></li>
+      <li class="glass on"><b>Counter-Strike 2</b><span>Settings, Valve server ping</span></li>
+      <li class="glass"><b>Valorant</b><span>In the works</span></li>
+      <li class="glass"><b>Overwatch 2</b><span>In the works</span></li>
+      <li class="glass"><b>Rainbow Six Siege X</b><span>In the works</span></li>
+      <li class="glass"><b>Marvel Rivals</b><span>In the works</span></li>
+      <li class="glass"><b>Rematch</b><span>In the works</span></li>
+      <li class="glass"><b>Where Winds Meet</b><span>In the works</span></li>
+      <li class="glass"><b>eFootball</b><span>In the works</span></li>
+      <li class="glass"><b>NBA 2K27</b><span>In the works</span></li>
+      <li class="glass"><b>Undisputed</b><span>In the works</span></li>
+    </ul>
+  </section>
+
+  <section id="install" class="install reveal">
+    <h2>Install in a minute</h2>
+    <ol class="steps">
+      <li class="glass"><span class="n">1</span><div><h3>Download</h3><p>Get <code>ZeroDelay-Setup.exe</code> with the button above. The SHA-256 under it lets you check the file is the one published on GitHub.</p></div></li>
+      <li class="glass"><span class="n">2</span><div><h3>Get past SmartScreen</h3><p>Windows warns about apps without a paid code-signing certificate. Click <b>More info</b>, then <b>Run anyway</b>. The full source is on GitHub if you want to read it first.</p></div></li>
+      <li class="glass"><span class="n">3</span><div><h3>Allow admin rights</h3><p>Power plans, network adapters and driver settings need administrator rights, so Windows asks once each time ZeroDelay starts.</p></div></li>
+      <li class="glass"><span class="n">4</span><div><h3>Press Boost now</h3><p>ZeroDelay offers a restore point, lists the recommended tweaks that are still off, and you tick what you want. Updates install from inside the app with <b>Update now</b>.</p></div></li>
+    </ol>
+  </section>
+
+  <section id="faq" class="faq reveal">
+    <h2>Questions</h2>
+    <details class="glass"><summary>Can it get me banned?</summary><p>ZeroDelay never touches anti-cheat, game files or game memory. It changes Windows settings, your graphics driver's settings for a game, and the game's own settings file, the same file the in-game menu writes. Where a publisher asks players not to edit that file, ZeroDelay shows you the menu setting instead of changing it.</p></details>
+    <details class="glass"><summary>How do I undo something?</summary><p>Switch the card off and the saved original comes back. <b>Restore</b> on Home undoes everything ZeroDelay changed. If you made a restore point at the start, Windows can roll back to it too.</p></details>
+    <details class="glass"><summary>Will it give me more FPS?</summary><p>It depends on your PC. ZeroDelay does not promise numbers; the score on Home counts the recommended tweaks that are on. Your match reports and the benchmark show what actually changed for you.</p></details>
+    <details class="glass"><summary>Does it collect data?</summary><p>No accounts and no analytics. It contacts GitHub to check for updates, Epic's status page and game servers when you run a ping or route test, and Intel's GitHub when you choose to download PresentMon for the latency test.</p></details>
+    <details class="glass"><summary>Why does Windows warn about it?</summary><p>Code-signing certificates cost several hundred euros a year, and ZeroDelay is free. Every release lists its SHA-256 so you can check the download matches the published file.</p></details>
+    <details class="glass"><summary>Does it work with other optimizers and ping boosters?</summary><p>It works alongside GearUP, ExitLag, WTFast and NoPing. When it finds another optimizer installed, it shows what it would change instead of fighting over the same settings.</p></details>
+  </section>
+
+  <section id="changes" class="changes reveal">
+    <h2>What changed</h2>
+    <p class="sub">Straight from the releases on GitHub.</p>
+    <div id="releases" class="releases"><p class="muted">Loading the latest releases…</p></div>
+    <a class="btn ghost small" href="https://github.com/CaluMerge-cpu/ZeroDelay/releases">All releases</a>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>ZeroDelay is free and open source under the MIT licence. <a href="https://github.com/CaluMerge-cpu/ZeroDelay">Source on GitHub</a>.</p>
+  <p class="muted">Not affiliated with Epic Games, Valve, Riot Games, Blizzard, Ubisoft, NetEase, Konami, 2K, Sloclap, Steel City Interactive, NVIDIA, AMD or Microsoft. Game names belong to their owners.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
