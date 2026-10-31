@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.16.2'
+$AppVersion = '1.17.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -2384,7 +2384,7 @@ function Get-FnNetReport {
     }
     $bad = @()
     if ($rows | Where-Object { $_.InPacketsLostPercentage -gt 0.5 -or $_.OutPacketsLostPercentage -gt 0.5 }) { $bad += 'Packet loss above 0.5% in some matches: that causes rubber-banding and missed shots. Run Test the link to your router and the Jitter and loss test to find where it starts.' }
-    if ($rows | Where-Object { $_.AverageJitter -gt 5 }) { $bad += 'Jitter above 5 ms: usually Wi-Fi or a busy connection. Check the Bufferbloat test and use a cable if you can.' }
+    if ($rows | Where-Object { $_.AverageJitter -gt 5 }) { $bad += 'Jitter above 5 ms: usually Wi-Fi or a busy connection. Check the Busy-connection lag test and use a cable if you can.' }
     if ($rows | Where-Object { $_.PercentFramesOverBadPingThreshold -gt 1 }) { $bad += 'Some matches spent more than 1% of the time over Fortnite''s bad-ping limit.' }
     $s = "Measured by Fortnite itself in your last matches:`n`n$($lines -join "`n")`n`n"
     $s + $(if ($bad.Count) { $bad -join "`n`n" } else { 'Your matches were clean: no meaningful packet loss or jitter. If the game still feels laggy, compare your ping per subregion with Fortnite subregion ping.' })
@@ -2716,11 +2716,11 @@ function Get-TimerResText($q, $r) {
     # closer to 1 ms and steadier is better: distance from 1 ms plus the spread
     $one = [Math]::Abs($r[1][0] - 1) + $r[1][1]; $half = [Math]::Abs($r[2][0] - 1) + $r[2][1]
     $s += "`n"
-    $s += if ($one - $half -ge 0.1) { "0.5 ms is clearly steadier on this PC ({0:0.00} ms closer to an exact 1 ms wake). The Hold 0.5 ms timer resolution card is worth trying; check your match reports before and after." -f ($one - $half) }
+    $s += if ($one - $half -ge 0.1) { "0.5 ms is clearly steadier on this PC ({0:0.00} ms closer to an exact 1 ms wake). The 'Make the Windows clock tick every 0.5 ms' card is worth trying; check your match reports before and after." -f ($one - $half) }
           elseif ($one - $half -gt 0.02) { 'On this PC 0.5 ms is only a little steadier than 1 ms, which Fortnite already asks for itself. Holding 0.5 ms is optional: expect no visible difference.' }
-          else { 'On this PC 0.5 ms is no better than 1 ms, which Fortnite already asks for itself. Leave the Hold 0.5 ms timer resolution card off.' }
+          else { 'On this PC 0.5 ms is no better than 1 ms, which Fortnite already asks for itself. Leave the "Make the Windows clock tick every 0.5 ms" card off.' }
     $g = "$(Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests')" -eq '1'
-    $s += "`n`nNote: on Windows 11 a timer request only reaches games when global timer requests are on (they are $(if ($g) { 'on' } else { 'off' }) here). The Hold card turns them on for you."
+    $s += "`n`nNote: on Windows 11 a timer request only reaches games when global timer requests are on (they are $(if ($g) { 'on' } else { 'off' }) here). The 'Make the Windows clock tick every 0.5 ms' card turns them on for you."
     $s
 }
 # --- Helpers for research round 6 (1.15)
@@ -3754,7 +3754,7 @@ function Get-FnCompositionCauses {
     if ("$(Get-IniValue $l 'FullscreenMode')" -in '1', '2') { $out += "Fortnite runs in a window or windowed fullscreen: anything drawn on top (notifications, the volume pop-up, a window from the other screen) makes Windows compose. $(Get-FrameCardRef 'fullscreen' 'True fullscreen') avoids most of it." }
     if ("$(Get-IniValue $l 'bUseVSync')" -eq 'True') { $out += "V-Sync is on in Fortnite; in windowed fullscreen that keeps frames waiting for the compositor. $(Get-FrameCardRef 'vsync' 'Turning V-Sync off') fixes it unless you use G-SYNC." }
     $mpo = $null; try { $mpo = Find-Tweak 'mpo-off' } catch {}
-    if ($mpo -and $mpo.State -eq $true) { $out += "$(Get-FrameCardRef 'mpo-off' 'MPO off') is on. Without overlay planes nothing on top of the game can stay on its own plane, so Windows composes every frame while it is visible. Switch it off unless it fixed flicker for you." }
+    if ($mpo -and $mpo.State -eq $true) { $out += "$(Get-FrameCardRef 'mpo-off' 'Fix flicker and stutter with two monitors') is on. Without overlay planes nothing on top of the game can stay on its own plane, so Windows composes every frame while it is visible. Switch it off unless it fixed flicker for you." }
     $procs = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
     $ov = @(@{ Rx = '^Discord$'; N = 'Discord' }, @{ Rx = '^Overwolf'; N = 'Overwolf' }, @{ Rx = '^(Medal|MedalEncoder)$'; N = 'Medal' }, @{ Rx = '^GameBar$'; N = 'Xbox Game Bar' }, @{ Rx = '^RTSS$'; N = 'RivaTuner (users report PresentMon 2.x showing composition while RTSS hooks a game)' } |
            Where-Object { $rx = $_.Rx; $procs | Where-Object { $_ -match $rx } } | ForEach-Object { $_.N })
@@ -5270,7 +5270,7 @@ function Format-CcdParkingReport($r) {
     if ($r.GameBar) { $l += "Xbox Game Bar package: $($r.GameBar). OK (the overlay may stay off; only the package and its game detection are needed)" } else { $bad++; $l += 'Xbox Game Bar package: REMOVED. AMD''s driver uses its game detection; reinstall Xbox Game Bar from the Microsoft Store.' }
     if ($r.GameMode -and $r.AllowGM) { $l += 'Windows Game Mode: on. OK' } else { $bad++; $l += 'Windows Game Mode: OFF. Switch on the Windows Game Mode card (Settings > Gaming > Game Mode).' }
     if ($r.MinCores -ge 100 -and -not $r.Ppm) { $l += "Core parking minimum on Balanced: 100%, Windows' desktop default: no core can park until AMD's provisioning (the chipset driver above) lowers it." }
-    elseif ($r.MinCores -ge 100) { $bad++; $l += "Core parking minimum on Balanced: 100%. FAIL: no core can park. Either the chipset driver's provisioning is not applied (reinstall it) or a tool set Unpark all cores on the Balanced plan." }
+    elseif ($r.MinCores -ge 100) { $bad++; $l += "Core parking minimum on Balanced: 100%. FAIL: no core can park. Either the chipset driver's provisioning is not applied (reinstall it) or a tool set Keep all CPU cores awake on the Balanced plan." }
     elseif ($r.MinCores -ge 0) { $l += "Core parking minimum on Balanced: $($r.MinCores)%. OK$(if ($r.Prov) { ' (AMD provisioning present)' })" }
     else { $l += 'Core parking minimum on Balanced: could not be read.' }
     if ($r.Running) {
@@ -5280,7 +5280,7 @@ function Format-CcdParkingReport($r) {
     } else { $l += 'Live check: start a match and run this check again to see whether the second die really parks.' }
     if (@($r.Tools).Count) { $l += "Running: $(@($r.Tools) -join ', '). These tools set their own affinity or power plan and are the usual reason parking does not stick; exclude Fortnite in them or close them." }
     $head = if ($bad) { "$bad of the requirements for AMD's core parking are not met:" } else { 'Everything AMD requires for core parking is in place:' }
-    $tail = "`n`nRepairs AMD documents: reinstall AMD Chipset Software (its installer rewrites the Balanced plan); run  Rundll32.exe advapi32.dll,ProcessIdleTasks  from an administrator prompt and leave the PC idle for about 15 minutes to refresh the game list; in Win+G > Settings confirm 'Remember this is a game' for Fortnite. The Keep Fortnite on one CPU die card is the manual fallback when parking never engages."
+    $tail = "`n`nRepairs AMD documents: reinstall AMD Chipset Software (its installer rewrites the Balanced plan); run  Rundll32.exe advapi32.dll,ProcessIdleTasks  from an administrator prompt and leave the PC idle for about 15 minutes to refresh the game list; in Win+G > Settings confirm 'Remember this is a game' for Fortnite. The Keep Fortnite on one half of a Ryzen CPU card is the manual fallback when parking never engages."
     "$head`n`n$($l -join "`n")$tail"
 }
 
@@ -5442,7 +5442,7 @@ function Format-WheaReport($r) {
         $l += "$($kp.Count) x Kernel-Power 41 (the PC restarted without shutting down), last $($kp[0].When.ToString('d MMM HH:mm'))$(if ($bc) { ", $bc after a blue screen" } else { ', none with a blue screen' })."
         if ($kp.Count -gt $bc) { $adv += 'A Kernel-Power 41 with no blue screen is a hard reset or power loss: the power button held down, a power cut, or a crash the CPU could not report (over-aggressive undervolt, memory profile, or power supply). If it was not you, the WHEA lines above and the Fortnite crash check narrow it down.' }
     }
-    "In the last $days days:`n`n$($l -join "`n")`n`n$(@($adv | Select-Object -Unique) -join "`n`n")`n`nZeroDelay changes none of this: these are BIOS settings (EXPO/XMP, Curve Optimizer, PCIe slot speed) or hardware. The PCIe power-saving card handles the Windows side of ASPM."
+    "In the last $days days:`n`n$($l -join "`n")`n`n$(@($adv | Select-Object -Unique) -join "`n`n")`n`nZeroDelay changes none of this: these are BIOS settings (EXPO/XMP, Curve Optimizer, PCIe slot speed) or hardware. The 'Stop graphics card and SSD links dozing' card handles the Windows side of ASPM."
 }
 
 # --- fTPM stutter on AM4: BIOS date against AMD's AGESA 1.2.0.7 fix
@@ -5923,7 +5923,7 @@ function Get-MixedRefreshReport {
     elseif ($mult) { "The rates are whole multiples of each other ($($main.Hz.ToString('0.##', $inv)) and $($worst.Hz.ToString('0.##', $inv))), the best case when they cannot be equal." }
     else { "Since Windows 10 2004 the desktop composes each monitor on its own, so a 60 Hz screen no longer drags a 240 Hz one down. Stutter is still widely reported when a video or Discord stream plays on the slower screen while the game runs borderless. The safe options: set the second screen to the same rate or a whole multiple ($($main.Hz.ToString('0.##', $inv)) with $([math]::Round($main.Hz / 2).ToString('0', $inv)) or $([math]::Round($main.Hz / 3).ToString('0', $inv))) in Settings > System > Display > Advanced display, pause video on the other screen in matches, or play true fullscreen (the Fortnite tab has a card for it)." }
     if ($modeText) { $s += "`n`n$modeText" }
-    $s + "`n`nIf you see flicker or stutter when both screens show motion, the multiplane overlay card (Graphics tab) is NVIDIA's documented fix. ZeroDelay changes no display setting here."
+    $s + "`n`nIf you see flicker or stutter when both screens show motion, the 'Fix flicker and stutter with two monitors' card (Graphics tab) is NVIDIA's documented fix. ZeroDelay changes no display setting here."
 }
 
 # --- Administrator protection (Windows 11 24H2+): elevated apps get a separate, hidden profile for HKCU and %LOCALAPPDATA%
@@ -5984,7 +5984,7 @@ function Get-KernelDriverToolsReport {
     $s = ($out -join "`n`n") + "`n`n"
     $why = 'Why it matters: these tools read temperatures, fan speeds and RGB chips through the embedded controller, SMBus or raw port I/O, work that runs with every core blocked (DPC or SMI context). Each poll can stall the whole PC for 0.1 to several milliseconds, a few times per second: the ACPI.sys and Wdf01000.sys spikes LatencyMon shows. ASUS and MSI forum users traced in-game stutter to iCUE and HWiNFO polling. The idle spike test (System tab) measures the stalls.'
     $inp = $drv | Where-Object { $_.N -eq 'inpoutx64' } | Select-Object -First 1
-    if ($inp) { $s += "inpoutx64 and anti-cheat: Microsoft's Windows release health (opened 19 August 2026, after KB5121003) says some PCs could not run certain games (ARC Raiders, MARVEL Tokon, THE FINALS: hang, silent close, EXCEPTION_ACCESS_VIOLATION or a reboot) and that the cause is the inpoutx64 driver shipped by RGB and peripheral software, not Windows. All three are Easy Anti-Cheat games like Fortnite; Microsoft's workaround is to set the driver's Start value to 4 and restart, and it states that its investigation does not indicate that disabling the key causes unintended behaviour. The card 'Stop the inpoutx64 driver loading' does exactly that, reversibly. Fan or RGB tools that depend on it lose their sensors.`n`n" }
+    if ($inp) { $s += "inpoutx64 and anti-cheat: Microsoft's Windows release health (opened 19 August 2026, after KB5121003) says some PCs could not run certain games (ARC Raiders, MARVEL Tokon, THE FINALS: hang, silent close, EXCEPTION_ACCESS_VIOLATION or a reboot) and that the cause is the inpoutx64 driver shipped by RGB and peripheral software, not Windows. All three are Easy Anti-Cheat games like Fortnite; Microsoft's workaround is to set the driver's Start value to 4 and restart, and it states that its investigation does not indicate that disabling the key causes unintended behaviour. The card 'Block the RGB and fan driver that crashes games' does exactly that, reversibly. Fan or RGB tools that depend on it lose their sensors.`n`n" }
     $s + $why + "`n`nZeroDelay changes nothing here except through that separate card."
 }
 
@@ -6091,7 +6091,7 @@ try {
         $s += $verdict
         $tips = @()
         if ($r.Dpc -ge 2 -or $r.Int -ge 1) { $tips += 'Driver callback or interrupt time is high for an idle PC (healthy is under 0.5% DPC and 0.2% interrupts): a driver is busy doing nothing. Usual sources: Wi-Fi scanning (Network tab: roaming and Wi-Fi power cards, or use a cable), the GPU driver after an update (clean reinstall), USB audio or RGB controllers.' }
-        if ($r.MaxUs -ge 3000) { $tips += 'Where to look: sensor and RGB pollers (System tab: Find kernel-driver sensor tools), Wi-Fi on a cable-capable PC, NVMe power states (nvme-idle card), audio enhancements, VPN or firewall filter drivers. Run the test again after each change; LatencyMon shows the driver by name if you want to go deeper.' }
+        if ($r.MaxUs -ge 3000) { $tips += 'Where to look: sensor and RGB pollers (System tab: Find sensor and RGB tools that stall the CPU), Wi-Fi on a cable-capable PC, NVMe power states (nvme-idle card), audio enhancements, VPN or firewall filter drivers. Run the test again after each change; LatencyMon shows the driver by name if you want to go deeper.' }
         if ($tips.Count) { $s += "`n`n" + ($tips -join "`n`n") }
         $s += "`n`nThis is a user-mode measurement (no kernel tracing): it shows that stalls happen and how long, not which driver. Results are only meaningful with the PC idle."
         [void](Show-ZdDialog $s 'Idle spike test' 'OK' 'Information')
@@ -6188,7 +6188,7 @@ $docker = [bool](Get-Process 'Docker Desktop', 'com.docker.backend' -ErrorAction
         $sv = { param($n) $svc[$n] }
         $run = @($r.Running)
         $causes = @()
-        if ($r.Vbs -eq 2 -or $r.Vbs -eq 1) { $causes += "Virtualization-based Security is $(if ($r.Vbs -eq 2) { 'running' } else { 'enabled (starts at next boot)' })$(if ($run -contains 2) { ' with Memory Integrity' } else { ' without Memory Integrity' }): the 'Turn off Virtualization-based Security' card (System tab) switches it off; Memory Integrity alone is only one of its tenants." }
+        if ($r.Vbs -eq 2 -or $r.Vbs -eq 1) { $causes += "Virtualization-based Security is $(if ($r.Vbs -eq 2) { 'running' } else { 'enabled (starts at next boot)' })$(if ($run -contains 2) { ' with Memory Integrity' } else { ' without Memory Integrity' }): the 'Turn off the virtual machine security layer' card (System tab) switches it off; Memory Integrity alone is only one of its tenants." }
         if ($run -contains 1 -or ((& $rv 'Lsa\LsaCfgFlags') -gt 0)) { $causes += 'Credential Guard is on: usually a work policy (Intune / Group Policy). It needs VBS and will be re-enabled by the policy; ask your admin or leave it.' }
         if ($run -contains 5 -or (& $rv 'KernelShadowStacks\Enabled') -eq 1) { $causes += 'Kernel-mode Hardware-enforced Stack Protection is on: it needs VBS and goes away with it.' }
         $fnames = @{ 'Microsoft-Hyper-V-All' = 'Hyper-V'; 'Microsoft-Hyper-V' = 'Hyper-V'; 'Microsoft-Hyper-V-Hypervisor' = 'Hyper-V hypervisor'; 'VirtualMachinePlatform' = 'Virtual Machine Platform (WSL2, Docker, Android emulators)'; 'Microsoft-Windows-Subsystem-Linux' = 'Windows Subsystem for Linux'; 'Containers-DisposableClientVM' = 'Windows Sandbox'; 'HypervisorPlatform' = 'Windows Hypervisor Platform (VMware, VirtualBox, some emulators)'; 'Windows-Defender-ApplicationGuard' = 'Application Guard' }
@@ -6318,7 +6318,7 @@ function Get-LinkReport {
         if ($a.FullDuplex -eq $false) { $bad = $true; $lines += 'Problem: half duplex means the link cannot send and receive at the same time. Set Speed & Duplex back to Auto Negotiation (Device Manager > your adapter > Advanced) and check the cable.' }
         if ($sd -and "$($sd.RegistryValue[0])" -ne '0' -and "$($sd.DisplayValue)" -notmatch 'Auto') { $lines += "Note: Speed & Duplex is forced to '$($sd.DisplayValue)'. Auto Negotiation is safer; a forced speed can cause a duplex mismatch." }
         $gl = Get-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword 'GigaLite' -ErrorAction SilentlyContinue
-        if ($gl -and "$($gl.RegistryValue[0])" -eq '1') { $lines += "Note: Realtek's Gigabit Lite is on, so this card may quietly settle for 500 Mbit/s on a marginal cable$(if ($mbps -eq 500) { ' (it is at 500 Mbit/s right now)' }). The Realtek: turn off Gigabit Lite card makes a bad cable show up here instead." }
+        if ($gl -and "$($gl.RegistryValue[0])" -eq '1') { $lines += "Note: Realtek's Gigabit Lite is on, so this card may quietly settle for 500 Mbit/s on a marginal cable$(if ($mbps -eq 500) { ' (it is at 500 Mbit/s right now)' }). The 'Realtek: stop quietly dropping to half speed' card makes a bad cable show up here instead." }
         if ($pkts -gt 10000 -and $errs / [double]$pkts -gt 0.0001) { $bad = $true; $lines += 'Problem: the error count is high, which points to a bad cable, a bad port, or interference. Swap the cable first.' }
         if (-not $bad) { $lines += 'This link looks healthy.' }
         $lines -join "`n"
@@ -6364,9 +6364,9 @@ function Get-RouterTestText([int[]]$R, [bool]$Wifi) {
     $notDirect = -not $Wifi -and ($med -gt 1.5 -or $p95 -gt 4)
     $directHint = "A real cable straight to the router answers in under 1 ms, steadily. Typical $(& $ms $med) with 95% at $(& $ms $p95) means something else is in the path: a powerline adapter, a mesh satellite or a Wi-Fi extender with a LAN port. Those add a few ms and spikes; a direct cable to the router removes them. Some provider routers answer ping slowly, so run the test again with nothing else busy before you buy anything."
     if ($notDirect -and $loss -lt 1 -and $p95 -le 15) { $s += $directHint }
-    elseif ($good) { $s += 'Your home network is clean. If your Fortnite ping still spikes, the cause is your internet line or the route to the server, not your PC, cable or Wi-Fi. Run the Bufferbloat test to check the line.' }
+    elseif ($good) { $s += 'Your home network is clean. If your Fortnite ping still spikes, the cause is your internet line or the route to the server, not your PC, cable or Wi-Fi. Run the Busy-connection lag test to check the line.' }
     elseif ($Wifi) { $s += 'Your Wi-Fi adds the spikes. Move closer to the router, use its 5 GHz network (see Prefer 5 GHz), run Check your Wi-Fi signal, or best of all use a cable. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.' }
-    else { $s += 'There are spikes even on the cable. Run Check your cable connection, make sure nobody is downloading or streaming heavily (see the Bufferbloat test), and check Find traffic shapers. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.'; if ($notDirect) { $s += "`n`n$directHint" } }
+    else { $s += 'There are spikes even on the cable. Run Check your cable connection, make sure nobody is downloading or streaming heavily (see the Busy-connection lag test), and check Find traffic shapers. Routers answer ping slowly when busy, so one odd spike means little; regular spikes or loss are the problem.'; if ($notDirect) { $s += "`n`n$directHint" } }
     $s
 }
 
@@ -6560,8 +6560,8 @@ $Tweaks = @(
        Reg   = @( @{ P = 'HKCU:\Software\Microsoft\GameBar'; N = 'AutoGameModeEnabled'; V = 1; D = $null; M = 1 } ) }
 
     @{ Id = 'prioSep'; Cat = 'System'; Icon = [char]0xE9D9; Rec = $false
-       Title = 'Foreground priority: Programs'
-       Desc  = 'Sets Windows'' "Adjust for best performance of: Programs" scheduling (Win32PrioritySeparation 0x26). On desktop Windows that is the same as the default, so it only changes something when another tool switched it to background services or fixed time slices.'
+       Title = 'Give the window you are using more CPU time'
+       Desc  = 'Sets Windows'' foreground priority, "Adjust for best performance of: Programs" (Win32PrioritySeparation 0x26). On desktop Windows that is the same as the default, so it only changes something when another tool switched it to background services or fixed time slices.'
        Warn  = 'Never really: it puts the normal foreground boost back. It does not make Fortnite faster than a clean Windows.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl'; N = 'Win32PrioritySeparation'; V = 38; D = 2; M = 2 } ) }
 
@@ -6586,8 +6586,8 @@ $Tweaks = @(
        Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications'; N = 'GlobalUserDisabled'; V = 1; D = $null; M = 0 } ) }
 
     @{ Id = 'timer'; Cat = 'System'; Icon = [char]0xE823; Rec = $false; Badge = 'restart'
-       Title = 'Global timer resolution requests'
-       Desc  = 'Brings back the old system-wide timer behaviour, so a separate timer tool can raise the timer for Fortnite. Fortnite on screen already gets its own timer; this only matters when it is minimized or fully covered.'
+       Title = 'Let one app''s timer setting apply to all again'
+       Desc  = 'Brings back the old global timer resolution behaviour, so a separate timer tool can raise the timer for Fortnite. Fortnite on screen already gets its own timer; this only matters when it is minimized or fully covered.'
        Warn  = 'You do not run a timer-resolution tool: then it only lets every background app''s timer request wake the whole PC, costing a little CPU and power.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; N = 'GlobalTimerResolutionRequests'; V = 1; D = $null; M = 0 } ) }
 
@@ -6598,8 +6598,8 @@ $Tweaks = @(
        Power = @{ Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Set = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; V = 0; D = 1 } }
 
     @{ Id = 'pcie'; Cat = 'Power'; Icon = [char]0xE964; Rec = $true
-       Title = 'Turn off PCIe power-saving'
-       Desc  = 'Keeps the link to your graphics card and NVMe drive at full speed (Link State Power Management off).'
+       Title = 'Stop graphics card and SSD links dozing'
+       Desc  = 'Keeps the PCIe link to your graphics card and NVMe drive at full speed (Link State Power Management off).'
        Warn  = 'You are on a laptop on battery. Only the plugged-in setting of the current power plan is changed.'
        Power = @{ Sub = '501a4d13-42af-4429-9fd1-a8218c268e20'; Set = 'ee12f906-d277-404b-b6da-e5fa1a576df5'; V = 0; D = 1 } }
 
@@ -6623,8 +6623,8 @@ $Tweaks = @(
        After = { Sync-Service 'DiagTrack' } }
 
     @{ Id = 'sysmain'; Cat = 'Services'; Icon = [char]0xEDA2; Rec = $false; Badge = 'advanced'
-       Title = 'Turn off SysMain (Superfetch)'
-       Desc  = 'Stops Windows pre-loading apps into memory, which can cause disk and CPU bursts mid-game.'
+       Title = 'Stop Windows preloading apps into memory'
+       Desc  = 'Stops SysMain (formerly Superfetch), the service that pre-loads apps into memory, which can cause disk and CPU bursts mid-game.'
        Warn  = 'You have a hard drive (HDD) or under 16 GB of RAM. SysMain helps those systems more than it costs.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\SysMain'; N = 'Start'; V = 4; D = 2; M = 2 } )
        After = { Sync-Service 'SysMain' } }
@@ -6690,8 +6690,8 @@ $Tweaks = @(
        ) }
 
     @{ Id = 'hags'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Badge = 'restart'
-       Title = 'Hardware-accelerated GPU scheduling'
-       Desc  = 'Lets the GPU manage its own memory queue. Can lower latency on RTX 20 / RX 6000 and newer.'
+       Title = 'Let the graphics card schedule its own work'
+       Desc  = 'Hardware-accelerated GPU scheduling (HAGS) lets the GPU manage its own memory queue. Can lower latency on RTX 20 / RX 6000 and newer.'
        Warn  = 'You have an older GPU, or you notice stutter after enabling. Results vary, test both ways.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; N = 'HwSchMode'; V = 2; D = 1; M = 1 } ) }
 
@@ -6753,16 +6753,16 @@ $Tweaks = @(
        } }
 
     @{ Id = 'eee'; Cat = 'Network'; Icon = [char]0xE968; Rec = $true
-       Title = 'Turn off Energy-Efficient Ethernet'
-       Desc  = 'Stops the Ethernet link from dozing between packets, which adds small, random delays.'
+       Title = 'Stop the network cable from dozing'
+       Desc  = 'Turns off Energy-Efficient Ethernet (EEE), which lets the Ethernet link doze between packets and adds small, random delays.'
        Warn  = 'You only use Wi-Fi (not available). Applying briefly reconnects the adapter.'
        Test  = { Test-AdvPropsOff @('*EEE', 'EEELinkAdvertisement') 0 }
        On    = { Set-AdvProp 'eee' '*EEE' 0; Set-AdvPropHidden 'eee-la' 'EEELinkAdvertisement' 0 }
        Off   = { Reset-AdvProp 'eee' '*EEE' 1; Reset-AdvPropEach 'eee-la' 'EEELinkAdvertisement' { param($n) Get-EeeLinkAdvDefault $n } } }
 
     @{ Id = 'intmod'; Cat = 'Network'; Icon = [char]0xE81C; Rec = $false; Badge = 'advanced'
-       Title = 'Turn off interrupt moderation'
-       Desc  = 'The network card reports every packet immediately instead of batching them.'
+       Title = 'Network card: report every packet at once'
+       Desc  = 'Turns off interrupt moderation: the network card reports every packet immediately instead of batching them.'
        Warn  = 'Your CPU is weak or you download a lot while playing. CPU usage rises; test with and without. Measured: Medium moderation is already about as fast for small game packets.'
        Test  = { Test-AdvProp '*InterruptModeration' 0 }
        On    = { Set-AdvProp 'intmod' '*InterruptModeration' 0 }
@@ -6781,8 +6781,8 @@ $Tweaks = @(
        Power = @{ Sub = '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1'; Set = '12bbebe6-58d6-4636-95bb-3217ef867c1a'; V = 0; D = 1 } }
 
     @{ Id = 'rss'; Cat = 'Network'; Icon = [char]0xE9F5; Rec = $true
-       Title = 'Receive Side Scaling on'
-       Desc  = 'Spreads network processing across CPU cores instead of piling it onto one.'
+       Title = 'Spread network work across CPU cores'
+       Desc  = 'Turns on Receive Side Scaling (RSS), which spreads network processing across CPU cores instead of piling it onto one.'
        Warn  = 'Your adapter driver is old and drops the connection with RSS on. Applying briefly reconnects the adapter.'
        Test  = { Test-AdvProp '*RSS' 1 }
        On    = { Set-AdvProp 'rss' '*RSS' 1 }
@@ -7179,7 +7179,7 @@ $Tweaks = @(
        } }
 
     @{ Id = 'ccdpin'; Cat = 'Fortnite'; Icon = [char]0xE964; Action = 'Pin now'; Lat = $true
-       Title = 'Keep Fortnite on one CPU die'
+       Title = 'Keep Fortnite on one half of a Ryzen CPU'
        Desc  = 'On 12/16-core Ryzen, keeps game threads on the first CCD to avoid cross-die delay. Run while Fortnite is open.'
        Warn  = ''
        Requires = { (Get-CpuName) -match 'Ryzen 9 \d{4}X' }
@@ -7193,8 +7193,8 @@ $Tweaks = @(
        } }
 
     @{ Id = 'vbs'; Cat = 'System'; Icon = [char]0xE83D; Rec = $false; Lat = $true; Badge = 'restart'
-       Title = 'Turn off Virtualization-based Security'
-       Desc  = 'Goes one step past Memory Integrity: stops VBS itself. Measured up to ~5% FPS loss with it on.'
+       Title = 'Turn off the virtual machine security layer'
+       Desc  = 'Goes one step past Memory Integrity: stops Virtualization-based Security (VBS) itself. Measured up to ~5% FPS loss with it on.'
        Warn  = 'Your PC is managed by work/school, you use Credential Guard, or a game''s anti-cheat requires VBS. Lowers security.'
        Test  = {
            if ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard' 'EnableVirtualizationBasedSecurity') -eq 0) { return $true }
@@ -7288,13 +7288,13 @@ $Tweaks = @(
        } }
 
     @{ Id = 'prefetchon'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true
-       Title = 'Turn the prefetcher back on'
+       Title = 'Turn app preloading back on'
        Desc  = 'Another tool turned off Windows prefetching. Windows loads apps and games slower without it, even on fast SSDs.'
        Warn  = 'You turned it off on purpose and measured a benefit. The old value is backed up.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters'; N = 'EnablePrefetcher'; V = 3; D = 0; M = 3 } ) }
 
     @{ Id = 'idleon'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true; Lat = $true
-       Title = 'Allow CPU idle states'
+       Title = 'Let the CPU rest between tasks again'
        Desc  = 'Turning idle states off (EXM "Disable Idle") stops Ryzen and Intel boosting to full clock on busy cores. This allows them again.'
        Warn  = 'You turned idle states off on purpose and measured lower latency. Only the current power plan changes.'
        Power = @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '5d76a2ca-e8c0-402f-a133-2158492d58ad'; V = 0; D = 1 } }
@@ -7327,7 +7327,7 @@ $Tweaks = @(
 
     # ---------------------------------------------- repair: undo risky tweaks left by other tools
     @{ Id = 'nvpreempt'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true; Badge = 'restart'
-       Title = 'Restore NVIDIA GPU preemption'
+       Title = 'NVIDIA: remove a tweak that risks GPU hangs'
        Desc  = 'Removes "DisablePreemption" keys some optimizers add. They make GPU hangs more likely with no measured latency gain.'
        Warn  = 'Never really. The keys are backed up and switching this off puts them back.'
        Remove = @(
@@ -7336,7 +7336,7 @@ $Tweaks = @(
        ) }
 
     @{ Id = 'nvpstate'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $false; Badge = 'restart'
-       Title = 'Restore NVIDIA dynamic clocks'
+       Title = 'NVIDIA: stop locking the card at full clocks'
        Desc  = 'Removes keys that lock the GPU at full clocks. Reflex Boost already raises clocks when it matters; locking only adds heat.'
        Warn  = 'You deliberately locked clocks and measured a benefit. The keys are backed up.'
        Requires = { [bool](Get-NvidiaClassKey) }
@@ -7398,7 +7398,7 @@ $Tweaks = @(
        Ini   = @{ FrontendFrameRateLimit = @('60', '120') } }
 
     @{ Id = 'uro'; Cat = 'Network'; Icon = [char]0xE839; Rec = $true; Lat = $true
-       Title = 'Keep UDP receive batching off'
+       Title = 'Stop Windows bundling incoming game packets'
        Desc  = 'Stops Windows batching incoming UDP packets (URO). Fortnite gameplay runs over UDP.'
        Warn  = 'You download huge files over UDP-based protocols and want maximum throughput.'
        Test  = {
@@ -7414,7 +7414,7 @@ $Tweaks = @(
        Off   = { netsh int udp set global uro=enabled | Out-Null; $script:Backup.Custom.Remove('uro') } }
 
     @{ Id = 'itr'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Lat = $true; Badge = 'advanced'
-       Title = 'Intel / Marvell: minimal interrupt throttling'
+       Title = 'Intel / Marvell: report packets with less delay'
        Desc  = 'The card waits less before reporting packets (Interrupt Moderation Rate: Minimal, or Low on Marvell AQtion). Intel: a higher rate means more latency handling packets.'
        Warn  = 'You already turned interrupt moderation off (this is then redundant). Intel and Marvell AQtion adapters only. Briefly reconnects.'
        Test  = { Test-ItrMin }
@@ -7422,8 +7422,8 @@ $Tweaks = @(
        Off   = { Reset-AdvPropEach 'itr' 'ITR' { param($n) Get-ItrDefault $n } } }
 
     @{ Id = 'wol'; Cat = 'Network'; Icon = [char]0xE7E8; Rec = $false
-       Title = 'Turn off Wake-on-LAN'
-       Desc  = 'Stops network traffic waking your PC from sleep. Housekeeping, no effect on ping.'
+       Title = 'Stop the network waking your PC'
+       Desc  = 'Turns off Wake-on-LAN, so network traffic no longer wakes your PC from sleep. Housekeeping, no effect on ping.'
        Warn  = 'You wake this PC remotely (Parsec, Steam Link, remote desktop). Briefly reconnects the adapter.'
        Test  = { Test-AdvPropsOff @('*WakeOnMagicPacket', '*WakeOnPattern', 'S5WakeOnLan') 0 }
        On    = { Set-AdvProp 'wol-magic' '*WakeOnMagicPacket' 0; Set-AdvProp 'wol-pattern' '*WakeOnPattern' 0; Set-AdvProp 'wol-s5' 'S5WakeOnLan' 0; $script:Backup.Custom['wol'] = $true }
@@ -7442,21 +7442,21 @@ $Tweaks = @(
        Run   = { Start-Process 'ms-settings:network-ethernet'; 'Turn on "Metered connection" for your network. Turn it off again to get updates.' } }
 
     @{ Id = 'bufferbloat'; Cat = 'Network'; Icon = [char]0xE909; Action = 'Run test'; Lat = $true
-       Title = 'Bufferbloat test'
-       Desc  = 'Checks if your router adds lag when the line is busy. Grade C or worse: turn on SQM/QoS in your router.'
+       Title = 'Busy-connection lag test'
+       Desc  = 'Checks for bufferbloat: whether your router adds lag when the line is busy. Grade C or worse: turn on SQM/QoS in your router.'
        Warn  = ''
        Run   = { Start-Process 'https://www.waveform.com/tools/bufferbloat'; 'Opened the bufferbloat test in your browser.' } }
 
     # =========================================================== Power & CPU
     @{ Id = 'minstate'; Cat = 'Power'; Icon = [char]0xEC4A; Rec = $true
-       Title = 'CPU minimum state 100%'
-       Desc  = 'Stops the CPU dropping to low clocks between frames. Some third-party power plans set this to 0%.'
+       Title = 'Keep the CPU from slowing between frames'
+       Desc  = 'Sets the minimum processor state to 100%, which stops the CPU dropping to low clocks between frames. Some third-party power plans set this to 0%.'
        Warn  = 'You are on a laptop on battery or the PC runs hot. Only the plugged-in value of the current plan changes.'
        Power = @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '893dee8e-2bef-41e0-89c6-b55d0929964c'; V = 100; D = 5 } }
 
     @{ Id = 'epp'; Cat = 'Power'; Icon = [char]0xE945; Rec = $true
-       Title = 'Max performance energy preference'
-       Desc  = 'Tells the CPU to ramp clocks up instantly instead of saving energy (EPP 0).'
+       Title = 'Tell the CPU to speed up instantly'
+       Desc  = 'Tells the CPU to ramp clocks up instantly instead of saving energy (energy performance preference, EPP 0).'
        Warn  = 'You are on a laptop and care about heat and fan noise. Only the plugged-in value changes.'
        Power = @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '36687f9e-e3a5-4dbf-b1dc-15eb381c6863'; V = 0; D = 33 } }
 
@@ -7467,14 +7467,14 @@ $Tweaks = @(
        Power = @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = 'be337238-0d82-4146-a960-4f3749d470c7'; V = 2; D = 1 } }
 
     @{ Id = 'coreparking'; Cat = 'Power'; Icon = [char]0xE964; Rec = $true
-       Title = 'Unpark all CPU cores'
-       Desc  = 'Keeps every core awake so game threads never wait for a parked core to wake up.'
+       Title = 'Keep all CPU cores awake'
+       Desc  = 'Turns off core parking: keeps every core awake so game threads never wait for a parked core to wake up.'
        Warn  = 'You have an X3D dual-CCD Ryzen (7950X3D/9950X3D). Their driver parks cores on purpose (hidden on those CPUs).'
        Requires = { (Get-CpuName) -notmatch 'X3D' }
        Power = @{ Sub = '54533251-82be-4824-96c1-47b60b740d00'; Set = '0cc5b647-c1df-4637-891a-dec35c318583'; V = 100; D = 10 } }
 
     @{ Id = 'usb3lpm'; Cat = 'Power'; Icon = [char]0xE88E; Rec = $true
-       Title = 'Turn off USB 3 link power-saving'
+       Title = 'Stop USB 3 ports dozing between clicks'
        Desc  = 'Stops USB 3 ports dropping into low-power link states between mouse and keyboard reports.'
        Warn  = 'You are on a laptop on battery. Only the plugged-in value of the current plan changes.'
        Power = @{ Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Set = 'd4e98f31-5ffe-4ce1-be31-1b38b384c009'; V = 0; D = 2 } }
@@ -7544,32 +7544,32 @@ $Tweaks = @(
 
     # =============================================================== Network
     @{ Id = 'coalescing'; Cat = 'Network'; Icon = [char]0xE839; Rec = $true
-       Title = 'Turn off packet coalescing'
-       Desc  = 'Stops the adapter holding incoming packets to deliver them in batches.'
+       Title = 'Stop the network card holding packets back'
+       Desc  = 'Turns off packet coalescing, so the adapter no longer holds incoming packets to deliver them in batches.'
        Warn  = 'You are on a laptop on battery. Applying briefly reconnects the adapter.'
        Test  = { Test-AdvProp '*PacketCoalescing' 0 }
        On    = { Set-AdvProp 'coalescing' '*PacketCoalescing' 0 }
        Off   = { Reset-AdvProp 'coalescing' '*PacketCoalescing' 1 } }
 
     @{ Id = 'flowcontrol'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Badge = 'advanced'
-       Title = 'Turn off flow control'
-       Desc  = 'Stops the adapter pausing traffic when the switch or router signals congestion.'
+       Title = 'Stop the network card pausing traffic'
+       Desc  = 'Turns off flow control, so the adapter no longer pauses traffic when the switch or router signals congestion.'
        Warn  = 'You see packet loss afterwards. Some cheap switches need flow control.'
        Test  = { Test-AdvProp '*FlowControl' 0 }
        On    = { Set-AdvProp 'flowcontrol' '*FlowControl' 0 }
        Off   = { Reset-AdvProp 'flowcontrol' '*FlowControl' 3 } }
 
     @{ Id = 'greeneth'; Cat = 'Network'; Icon = [char]0xE968; Rec = $true
-       Title = 'Turn off Green Ethernet'
-       Desc  = 'Realtek power-saving that lowers link power on short cables and can add jitter.'
+       Title = 'Realtek: stop the cable link saving power'
+       Desc  = 'Turns off Green Ethernet, Realtek power-saving that lowers link power on short cables and can add jitter.'
        Warn  = 'You do not have a Realtek adapter (hidden then). Applying briefly reconnects the adapter.'
        Test  = { Test-AdvProp 'EnableGreenEthernet' 0 }
        On    = { Set-AdvProp 'greeneth' 'EnableGreenEthernet' 0 }
        Off   = { Reset-AdvProp 'greeneth' 'EnableGreenEthernet' 1 } }
 
     @{ Id = 'advancedeee'; Cat = 'Network'; Icon = [char]0xE968; Rec = $true
-       Title = 'Turn off Advanced EEE'
-       Desc  = 'Realtek''s extra Energy-Efficient Ethernet mode, separate from standard EEE.'
+       Title = 'Realtek: stop the extra cable power-saving mode'
+       Desc  = 'Turns off Advanced EEE, Realtek''s extra Energy-Efficient Ethernet mode, separate from standard EEE.'
        Warn  = 'You do not have a Realtek adapter (hidden then). Applying briefly reconnects the adapter.'
        Test  = { Test-AdvProp 'AdvancedEEE' 0 }
        On    = { Set-AdvProp 'advancedeee' 'AdvancedEEE' 0 }
@@ -7584,16 +7584,16 @@ $Tweaks = @(
        Off   = { Reset-AdvProp 'rtkpower' 'PowerSavingMode' 1 } }
 
     @{ Id = 'roaming'; Cat = 'Network'; Icon = [char]0xE701; Rec = $true
-       Title = 'Wi-Fi: lowest roaming aggressiveness'
-       Desc  = 'Stops Intel Wi-Fi scanning for a "better" access point mid-game, a classic cause of ping spikes.'
+       Title = 'Wi-Fi: stop hunting for a better access point'
+       Desc  = 'Sets roaming aggressiveness to lowest, so Intel Wi-Fi stops scanning for a "better" access point mid-game, a classic cause of ping spikes.'
        Warn  = 'You move around a big home with several access points. Applying briefly reconnects Wi-Fi.'
        Test  = { Test-AdvDisplay 'RoamAggressiveness' 'Lowest' }
        On    = { Set-AdvDisplay 'roaming' 'RoamAggressiveness' 'Lowest' }
        Off   = { Reset-AdvProp 'roaming' 'RoamAggressiveness' 2 } }
 
     @{ Id = 'mimo'; Cat = 'Network'; Icon = [char]0xE701; Rec = $true
-       Title = 'Wi-Fi: no MIMO power saving'
-       Desc  = 'Keeps all Intel Wi-Fi antennas active instead of switching some off to save power.'
+       Title = 'Wi-Fi: keep all antennas on'
+       Desc  = 'Keeps all Intel Wi-Fi antennas active (MIMO power saving off) instead of switching some off to save power.'
        Warn  = 'You are on battery. Intel adapters only (hidden otherwise). Applying briefly reconnects Wi-Fi.'
        Test  = { Test-AdvDisplay 'MIMOPowerSaveMode' 'No SMPS' }
        On    = { Set-AdvDisplay 'mimo' 'MIMOPowerSaveMode' 'No SMPS' }
@@ -7739,11 +7739,11 @@ $Tweaks = @(
     (New-SvcTweak 'svc-fax' 'Fax' 3 'Turn off Fax service' 'Disables the fax service almost nobody uses.' 'You send faxes from this PC.' $true $null)
     (New-SvcTweak 'svc-maps' 'MapsBroker' 2 'Turn off Downloaded Maps Manager' 'Stops the service that manages offline maps.' 'You use offline maps.' $true $null)
     (New-SvcTweak 'svc-retaildemo' 'RetailDemo' 3 'Turn off Retail Demo service' 'Disables the shop-display demo mode service.' 'Never on a home PC.' $true $null)
-    (New-SvcTweak 'svc-wappush' 'dmwappushservice' 3 'Turn off WAP Push routing' 'Telemetry companion service that routes device-management push messages.' 'Your PC is managed by work or school IT (Intune/MDM).' $true $null)
+    (New-SvcTweak 'svc-wappush' 'dmwappushservice' 3 'Turn off the device-management push service' 'Telemetry companion service (WAP Push) that routes device-management push messages.' 'Your PC is managed by work or school IT (Intune/MDM).' $true $null)
     (New-SvcTweak 'svc-geo' 'lfsvc' 3 'Turn off Geolocation service' 'Stops apps polling your location in the background.' 'You use automatic time zone, weather location or Find My Device.' $false $null)
-    (New-SvcTweak 'svc-trkwks' 'TrkWks' 2 'Turn off Link Tracking client' 'Tracks moved files on NTFS network shares, which home PCs do not need.' 'You use shortcuts to files on a work network share.' $true $null)
+    (New-SvcTweak 'svc-trkwks' 'TrkWks' 2 'Turn off moved-file tracking' 'Distributed Link Tracking client: tracks moved files on NTFS network shares, which home PCs do not need.' 'You use shortcuts to files on a work network share.' $true $null)
     (New-SvcTweak 'svc-pca' 'PcaSvc' 2 'Turn off Program Compatibility Assistant' 'Stops Windows monitoring every program you run for compatibility problems.' 'You run very old programs that need compatibility fixes.' $false 'advanced')
-    (New-SvcTweak 'svc-iphlp' 'iphlpsvc' 2 'Turn off IP Helper' 'IPv6 transition tunnels (Teredo, IP-HTTPS) that Fortnite does not use.' 'You use Xbox party chat on PC or a work VPN that needs IP-HTTPS.' $false 'advanced')
+    (New-SvcTweak 'svc-iphlp' 'iphlpsvc' 2 'Turn off the IPv6 tunnel helper' 'IP Helper runs IPv6 transition tunnels (Teredo, IP-HTTPS) that Fortnite does not use.' 'You use Xbox party chat on PC or a work VPN that needs IP-HTTPS.' $false 'advanced')
     (New-SvcTweak 'svc-nvtelemetry' 'NvTelemetryContainer' 2 'Turn off NVIDIA telemetry' 'Older NVIDIA drivers run a telemetry container in the background (hidden if you do not have it).' 'Never. Drivers and the NVIDIA app keep working.' $true $null)
 
     @{ Id = 'task-telemetry'; Cat = 'Services'; Icon = [char]0xE823; Rec = $true
@@ -7851,14 +7851,14 @@ $Tweaks = @(
        Test  = { Test-PowerSet $t }; On = { Enable-PowerSet $t }; Off = { Disable-PowerSet $t } }
 
     @{ Id = 'sata-lpm'; Cat = 'Power'; Icon = [char]0xEDA2; Rec = $true; Lat = $true
-       Title = 'Turn off SATA link power-saving'
+       Title = 'Stop SATA drives dozing between reads'
        Desc  = 'Keeps the link to SATA SSDs and hard drives awake instead of letting it sleep between reads, which can cost up to 10 ms on wake.'
        Warn  = 'Laptops: slightly more power use. Does nothing if all your drives are NVMe.'
        Power = @{ Sub = '0012ee47-9041-4b5d-9b77-535fba8b1442'; Set = '0b2d69d7-a2a1-449c-9680-f91c70521c60'; V = 0; D = 1 } }
 
     @{ Id = 'gpu-msi'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Lat = $true; Badge = 'restart'
-       Title = 'Graphics card: message-signalled interrupts'
-       Desc  = 'Lets the graphics card signal the CPU without sharing an interrupt line, which lowers driver latency spikes. Only shown when your driver has not already done this itself (most new ones have).'
+       Title = 'Graphics card: quicker signals to the CPU'
+       Desc  = 'Turns on message-signalled interrupts (MSI): the graphics card signals the CPU without sharing an interrupt line, which lowers driver latency spikes. Only shown when your driver has not already done this itself (most new ones have).'
        Warn  = 'If a device stops working after the restart, turn this off again. A driver reinstall can reset it.'
        Requires = { @(Get-GpuMsiKeys).Count -gt 0 -and ((Test-GpuMsi) -eq $false -or $script:Backup.Custom.ContainsKey('gpu-msi')) }
        Test  = { Test-GpuMsi }
@@ -7886,15 +7886,15 @@ $Tweaks = @(
            $script:Backup.Custom.Remove($t.Id) } }
 
     @{ Id = 'mpo-off'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Badge = 'restart'
-       Title = 'Turn off multiplane overlay (MPO)'
-       Desc  = 'NVIDIA''s official fix for flicker, black flashes and stutter on multi-monitor or mixed-refresh setups, often with a browser or Discord on a second screen. True fullscreen is not affected.'
-       Warn  = 'Only use it if you see flicker or stutter with several monitors: it can add delay in borderless mode. Don''t combine with "Keep low-FPS games on overlay planes".'
+       Title = 'Fix flicker and stutter with two monitors'
+       Desc  = 'Turns off multiplane overlay (MPO), NVIDIA''s official fix for flicker, black flashes and stutter on multi-monitor or mixed-refresh setups, often with a browser or Discord on a second screen. True fullscreen is not affected.'
+       Warn  = 'Only use it if you see flicker or stutter with several monitors: it can add delay in borderless mode. Don''t combine with "Keep the fast screen path when FPS dips".'
        Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'; N = 'OverlayTestMode'; V = 5; D = $null; M = 0 } ) }
 
     @{ Id = 'overlay-minfps'; Cat = 'Graphics'; Icon = [char]0xE740; Rec = $false; Lat = $true; Badge = 'restart'
-       Title = 'Keep low-FPS games on overlay planes'
-       Desc  = 'A Microsoft-documented setting: a borderless game that briefly drops FPS keeps its low-latency direct path to the screen instead of being switched back to slower desktop composition.'
-       Warn  = 'Only helps borderless/windowed play on Windows 11. Microsoft may remove it in a future version. Don''t combine with "Turn off multiplane overlay".'
+       Title = 'Keep the fast screen path when FPS dips'
+       Desc  = 'A Microsoft-documented setting: a borderless game that briefly drops FPS keeps its low-latency direct path to the screen (overlay planes) instead of being switched back to slower desktop composition.'
+       Warn  = 'Only helps borderless/windowed play on Windows 11. Microsoft may remove it in a future version. Don''t combine with "Fix flicker and stutter with two monitors".'
        Reg   = @( @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'; N = 'OverlayMinFPS'; V = 0; D = $null; M = 15 } ) }
 
     (New-SvcTweak 'nahimic' 'NahimicService' 2 'Turn off Nahimic audio effects' 'Nahimic (bundled with MSI, Alienware, Legion and some ASUS/Gigabyte boards) is widely reported to cause CPU spikes and game stutter.' 'You lose Nahimic sound and mic effects. Some driver updates turn it back on.' $true 'restart')
@@ -8288,7 +8288,7 @@ $Tweaks = @(
     @{ Id = 'uploadcap'; Cat = 'Network'; Icon = [char]0xE898; Rec = $false; Lat = $true
        Title = 'Cap upload of cloud sync and torrent apps'
        Desc  = 'Limits Dropbox, Google Drive, MEGA, iCloud and torrent clients to about 4 Mbit/s upload, so a sync cannot fill your upload and cause bufferbloat lag. Fortnite''s own traffic is not touched.'
-       Warn  = 'You need fast uploads from these apps, or the Bufferbloat test already shows a clean upload.'
+       Warn  = 'You need fast uploads from these apps, or the Busy-connection lag test already shows a clean upload.'
        Test  = { [bool](Get-NetQosPolicy -ErrorAction Stop | Where-Object { $_.Name -like 'ZeroDelay cap *' }) }
        On    = {
            foreach ($exe in 'Dropbox.exe', 'GoogleDriveFS.exe', 'MEGAsync.exe', 'iCloudDrive.exe', 'qbittorrent.exe', 'BitTorrent.exe', 'uTorrent.exe') {
@@ -8300,9 +8300,9 @@ $Tweaks = @(
        Off   = { Get-NetQosPolicy -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'ZeroDelay cap *' } | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue } }
 
     @{ Id = 'bitscap'; Cat = 'Network'; Icon = [char]0xE896; Rec = $false; Lat = $true
-       Title = 'Cap background BITS downloads'
-       Desc  = 'Limits Windows'' Background Intelligent Transfer Service, used by some updaters and apps, to 10 Mbit/s so its downloads cannot fill a slower connection while you play.'
-       Warn  = 'Your connection is faster than about 100 Mbit/s and the Bufferbloat test is clean: then this only slows background updates.'
+       Title = 'Cap Windows background app downloads'
+       Desc  = 'Limits Windows'' Background Intelligent Transfer Service (BITS), used by some updaters and apps, to 10 Mbit/s so its downloads cannot fill a slower connection while you play.'
+       Warn  = 'Your connection is faster than about 100 Mbit/s and the Busy-connection lag test is clean: then this only slows background updates.'
        Reg   = @(
            @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'EnableBITSMaxBandwidth'; V = 1; D = $null }
            @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\BITS'; N = 'MaxTransferRateOnSchedule'; V = 10000; D = $null }
@@ -8731,15 +8731,15 @@ $Tweaks = @(
        Run   = { [void](Show-ZdDialog ("In Fortnite: Settings > Game UI > Net Debug Stats: On (some seasons also have Latency Debug Stats).`n`nWhat to look for:`n- Ping: your real game ping, which beats any outside test.`n- Packet loss in or out above 0: the cause of rubber-banding. Run the Jitter and loss test and Find where the lag starts.") ('Net Debug Stats') ('OK') ('Information')); 'Shown.' } }
 
     @{ Id = 'sqmguide'; Cat = 'Network'; Icon = [char]0xE839; Action = 'Show how'; Lat = $true
-       Title = 'Fix bufferbloat on your router (guided)'
-       Desc  = 'If the Bufferbloat test gives you grade C or worse, your router lets downloads queue in front of your game packets. Turning on Smart Queue / SQM on the router fixes that at the source; here is where it lives.'
+       Title = 'Fix lag when your connection is busy (guided)'
+       Desc  = 'If the Busy-connection lag test gives you grade C or worse, your router has bufferbloat: it lets downloads queue in front of your game packets. Turning on Smart Queue / SQM on the router fixes that at the source; here is where it lives.'
        Warn  = ''
-       Run   = { [void](Show-ZdDialog ("Turn on the router's queue management and set it to about 90% of your measured speeds:`n`n- ASUS: Adaptive QoS > QoS > enable, type 'Adaptive QoS' or (Merlin) 'Cake'.`n- UniFi: Settings > Internet > Smart Queues: on.`n- OpenWrt: install luci-app-sqm, Network > SQM QoS, queue 'cake'.`n- Netgear Nighthawk Pro / DumaOS: QoS > Anti-Bufferbloat: Always.`n- FRITZ!Box: Internet > Filters > Prioritization: put Fortnite (or the PC) in Real-time applications.`n- TP-Link Deco/Archer: QoS > enable, set the bandwidth, high priority for this PC.`n`nThen run the Bufferbloat test again: grade A or B means it worked. Provider-supplied routers often lack this option; then a router that has it is the fix.") ('Router bufferbloat fix') ('OK') ('Information')); 'Shown.' } }
+       Run   = { [void](Show-ZdDialog ("Turn on the router's queue management and set it to about 90% of your measured speeds:`n`n- ASUS: Adaptive QoS > QoS > enable, type 'Adaptive QoS' or (Merlin) 'Cake'.`n- UniFi: Settings > Internet > Smart Queues: on.`n- OpenWrt: install luci-app-sqm, Network > SQM QoS, queue 'cake'.`n- Netgear Nighthawk Pro / DumaOS: QoS > Anti-Bufferbloat: Always.`n- FRITZ!Box: Internet > Filters > Prioritization: put Fortnite (or the PC) in Real-time applications.`n- TP-Link Deco/Archer: QoS > enable, set the bandwidth, high priority for this PC.`n`nThen run the Busy-connection lag test again: grade A or B means it worked. Provider-supplied routers often lack this option; then a router that has it is the fix.") ('Router bufferbloat fix') ('OK') ('Information')); 'Shown.' } }
 
     @{ Id = 'nic-dmacoalesce'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Lat = $true
        Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'DMACoalescing' }) }
-       Title = 'Intel: turn off DMA coalescing'
-       Desc  = 'Some Intel network cards hold incoming packets back for a moment to save power. Intel''s own guide says this may increase network latency.'
+       Title = 'Intel: stop the network card holding packets'
+       Desc  = 'Some Intel network cards hold incoming packets back for a moment to save power (DMA coalescing). Intel''s own guide says this may increase network latency.'
        Warn  = 'You are on a laptop and battery life matters more than ping. Applying briefly reconnects the adapter.'
        Test  = { Test-AdvProp 'DMACoalescing' 0 }
        On    = { Set-AdvProp 'nic-dmacoalesce' 'DMACoalescing' 0 }
@@ -8766,8 +8766,8 @@ $Tweaks = @(
     # -------------------------------------------------------- Power / System
     @{ Id = 'x3d-balanced'; Cat = 'Power'; Icon = [char]0xE945; Rec = $true; Lat = $true
        Requires = { Test-DualCcdX3D }
-       Title = 'X3D: Balanced plan so AMD can park the slow die'
-       Desc  = 'On 7900X3D / 7950X3D / 9900X3D / 9950X3D, AMD''s driver only moves games onto the V-Cache die on the Balanced plan; high-performance plans keep both dies awake and Fortnite spreads across them. AMD''s own advice is Balanced.'
+       Title = 'X3D: Balanced plan so games use the cache cores'
+       Desc  = 'On 7900X3D / 7950X3D / 9900X3D / 9950X3D, AMD''s driver only parks the other die and moves games onto the V-Cache die on the Balanced plan; high-performance plans keep both dies awake and Fortnite spreads across them. AMD''s own advice is Balanced.'
        Warn  = 'Use this instead of the ZeroDelay or Ultimate Performance plan cards, not together with them. Set Windows'' Power mode to Best performance as well.'
        Test  = { (Get-ActivePowerScheme).Guid -eq $BalancedGuid }
        On    = {
@@ -8778,14 +8778,14 @@ $Tweaks = @(
        Off   = { $p = $script:Backup.Custom[$t.Id]; if ($p -and (powercfg /list | Where-Object { $_ -match $p })) { powercfg /setactive $p }; $script:Backup.Custom.Remove($t.Id) } }
 
     @{ Id = 'timerres-test'; Cat = 'System'; Icon = [char]0xE916; Action = 'Test'; Lat = $true
-       Title = 'Test your timer resolution'
-       Desc  = 'Measures how precisely Windows wakes a 1 ms sleep with no timer request, at 1 ms and at 0.5 ms (about a second), and says which is steadiest on this PC. Smaller is not always better, so measure before holding a resolution.'
+       Title = 'Test how precisely Windows keeps time'
+       Desc  = 'Measures how precisely Windows wakes a 1 ms sleep with no timer request, at 1 ms and at 0.5 ms timer resolution (about a second), and says which is steadiest on this PC. Smaller is not always better, so measure before holding a resolution.'
        Warn  = ''
        Run   = { Start-TimerResTest; 'Measuring the timer...' } }
 
     @{ Id = 'timerres-hold'; Cat = 'System'; Icon = [char]0xE916; Rec = $false; Lat = $true; Badge = 'restart'
-       Title = 'Hold 0.5 ms timer resolution'
-       Desc  = 'Keeps Windows'' timer at 0.5 ms while ZeroDelay runs (also in the tray) and lets games see it: Windows 11 otherwise keeps timer requests per app. Fortnite already asks for 1 ms; 0.5 ms makes frame caps and waits a little more even on some PCs and changes nothing on others.'
+       Title = 'Make the Windows clock tick every 0.5 ms'
+       Desc  = 'Keeps Windows'' timer resolution at 0.5 ms while ZeroDelay runs (also in the tray) and lets games see it: Windows 11 otherwise keeps timer requests per app. Fortnite already asks for 1 ms; 0.5 ms makes frame caps and waits a little more even on some PCs and changes nothing on others.'
        Warn  = 'The timer test shows no gain on your PC, or you play on battery: it costs a little power. Needs a restart the first time.'
        Test  = { [bool]$script:Backup.Custom['timerhold'] -and "$(Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'GlobalTimerResolutionRequests')" -eq '1' }
        On    = {
@@ -8843,8 +8843,8 @@ $Tweaks = @(
        ) }
 
     @{ Id = 'repair-platformclock'; Cat = 'Repair'; Icon = [char]0xE823; Rec = $true; Badge = 'restart'
-       Title = 'Stop forcing the slow HPET timer'
-       Desc  = 'Removes boot settings other tools add (useplatformclock, useplatformtick, disabledynamictick). Forcing the platform clock makes every high-precision time read cost about 1 µs plus a system call instead of about 30 ns.'
+       Title = 'Stop forcing the slow hardware clock'
+       Desc  = 'Removes boot settings other tools add (useplatformclock, useplatformtick, disabledynamictick) to force the HPET platform clock. That makes every high-precision time read cost about 1 µs plus a system call instead of about 30 ns.'
        Warn  = 'You set these for a specific reason and measured it. The values are backed up and come back if you switch this off.'
        Test  = { $v = Get-BcdTimerValues; if ($null -eq $v) { return $null }; $v.Count -eq 0 }
        On    = {
@@ -9032,7 +9032,7 @@ $Tweaks = @(
 
     @{ Id = 'repair-ifeo-junk'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $false
        Requires = { Test-RepairShown 'repair-ifeo-junk' }
-       Title = 'Remove fake Fortnite and csrss priority values'
+       Title = 'Remove fake Fortnite and system priority hacks'
        Desc  = 'Removes made-up values tweak packs write for Fortnite (CpuUtilization, GpuSpeed, InputBoosted, Disable...Validation), a Realtime priority, the run-as-administrator layer that stops overlays hooking in, and priority overrides on csrss.exe. ZeroDelay''s own priority and fullscreen settings stay.'
        Warn  = 'You set Fortnite to run as administrator on purpose. The values are backed up and come back if you switch this off. Restart Fortnite afterwards.'
        Test  = { Test-RepairClean 'repair-ifeo-junk' }
@@ -9118,7 +9118,7 @@ $Tweaks = @(
 
     @{ Id = 'wifi-mtk-roam'; Cat = 'Network'; Icon = [char]0xE701; Rec = $true
        Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'RoamNeedIndicateTh' }) }
-       Title = 'MediaTek Wi-Fi: lowest roaming aggressiveness'
+       Title = 'MediaTek Wi-Fi: stop hunting for access points'
        Desc  = 'MediaTek''s driver ships with roaming at Medium-High, so it starts looking for a "better" access point while the signal is still fine, and a scan mid-match is a ping spike. Lowest only roams when the signal is really weak. Twin of the Intel roaming card.'
        Warn  = 'You walk around a large home with several access points or a mesh. Applying briefly reconnects Wi-Fi.'
        Test  = { Test-AdvProp 'RoamNeedIndicateTh' 85 }
@@ -9144,8 +9144,8 @@ $Tweaks = @(
        Off   = { Restore-VnicMetric $t.Id } }
 
     @{ Id = 'repair-tcpleftovers'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true
-       Title = 'Undo netsh TCP tweaks from tweak packs'
-       Desc  = 'Puts TCP globals that tweak packs change (auto-tuning disabled, task offload off, odd congestion control, ECN, neighbour cache) back to the Windows defaults. Honest note: Fortnite''s match traffic is UDP, which none of these touch. Disabled auto-tuning does cap every download, launcher and browser at a 64 KB window though.'
+       Title = 'Undo tweak-pack changes to Windows networking'
+       Desc  = 'Puts netsh TCP globals that tweak packs change (auto-tuning disabled, task offload off, odd congestion control, ECN, neighbour cache) back to the Windows defaults. Honest note: Fortnite''s match traffic is UDP, which none of these touch. Disabled auto-tuning does cap every download, launcher and browser at a 64 KB window though.'
        Warn  = 'You set one of these yourself and measured a benefit. The old values are backed up and come back if you switch this off.'
        Test  = { try { @(Get-TcpLeftovers).Count -eq 0 } catch { $null } }
        On    = { Repair-TcpDefaults $t.Id }
@@ -9159,8 +9159,8 @@ $Tweaks = @(
 
     @{ Id = 'nic-msi'; Cat = 'Repair'; Icon = [char]0xE839; Rec = $false; Badge = 'restart'
        Requires = { (Get-NicMsiKey) -and ((Test-NicMsi) -eq $false -or $script:Backup.Custom.ContainsKey('nic-msi')) }
-       Title = 'Network card: message-signalled interrupts'
-       Desc  = 'Lets the network card signal the CPU with a message instead of a shared interrupt line, as the graphics card option does. Current Intel, Realtek and Marvell drivers already do this themselves; it is only shown when yours does not. One author measured ping 21 to 19 ms and less loss; no controlled test exists.'
+       Title = 'Network card: quicker signals to the CPU'
+       Desc  = 'Lets the network card signal the CPU with a message-signalled interrupt (MSI) instead of a shared line, as the graphics card option does. Current Intel, Realtek and Marvell drivers already do this themselves; it is only shown when yours does not. One author measured ping 21 to 19 ms and less loss; no controlled test exists.'
        Warn  = 'If the network card stops working after the restart, switch this off again (safe mode works if needed). A driver reinstall can reset it. Not for USB adapters.'
        Test  = { Test-NicMsi }
        On    = {
@@ -9177,7 +9177,7 @@ $Tweaks = @(
 
     @{ Id = 'rtl-gigalite-off'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false
        Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'GigaLite' }) }
-       Title = 'Realtek: turn off Gigabit Lite'
+       Title = 'Realtek: stop quietly dropping to half speed'
        Desc  = 'Gigabit Lite lets a Realtek card quietly settle for a 500 Mbit/s link on a marginal cable instead of full gigabit. It does not change per-packet delay; switching it off makes a bad cable show up as a real problem in Check your cable connection instead of a hidden slowdown.'
        Warn  = 'Your cable is marginal and you prefer a slower link over drops. Applying briefly reconnects the adapter.'
        Test  = { Test-AdvProp 'GigaLite' 0 }
@@ -9188,9 +9188,9 @@ $Tweaks = @(
     # ---------------------------------------------------------- Power / AMD
     @{ Id = 'ccd-balanced'; Cat = 'Power'; Icon = [char]0xE945; Rec = $false; Lat = $true
        Requires = { Test-DualCcdRyzen }
-       Title = '9900X / 9950X: Balanced plan for die parking'
+       Title = '9900X / 9950X: Balanced plan, games on one half'
        Desc  = 'On the Ryzen 9 9900X and 9950X, AMD''s chipset driver parks the second die while a game runs, but only on the Balanced plan with Game Mode on and Xbox Game Bar installed. High-performance plans keep both dies awake, so Fortnite''s threads spread across them (about 210 ns between dies on Zen 5). Reviewers expect a few percent.'
-       Warn  = 'Use instead of the ZeroDelay or Ultimate plan cards, not with them, and leave Unpark all cores off. Set Windows'' Power mode to Best performance. Does nothing without AMD''s chipset driver (the AMD chipset card checks).'
+       Warn  = 'Use instead of the ZeroDelay or Ultimate plan cards, not with them, and leave Keep all CPU cores awake off. Set Windows'' Power mode to Best performance. Does nothing without AMD''s chipset driver (the AMD chipset card checks).'
        Test  = { (Get-ActivePowerScheme).Guid -eq $BalancedGuid }
        On    = {
            if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = (Get-ActivePowerScheme).Guid }
@@ -9201,7 +9201,7 @@ $Tweaks = @(
 
     @{ Id = 'ccd-parking'; Cat = 'Power'; Icon = [char]0xE964; Action = 'Check'
        Requires = { (Test-DualCcdX3D) -or (Test-DualCcdRyzen) }
-       Title = 'Check AMD core parking'
+       Title = 'Check Ryzen games stay on one half of the CPU'
        Desc  = 'On dual-die Ryzen (9900X, 9950X and the X3D versions) checks everything AMD needs to park the second die for games: Balanced plan, chipset driver, Xbox Game Bar, Game Mode, the plan''s parking minimum, and while Fortnite runs, how many cores are really parked. Lists AMD''s documented repairs.'
        Warn  = ''
        Run   = { Start-CcdParkingCheck; 'Checking AMD core parking...' } }
@@ -9215,8 +9215,8 @@ $Tweaks = @(
 
     @{ Id = 'ftpm-stutter'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'
        Requires = { (Test-Am4Ryzen) -and ((Get-TpmInfo).Mfr -eq 'AMD') }
-       Title = 'AM4: check for the fTPM stutter'
-       Desc  = 'Ryzen 1000 to 5000 PCs using the firmware TPM froze for one to three seconds every few minutes, with crackling audio, until AMD''s AGESA 1.2.0.7 fix (May 2022). Compares your BIOS date with that fix. Hidden on AM5, which shipped after the fix, and when a discrete TPM is used.'
+       Title = 'AM4 Ryzen: check for the random freeze bug'
+       Desc  = 'Ryzen 1000 to 5000 PCs using the firmware TPM (fTPM) froze for one to three seconds every few minutes, with crackling audio, until AMD''s AGESA 1.2.0.7 fix (May 2022). Compares your BIOS date with that fix. Hidden on AM5, which shipped after the fix, and when a discrete TPM is used.'
        Warn  = ''
        Run   = { [void](Show-ZdDialog (Get-FtpmReport) 'fTPM stutter' 'OK' 'Information'); 'Checked.' } }
 
@@ -9258,7 +9258,7 @@ $Tweaks = @(
        Run   = { [void](Show-ZdDialog (Get-RebarReport) 'Resizable BAR' 'OK' 'Information'); 'Checked.' } }
 
     @{ Id = 'pcie-link'; Cat = 'Graphics'; Icon = [char]0xE964; Action = 'Check'
-       Title = 'Check the graphics card''s PCIe link'
+       Title = 'Check the graphics card''s slot speed'
        Desc  = 'Reads the PCIe width and generation your graphics card negotiated against what it supports. Boards split the top slot to x8 when certain M.2 slots are used; PCIe 3.0 x8 or less costs about 5% average FPS and more in 1% lows (TechPowerUp). Run it during a match to see the loaded speed.'
        Warn  = ''
        Run   = { Start-PcieLinkCheck; 'Reading the PCIe link...' } }
@@ -9313,7 +9313,7 @@ $Tweaks = @(
 
     @{ Id = 'gameinput-dup'; Cat = 'Input'; Icon = [char]0xE7FC; Action = 'Check'
        Requires = { Test-SvcKey 'GameInputSvc' }
-       Title = 'Two GameInput versions installed?'
+       Title = 'Two controller input packages installed?'
        Desc  = 'Since September 2025, FPS drops and crackling audio a few minutes after touching a controller were traced to two Microsoft GameInput versions installed side by side. This finds the duplicate and shows which one to remove. The GameInput service itself is never disabled.'
        Warn  = ''
        Run   = { [void](Show-ZdDialog (Get-GameInputReport) 'Microsoft GameInput' 'OK' 'Information'); 'Checked.' } }
@@ -9342,14 +9342,14 @@ $Tweaks = @(
        Run   = { [void](Show-ZdDialog (Get-AdminProtectionReport) 'Administrator protection' 'OK' 'Information'); 'Checked.' } }
 
     @{ Id = 'kerneldriver-tools'; Cat = 'System'; Icon = [char]0xE9F9; Action = 'Check'; Lat = $true
-       Title = 'Find kernel-driver sensor and RGB tools'
-       Desc  = 'Lists the port I/O drivers (inpoutx64, WinRing0, AsIO, gdrv, RwDrv, NTIOLib) and the sensor and RGB apps using them (iCUE, Armoury Crate, MSI Center, NZXT CAM, HWiNFO64, Afterburner, AIDA64, OpenRGB, SignalRGB). Their polling stalls every core for up to milliseconds, and Microsoft ties inpoutx64 to anti-cheat game crashes.'
+       Title = 'Find sensor and RGB tools that stall the CPU'
+       Desc  = 'Lists kernel port I/O drivers (inpoutx64, WinRing0, AsIO, gdrv, RwDrv, NTIOLib) and the sensor and RGB apps using them (iCUE, Armoury Crate, MSI Center, NZXT CAM, HWiNFO64, Afterburner, AIDA64, OpenRGB, SignalRGB). Their polling stalls every core for up to milliseconds, and Microsoft ties inpoutx64 to anti-cheat game crashes.'
        Warn  = ''
        Run   = { Start-BackgroundReport 'Get-KernelDriverToolsReport'; 'Looking for sensor drivers and pollers...' } }
 
     @{ Id = 'inpoutx64-off'; Cat = 'System'; Icon = [char]0xE83D; Rec = $false; Badge = 'restart'
        Requires = { Test-SvcKey 'inpoutx64' }
-       Title = 'Stop the inpoutx64 driver loading'
+       Title = 'Block the RGB and fan driver that crashes games'
        Desc  = 'Microsoft''s own workaround (release health, August 2026) for games that hang, close silently or reboot the PC when the inpoutx64 port I/O driver from RGB or fan software is present (ARC Raiders, THE FINALS and other Easy Anti-Cheat games). Sets the driver to disabled; your Start value is backed up.'
        Warn  = 'A fan or RGB tool that needs it (FanControl, older OpenRGB, some MSI and ASRock utilities) loses its sensors or lighting control. Microsoft states its investigation shows no unintended behaviour from disabling it.'
        Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\inpoutx64'; N = 'Start'; V = 4; D = 3; M = 3 } ) }
@@ -9373,7 +9373,7 @@ $Tweaks = @(
        Run   = { Start-TaskAudit; 'Reading the scheduled tasks...' } }
 
     @{ Id = 'hyperv-check'; Cat = 'System'; Icon = [char]0xE83D; Action = 'Check'; Lat = $true
-       Title = 'Is Windows running under Hyper-V?'
+       Title = 'Is Windows running inside a virtual machine?'
        Desc  = 'Shows whether Windows runs as a virtual machine on its own hypervisor and what keeps it there: VBS, Credential Guard, WSL2, Docker, Windows Sandbox, Virtual Machine Platform or Hyper-V. Explains why turning Memory Integrity off alone changed nothing. Reports only; the fixes are existing cards.'
        Warn  = ''
        Run   = { Start-HypervisorReport; 'Checking the virtualization state...' } }
@@ -9657,8 +9657,8 @@ $Tweaks = @(
        Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'TaskbarAnimations'; V = 0; D = 1; M = 1 } ) }
 
     @{ Id = 'peek'; Cat = 'Visuals'; Icon = [char]0xE7B3; Rec = $false; Badge = 'signout'
-       Title = 'Turn off Aero Peek'
-       Desc  = 'Stops the desktop preview when you hover the corner of the taskbar.'
+       Title = 'Turn off the desktop preview on hover'
+       Desc  = 'Turns off Aero Peek, the desktop preview when you hover the corner of the taskbar.'
        Warn  = 'You use Peek to glance at the desktop.'
        Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\DWM'; N = 'EnablePeek'; V = 0; D = 1; M = 1 } ) }
 
@@ -10555,8 +10555,8 @@ if ($script:Glass) {
                 <ToggleButton x:Name="GmSwitch" Grid.Column="1" Style="{StaticResource Switch}" Width="36" Height="22" VerticalAlignment="Center" Margin="8,0,0,0"/>
               </Grid>
             </Border>
-            <Border Height="1" Background="#38383A" Margin="15,0,0,0"/>
-            <StackPanel x:Name="ActivePanel" Margin="15,10,15,12" Background="Transparent" Cursor="Hand" ToolTip="See every active tweak">
+            <Border Height="1" Background="#38383A" Margin="15,0,0,0" Visibility="Collapsed"/>
+            <StackPanel x:Name="ActivePanel" Visibility="Collapsed" Margin="15,10,15,12" Background="Transparent" Cursor="Hand" ToolTip="See every active tweak">
               <StackPanel Orientation="Horizontal">
                 <TextBlock x:Name="ActiveCount" FontSize="15" FontWeight="Bold" Typography.NumeralAlignment="Tabular"/>
                 <TextBlock Text="active" FontSize="12" Foreground="#A1A1A6" VerticalAlignment="Bottom" Margin="6,0,0,1"/>
@@ -10596,7 +10596,12 @@ if ($script:Glass) {
       <Grid Margin="32,28,32,20">
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-        <TextBlock x:Name="PageTitle" Text="All optimizations" FontSize="28" FontWeight="Bold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="BackBtn" Style="{StaticResource Btn}" Padding="10,6" Margin="0,0,14,0" VerticalAlignment="Center" Visibility="Collapsed">
+            <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE72B;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="12" Margin="0,1,8,0"/><TextBlock x:Name="BackText" Text="Tools"/></StackPanel>
+          </Button>
+          <TextBlock x:Name="PageTitle" Text="All optimizations" FontSize="28" FontWeight="Bold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+        </StackPanel>
         <StackPanel Grid.Row="1" Grid.ColumnSpan="2">
           <TextBlock x:Name="LatencyNote" Margin="0,6,0,0" FontSize="13" Foreground="#A1A1A6" TextWrapping="Wrap" MaxWidth="760" HorizontalAlignment="Left" Visibility="Collapsed"
                      Text="Only the tweaks that change input delay, frame time or ping. Green icons mark them in every tab."/>
@@ -10634,6 +10639,10 @@ if ($script:Glass) {
         </StackPanel>
       </Grid>
       <StackPanel Grid.Row="1">
+      <StackPanel x:Name="ChipBar" Margin="32,0,32,4" Visibility="Collapsed">
+        <WrapPanel x:Name="ChipViews"/>
+        <WrapPanel x:Name="ChipAreas" Margin="0,2,0,0"/>
+      </StackPanel>
       <Border x:Name="UpdateBar" Margin="32,0,32,12" Background="#2C2C2E" BorderBrush="#38383A" BorderThickness="1" CornerRadius="12" Padding="12,12,16,12" Visibility="Collapsed">
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -10811,7 +10820,7 @@ $ui = @{}
 foreach ($n in 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
             'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon',
-            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote') { $ui[$n] = $window.FindName($n) }
+            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
     restart  = @{ Color = '#0A84FF'; Label = 'Needs restart'; Tip = 'Takes effect after you restart the PC.' }
@@ -11642,6 +11651,9 @@ $Categories = @(
     @{ Name = 'Home';       Icon = [char]0xE80F; Title = 'Home'; Page = 'Home' }
     @{ Name = 'Games';      Icon = [char]0xE7FC; Title = 'Games'; Page = 'Games' }
     @{ Name = 'Boost';      Icon = [char]0xE945; Title = 'Boost'; Page = 'Boost' }
+    @{ Name = 'Tweaks';     Icon = [char]0xE9E9; Title = 'Tweaks' }
+    @{ Name = 'Checks';     Icon = [char]0xE9D9; Title = 'Checks' }
+    @{ Name = 'Tools';      Icon = [char]0xE71D; Title = 'Tools'; Page = 'Tools' }
     @{ Name = 'All';        Icon = [char]0xE80F; Title = 'All optimizations' }
     @{ Name = 'Active';     Icon = [char]0xE73E; Title = 'Active tweaks'; Page = 'Active' }
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
@@ -13300,7 +13312,7 @@ function Invoke-Wizard {
     Add-History 'Setup wizard finished' 'wizard' $null
     $ui.Wizard.Visibility = 'Collapsed'
     Show-Toast ("All set: $($msg -join ', '). " + $(if ($rp -like 'Restore point created*') { 'A restore point was made first.' } elseif ($rp -like 'Could not*') { "No restore point was made. $rp" } else { '' })) $(if ($rp -like 'Could not*') { '#FF9F0A' } else { '#30D158' })
-    $script:NavButtons['Health'].IsChecked = $true
+    Select-NavPage 'Health'
 }
 
 # =============================================================== Settings (tray, auto-fix)
@@ -13608,6 +13620,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.17.0' = @(
+        @{ T = 'A simpler ZeroDelay'; D = 'Six places in the menu instead of about forty: Home, Games, Tweaks, Checks, Tools and Settings. Every tweak, check and tool is still here.' }
+        @{ T = 'Home shows your results first'; D = 'Your last matches: ping, packet loss, FPS and stutters, then your score with Boost now and Restore, the live view, and how much is on for each part of your PC.' }
+        @{ T = 'Tweaks with filters'; D = 'One page with the recommended tweaks first and chips for input delay, what is switched on, what is new, everything, and each area (Fortnite, graphics, network and more).' }
+        @{ T = 'Checks in one place'; D = 'Everything that only looks and reports is on the Checks page, grouped by area, with the full health check one click away. Tweaks change your PC; checks never do.' }
+        @{ T = 'Tools as tiles, and plainer names'; D = 'Match reports, benchmark, Game Mode, sensitivity, cleanup and the rest are tiles on Tools. Many card titles now say what you will notice instead of the technical name; search still finds the old names.' }
+    )
     '1.16.2' = @(
         @{ T = 'Timer resolution'; D = 'A test that measures how precisely Windows wakes at the default timer, 1 ms and 0.5 ms on your PC, and a card that holds 0.5 ms while ZeroDelay runs and lets games see it. Smaller is not always better, so the test tells you whether it helps here.' }
         @{ T = 'Real game logos'; D = 'The Fortnite and Counter-Strike 2 tiles and game pages show each game''s own logo, read from the game installed on your PC (nothing is copied into ZeroDelay). Games that are not installed keep ZeroDelay''s artwork.' }
@@ -16470,9 +16489,20 @@ function Update-StatusStrip([bool]$Paused) {
 function New-HomePage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
-  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='10,6' Margin='0,0,0,16'>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='24,20' Margin='0,0,0,16'>
     <Grid>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text='Your last matches' FontSize='15' FontWeight='SemiBold'/>
+        <TextBlock x:Name='ResSub' FontSize='12.5' Foreground='#A1A1A6' Margin='0,2,0,0' TextWrapping='Wrap'/>
+      </StackPanel>
+      <Button x:Name='ResOpen' Grid.Column='1' Style='{DynamicResource Btn}' Content='Match reports' VerticalAlignment='Top' Padding='12,6'/>
+    </Grid>
+  </Border>
+  <UniformGrid x:Name='ResNums' Columns='4' Margin='-14,-30,-2,2'/>
+  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='10,6' Margin='0,14,0,16'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
       <Grid Width='132' Height='132' VerticalAlignment='Center' Margin='24'>
         <Ellipse Stroke='#3A3A3C' StrokeThickness='11'/>
         <Ellipse x:Name='Ring' Stroke='#30D158' StrokeThickness='11' StrokeDashCap='Round' RenderTransformOrigin='0.5,0.5'>
@@ -16483,13 +16513,22 @@ function New-HomePage {
           <TextBlock Text='optimized' FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center' Margin='0,-4,0,0'/>
         </StackPanel>
       </Grid>
-      <StackPanel Grid.Column='1' Margin='6,0,24,0' VerticalAlignment='Center'>
-        <TextBlock x:Name='Headline' FontSize='26' FontWeight='Bold' TextWrapping='Wrap'/>
-        <TextBlock x:Name='Sub' FontSize='13.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'/>
+      <StackPanel Grid.Column='1' Margin='6,24,24,24' VerticalAlignment='Center'>
+        <TextBlock x:Name='Headline' FontSize='24' FontWeight='Bold' TextWrapping='Wrap'/>
+        <TextBlock x:Name='Sub' FontSize='13' Foreground='#A1A1A6' Margin='0,6,0,0' TextWrapping='Wrap' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+        <WrapPanel Margin='0,16,0,0'>
+          <Button x:Name='Go' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='22,10' FontSize='14' Margin='0,0,10,8'>
+            <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,8,0'/><TextBlock x:Name='GoText' Text='Boost now'/></StackPanel>
+          </Button>
+          <Button x:Name='Undo' Style='{DynamicResource Btn}' Padding='18,10' FontSize='14' Margin='0,0,18,8'>
+            <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE7A7;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,8,0'/><TextBlock Text='Restore'/></StackPanel>
+          </Button>
+          <StackPanel Orientation='Horizontal' VerticalAlignment='Center' Margin='0,0,0,8'>
+            <ToggleButton x:Name='Auto' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
+            <TextBlock Text='Game Mode by itself when Fortnite starts' FontSize='12.5' VerticalAlignment='Center' Margin='10,0,0,0'/>
+          </StackPanel>
+        </WrapPanel>
       </StackPanel>
-      <Button x:Name='Go' Grid.Column='2' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='26,13' FontSize='15' VerticalAlignment='Center' Margin='0,0,24,0'>
-        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,10,0'/><TextBlock x:Name='GoText' Text='Optimize'/></StackPanel>
-      </Button>
     </Grid>
   </Border>
   <Border x:Name='Warm' CornerRadius='16' Background='#1F0A84FF' BorderBrush='#550A84FF' BorderThickness='1' Padding='18,14' Margin='0,0,12,16' Visibility='Collapsed'>
@@ -16504,65 +16543,51 @@ function New-HomePage {
     <TextBlock Text='Live while this page is open' FontSize='12' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Bottom'/>
   </Grid>
   <UniformGrid x:Name='Live' Columns='3' Margin='-14,-6,-2,22'/>
-  <UniformGrid Columns='3' Margin='-14,-14,-2,-14'>
-    <Border Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2'>
-      <StackPanel>
-        <Grid><TextBlock Text='Game Mode' FontSize='15' FontWeight='SemiBold'/><ToggleButton x:Name='Gm' Style='{DynamicResource Switch}' HorizontalAlignment='Right'/></Grid>
-        <TextBlock x:Name='GmText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
-      </StackPanel>
-    </Border>
-    <Border x:Name='HealthTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
-      <StackPanel>
-        <Grid><TextBlock Text='Health check' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
-        <TextBlock x:Name='HealthText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
-      </StackPanel>
-    </Border>
-    <Border x:Name='MatchTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
-      <StackPanel>
-        <Grid><TextBlock Text='Last match' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
-        <TextBlock x:Name='MatchText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
-      </StackPanel>
-    </Border>
-    <Border x:Name='PcTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
-      <StackPanel>
-        <Grid><TextBlock Text='This PC' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
-        <TextBlock x:Name='PcText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
-      </StackPanel>
-    </Border>
-    <Border x:Name='CleanTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
-      <StackPanel>
-        <Grid><TextBlock Text='Clean up' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
-        <TextBlock Text='Temp files, update leftovers and caches. You see the size first.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
-      </StackPanel>
-    </Border>
-    <Border x:Name='TweaksTile' Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2' Cursor='Hand'>
-      <StackPanel>
-        <Grid><TextBlock Text='All tweaks' FontSize='15' FontWeight='SemiBold'/><TextBlock Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Center'/></Grid>
-        <TextBlock x:Name='TweaksText' FontSize='12.5' Foreground='#A1A1A6' Margin='0,8,0,0' TextWrapping='Wrap' MinHeight='36'/>
-      </StackPanel>
-    </Border>
-  </UniformGrid>
+  <TextBlock Text='Your PC' FontSize='15' FontWeight='SemiBold'/>
+  <UniformGrid x:Name='Areas' Columns='3' Margin='-14,-6,-2,-14'/>
 </StackPanel>
 "@)
-    $h = @{}; foreach ($n in 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Gm', 'GmText', 'HealthTile', 'HealthText', 'MatchTile', 'MatchText', 'PcTile', 'PcText', 'CleanTile', 'TweaksTile', 'TweaksText', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk') { $h[$n] = $root.FindName($n) }
+    $h = @{}
+    foreach ($n in 'ResSub', 'ResOpen', 'ResNums', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk', 'Areas') { $h[$n] = $root.FindName($n) }
     $h.WarmOk.Add_Click({ $script:Backup.Custom.Remove('shaderwarm'); Save-Backup; Hide-Animated $script:HomeUi.Warm 200 })
     $script:HomeUi = $h
+    $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
+    $h.Undo.Add_Click({ $ui.RestoreAll.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
+    $h.Auto.Add_Click({ param($s, $e) $p = Get-GameModePrefs; $p['auto'] = [bool]$s.IsChecked; $script:Backup.Custom['gamemodeprefs'] = $p; Save-Backup; Update-GameModeUi; Show-Toast $(if ($s.IsChecked) { 'Game Mode turns on by itself when Fortnite starts.' } else { 'Game Mode only turns on when you start it.' }) '#30D158' })
+    $h.ResOpen.Add_Click({ Select-NavPage 'Matches' })
+    # last matches: four numbers
+    $h.Res = @{}
+    foreach ($k in @(@('ping', 'ms ping'), @('loss', '% packet loss'), @('fps', 'average FPS'), @('stut', 'stutters per minute'))) {
+        $b = [ZdTheme]::Parse("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='20,14' Margin='14,14,-2,-2'><StackPanel><TextBlock Text='-' FontSize='28' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='$($k[1])' FontSize='12' Foreground='#A1A1A6'/></StackPanel></Border>")
+        [void]$h.ResNums.Children.Add($b); $h.Res[$k[0]] = $b.Child.Children[0]
+    }
+    # live tiles
     $live = $root.FindName('Live'); $script:LiveUi = @{}
     foreach ($d in $LiveTileDefs) { $script:LiveUi[$d.Key] = New-LiveTile $d; [void]$live.Children.Add($script:LiveUi[$d.Key].Root) }
     $script:LiveUi.apps = New-LiveAppsTile; [void]$live.Children.Add($script:LiveUi.apps.Root)
     Update-LiveTiles; Start-LiveTimer
-    $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
-    $h.Gm.Add_Click({ param($s, $e)
-        $window.Cursor = [Windows.Input.Cursors]::Wait
-        $msg = if ($s.IsChecked) { Enable-ZDGameMode } else { $m = Disable-ZDGameMode; if (Test-FortniteRunning) { $script:GmSuppress = $true }; $m }
-        $window.Cursor = $null
-        Show-Toast $msg '#30D158'; Update-GameModeUi; Update-HomePage })
-    foreach ($pair in @(@('HealthTile', 'Health'), @('MatchTile', 'Matches'), @('PcTile', 'ThisPC'), @('CleanTile', 'Clean'), @('TweaksTile', 'All'))) {
-        $h[$pair[0]].Tag = $pair[1]
-        $h[$pair[0]].Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag })
-        $h[$pair[0]].RenderTransform = New-Object Windows.Media.TranslateTransform
-        $h[$pair[0]].Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
-        $h[$pair[0]].Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
+    # the parts of the PC the tweaks cover; a click opens Tweaks on that area
+    $h.AreaTiles = @{}
+    foreach ($a in $BoostAreas + @(@{ Title = 'Graphics driver'; Icon = [char]0xE7F8; Cats = @(); Nav = 'Nvidia'; Driver = $true })) {
+        $tile = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='18,14' Margin='14,14,-2,-2' Cursor='Hand'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+    <Border Width='38' Height='38' CornerRadius='11' Background='#2C2C2E' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$a.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <StackPanel Grid.Column='1' Margin='12,0,0,0' VerticalAlignment='Center'>
+      <TextBlock Text='$(Esc $a.Title)' FontSize='14' FontWeight='SemiBold'/>
+      <TextBlock FontSize='12' Foreground='#A1A1A6' Margin='0,2,0,0' TextWrapping='Wrap'/>
+    </StackPanel>
+  </Grid>
+</Border>
+"@)
+        $tile.Tag = $a
+        $tile.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag.Nav })
+        $tile.RenderTransform = New-Object Windows.Media.TranslateTransform
+        $tile.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
+        $tile.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
+        [void]$h.Areas.Children.Add($tile)
+        $h.AreaTiles[$a.Title] = $tile
     }
     $script:PageRefresh['Home'] = { Update-HomePage }
     Update-HomePage
@@ -16576,43 +16601,220 @@ function Update-HomePage {
         $h.WarmText.Text = "Fortnite rebuilds its shaders after a game or driver update, so your next $([int]$w.Left) match$(if ([int]$w.Left -ne 1) { 'es' }) may hitch. Play a warm-up match before a cup or a benchmark; it settles by itself."
         $h.Warm.Visibility = 'Visible'
     } else { $h.Warm.Visibility = 'Collapsed' }
-    $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State })
+    # last matches (up to 5)
+    $reps = @(Get-MatchReports | Select-Object -First 5)
+    $num = { param($v) if ($null -eq $v) { $null } else { [double]$v } }
+    $avg = { param($vals) $v = @($vals | Where-Object { $null -ne $_ }); if ($v.Count) { ($v | Measure-Object -Average).Average } else { $null } }
+    $ping = & $avg @($reps | ForEach-Object { & $num $_.PingAvg })
+    $loss = & $avg @($reps | ForEach-Object { & $num $_.LossPct })
+    $fps = & $avg @($reps | ForEach-Object { if ($_.Fps) { & $num $_.Fps.Avg } })
+    $mins = (@($reps | Where-Object { $null -ne $_.StutterCount } | ForEach-Object { [double]$_.Minutes }) | Measure-Object -Sum).Sum
+    $stut = if ($mins -gt 0) { (@($reps | ForEach-Object { & $num $_.StutterCount }) | Measure-Object -Sum).Sum / $mins } else { $null }
+    $h.Res.ping.Text = if ($null -ne $ping) { '{0:0}' -f $ping } else { '-' }
+    $h.Res.loss.Text = if ($null -ne $loss) { '{0:0.#}' -f $loss } else { '-' }
+    $h.Res.fps.Text = if ($null -ne $fps) { '{0:0}' -f $fps } else { '-' }
+    $h.Res.stut.Text = if ($null -ne $stut) { '{0:0.#}' -f $stut } else { '-' }
+    $h.ResSub.Text = if ($reps.Count) { "Averages of your last $($reps.Count) match$(if ($reps.Count -ne 1) { 'es' }), the latest on $(([datetime]$reps[0].Start).ToString('ddd d MMM, HH:mm')). This is what your settings really do." }
+                     else { 'Play a match with ZeroDelay open and your ping, packet loss, FPS and stutters show up here. That is what your settings really do.' }
+    # score
+    $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State -and -not $_.Hidden })
     $on = @($rec | Where-Object { $_.State }).Count
     $left = $rec.Count - $on
     $pct = if ($rec.Count) { [int][Math]::Round(100 * $on / $rec.Count) } else { 100 }
     Start-CountUp $h.Pct $pct '' 900
-    # ring: dash length in stroke-thickness units around the circle (diameter 132 - stroke 11)
     $circ = [Math]::PI * (132 - 11) / 11
     $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(($circ * $pct / 100), 1000))
     $h.Ring.Stroke = ConvertTo-Brush $(if ($pct -ge 90) { '#30D158' } elseif ($pct -ge 60) { '#FFD60A' } else { '#FF9F0A' })
-    $h.Ring.Effect = New-Glow $h.Ring.Stroke.Color 22 0.55   # the ring glows in its own colour
+    $h.Ring.Effect = New-Glow $h.Ring.Stroke.Color 22 0.55
     if ($left -gt 0) {
         $h.Headline.Text = "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off"
-        $h.Sub.Text = 'Optimize shows the list and you pick what to switch on. A restore point comes first, and every change can be undone from the menu next to Optimize.'
-        $h.Go.IsEnabled = $true; $h.GoText.Text = 'Optimize'
+        $h.Sub.Text = 'Boost now shows the list and you pick what to switch on. A restore point comes first; Restore undoes everything ZeroDelay changed.'
+        $h.Go.IsEnabled = $true; $h.GoText.Text = 'Boost now'
     } else {
         $h.Headline.Text = 'Your PC is fully optimized'
         $h.Sub.Text = 'Everything recommended for this PC is on. ZeroDelay keeps watching and tells you if another program changes something back.'
         $h.Go.IsEnabled = $false; $h.GoText.Text = 'All set'
     }
-    $gm = Test-ZDGameMode
-    $h.Gm.IsChecked = $gm
-    $h.GmText.Text = if ($gm) { 'On. Background apps are closed and the PC is in match mode.' } elseif ((Get-GameModePrefs).auto) { 'Turns on by itself when Fortnite starts.' } else { 'Closes background apps and switches to match mode while you play.' }
-    $issues = @($script:HealthIssues)
-    $h.HealthText.Text = if ($null -eq $script:HealthIssues) { 'Scan for the problems that cost the most FPS and delay.' } elseif ($issues.Count) { "$($issues.Count) thing$(if ($issues.Count -ne 1) { 's' }) to look at." } else { 'Everything looks good.' }
-    $mr = @(Get-MatchReports) | Select-Object -First 1
-    $h.MatchText.Text = if ($mr) { "$(([datetime]$mr.Start).ToString('ddd HH:mm')): $(if (@($mr.Issues).Count) { "$(@($mr.Issues).Count) thing$(if (@($mr.Issues).Count -ne 1) { 's' }) got in the way" } else { 'smooth' })$(if ($mr.Fps) { ", $($mr.Fps.Avg) FPS" })." } else { 'Play a match with ZeroDelay open to get your first report.' }
-    $p = $script:SysProfile
-    $h.PcText.Text = if ($p) { "$((Get-MainGpu $p).Name), $($p.Memory.TotalGb) GB RAM. $(@($script:TailorNotes).Count) adjustments for this PC." } else { 'Scanning your hardware and apps...' }
-    $all = @($Tweaks | Where-Object { $_.Toggle -and $null -ne $_.State })
-    $h.TweaksText.Text = "$(@($all | Where-Object { $_.State }).Count) of $($all.Count) switched on, in $(@($Categories | Where-Object { -not $_.Page }).Count) groups."
+    $h.Auto.IsChecked = [bool](Get-GameModePrefs)['auto']
+    foreach ($a in $BoostAreas) {
+        $r = @($rec | Where-Object { $a.Cats -contains $_.Cat }); $o = @($r | Where-Object { $_.State }).Count
+        $h.AreaTiles[$a.Title].Child.Children[1].Children[1].Text = if ($r.Count) { "$o of $($r.Count) recommended on" } else { 'Nothing recommended for this PC' }
+    }
+    $d = try { Get-NvDriverInfo } catch { $null }
+    $h.AreaTiles['Graphics driver'].Child.Children[1].Children[1].Text = if ($d -and $d.Latest -and $d.Installed -ne $d.Latest) { "$($d.Installed) installed, $($d.Latest) available" }
+        elseif ($d) { "NVIDIA $($d.Installed)$(if ($d.Latest) { ', the latest' })" } else { 'See This PC for your driver' }
 }
-# Switches the left menu (and the page) to a category, opening its group if it is folded.
+
+# =============================================================== Navigation (1.17): six places in the menu
+# Home, Games, Tweaks, Checks, Tools and Settings. Every other page opens from inside those, and every tweak area is a
+# filter chip on the Tweaks page, so nothing is lost: Select-NavPage still takes any page or area name.
+$MainNav = @('Home', 'Games', 'Tweaks', 'Checks', 'Tools', 'Settings')
+$CheckActions = @('Check', 'Test', 'Run test', 'Test ping')
+# a card that only looks and reports (it changes nothing): these live on the Checks page
+function Test-CheckCard($t) { [bool]($t.Action -and $CheckActions -contains $t.Action) }
+# which menu item a page or area belongs to
+function Get-NavParent([string]$Name) {
+    if ($MainNav -contains $Name) { return $Name }
+    switch ($Name) {
+        'Boost' { return 'Home' }
+        'Health' { return 'Checks' }
+        'GameMode' { return 'Games' }
+    }
+    $c = $Categories | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if ($c -and $c.Page) { 'Tools' } else { 'Tweaks' }
+}
+# the tweak areas shown as chips: every category that holds switches, in menu order
+function Get-TweakAreas {
+    @($Categories | Where-Object {
+        -not $_.Page -and @('All', 'Latency', 'New', 'Tweaks', 'Checks') -notcontains $_.Name -and -not ($_.Requires -and -not (& $_.Requires))
+    } | Where-Object { $n = $_.Name; [bool]($Tweaks | Where-Object { -not (Test-CheckCard $_) -and -not $_.Hidden -and ($_.Cat -eq $n -or ($n -eq 'Potato' -and $_.Potato) -or ($n -eq 'Gtx1080Ti' -and $_.Gtx)) } | Select-Object -First 1) })
+}
+$CheckAreas = [ordered]@{
+    'All' = $null
+    'Fortnite' = @('Fortnite')
+    'Network' = @('Network')
+    'Graphics' = @('Graphics', 'Potato', 'Gtx1080Ti')
+    'PC and Windows' = @('System', 'Power', 'Storage', 'Vendor', 'Input', 'Background', 'Services', 'Startup', 'Visuals', 'Creator')
+    'Repairs' = @('Repair')
+    'Counter-Strike 2' = @('CS2')
+}
+if (-not $script:TweakView) { $script:TweakView = 'Recommended' }
+if (-not $script:TweakArea) { $script:TweakArea = 'All' }
+if (-not $script:CheckArea) { $script:CheckArea = 'All' }
+function Test-TweakCardVisible($t) {
+    if (Test-CheckCard $t) { return $false }
+    $a = $script:TweakArea
+    $inArea = if ($a -eq 'All') { -not $t.Header } elseif ($a -eq 'Potato') { [bool]$t.Potato -or $t.Cat -eq 'Potato' } elseif ($a -eq 'Gtx1080Ti') { [bool]$t.Gtx -or $t.Cat -eq 'Gtx1080Ti' } else { $t.Cat -eq $a -and -not $t.Header }
+    if (-not $inArea) { return $false }
+    if ($t.Header) { return $true }
+    switch ($script:TweakView) {
+        'Recommended' { return [bool]($t.Rec -or $t.Lat) }
+        'Latency' { return [bool]$t.Lat }
+        'On' { return [bool]($t.Toggle -and $t.State) }
+        'New' { return [bool]$t.New }
+        default { return $true }
+    }
+}
+function Test-CheckCardVisible($t) {
+    if (-not (Test-CheckCard $t)) { return $false }
+    $cats = $CheckAreas[$script:CheckArea]
+    (-not $cats) -or ($cats -contains $t.Cat)
+}
+function New-Chip([string]$Label, [bool]$On, [scriptblock]$Click, $Tag) {
+    $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Padding='12,5' Margin='0,0,6,6' FontSize='12.5'><TextBlock Text='$(Esc $Label)'/></Button>")
+    $c.Background = ConvertTo-Brush $(if ($On) { '#0A84FF' } else { '#2C2C2E' })
+    $c.Content.Foreground = ConvertTo-Brush $(if ($On) { '#FDFDFD' } else { '#F5F5F7' })
+    $c.Tag = $Tag; $c.Add_Click($Click)
+    $c
+}
+# the chip rows above the cards on Tweaks and Checks
+function Update-ChipBar {
+    $ui.ChipViews.Children.Clear(); $ui.ChipAreas.Children.Clear()
+    if ($script:CurrentCat.Name -eq 'Tweaks') {
+        foreach ($v in @(@('Recommended', 'Recommended'), @('Latency', 'Input delay and ping'), @('On', 'Switched on'), @('New', 'New in this version'), @('All', 'Everything'))) {
+            [void]$ui.ChipViews.Children.Add((New-Chip $v[1] ($script:TweakView -eq $v[0]) { param($s, $e) $script:TweakView = $s.Tag; Update-Filter; Reset-Scroll } $v[0]))
+        }
+        [void]$ui.ChipAreas.Children.Add((New-Chip 'All areas' ($script:TweakArea -eq 'All') { param($s, $e) $script:TweakArea = 'All'; Update-Filter; Reset-Scroll } 'All'))
+        foreach ($c in Get-TweakAreas) {
+            [void]$ui.ChipAreas.Children.Add((New-Chip $c.Title ($script:TweakArea -eq $c.Name) { param($s, $e) $script:TweakArea = $s.Tag; if ($script:TweakView -eq 'Recommended') { $script:TweakView = 'All' }; Update-Filter; Reset-Scroll } $c.Name))
+        }
+    } elseif ($script:CurrentCat.Name -eq 'Checks') {
+        foreach ($k in $CheckAreas.Keys) {
+            [void]$ui.ChipAreas.Children.Add((New-Chip $(if ($k -eq 'All') { 'All checks' } else { $k }) ($script:CheckArea -eq $k) { param($s, $e) $script:CheckArea = $s.Tag; Update-Filter; Reset-Scroll } $k))
+        }
+        $hc = New-Chip 'Run the full health check' $false { Select-NavPage 'Health' } 'Health'
+        $hc.Background = ConvertTo-Brush '#1F30D158'; $hc.Content.Foreground = ConvertTo-Brush '#30D158'
+        [void]$ui.ChipViews.Children.Add($hc)
+    }
+}
+# the line under the title on Tweaks and Checks: what is shown and how to see more
+function Get-ViewNote {
+    $vis = @($Tweaks | Where-Object { $_.Card -and $_.Card.Visibility -eq 'Visible' -and -not $_.Header }).Count
+    if ($script:CurrentCat.Name -eq 'Tweaks') {
+        $all = @($Tweaks | Where-Object { -not (Test-CheckCard $_) -and -not $_.Hidden -and -not $_.Header }).Count
+        $what = switch ($script:TweakView) { 'Recommended' { 'the recommended and input-delay tweaks for this PC' } 'Latency' { 'the tweaks that change input delay, frame time or ping' } 'On' { 'what is switched on' } 'New' { 'the cards added in the latest versions' } default { 'every tweak' } }
+        "Showing $vis of ${all}: $what$(if ($script:TweakArea -ne 'All') { " in $(($Categories | Where-Object { $_.Name -eq $script:TweakArea } | Select-Object -First 1).Title)" }). Tweaks change your PC; every one can be undone."
+    } else {
+        "$vis checks. Checks only look and report: they never change anything. Pick an area, or run the full health check for the ones that matter most."
+    }
+}
+# opens a page or the card grid; $Parent is the menu item that stays highlighted
+function Show-Category($cat, [string]$Parent) {
+    $script:CurrentCat = $cat
+    $script:NavSilent = $true
+    try { if ($script:NavButtons.ContainsKey($Parent)) { $script:NavButtons[$Parent].IsChecked = $true } } finally { $script:NavSilent = $false }
+    if ($ui.Search.Text) { $ui.Search.Text = '' }
+    Update-Filter
+    Reset-Scroll
+    if ($cat.Page) { Show-Animated $ui.PageHost 12 280 } else { Show-Animated $ui.Scroller 12 280 }
+    if ($cat.Page -and $script:PageRefresh[$cat.Page]) { & $script:PageRefresh[$cat.Page] }
+    $sub = $MainNav -notcontains $cat.Name
+    $ui.BackBtn.Visibility = if ($sub) { 'Visible' } else { 'Collapsed' }
+    $ui.BackBtn.Tag = $Parent
+    $ui.BackText.Text = (($Categories | Where-Object { $_.Name -eq $Parent } | Select-Object -First 1).Title)
+}
+# opens any page or tweak area by name (menu items, pages inside Tools, Checks and Games, tweak areas and views)
 function Select-NavPage([string]$Name) {
-    if (-not $script:NavButtons.ContainsKey($Name)) { return }
-    Set-NavGroupOpen (Get-NavGroupOf $Name) $true
-    $script:NavButtons[$Name].IsChecked = $true
-    $script:NavButtons[$Name].BringIntoView()
+    if ($Name -eq 'Boost') { $Name = 'Home' }
+    $parent = Get-NavParent $Name
+    if ($parent -eq 'Tweaks' -and $Name -ne 'Tweaks') {
+        switch ($Name) {
+            'All' { $script:TweakArea = 'All'; $script:TweakView = 'All' }
+            'Latency' { $script:TweakArea = 'All'; $script:TweakView = 'Latency' }
+            'New' { $script:TweakArea = 'All'; $script:TweakView = 'New' }
+            default { $script:TweakArea = $Name; $script:TweakView = 'All' }
+        }
+        $Name = 'Tweaks'
+    }
+    $cat = $Categories | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if (-not $cat) { return }
+    Show-Category $cat $parent
+}
+
+# --- Tools: every page that is not a tweak or a check, as tiles
+$ToolInfo = [ordered]@{
+    'GameMode' = 'Start Game, background apps closed while you play, and live numbers during a match.'
+    'Matches'  = 'A report after every match: FPS, stutters, ping, and what got in the way.'
+    'Trends'   = 'How your matches change over days, and after each change you make.'
+    'Benchmark' = 'Measure FPS and frame times before and after a change.'
+    'Events'   = 'Epic''s competitive schedule for the region you play.'
+    'Active'   = 'Everything ZeroDelay has switched on, when, and a switch to undo each one.'
+    'ThisPC'   = 'Your hardware, drivers and Windows, and how ZeroDelay adapted to them.'
+    'Nvidia'   = 'G-SYNC, V-Sync, Reflex and frame-cap check with one-click presets.'
+    'Sync'     = 'Variable refresh: the range and status of each monitor.'
+    'Booster'  = 'Works with GearUP, ExitLag, WTFast and NoPing, and checks they help.'
+    'Ping'     = 'Live ping to Fortnite''s servers while you play.'
+    'Sens'     = 'Carry your aim between games: sensitivity, eDPI and cm/360.'
+    'Mouse'    = 'Measure your mouse''s real polling rate.'
+    'Profiles' = 'Save sets of tweaks and switch between them.'
+    'History'  = 'Every change ZeroDelay made, and when.'
+    'Debloat'  = 'Preinstalled apps explained; removed only when you choose.'
+    'Apps'     = 'Uninstall apps you no longer use.'
+    'Clean'    = 'Temp files, update leftovers and caches. You see the size first.'
+    'Memory'   = 'Free memory before a match and see what uses it.'
+}
+function New-ToolsPage {
+    $root = [ZdTheme]::Parse("<UniformGrid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Columns='3' MaxWidth='1080' HorizontalAlignment='Left' Margin='-14,-14,-2,-14'/>")
+    foreach ($name in $ToolInfo.Keys) {
+        $c = $Categories | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if (-not $c -or ($c.Requires -and -not (& $c.Requires))) { continue }
+        $tile = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='20,18' Margin='14,14,-2,-2' Cursor='Hand'>
+  <StackPanel>
+    <Border Width='40' Height='40' CornerRadius='11' Background='#2C2C2E' HorizontalAlignment='Left'><TextBlock Text='$('&#x{0:X};' -f [int][char]$c.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <TextBlock Text='$(Esc $c.Title)' FontSize='15' FontWeight='SemiBold' Margin='0,12,0,0'/>
+    <TextBlock Text='$(Esc $ToolInfo[$name])' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,0' MinHeight='34'/>
+  </StackPanel>
+</Border>
+"@)
+        $tile.Tag = $name
+        $tile.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag })
+        $tile.RenderTransform = New-Object Windows.Media.TranslateTransform
+        $tile.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
+        $tile.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
+        [void]$root.Children.Add($tile)
+    }
+    New-PageScroll $root
 }
 
 # =============================================================== Game Mode page (booster dashboard)
@@ -18068,7 +18270,7 @@ function New-TrayIcon {
     $script:TrayGm = $gm
     $ni.ContextMenuStrip = $menu
     $ni.Add_MouseClick({ param($s, $e) if ($e.Button -eq 'Left') { Show-MainWindow } })
-    $ni.Add_BalloonTipClicked({ Show-MainWindow; if ($script:BalloonPage) { $script:NavButtons[$script:BalloonPage].IsChecked = $true; $script:BalloonPage = $null } })
+    $ni.Add_BalloonTipClicked({ Show-MainWindow; if ($script:BalloonPage) { Select-NavPage $script:BalloonPage; $script:BalloonPage = $null } })
     $ni.Visible = $true
     $ni
 }
@@ -18384,6 +18586,12 @@ function Update-Filter {
     if ($script:CurrentCat.Name -eq 'Potato') { $cur = Get-CurrentPotatoScore; if ($null -ne $cur) { $note += "   Your settings right now: $cur% potato." } }
     $ui.LatencyNote.Text = $note
     $ui.LatencyNote.Visibility = if (-not $q -and $script:CurrentCat.Note) { 'Visible' } else { 'Collapsed' }
+    $cn = $script:CurrentCat.Name
+    $ui.ApplyRec.Visibility = if ($q -or $cn -eq 'Home' -or $cn -eq 'Tweaks') { 'Visible' } else { 'Collapsed' }
+    $ui.MoreBtn.Visibility = $ui.ApplyRec.Visibility
+    $chips = -not $q -and ($cn -eq 'Tweaks' -or $cn -eq 'Checks')
+    $ui.ChipBar.Visibility = if ($chips) { 'Visible' } else { 'Collapsed' }
+    if ($chips) { Update-ChipBar }
     if (-not $q -and $script:CurrentCat.Page) {
         $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'
         $ui.PageHost.Content = Get-PageContent $script:CurrentCat.Page
@@ -18392,6 +18600,8 @@ function Update-Filter {
     $ui.Scroller.Visibility = 'Visible'; $ui.PageHost.Visibility = 'Collapsed'
     foreach ($t in $Tweaks) {
         $show = if ($q) { -not $t.Header -and ($t.Title -like "*$q*" -or $t.Desc -like "*$q*") }
+                elseif ($cn -eq 'Tweaks') { Test-TweakCardVisible $t }
+                elseif ($cn -eq 'Checks') { Test-CheckCardVisible $t }
                 elseif ($script:CurrentCat.Name -eq 'Latency') { [bool]$t.Lat }
                 elseif ($script:CurrentCat.Name -eq 'Potato') { [bool]$t.Potato }
                 elseif ($script:CurrentCat.Name -eq 'New') { [bool]$t.New }
@@ -18399,10 +18609,11 @@ function Update-Filter {
                 else { $script:CurrentCat.Name -eq 'All' -or $t.Cat -eq $script:CurrentCat.Name }
         $t.Card.Visibility = if ($show -and -not $t.Hidden) { 'Visible' } else { 'Collapsed' }
     }
+    if ($chips) { $ui.LatencyNote.Text = Get-ViewNote; $ui.LatencyNote.Visibility = 'Visible' }
 }
 $ui.Search.Add_TextChanged({ Update-Filter })
 $script:NavButtons = @{}
-$NavTop = @('Home', 'Games', 'Boost', 'GameMode', 'Events', 'Health')
+$NavTop = @('Home', 'Games', 'Tweaks', 'Checks', 'Tools')
 $NavTools = @('ThisPC', 'Sync', 'Nvidia', 'Benchmark', 'Matches', 'Trends', 'Booster', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Debloat', 'Apps', 'Clean', 'Memory')
 $NavEnd = @('Settings')
 function Get-NavGroupOf([string]$Name) { if ($NavTop -contains $Name -or $NavEnd -contains $Name) { '' } elseif ($NavTools -contains $Name) { 'Tools' } else { 'Tweaks' } }
@@ -18435,10 +18646,7 @@ function New-NavGroup([string]$Group, [string]$Title) {
     $panel.Visibility = if ($open) { 'Visible' } else { 'Collapsed' }
     if ($open) { $script:NavGroups[$Group].Chevron.Angle = 90 }
 }
-$navOrder = @($Categories | Where-Object { $NavTop -contains $_.Name } | Sort-Object { $NavTop.IndexOf($_.Name) }) +
-            @($Categories | Where-Object { (Get-NavGroupOf $_.Name) -eq 'Tweaks' }) +
-            @($Categories | Where-Object { $NavTools -contains $_.Name } | Sort-Object { $NavTools.IndexOf($_.Name) }) +
-            @($Categories | Where-Object { $NavEnd -contains $_.Name })
+$navOrder = @($MainNav | ForEach-Object { $n = $_; $Categories | Where-Object { $_.Name -eq $n } | Select-Object -First 1 })
 $navTarget = $ui.Nav
 foreach ($c in $navOrder) {
     if ($c.Requires -and -not (& $c.Requires)) { continue }   # e.g. the GTX 1080 Ti tab on other PCs
@@ -18469,15 +18677,7 @@ foreach ($c in $navOrder) {
 </RadioButton>
 "@)
     $rb.Tag = $c
-    $rb.Add_Checked({
-        param($s, $e)
-        $script:CurrentCat = $s.Tag
-        $ui.Search.Text = ''
-        Update-Filter
-        Reset-Scroll
-        if ($s.Tag.Page) { Show-Animated $ui.PageHost 12 280 } else { Show-Animated $ui.Scroller 12 280 }
-        if ($s.Tag.Page -and $script:PageRefresh[$s.Tag.Page]) { & $script:PageRefresh[$s.Tag.Page] }
-    })
+    $rb.Add_Click({ param($s, $e) if (-not $script:NavSilent) { Select-NavPage $s.Tag.Name } })
     $script:NavButtons[$c.Name] = $rb
     [void]$navTarget.Children.Add($rb)
 }
@@ -18502,6 +18702,7 @@ $ui.RestorePoint.Add_Click({
 })
 
 $ui.MoreBtn.Add_Click({ $ui.MorePop.IsOpen = -not $ui.MorePop.IsOpen })
+$ui.BackBtn.Add_Click({ param($s, $e) Select-NavPage $s.Tag })
 $window.FindName('ActivePanel').Add_MouseLeftButtonUp({ Select-NavPage 'Active' })
 $ui.RestorePoint.Add_PreviewMouseLeftButtonUp({ $ui.MorePop.IsOpen = $false })
 $ui.RestoreAll.Add_PreviewMouseLeftButtonUp({ $ui.MorePop.IsOpen = $false })
@@ -18834,10 +19035,8 @@ $ui.Cards.Add_SizeChanged({
     $cardW = [Math]::Floor($w / $cols) - 16
     foreach ($c in $ui.Cards.Children) { $c.Width = if ($c.Tag.Header -or $c.Tag.Extra -eq 'builder') { [Math]::Max(100, $w - 16) } else { $cardW } }
 })
-$startName = if ($Page -and $script:NavButtons.ContainsKey($Page)) { $Page } else { 'Home' }
-Set-NavGroupOpen (Get-NavGroupOf $startName) $true
-$script:NavButtons[$startName].IsChecked = $true
-$window.Add_ContentRendered({ $script:NavButtons[$script:CurrentCat.Name].BringIntoView() })
+$startName = if ($Page -and ($Categories | Where-Object { $_.Name -eq $Page })) { $Page } else { 'Home' }
+Select-NavPage $startName
 Update-GameModeUi
 if (-not $Snapshot -or $env:ZD_SNAPWAIT) { New-StatusStrip; Start-LiveTimer }
 function Complete-Startup {
@@ -18865,9 +19064,9 @@ if ($Snapshot) {
         $sw.Restart(); [void](Get-NvSyncStatus); [Console]::WriteLine("NV-SYNC-STATUS {0} ms" -f $sw.ElapsedMilliseconds)
         $sw.Restart(); [void](Get-ActivePowerScheme); [Console]::WriteLine("POWERCFG {0} ms" -f $sw.ElapsedMilliseconds)
     }    if ($env:ZD_SCAN -and $script:Health) { Invoke-HealthScan }
-    if ($env:ZD_DRIFT) { Invoke-DriftCheck; if (-not $script:DriftItems) { $ui.DriftTitle.Text = '2 settings were changed back — ExitLag is running'; $ui.DriftText.Text = 'Turn off USB 3 link power-saving  ·  USB hubs never suspend'; $ui.DriftBar.Visibility = 'Visible' } }
+    if ($env:ZD_DRIFT) { Invoke-DriftCheck; if (-not $script:DriftItems) { $ui.DriftTitle.Text = '2 settings were changed back — ExitLag is running'; $ui.DriftText.Text = 'Stop USB 3 ports dozing between clicks  ·  USB hubs never suspend'; $ui.DriftBar.Visibility = 'Visible' } }
     if ($env:ZD_FAKE_UPDATE) { Start-UpdateCheck }
-    if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Hardware-accelerated GPU scheduling', 'Consistent timer resolution') }; Update-RestartBar }
+    if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Let the graphics card schedule its own work', 'Consistent timer resolution') }; Update-RestartBar }
     if ($script:Glass) {
         $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
         foreach ($st in @(@('#FF050506', 0), @('#FF08070B', 0.55), @('#FF040606', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) }

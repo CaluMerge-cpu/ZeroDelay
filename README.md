@@ -10,7 +10,9 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 - **Knows your PC**: on first start (and every few days) ZeroDelay scans the hardware, drivers, Windows and installed
   apps, and adapts its recommendations: laptops, streamers, Wi-Fi vs Ethernet, X3D and hybrid CPUs, GPU model.
   **Tools > This PC** shows everything it found and what it changed. Nothing is sent anywhere.
-- **Clean, simple design**: a Home page with an Optimize button that lists what is still off so you choose what to switch on, folding menu groups, and frosted glass on Windows 11.
+- **Clean, simple design**: six places in the menu (Home, Games, Tweaks, Checks, Tools, Settings). Home shows your last
+  matches first, then your score with Boost now and Restore. Tweaks opens on the recommended ones with filter chips for
+  the rest; Checks holds everything that only looks and reports; Tools holds the other pages as tiles.
 - **Live view on Home**: CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a
   one-minute graph, plus the apps using the most CPU. It only measures while Home is open.
 - **Timer resolution**: a test that measures how precisely Windows wakes at the default timer, 1 ms and 0.5 ms on your
