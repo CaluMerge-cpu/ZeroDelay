@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.13.1'
+$AppVersion = '1.14.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -496,6 +496,233 @@ public static class MemTools {
         if (!EnablePrivilege("SeProfileSingleProcessPrivilege")) return -1;
         int command = 4;   // MemoryPurgeStandbyList
         return NtSetSystemInformation(80 /* SystemMemoryListInformation */, ref command, 4);
+    }
+}
+'@
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Threading;
+// Live load for the Home page: CPU, memory, GPU, disk, network and the busiest apps.
+// Samples once a second on a thread-pool timer (never on the UI thread) and only while Start() is in effect.
+// Counters are added by their English names (PdhAddEnglishCounter), so it works on every Windows language.
+public sealed class LiveSnap {
+    public double Cpu = -1, CpuGhz = -1, Mem = -1, MemUsedGb = -1, MemTotalGb = -1;
+    public double Gpu = -1, GpuTemp = -1, GpuMhz = -1, VramGb = -1, VramTotalGb = -1;
+    public double Disk = -1, DiskRead = -1, DiskWrite = -1, NetDown = -1, NetUp = -1;
+    public string[] TopName = new string[0]; public double[] TopCpu = new double[0]; public double[] TopMb = new double[0];
+    public long Seq;
+}
+public static class LiveStats {
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)] static extern int PdhOpenQuery(string src, IntPtr user, out IntPtr q);
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)] static extern int PdhAddEnglishCounter(IntPtr q, string path, IntPtr user, out IntPtr c);
+    [DllImport("pdh.dll")] static extern int PdhCollectQueryData(IntPtr q);
+    [StructLayout(LayoutKind.Explicit)] struct FmtValue { [FieldOffset(0)] public uint CStatus; [FieldOffset(8)] public double Value; }
+    [DllImport("pdh.dll")] static extern int PdhGetFormattedCounterValue(IntPtr c, uint fmt, IntPtr type, out FmtValue v);
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)] static extern int PdhGetFormattedCounterArray(IntPtr c, uint fmt, ref uint size, out uint count, IntPtr buf);
+    [StructLayout(LayoutKind.Sequential)] class MemStatus { public uint Length = 64; public uint Load; public ulong TotalPhys, AvailPhys, TotalPage, AvailPage, TotalVirt, AvailVirt, AvailExt; }
+    [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx([In, Out] MemStatus m);
+    // NVIDIA's management library ships with the driver (System32\nvml.dll); missing on other GPUs, which is fine
+    [StructLayout(LayoutKind.Sequential)] struct NvUtil { public uint Gpu, Memory; }
+    [StructLayout(LayoutKind.Sequential)] struct NvMem { public ulong Total, Free, Used; }
+    [DllImport("nvml.dll")] static extern int nvmlInit_v2();
+    [DllImport("nvml.dll")] static extern int nvmlDeviceGetHandleByIndex_v2(uint i, out IntPtr d);
+    [DllImport("nvml.dll")] static extern int nvmlDeviceGetTemperature(IntPtr d, int sensor, out uint t);
+    [DllImport("nvml.dll")] static extern int nvmlDeviceGetClockInfo(IntPtr d, int type, out uint mhz);
+    [DllImport("nvml.dll")] static extern int nvmlDeviceGetUtilizationRates(IntPtr d, out NvUtil u);
+    [DllImport("nvml.dll")] static extern int nvmlDeviceGetMemoryInfo(IntPtr d, out NvMem m);
+
+    // disk activity straight from the drives, for PCs whose disk counters are missing (IOCTL_DISK_PERFORMANCE, no admin needed)
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool DeviceIoControl(IntPtr h, uint code, IntPtr inBuf, uint inSize, byte[] outBuf, uint outSize, out uint ret, IntPtr ov);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    const uint FmtDouble = 0x200, NoCap = 0x8000;
+    const int HistLen = 60;
+    static readonly object Gate = new object();
+    static Timer timer; static int busy; static bool started;
+    static IntPtr q, cUtil, cPerf, cFreq, cIdle, cRead, cWrite, cEngine, cVram;
+    static bool pdhOk, nvTried; static IntPtr nvDev;
+    static Dictionary<string, long[]> netPrev = new Dictionary<string, long[]>();
+    static DateTime netAt;
+    static Dictionary<int, TimeSpan> cpuPrev = new Dictionary<int, TimeSpan>();
+    static DateTime procAt; static int tick;
+    static readonly Dictionary<string, Queue<double>> hist = new Dictionary<string, Queue<double>>();
+    public static volatile LiveSnap Latest = new LiveSnap();
+    public static int OwnPid = Process.GetCurrentProcess().Id;
+    public static string LastError = "";
+    public static double LastMs;   // how long the last sample took
+
+    public static void Start() {
+        lock (Gate) {
+            if (started) return; started = true;
+            if (timer == null) timer = new Timer(Sample, null, 0, 1000); else timer.Change(0, 1000);
+        }
+    }
+    public static void Stop() { lock (Gate) { if (!started) return; started = false; if (timer != null) timer.Change(Timeout.Infinite, Timeout.Infinite); } }
+    public static bool Running { get { return started; } }
+    // the last 60 samples of "cpu", "mem", "gpu", "disk" or "net" (download), oldest first
+    public static double[] History(string key) { lock (Gate) { Queue<double> h; return hist.TryGetValue(key, out h) ? h.ToArray() : new double[0]; } }
+
+    static void Push(string key, double v) {
+        if (v < 0) return;
+        lock (Gate) { Queue<double> h; if (!hist.TryGetValue(key, out h)) { h = new Queue<double>(); hist[key] = h; } h.Enqueue(v); while (h.Count > HistLen) h.Dequeue(); }
+    }
+    static void OpenPdh() {
+        if (PdhOpenQuery(null, IntPtr.Zero, out q) != 0) return;
+        PdhAddEnglishCounter(q, @"\Processor Information(_Total)\% Processor Utility", IntPtr.Zero, out cUtil);
+        PdhAddEnglishCounter(q, @"\Processor Information(_Total)\% Processor Performance", IntPtr.Zero, out cPerf);
+        PdhAddEnglishCounter(q, @"\Processor Information(_Total)\Processor Frequency", IntPtr.Zero, out cFreq);
+        PdhAddEnglishCounter(q, @"\PhysicalDisk(_Total)\% Idle Time", IntPtr.Zero, out cIdle);
+        PdhAddEnglishCounter(q, @"\PhysicalDisk(_Total)\Disk Read Bytes/sec", IntPtr.Zero, out cRead);
+        PdhAddEnglishCounter(q, @"\PhysicalDisk(_Total)\Disk Write Bytes/sec", IntPtr.Zero, out cWrite);
+        PdhAddEnglishCounter(q, @"\GPU Engine(*)\Utilization Percentage", IntPtr.Zero, out cEngine);
+        PdhAddEnglishCounter(q, @"\GPU Adapter Memory(*)\Dedicated Usage", IntPtr.Zero, out cVram);
+        PdhCollectQueryData(q);
+        pdhOk = true;
+    }
+    static double Val(IntPtr c, bool nocap) {
+        if (c == IntPtr.Zero) return -1;
+        FmtValue v; if (PdhGetFormattedCounterValue(c, FmtDouble | (nocap ? NoCap : 0), IntPtr.Zero, out v) != 0 || v.CStatus > 1) return -1;
+        return v.Value;
+    }
+    static List<KeyValuePair<string, double>> Arr(IntPtr c) {
+        var list = new List<KeyValuePair<string, double>>();
+        if (c == IntPtr.Zero) return list;
+        uint size = 0, count;
+        PdhGetFormattedCounterArray(c, FmtDouble | NoCap, ref size, out count, IntPtr.Zero);
+        if (size == 0) return list;
+        IntPtr buf = Marshal.AllocHGlobal((int)size);
+        try {
+            if (PdhGetFormattedCounterArray(c, FmtDouble | NoCap, ref size, out count, buf) != 0) return list;
+            int stride = IntPtr.Size + 16;   // PDH_FMT_COUNTERVALUE_ITEM_W: name pointer, then the 16-byte value
+            for (int i = 0; i < count; i++) {
+                IntPtr item = new IntPtr(buf.ToInt64() + i * stride);
+                string name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(item));
+                uint status = (uint)Marshal.ReadInt32(item, IntPtr.Size);
+                double v = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, IntPtr.Size + 8));
+                if (status <= 1 && name != null) list.Add(new KeyValuePair<string, double>(name, v));
+            }
+        } finally { Marshal.FreeHGlobal(buf); }
+        return list;
+    }
+    static void Sample(object state) {
+        if (Interlocked.Exchange(ref busy, 1) == 1) return;
+        var sw = Stopwatch.StartNew();
+        try {
+            var s = new LiveSnap(); s.Seq = Latest.Seq + 1; tick++;
+            if (!pdhOk) { try { OpenPdh(); } catch (Exception e) { LastError = e.Message; } }
+            if (pdhOk && PdhCollectQueryData(q) == 0) {
+                double u = Val(cUtil, true); if (u >= 0) s.Cpu = Math.Min(100, Math.Round(u));
+                double perf = Val(cPerf, true), freq = Val(cFreq, true);
+                if (perf > 0 && freq > 0) s.CpuGhz = Math.Round(freq * perf / 100 / 1000, 1);
+                double idle = Val(cIdle, true); if (idle >= 0) s.Disk = Math.Max(0, Math.Min(100, Math.Round(100 - idle)));
+                s.DiskRead = Val(cRead, true); s.DiskWrite = Val(cWrite, true);
+                // GPU load as Task Manager shows it: each engine summed over processes, then the busiest engine of the busiest GPU
+                var engines = new Dictionary<string, double>();
+                foreach (var kv in Arr(cEngine)) {
+                    int at = kv.Key.IndexOf("luid_"); if (at < 0) continue;
+                    int et = kv.Key.IndexOf("_engtype_"); string key = et > at ? kv.Key.Substring(at, et - at) : kv.Key.Substring(at);
+                    double cur; engines.TryGetValue(key, out cur); engines[key] = cur + kv.Value;
+                }
+                double best = -1; foreach (var v in engines.Values) if (v > best) best = v;
+                if (best >= 0) s.Gpu = Math.Min(100, Math.Round(best));
+                double vram = -1; foreach (var kv in Arr(cVram)) if (kv.Value > vram) vram = kv.Value;
+                if (vram >= 0) s.VramGb = Math.Round(vram / 1073741824.0, 1);
+            }
+            var m = new MemStatus();
+            if (GlobalMemoryStatusEx(m)) {
+                s.MemTotalGb = Math.Round(m.TotalPhys / 1073741824.0, 1);
+                s.MemUsedGb = Math.Round((m.TotalPhys - m.AvailPhys) / 1073741824.0, 1);
+                s.Mem = Math.Round(100.0 * (m.TotalPhys - m.AvailPhys) / m.TotalPhys);
+            }
+            if (s.Disk < 0) SampleDisks(s);
+            SampleNvidia(s);
+            SampleNet(s);
+            if (tick % 2 == 1) SampleProcs(s); else { var p = Latest; s.TopName = p.TopName; s.TopCpu = p.TopCpu; s.TopMb = p.TopMb; }
+            Push("cpu", s.Cpu); Push("mem", s.Mem); Push("gpu", s.Gpu); Push("disk", s.Disk); Push("net", s.NetDown);
+            Latest = s;
+        } catch (Exception e) { LastError = e.Message; }
+        finally { LastMs = sw.Elapsed.TotalMilliseconds; Interlocked.Exchange(ref busy, 0); }
+    }
+    static Dictionary<int, long[]> diskPrev = new Dictionary<int, long[]>();
+    static void SampleDisks(LiveSnap s) {
+        var next = new Dictionary<int, long[]>(); double busy = -1, rd = 0, wr = 0; bool any = false;
+        var buf = new byte[88];
+        for (int i = 0; i < 16; i++) {
+            IntPtr h = CreateFile(@"\\.\PhysicalDrive" + i, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (h == new IntPtr(-1)) continue;
+            try {
+                uint ret; if (!DeviceIoControl(h, 0x70020, IntPtr.Zero, 0, buf, (uint)buf.Length, out ret, IntPtr.Zero) || ret < 64) continue;
+                // DISK_PERFORMANCE: bytes read, bytes written, read time, write time, idle time (100 ns), ..., query time
+                long[] cur = new long[] { BitConverter.ToInt64(buf, 0), BitConverter.ToInt64(buf, 8), BitConverter.ToInt64(buf, 32), BitConverter.ToInt64(buf, 56) };
+                next[i] = cur;
+                long[] prev;
+                if (diskPrev.TryGetValue(i, out prev)) {
+                    double span = cur[3] - prev[3]; if (span <= 0) continue;
+                    double b = 100 - (cur[2] - prev[2]) / span * 100; b = Math.Max(0, Math.Min(100, b));
+                    if (b > busy) busy = b;
+                    rd += (cur[0] - prev[0]) / (span / 1e7); wr += (cur[1] - prev[1]) / (span / 1e7); any = true;
+                }
+            } finally { CloseHandle(h); }
+        }
+        diskPrev = next;
+        if (any) { s.Disk = Math.Round(busy); s.DiskRead = rd; s.DiskWrite = wr; }
+    }
+    static void SampleNvidia(LiveSnap s) {
+        try {
+            if (!nvTried) { nvTried = true; if (nvmlInit_v2() != 0 || nvmlDeviceGetHandleByIndex_v2(0, out nvDev) != 0) nvDev = IntPtr.Zero; }
+            if (nvDev == IntPtr.Zero) return;
+            uint t, mhz; NvUtil u; NvMem mem;
+            if (nvmlDeviceGetTemperature(nvDev, 0, out t) == 0) s.GpuTemp = t;
+            if (nvmlDeviceGetClockInfo(nvDev, 0, out mhz) == 0) s.GpuMhz = mhz;
+            if (nvmlDeviceGetUtilizationRates(nvDev, out u) == 0 && s.Gpu < 0) s.Gpu = u.Gpu;
+            if (nvmlDeviceGetMemoryInfo(nvDev, out mem) == 0) { s.VramGb = Math.Round(mem.Used / 1073741824.0, 1); s.VramTotalGb = Math.Round(mem.Total / 1073741824.0); }
+        } catch (DllNotFoundException) { nvDev = IntPtr.Zero; } catch (EntryPointNotFoundException) { nvDev = IntPtr.Zero; }
+    }
+    static void SampleNet(LiveSnap s) {
+        long down = 0, up = 0; var seen = new Dictionary<string, long[]>(); bool any = false;
+        foreach (var n in NetworkInterface.GetAllNetworkInterfaces()) {
+            if (n.OperationalStatus != OperationalStatus.Up) continue;
+            if (n.NetworkInterfaceType != NetworkInterfaceType.Ethernet && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211 && n.NetworkInterfaceType != NetworkInterfaceType.GigabitEthernet) continue;
+            string d = (n.Description ?? "") + " " + (n.Name ?? "");
+            if (System.Text.RegularExpressions.Regex.IsMatch(d, "Virtual|Hyper-V|vEthernet|VMware|VirtualBox|TAP-|WireGuard|Loopback|Bluetooth|WAN Miniport|Npcap", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) continue;
+            IPv4InterfaceStatistics st; try { st = n.GetIPv4Statistics(); } catch { continue; }
+            long[] cur = new long[] { st.BytesReceived, st.BytesSent }; seen[n.Id] = cur;
+            long[] prev; if (netPrev.TryGetValue(n.Id, out prev)) { down += Math.Max(0, cur[0] - prev[0]); up += Math.Max(0, cur[1] - prev[1]); any = true; }
+        }
+        double secs = (DateTime.UtcNow - netAt).TotalSeconds; netAt = DateTime.UtcNow; netPrev = seen;
+        if (any && secs > 0.2 && secs < 10) { s.NetDown = down / secs; s.NetUp = up / secs; }
+    }
+    static void SampleProcs(LiveSnap s) {
+        var now = DateTime.UtcNow; double secs = (now - procAt).TotalSeconds; procAt = now;
+        var next = new Dictionary<int, TimeSpan>(); var rows = new List<object[]>();
+        int cores = Environment.ProcessorCount;
+        foreach (var p in Process.GetProcesses()) {
+            try {
+                if (p.Id == 0) continue;
+                TimeSpan cpu; try { cpu = p.TotalProcessorTime; } catch { continue; }   // protected processes (anti-cheat, system) cannot be read
+                next[p.Id] = cpu;
+                TimeSpan prev;
+                if (cpuPrev.TryGetValue(p.Id, out prev) && secs > 0.5 && secs < 10) {
+                    double pct = (cpu - prev).TotalSeconds / secs / cores * 100;
+                    string name = p.Id == OwnPid ? "ZeroDelay" : p.ProcessName;
+                    rows.Add(new object[] { name, pct, p.WorkingSet64 / 1048576.0 });
+                }
+            } catch { } finally { p.Dispose(); }
+        }
+        cpuPrev = next;
+        // merge processes that share a name (browsers, Discord) into one row, like Task Manager's app groups
+        var merged = new Dictionary<string, double[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var r in rows) { string n = (string)r[0]; double[] a; if (!merged.TryGetValue(n, out a)) { a = new double[2]; merged[n] = a; } a[0] += (double)r[1]; a[1] += (double)r[2]; }
+        var list = new List<KeyValuePair<string, double[]>>(merged);
+        list.Sort((a, b) => b.Value[0] != a.Value[0] ? b.Value[0].CompareTo(a.Value[0]) : b.Value[1].CompareTo(a.Value[1]));
+        int k = Math.Min(5, list.Count);
+        s.TopName = new string[k]; s.TopCpu = new double[k]; s.TopMb = new double[k];
+        for (int i = 0; i < k; i++) { s.TopName[i] = list[i].Key; s.TopCpu[i] = Math.Round(list[i].Value[0], 1); s.TopMb[i] = Math.Round(list[i].Value[1]); }
     }
 }
 '@
@@ -1412,10 +1639,10 @@ function Test-VrrActive {
 function Test-NvAvailable { if ($null -eq $script:NvOk) { $script:NvOk = [NvDrs]::Available($NvProfile) }; $script:NvOk }
 function Get-NvLod { $v = [NvDrs]::Get($NvProfile, $NvLodId); if ($v -lt -1) { return $null }; if ($v -lt 0) { 0 } else { [int]$v } }
 
-# Deletes the NVIDIA and DirectX shader caches. They rebuild automatically; the first match afterwards may stutter briefly.
+# Deletes the NVIDIA, AMD and DirectX shader caches. They rebuild automatically; the first match afterwards may stutter briefly.
 function Clear-ShaderCaches {
     $n = 0
-    foreach ($dir in "$env:LOCALAPPDATA\NVIDIA\DXCache", "$env:LOCALAPPDATA\NVIDIA\GLCache", "$env:LOCALAPPDATA\D3DSCache", "$env:LOCALAPPDATA\NVIDIA Corporation\NV_Cache") {
+    foreach ($dir in "$env:LOCALAPPDATA\NVIDIA\DXCache", "$env:LOCALAPPDATA\NVIDIA\GLCache", "$env:LOCALAPPDATA\D3DSCache", "$env:LOCALAPPDATA\NVIDIA Corporation\NV_Cache", "$env:LOCALAPPDATA\AMD\DxCache", "$env:LOCALAPPDATA\AMD\DxcCache", "$env:LOCALAPPDATA\AMD\GLCache", "$env:LOCALAPPDATA\AMD\VkCache") {
         if (-not (Test-Path $dir)) { continue }
         Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
             try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $n++ } catch {}
@@ -1582,12 +1809,14 @@ $SessionApps = @(
     @{ Detect = 'Overwolf|Outplayed|CurseForge'; Key = 'overwolf';   Name = 'Overwolf / Outplayed / CurseForge (stops clips and overlays)'; PathRx = '\\(Overwolf|OverwolfBrowser|OverwolfHelper|OverwolfHelper64|OverwolfLauncher|OverwolfStarter|CurseForge)\.exe$'; Main = 'OverwolfLauncher.exe' }
     @{ Detect = 'Razer Cortex'; Key = 'razercortex'; Name = 'Razer Cortex';               PathRx = '\\(RazerCortex|Cortex|RzKLService)\.exe$';     Main = $null }
     @{ Detect = 'SteelSeries GG'; Key = 'steelseries'; Name = 'SteelSeries GG (stops Sonar audio)'; PathRx = '\\(SteelSeriesGG|SteelSeriesGGClient|SteelSeriesEngine3)\.exe$'; Main = 'SteelSeriesGG.exe' }
+    @{ Detect = 'NVIDIA Broadcast'; Key = 'nvbroadcast'; Name = 'NVIDIA Broadcast (stops mic and camera effects)'; PathRx = '\\NVIDIA Broadcast( UI)?\.exe$'; Main = 'NVIDIA Broadcast.exe' }
+    @{ Detect = 'Razer Synapse'; Key = 'synapseui';  Name = 'Razer Synapse (window)';          PathRx = '\\Razer Synapse( [34])?\.exe$';               Main = $null }
 )
 $SessionFile = Join-Path $DataDir 'game-session.json'
 function Get-SessionPrefs {
     $p = @{}; foreach ($a in $SessionApps) { $p[$a.Key] = $true }
     $p['xbox'] = $true; $p['streamdock'] = $false   # Stream Dock stays open by default: many people use it mid-game
-    foreach ($k in 'launchers', 'medal', 'overwolf', 'razercortex', 'steelseries') { $p[$k] = $false }   # clip recorders, Sonar, launchers you may be using
+    foreach ($k in 'launchers', 'medal', 'overwolf', 'razercortex', 'steelseries', 'nvbroadcast') { $p[$k] = $false }   # clip recorders, Sonar, launchers you may be using
     $saved = $script:Backup.Custom['sessionprefs']
     if ($saved -is [hashtable]) { foreach ($k in @($saved.Keys)) { $p[$k] = [bool]$saved[$k] } }
     elseif ($saved) { $saved.PSObject.Properties | ForEach-Object { $p[$_.Name] = [bool]$_.Value } }
@@ -2124,7 +2353,7 @@ function Get-FnHitchReport {
 
 # big Fortnite logs take seconds to read: build the report in the background worker, then show it
 $script:ReportBusy = @{}
-$script:ReportTitles = @{ 'Get-FnHitchReport' = 'Stutters in your matches'; 'Get-FnNetReport' = 'Your matches, measured by Fortnite' }
+$script:ReportTitles = @{ 'Get-FnHitchReport' = 'Stutters in your matches'; 'Get-FnNetReport' = 'Your matches, measured by Fortnite'; 'Get-WinUpdateReport' = 'Windows build check'; 'Get-KernelDriverToolsReport' = 'Kernel-driver sensor tools' }
 function Start-BackgroundReport([string]$Fn) {
     if ($script:ReportBusy[$Fn]) { throw 'Already reading Fortnite''s logs.' }
     $script:ReportBusy[$Fn] = $true
@@ -2168,8 +2397,10 @@ function Get-FnEngineIniReport {
         if ($line -match '^\s*(Paths|CachedClientID)\s*=' -or -not $line.Trim()) { continue }
         if ($sec -match 'SystemSettings|ConsoleVariables|RendererSettings|Script/Engine\.Engine|TextureStreaming' -or $line -match '^\s*(r|t|fx|foliage|sg)\.') { $hits += "[$sec] $($line.Trim())" }
     }
-    if (-not $hits.Count) { return 'Engine.ini only holds Fortnite''s own entries. Good.' }
-    "Another tool added engine settings to Fortnite's Engine.ini ($($hits.Count) lines):`n`n$(($hits | Select-Object -First 12) -join "`n")$(if ($hits.Count -gt 12) { "`n..." })`n`nThese are unsupported edits that can cause crashes or odd behaviour. To remove them: close Fortnite and rename Engine.ini to Engine.ini.bak in $(Split-Path $p); Fortnite creates a clean one. ZeroDelay does not edit this file."
+    $extra = @(foreach ($n in 'Input.ini', 'Scalability.ini') { if (Test-Path (Join-Path (Split-Path $p) $n)) { $n } })
+    $extraNote = if ($extra.Count) { "`n`nAlso found next to it: $($extra -join ', '). Fortnite neither creates nor reads these (it keeps its quality groups in GameUserSettings.ini and has no mouse smoothing to switch off); a tweak pack left them. They can be deleted while Fortnite is closed." } else { '' }
+    if (-not $hits.Count) { return "Engine.ini only holds Fortnite's own entries. Good.$extraNote" }
+    "Another tool added engine settings to Fortnite's Engine.ini ($($hits.Count) lines):`n`n$(($hits | Select-Object -First 12) -join "`n")$(if ($hits.Count -gt 12) { "`n..." })`n`nThese are unsupported edits that can cause crashes or odd behaviour, and most of them do nothing: Epic's device profile and cloud hotfix set the same engine values at every start and win over Engine.ini (r.Streaming.PoolSize, for example, is pushed to 600 MB in Performance mode whatever the file says). To remove them: close Fortnite and rename Engine.ini to Engine.ini.bak in $(Split-Path $p); Fortnite creates a clean one. ZeroDelay does not edit this file.$extraNote"
 }
 
 # --- Fortnite subregions: Epic's ping hosts hand out servers in several cities; measure each one
@@ -2380,6 +2611,1656 @@ function Get-ControllerReport {
     } else { "Controller found: $names`nConnected over: cable or wireless adapter. That is the low-latency way; nothing to change." }
 }
 
+# --- Helpers for research round 5 (1.14)
+
+# --- Research round 5 (1.14, fngpu): Epic launcher autostart, Fortnite display and launch-argument audits, NVIDIA driver, windowed G-SYNC and background cap
+$EpicRunKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$EpicRunName = 'EpicGamesLauncher'
+# the Epic Games Launcher is on this PC: its Run entry, its settings folder or its exe (cached)
+function Test-EpicLauncherInstalled {
+    if ($null -eq $script:EpicInstalled) {
+        $exes = @($env:ProgramFiles, ${env:ProgramFiles(x86)} | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe' } | Where-Object { Test-Path $_ })
+        $script:EpicInstalled = [bool]((Get-RegValue $EpicRunKey $EpicRunName) -or (Test-Path (Join-Path $env:LOCALAPPDATA 'EpicGamesLauncher\Saved\Config')) -or $exes.Count)
+    }
+    $script:EpicInstalled
+}
+# launcher version facts from its own ini: the version that last ran and the version at which it last switched autostart back on
+function Get-EpicLauncherBootInfo {
+    $r = [pscustomobject]@{ Version = $null; AutoEnabledVer = $null }
+    foreach ($d in 'Windows', 'WindowsEditor') {
+        $f = "$env:LOCALAPPDATA\EpicGamesLauncher\Saved\Config\$d\GameUserSettings.ini"
+        if (-not (Test-Path $f)) { continue }
+        foreach ($l in Get-Content $f -ErrorAction SilentlyContinue) {
+            if ($l -match '^LastActiveVersion=(.+)$') { $r.Version = $Matches[1].Trim() }
+            elseif ($l -match '^AutoEnabledStartOnBootVer=(.+)$') { $r.AutoEnabledVer = $Matches[1].Trim() }
+        }
+        if ($r.Version -or $r.AutoEnabledVer) { break }
+    }
+    $r
+}
+
+# every attached display with the id Fortnite stores (MONITOR\XMI2001\{...}\0002), its GPU, current and highest refresh rate at the current resolution
+function Get-MonitorTargets {
+    if (-not ('ZdMonitorEnum' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ZdMonitorEnum {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DD { public int cb; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Name; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Str; public int Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Id; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Key; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DM { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName; public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput; public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName; public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string dev, uint i, ref DD dd, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string dev, int mode, ref DM dm);
+    // "\\.\DISPLAY1|MONITOR\XMI2001\{...}\0002|monitor|gpu|primary|hz|maxHz|width|height" per display attached to the desktop
+    public static string[] List() {
+        var res = new System.Collections.Generic.List<string>();
+        for (uint i = 0; ; i++) {
+            var a = new DD(); a.cb = Marshal.SizeOf(a);
+            if (!EnumDisplayDevices(null, i, ref a, 0)) break;
+            if ((a.Flags & 1) == 0) continue;
+            var m = new DD(); m.cb = Marshal.SizeOf(m);
+            string id = "", mon = a.Name;
+            if (EnumDisplayDevices(a.Name, 0, ref m, 0)) { id = m.Id ?? ""; mon = m.Str; }
+            var cur = new DM(); cur.dmSize = (short)Marshal.SizeOf(cur);
+            EnumDisplaySettings(a.Name, -1, ref cur);
+            int best = 0; var dm = new DM(); dm.dmSize = (short)Marshal.SizeOf(dm);
+            for (int j = 0; EnumDisplaySettings(a.Name, j, ref dm); j++) { if (dm.dmPelsWidth == cur.dmPelsWidth && dm.dmPelsHeight == cur.dmPelsHeight && dm.dmDisplayFrequency > best) best = dm.dmDisplayFrequency; }
+            res.Add(a.Name + "|" + id + "|" + mon + "|" + a.Str + "|" + ((a.Flags & 4) != 0 ? "1" : "0") + "|" + cur.dmDisplayFrequency + "|" + best + "|" + cur.dmPelsWidth + "|" + cur.dmPelsHeight);
+        }
+        return res.ToArray();
+    }
+}
+'@
+    }
+    # EnumDisplayDevices only knows "Generic PnP Monitor"; the EDID name comes from WMI, joined through the Windows display name
+    $names = @{}
+    try {
+        $inst = @{}; foreach ($row in [DisplayMap]::List()) { $p = $row -split '\|'; $inst[$p[1]] = $p[0] }
+        foreach ($m in @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop)) {
+            $gdi = $inst[($m.InstanceName -replace '_\d+$', '')]
+            $n = (-join ($m.UserFriendlyName | Where-Object { $_ } | ForEach-Object { [char]$_ })).Trim()
+            if ($gdi -and $n) { $names[$gdi] = $n }
+        }
+    } catch {}
+    @([ZdMonitorEnum]::List() | ForEach-Object {
+        $f = $_ -split '\|'
+        [pscustomobject]@{ Gdi = $f[0]; Id = $f[1]; Monitor = $(if ($names[$f[0]]) { $names[$f[0]] } else { $f[2] }); Gpu = $f[3]; Primary = ($f[4] -eq '1'); Hz = [int]$f[5]; MaxHz = [int]$f[6]; Width = [int]$f[7]; Height = [int]$f[8]; Discrete = ($f[3] -match $DiscreteGpuRx) }
+    } | Where-Object { "$($_.Gpu) $($_.Monitor)" -notmatch 'Virtual|Parsec|Remote Display|Meta ' })
+}
+# which monitor Fortnite is set to render on (DisplayID / DisplayIndex in GameUserSettings.ini) against what Windows reports
+function Get-FnDisplayReport {
+    if (-not (Test-Path $IniPath)) { return 'Fortnite''s settings file was not found. Start Fortnite once first.' }
+    $lines = Get-Content $IniPath
+    $rawId = Get-IniValue $lines 'DisplayID'
+    if ($null -eq $rawId) { return 'Fortnite has not saved a display choice yet (no DisplayID in its settings), so it opens on your main display. Nothing to check.' }
+    $fnId = ($rawId.Trim() -replace '^"|"$', '') -replace '\\\\', '\'
+    $idx = Get-IniValue $lines 'DisplayIndex'
+    $modeTxt = switch ("$(Get-IniValue $lines 'FullscreenMode')") { '0' { 'fullscreen' } '1' { 'windowed fullscreen' } '2' { 'windowed' } default { 'window mode unknown' } }
+    $mons = @(Get-MonitorTargets)
+    if (-not $mons.Count) { return 'Could not list your displays.' }
+    $best = ($mons | Measure-Object MaxHz -Maximum).Maximum
+    $target = $mons | Where-Object { $_.Id -ieq $fnId } | Select-Object -First 1
+    $list = foreach ($m in $mons | Sort-Object { -not $_.Primary }) {
+        "- $($m.Monitor): $($m.Hz) Hz now (up to $($m.MaxHz) Hz at $($m.Width)x$($m.Height)), $($m.Gpu)$(if ($m.Primary) { ', main display' })$(if ($target -and $m.Id -eq $target.Id) { '  <- Fortnite' })"
+    }
+    $out = @("Fortnite's saved display ($modeTxt, DisplayIndex $idx):`n$($list -join "`n")")
+    if (-not $target) {
+        $out += "Fortnite's saved display ($fnId) is not connected right now, so Fortnite falls back to the main display. If you swapped monitors, that is expected."
+    } else {
+        $bad = @()
+        if ($target.MaxHz -lt $best) { $bad += "Fortnite is set to a $($target.MaxHz) Hz display while another one does $best Hz: $([math]::Round(1000 / $target.MaxHz, 1)) ms per frame against $([math]::Round(1000 / $best, 1)) ms." }
+        if ($target.Hz -lt $target.MaxHz) { $bad += "That display runs at $($target.Hz) Hz but can do $($target.MaxHz) Hz at this resolution: use the refresh-rate card." }
+        if (-not $target.Discrete -and ($mons | Where-Object Discrete)) { $bad += "That display is driven by $($target.Gpu), not your graphics card: every frame is copied across GPUs, which adds delay. Plug it into the graphics card." }
+        if ($bad.Count) { $out += ($bad -join "`n`n"); $out += 'To move Fortnite: set Window Mode to Windowed in Fortnite, drag the window onto the right monitor, then set Window Mode back. Fortnite rewrites DisplayID itself. ZeroDelay changes nothing here.' }
+        else { $out += "Good: Fortnite targets your fastest display ($($target.MaxHz) Hz)$(if ($target.Discrete) { ' on the graphics card' })." }
+    }
+    $out -join "`n`n"
+}
+
+# launch-argument audit: what each token in the Epic launcher box really does (per Epic's Unreal command-line reference and Fortnite support)
+$FnArgClass = @{
+    Harmful = @{ notexturestreaming = 'loads every texture at full size: memory overflow and hitching'; malloc = 'replaces the memory allocator Fortnite ships with: slower, more fragmented'
+                 nothreading = 'switches multithreading off'; onethread = 'runs single-threaded'; norhithread = 'removes the render thread'; nosound = 'no audio' }
+    Real    = @{ d3d12 = 'forces DirectX 12 (Epic''s repair when the rendering mode will not save)'; dx12 = 'forces DirectX 12'; sm6 = 'DirectX 12 mode (Epic''s repair when the rendering mode will not save)'
+                 featurelevelES31 = 'Performance mode (Epic''s repair when the rendering mode will not save)'; d3d11 = 'the deprecated DirectX 11 renderer, removed from the menu in v40.10; may stop working with any patch'; dx11 = 'the deprecated DirectX 11 renderer; may stop working with any patch' }
+    Placebo = @{ useallavailablecores = 'Fortnite sets its own thread counts; no measured gain, never recommended by Epic'; nosplash = 'skips the splash window, nothing in a match'; lanplay = 'LAN update rates; on the internet the server sets the rate, so nothing changes'
+                 preferredprocessor = 'old UE4 flag; Windows places the thread'; limitclientticks = 'unknown to the engine'; high = 'a Source-engine flag; Unreal ignores it'; noverify = 'nothing in Unreal'
+                 nomansky = 'invented by blogs'; noglobalillumination = 'invented by blogs'; noforcemparmlightmaps = 'invented by blogs'; noverboselogging = 'invented by blogs'
+                 novsync = 'same as V-Sync off in the settings'; fullscreen = 'same as the window-mode setting'; windowed = 'same as the window-mode setting'; resx = 'same as the resolution setting'; resy = 'same as the resolution setting'
+                 benchmark = 'debug only'; fps = 'debug only' }
+}
+function Get-FnArgVerdict([string]$Token) {
+    $n = ($Token -replace '^-+', '' -replace '=.*$', '')
+    $k = $null; foreach ($grp in 'Harmful', 'Real', 'Placebo') { foreach ($key in $FnArgClass[$grp].Keys) { if ($key -ieq $n) { $k = $grp; $n = $key } } }
+    switch ($k) {
+        'Harmful' { "HARMFUL: $($FnArgClass.Harmful[$n])" }
+        'Real'    { "real: $($FnArgClass.Real[$n])" }
+        'Placebo' { "does nothing useful: $($FnArgClass.Placebo[$n])" }
+        default   { 'not in Epic''s argument reference; the engine ignores arguments it does not know' }
+    }
+}
+function Get-FnLaunchArgReport {
+    $a = Get-FnLaunchArgs
+    $raw = if ($a) { "$($a.Args)".Trim() } else { '' }
+    $out = @()
+    if (-not $a) { $out += 'The Epic launcher has no argument box saved for Fortnite yet, so nothing extra is passed.' }
+    elseif (-not $raw) { $out += 'The Additional Command Line Arguments box is empty. Good.' }
+    else {
+        $toks = @($raw -split '\s+' | Where-Object { $_ })
+        $rows = foreach ($tok in $toks) {
+            $n = $tok -replace '^-+', ''
+            if ($n -match '^\w+(-\w+)+$') {
+                $parts = @($n -split '-' | Where-Object { $_ } | ForEach-Object { "$_ ($(Get-FnArgVerdict $_))" })
+                "$tok`n  written without spaces, so Fortnite sees one unknown argument and ignores all of it. Its parts: $($parts -join '; ')"
+            } else { "$tok`n  $(Get-FnArgVerdict $tok)" }
+        }
+        $out += "Launcher box ($(if ($a.Enabled -eq 'True') { 'switched on' } else { 'switched off, so none of it reaches the game' })):`n`n$($rows -join "`n")"
+    }
+    $l = Get-FnLogs 1
+    if ($l.Count) {
+        $t = try { Read-SharedText $l[0].FullName } catch { '' }
+        $m = [regex]::Matches($t, '(?m)Filtered Command Line:(.*)$')
+        if ($m.Count) {
+            $cmd = ($m[$m.Count - 1].Groups[1].Value.Trim() -replace '(-AUTH_PASSWORD=)\S+', '$1(hidden)')
+            $out += "What reached the game at its last start ($($l[0].LastWriteTime.ToString('d MMM HH:mm')), from Fortnite's own log):`n$cmd"
+            if ($raw) {
+                $hit = @($toks | Where-Object { $cmd -match [regex]::Escape($_) })
+                $out += if ($hit.Count) { "Your arguments that reached the game: $($hit -join ' ')" } else { 'None of your arguments reached the game last time.' }
+            }
+        }
+    }
+    $out += 'The -AUTH_*, -epicapp, -epicenv and -EpicPortal arguments are Epic''s own sign-in handshake and are always there. The "Switch off fake launch arguments" card turns the box off without deleting your text.'
+    $out -join "`n`n"
+}
+
+# NVIDIA driver version in NVIDIA's three-digit form, from Windows' driver record (32.0.16.1742 -> 617.42), plus the GPU name
+function Get-NvDriverVersionInfo {
+    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' } | Select-Object -First 1
+    if (-not $gpu) { return $null }
+    $digits = "$($gpu.DriverVersion)" -replace '[^\d]', ''
+    $ver = if ($digits.Length -ge 5) { $d = $digits.Substring($digits.Length - 5); "$($d.Substring(0, 3)).$($d.Substring(3))" } else { $null }
+    [pscustomobject]@{ Name = "$($gpu.Name)"; Version = $ver; Raw = "$($gpu.DriverVersion)" }
+}
+# GPU generation from the card name: Legacy = security-only 580 branch (Maxwell, Pascal, Volta), Rtx = RTX 20 and newer
+function Get-NvGeneration([string]$Name) {
+    $gen = switch -Regex ($Name) {
+        'RTX 5\d{3}|RTX PRO \d{4} Blackwell' { 'RTX 50 (Blackwell)'; break }
+        'RTX 4\d{3}'                         { 'RTX 40 (Ada)'; break }
+        'RTX 3\d{3}'                         { 'RTX 30 (Ampere)'; break }
+        'RTX 2\d{3}|GTX 16\d{2}'             { 'RTX 20 / GTX 16 (Turing)'; break }
+        'GTX 10\d{2}|TITAN Xp?$'             { 'GTX 10 (Pascal)'; break }
+        'TITAN V'                            { 'Volta'; break }
+        'GTX (7|9)\d{2}'                     { 'GTX 700 / 900 (Maxwell)'; break }
+        default                              { 'unknown generation' }
+    }
+    [pscustomobject]@{ Gen = $gen; Legacy = ($gen -match 'Pascal|Volta|Maxwell'); Rtx = ($gen -match '^RTX'); Blackwell = ($gen -match 'Blackwell') }
+}
+# driver branch facts as of 29 Oct 2026, compared with the installed version; advisory only, never downloads anything
+function Get-NvDriverReport {
+    $i = Get-NvDriverVersionInfo
+    if (-not $i) { return 'No NVIDIA graphics card found.' }
+    $g = Get-NvGeneration $i.Name
+    $v = try { [version]$i.Version } catch { $null }
+    $out = @("$($i.Name): driver $(if ($i.Version) { $i.Version } else { $i.Raw }), $($g.Gen).")
+    if (-not $v) { $out += 'Could not read the driver version in NVIDIA''s form.' }
+    elseif ($g.Legacy) {
+        $out += "GTX 700, 900 and 10 cards are on NVIDIA's 580 security branch: 582.78 (1 October 2026) is the newest, security-only updates about quarterly until October 2028, no new game drivers. Drivers 590 and newer do not install on this card.$(if ($v -lt [version]'582.78') { ' Yours is older than 582.78.' } else { ' You have the newest.' })"
+    } else {
+        if ($v -lt [version]'576.02') { $out += "NVIDIA's only Fortnite-specific fix of 2025 (random crashes during gameplay) shipped in 576.02 (April 2025); yours is older." }
+        if ($v -eq [version]'610.74') { $out += 'Players reported "GPU Crash dump Triggered" crashes in Fortnite on 610.74 (July 2026, user reports, not in NVIDIA''s notes). 610.88 (3 August 2026) or 621.01 are the way past it.' }
+        if ($v -lt [version]'621.01') { $out += "The current Game Ready driver is 621.01 (21 October 2026, RTX 20 to 50). Yours is older; a newer driver is not automatically faster, so update when something is wrong or a patch note names Fortnite." }
+        elseif ($v -eq [version]'621.01') { $out += "You are on the current Game Ready driver.$(if ($g.Blackwell) { ' RTX 50 only: some cards freeze or go black on video playback with 621.01; hotfix 621.12 (27 October 2026, less testing than a WHQL driver) fixes that. Only worth it if you see the problem.' })" }
+        else { $out += 'You are newer than the 621.01 Game Ready driver these facts were written against.' }
+        if ([Environment]::OSVersion.Version.Build -lt 22000) { $out += 'Windows 10: NVIDIA''s Game Ready support for RTX cards on Windows 10 ended in October 2026, so new drivers may no longer list it.' }
+    }
+    $out += 'ZeroDelay never downloads or installs drivers: get them from the NVIDIA App or nvidia.com/drivers and tick the clean install. Facts dated 29 October 2026; newer drivers may exist by now.'
+    $out -join "`n`n"
+}
+
+# NVIDIA G-SYNC in windowed mode: three driver settings read, written and restored together (NvApiDriverSettings.h ids)
+$NvVrrWindowedIds = @(
+    @{ Profile = 'Base Profile'; Id = [uint32]0x1194F158; V = [uint32]2; Default = 1 }   # VRR_MODE: 1 = full screen only (default), 2 = full screen and windowed
+    @{ Profile = 'Fortnite';     Id = [uint32]0x10A879CE; V = [uint32]1; Default = 1 }   # VSYNCVRRCONTROL: 1 = G-SYNC on for this app (default)
+    @{ Profile = 'Fortnite';     Id = [uint32]0x10A879CF; V = [uint32]0; Default = 0 }   # VRR_APP_OVERRIDE: 0 = allow (default), 1 = force off, 2 = disallow
+)
+# $true when all three are at the windowed-G-SYNC values, $null without NVIDIA or when a read fails
+function Test-NvVrrWindowed {
+    if (-not (Test-NvAvailable)) { return $null }
+    foreach ($s in $NvVrrWindowedIds) {
+        $e = Get-NvEff $s.Profile $s.Id
+        $cur = if ($e.Found) { $e.Value } elseif ($e.Rc -eq -160) { $s.Default } else { return $null }
+        if ([int64]$cur -ne [int64]$s.V) { return $false }
+    }
+    $true
+}
+# backs up each profile's own value (or $null when inherited) exactly like Enable-NvTweak, then writes all three
+function Enable-NvVrrWindowed([string]$Id) {
+    if (-not (Test-NvAvailable)) { throw 'Needs an NVIDIA graphics card.' }
+    if (-not $script:Backup.Custom.ContainsKey($Id)) {
+        $script:Backup.Custom[$Id] = @{ Items = @($NvVrrWindowedIds | ForEach-Object { @{ Profile = $_.Profile; Id = [int64]$_.Id; Value = (Get-NvBackupValue $_.Profile $_.Id) } }) }
+    }
+    foreach ($s in $NvVrrWindowedIds) { $r = [NvDrs]::Set($s.Profile, $s.Id, $s.V); if ($r -ne 0) { throw "The NVIDIA driver refused the change (code $r)." } }
+}
+# puts each of the three back: the saved value, or deletes it so the profile inherits again
+function Disable-NvVrrWindowed([string]$Id) {
+    $b = $script:Backup.Custom[$Id]
+    $items = @(if ($b) { $b.Items })
+    foreach ($s in $NvVrrWindowedIds) {
+        $saved = $items | Where-Object { $_.Profile -eq $s.Profile -and [int64]$_.Id -eq [int64]$s.Id } | Select-Object -First 1
+        if ($saved -and $null -ne $saved.Value) { [void][NvDrs]::Set($s.Profile, $s.Id, [uint32]$saved.Value) } else { [void][NvDrs]::Delete($s.Profile, $s.Id) }
+    }
+    $script:Backup.Custom.Remove($Id)
+}
+
+# a Background Application Max Frame Rate (APPIDLE_DYNAMIC_FRL_FPS 0x10835016) is set globally or on the Fortnite profile (cached)
+function Test-NvBgCapPresent {
+    if ($null -eq $script:NvBgCap) {
+        $script:NvBgCap = $false
+        if (Test-NvAvailable) {
+            foreach ($p in 'Base Profile', 'Fortnite') { $v = [NvDrs]::Get($p, [uint32]0x10835016); if ($v -gt 0) { $script:NvBgCap = $true } }
+            if ($script:Backup.Custom.ContainsKey('nv-bgfps')) { $script:NvBgCap = $true }
+        }
+    }
+    $script:NvBgCap
+}
+
+
+# --- Research round 5 (1.14): network stack and NIC drivers
+
+# --- NIC advanced-property helpers shared by the fixed itr / eee / wol cards
+# null-aware AND over several keywords: $null when none exists, $true when every existing one equals $Value
+function Test-AdvPropsOff([string[]]$Keywords, $Value = 0) {
+    $seen = $false
+    foreach ($k in $Keywords) { $r = Test-AdvProp $k $Value; if ($null -eq $r) { continue }; $seen = $true; if (-not $r) { return $false } }
+    if ($seen) { $true } else { $null }
+}
+# Set-AdvProp for keywords without a display name (hidden INF params such as EEELinkAdvertisement on Intel 2.x)
+function Set-AdvPropHidden([string]$Id, [string]$Keyword, $Value) {
+    $props = @(Get-UpAdapters | ForEach-Object { Get-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword $Keyword -AllProperties -ErrorAction SilentlyContinue })
+    if (-not $script:Backup.Custom.ContainsKey($Id)) {
+        $script:Backup.Custom[$Id] = @($props | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = "$($_.RegistryValue[0])" } })
+    }
+    foreach ($p in $props) { Set-NetAdapterAdvancedProperty -Name $p.Name -RegistryKeyword $Keyword -RegistryValue $Value -AllProperties }
+}
+# Reset-AdvProp whose fallback default is computed per adapter ($DefaultFor gets the adapter name) when there is no backup
+function Reset-AdvPropEach([string]$Id, [string]$Keyword, [scriptblock]$DefaultFor) {
+    if ($script:Backup.Custom.ContainsKey($Id)) {
+        foreach ($o in @($script:Backup.Custom[$Id] | Where-Object { $_ -and $_.Name })) {
+            Set-NetAdapterAdvancedProperty -Name $o.Name -RegistryKeyword $Keyword -RegistryValue $o.Value -AllProperties -ErrorAction SilentlyContinue
+        }
+        $script:Backup.Custom.Remove($Id)
+    } else {
+        foreach ($a in Get-UpAdapters) {
+            $d = & $DefaultFor $a.Name
+            if ($null -ne $d) { Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword $Keyword -RegistryValue $d -AllProperties -ErrorAction SilentlyContinue }
+        }
+    }
+}
+# the cached advanced property of one adapter (hidden ones included)
+function Get-AdvPropOf([string]$Name, [string]$Keyword) { Get-AdvPropsAll | Where-Object { $_.Name -eq $Name -and $_.RegistryKeyword -eq $Keyword } | Select-Object -First 1 }
+
+# --- Interrupt Moderation Rate (ITR): the enum differs per driver, so pick by display name and read the default from the enum
+# Intel 1.x: Adaptive 65535 (default) ... Minimal 200; Intel 2.x (I225/I226): Low 64 (default), Minimal 32, no Adaptive; Marvell AQtion: Adaptive 65535 (default), Low 14, no Minimal
+function Get-ItrTargets {
+    $min = @(Get-AdvTargets 'ITR' '^Minimal$'); $names = @($min | ForEach-Object { $_.Name })
+    $min + @(Get-AdvTargets 'ITR' '^Low$' | Where-Object { $names -notcontains $_.Name })
+}
+function Test-ItrMin { $tg = @(Get-ItrTargets); if (-not $tg.Count) { return $null }; -not ($tg | Where-Object { $_.Current -ne $_.Target }) }
+function Set-ItrMin([string]$Id) {
+    $tg = @(Get-ItrTargets)
+    if (-not $script:Backup.Custom.ContainsKey($Id)) { $script:Backup.Custom[$Id] = @($tg | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = $_.Current } }) }
+    foreach ($x in $tg) { Set-NetAdapterAdvancedProperty -Name $x.Name -RegistryKeyword 'ITR' -RegistryValue $x.Target }
+}
+# driver default of ITR for one adapter: Adaptive (65535) where the enum has it, else the Intel 2.x default Low (64); $null when the adapter has no ITR
+function Get-ItrDefault([string]$Name) {
+    $p = Get-AdvPropOf $Name 'ITR'
+    if (-not $p) { return $null }
+    $dv = @($p.ValidDisplayValues); $rv = @($p.ValidRegistryValues | ForEach-Object { "$_" })
+    if ($dv -match '^Adaptive$') { return 65535 }
+    if ($rv -contains '64' -and $rv -contains '32') { return 64 }
+    65535
+}
+# driver default of Intel's EEELinkAdvertisement: 1 on the 1.x drivers, 0 on the 2.x (NetAdapterCx) drivers; $null when absent
+function Get-EeeLinkAdvDefault([string]$Name) {
+    if (-not (Get-AdvPropOf $Name 'EEELinkAdvertisement')) { return $null }
+    $a = Get-NetAdapter -Name $Name -ErrorAction SilentlyContinue
+    $v = try { [version]$a.DriverVersion } catch { $null }
+    if ($v -and $v.Major -ge 2) { 0 } else { 1 }
+}
+
+# --- Virtual adapters (Hyper-V Default Switch, WSL, Docker, VMware, VirtualBox, TAP) ranked level with or above the real NIC
+$VNicRx = 'Hyper-V Virtual Ethernet|VMware Virtual Ethernet|VirtualBox Host-Only|Npcap Loopback|TAP-Windows|TAP Adapter|Wintun|Docker|WSL'
+# cheap Requires check: any connected virtual adapter at all (no route lookup)
+function Test-VirtualNicPresent { [bool](Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and -not $_.HardwareInterface -and $_.InterfaceDescription -notmatch 'WAN Miniport|Kernel Debug' -and ("$($_.InterfaceDescription) $($_.Name)" -match $VNicRx -or $_.Name -like 'vEthernet*') }) }
+# connected virtual adapters, without the one that carries the internet route (a Hyper-V external switch sits in front of the real NIC)
+function Get-VirtualNics {
+    $r = Get-InternetRoute; $realIdx = if ($r -and $r.Adapter) { $r.Adapter.ifIndex } else { -1 }
+    @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.ifIndex -ne $realIdx -and -not $_.HardwareInterface -and $_.InterfaceDescription -notmatch 'WAN Miniport|Kernel Debug' -and ("$($_.InterfaceDescription) $($_.Name)" -match $VNicRx -or $_.Name -like 'vEthernet*') })
+}
+# IPv4 + IPv6 interface metrics of the virtual adapters next to the real NIC's metric
+function Get-VnicMetricRows {
+    $r = Get-InternetRoute
+    $real = if ($r -and $r.Adapter) { (Get-NetIPInterface -InterfaceIndex $r.Adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric } else { $null }
+    @(foreach ($v in Get-VirtualNics) {
+        foreach ($fam in 'IPv4', 'IPv6') {
+            $i = Get-NetIPInterface -InterfaceIndex $v.ifIndex -AddressFamily $fam -ErrorAction SilentlyContinue
+            if ($i) { [pscustomobject]@{ Index = [int]$v.ifIndex; Alias = $v.Name; Family = $fam; Metric = [int]$i.InterfaceMetric; Automatic = "$($i.AutomaticMetric)"; Real = $real } }
+        }
+    })
+}
+# $true when every virtual adapter ranks below the real NIC (or is already pushed to 5000); $null without virtual adapters
+function Test-VnicDemoted {
+    $rows = @(Get-VnicMetricRows); if (-not $rows.Count) { return $null }
+    -not ($rows | Where-Object { $_.Metric -lt 5000 -and ($null -eq $_.Real -or $_.Metric -le $_.Real) })
+}
+function Set-VnicDemoted([string]$Id) {
+    $rows = @(Get-VnicMetricRows)
+    if (-not $script:Backup.Custom.ContainsKey($Id)) { $script:Backup.Custom[$Id] = @($rows | ForEach-Object { @{ Alias = $_.Alias; Family = $_.Family; Metric = $_.Metric; Automatic = $_.Automatic } }) }
+    foreach ($x in $rows) { Set-NetIPInterface -InterfaceIndex $x.Index -AddressFamily $x.Family -InterfaceMetric 5000 -ErrorAction Stop }
+}
+# puts the saved metric back (automatic again where it was automatic); adapters recreated since (new ifIndex) are matched by alias
+function Restore-VnicMetric([string]$Id) {
+    foreach ($b in @($script:Backup.Custom[$Id] | Where-Object { $_ })) {
+        $alias = "$($b.Alias)"; $fam = "$($b.Family)"
+        if ($b.Automatic -eq 'Enabled') { Set-NetIPInterface -InterfaceAlias $alias -AddressFamily $fam -AutomaticMetric Enabled -ErrorAction SilentlyContinue }
+        else { Set-NetIPInterface -InterfaceAlias $alias -AddressFamily $fam -InterfaceMetric ([int]$b.Metric) -ErrorAction SilentlyContinue }
+    }
+    $script:Backup.Custom.Remove($Id)
+}
+
+# --- TCP / IP global leftovers from tweak packs (Fortnite's match traffic is UDP: these only touch browsers, launchers and downloads)
+# the Windows defaults of the globals tweak packs change; CUBIC exists from Windows 10 1709
+$TcpDefaults = @(
+    @{ Key = 'AutoTuningLevelLocal'; Default = 'Normal'; Label = 'TCP receive window auto-tuning' }
+    @{ Key = 'ScalingHeuristics'; Default = 'Disabled'; Label = 'Window scaling heuristics' }
+    @{ Key = 'EcnCapability'; Default = 'Disabled'; Label = 'ECN' }
+    @{ Key = 'CongestionProvider'; Default = 'CUBIC'; Label = 'Congestion control' }
+    @{ Key = 'TaskOffload'; Default = 'Enabled'; Label = 'Task offload (checksums on the card)' }
+    @{ Key = 'ReceiveSideScaling'; Default = 'Enabled'; Label = 'Receive Side Scaling (global)' }
+    @{ Key = 'ReceiveSegmentCoalescing'; Default = 'Enabled'; Label = 'Receive Segment Coalescing (global)' }
+    @{ Key = 'NeighborCacheLimit'; Default = '256'; Label = 'Neighbour cache limit' }
+)
+# current value of every global in $TcpDefaults (throws when the cmdlets are unavailable)
+function Get-TcpGlobals {
+    $tcp = Get-NetTCPSetting -SettingName Internet -ErrorAction Stop
+    $off = Get-NetOffloadGlobalSetting -ErrorAction Stop
+    $ip4 = Get-NetIPv4Protocol -ErrorAction Stop
+    $h = @{}
+    foreach ($k in 'AutoTuningLevelLocal', 'ScalingHeuristics', 'EcnCapability', 'CongestionProvider') { $h[$k] = "$($tcp.$k)" }
+    foreach ($k in 'TaskOffload', 'ReceiveSideScaling', 'ReceiveSegmentCoalescing') { $h[$k] = "$($off.$k)" }
+    $h['NeighborCacheLimit'] = "$($ip4.NeighborCacheLimit)"
+    $h
+}
+# the globals that differ from the Windows default, as rows (Key, Label, Current, Default)
+function Get-TcpLeftovers {
+    $cur = Get-TcpGlobals
+    @(foreach ($d in $TcpDefaults) {
+        if ($d.Key -eq 'CongestionProvider' -and [Environment]::OSVersion.Version.Build -lt 16299) { continue }
+        $c = $cur[$d.Key]; if ($c -and $c -ne $d.Default) { [pscustomobject]@{ Key = $d.Key; Label = $d.Label; Current = $c; Default = $d.Default } }
+    })
+}
+function Set-TcpGlobal([string]$Key, [string]$Value) {
+    switch ($Key) {
+        'AutoTuningLevelLocal' { Set-NetTCPSetting -SettingName Internet -AutoTuningLevelLocal $Value -ErrorAction Stop }
+        'ScalingHeuristics'    { Set-NetTCPSetting -SettingName Internet -ScalingHeuristics $Value -ErrorAction Stop }
+        'EcnCapability'        { Set-NetTCPSetting -SettingName Internet -EcnCapability $Value -ErrorAction Stop }
+        'CongestionProvider'   { Set-NetTCPSetting -SettingName Internet -CongestionProvider $Value -ErrorAction Stop }
+        'TaskOffload'          { Set-NetOffloadGlobalSetting -TaskOffload $Value -ErrorAction Stop }
+        'ReceiveSideScaling'   { Set-NetOffloadGlobalSetting -ReceiveSideScaling $Value -ErrorAction Stop }
+        'ReceiveSegmentCoalescing' { Set-NetOffloadGlobalSetting -ReceiveSegmentCoalescing $Value -ErrorAction Stop }
+        'NeighborCacheLimit'   { Set-NetIPv4Protocol -NeighborCacheLimit ([uint32]$Value) -ErrorAction Stop }
+    }
+}
+# puts the leftovers back to the defaults, saving the old values under $Id first
+function Repair-TcpDefaults([string]$Id) {
+    $left = @(Get-TcpLeftovers)
+    if (-not $script:Backup.Custom.ContainsKey($Id)) { $script:Backup.Custom[$Id] = @($left | ForEach-Object { @{ Key = $_.Key; Value = $_.Current } }) }
+    $failed = @()
+    foreach ($l in $left) { try { Set-TcpGlobal $l.Key $l.Default } catch { $failed += $l.Label } }
+    if ($failed.Count) { throw "Windows refused to reset: $($failed -join ', ')." }
+}
+function Restore-TcpDefaults([string]$Id) {
+    foreach ($b in @($script:Backup.Custom[$Id] | Where-Object { $_ })) { try { Set-TcpGlobal "$($b.Key)" "$($b.Value)" } catch {} }
+    $script:Backup.Custom.Remove($Id)
+}
+
+# --- NAT type (STUN, RFC 5389) and double NAT / CGNAT (first hops), run in the worker
+$StunServers = @('stun.cloudflare.com:3478', 'stun.l.google.com:19302')
+$script:NatCheckBusy = $false
+function Start-NatCheck {
+    if ($script:NatCheckBusy) { throw 'The NAT check is already running.' }
+    $script:NatCheckBusy = $true
+    Invoke-Worker @'
+param($servers)
+# one UDP socket, one 20-byte Binding Request per server, read XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001) from the answer
+$u = New-Object System.Net.Sockets.UdpClient 0
+$u.Client.ReceiveTimeout = 2500
+$rows = @()
+foreach ($s in $servers) {
+    $h, $p = $s -split ':'
+    $req = New-Object byte[] 20
+    $req[1] = 1; $req[4] = 0x21; $req[5] = 0x12; $req[6] = 0xA4; $req[7] = 0x42
+    $tid = New-Object byte[] 12; (New-Object System.Random).NextBytes($tid); [Array]::Copy($tid, 0, $req, 8, 12)
+    $ip = ''; $port = 0; $ms = -1
+    try {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        [void]$u.Send($req, 20, $h, [int]$p)
+        $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any), 0
+        $r = $u.Receive([ref]$ep); $ms = [int]$sw.ElapsedMilliseconds
+        if ($r.Length -ge 20 -and $r[0] -eq 1 -and $r[1] -eq 1) {
+            $i = 20
+            while ($i + 4 -le $r.Length) {
+                $type = ($r[$i] -shl 8) -bor $r[$i + 1]; $len = ($r[$i + 2] -shl 8) -bor $r[$i + 3]; $v = $i + 4
+                if ($v + 8 -gt $r.Length) { break }
+                if ($type -eq 0x20 -and $r[$v + 1] -eq 1) { $port = (($r[$v + 2] -shl 8) -bor $r[$v + 3]) -bxor 0x2112; $ip = "$($r[$v + 4] -bxor 0x21).$($r[$v + 5] -bxor 0x12).$($r[$v + 6] -bxor 0xA4).$($r[$v + 7] -bxor 0x42)"; break }
+                if ($type -eq 0x01 -and $r[$v + 1] -eq 1 -and -not $ip) { $port = ($r[$v + 2] -shl 8) -bor $r[$v + 3]; $ip = "$($r[$v + 4]).$($r[$v + 5]).$($r[$v + 6]).$($r[$v + 7])" }
+                $i = $v + $len + ((4 - ($len % 4)) % 4)
+            }
+        }
+    } catch {}
+    $rows += [pscustomobject]@{ Server = $s; Ip = $ip; Port = $port; Ms = $ms }
+}
+$u.Close()
+$local = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | ForEach-Object { $_.IPAddress })
+$hops = @()
+foreach ($l in @(& tracert.exe -d -h 3 -w 700 1.1.1.1 2>&1)) { if ("$l" -match '^\s*(\d+)\s+(.*\s)?(\d{1,3}(\.\d{1,3}){3})\s*$') { $hops += [pscustomobject]@{ Hop = [int]$Matches[1]; Ip = $Matches[3] } } elseif ("$l" -match '^\s*(\d+)\s+\*') { $hops += [pscustomobject]@{ Hop = [int]$Matches[1]; Ip = '*' } } }
+@{ Rows = $rows; Local = $local; Hops = $hops }
+'@ @(, $StunServers) {
+        param($out, $errs)
+        $script:NatCheckBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable])) { Show-Toast 'The NAT check could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Get-NatVerdict $res) 'NAT type' 'OK' 'Information')
+    }
+}
+# turns the worker result into the verdict text
+function Get-NatVerdict($Res) {
+    $ok = @($Res.Rows | Where-Object { $_.Ip })
+    $s = ''
+    if (-not $ok.Count) { $s = "Neither STUN server answered. Either you are offline, a firewall or VPN blocks UDP to port 3478/19302, or your network only allows web traffic. Fortnite itself needs outbound UDP, so a blocked check here is worth a look.`n`n" }
+    else {
+        $pub = $ok[0].Ip
+        $ports = @($ok | ForEach-Object { $_.Port } | Sort-Object -Unique)
+        if (@($Res.Local) -contains $pub) { $s = "Public address $pub is on this PC itself: no NAT at all (Open). Nothing to do here.`n`n" }
+        elseif ($ok.Count -lt 2) { $s = "Only one STUN server answered (public address $pub), so the NAT type could not be classified. Run the check again in a moment.`n`n" }
+        elseif ($ports.Count -eq 1) { $s = "Your router keeps the same public port ($pub`:$($ports[0])) for both test servers: a cone NAT, which Xbox and consoles call Open or Moderate. Party invites, joins and voice work normally.`n`n" }
+        else { $s = "Your router gave each test server a different public port ($pub`:$($ports -join ' and ')): a symmetric NAT, which Xbox and consoles call Strict. Party invites and voice with some friends can fail; turn on UPnP on the router, or set a static port / DMZ for this PC.`n`n" }
+    }
+    $private = { param($ip) $ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)' }
+    $cg = { param($ip) $ip -match '^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.' }
+    $h = @($Res.Hops | Sort-Object Hop); $h1 = $h | Where-Object { $_.Hop -eq 1 } | Select-Object -First 1; $h2 = $h | Where-Object { $_.Hop -eq 2 } | Select-Object -First 1
+    if ($h1 -and $h2 -and $h1.Ip -ne '*' -and $h2.Ip -ne '*') {
+        if (& $cg $h2.Ip) { $s += "Hop 2 ($($h2.Ip)) is a carrier-grade NAT address (100.64.0.0/10): your provider shares one public address between customers. UPnP and port forwarding on your own router then cannot open anything; only a public IP from the provider fixes a Strict NAT.`n`n" }
+        elseif ((& $private $h1.Ip) -and (& $private $h2.Ip)) { $s += "Hops 1 and 2 are both private addresses ($($h1.Ip), then $($h2.Ip)). That is either a second router in front of yours (double NAT: a provider box in router mode plus your own router) or your provider's internal network. If NAT came out Strict, put the provider box in bridge mode or enable UPnP on both.`n`n" }
+        else { $s += "Hop 1 is your router ($($h1.Ip)), hop 2 ($($h2.Ip)) is already your provider: no double NAT.`n`n" }
+    } elseif ($h1 -and $h1.Ip -ne '*') { $s += "Hop 1 is your router ($($h1.Ip)); hop 2 did not answer, so double NAT could not be ruled out.`n`n" }
+    $s + "What this affects: party invites, joining friends and voice chat, which connect PC to PC. It never changes your ping to the match server; those packets go out to Epic's servers, which every NAT allows."
+}
+
+# --- Game NIC in MSI mode (sibling of gpu-msi): the PCI adapter that carries the internet route
+function Get-NicMsiKey {
+    if ($null -eq $script:NicMsiKeyCache) {
+        # one connected adapter: that is the game NIC, no route lookup needed (the first NetTCPIP call costs ~470 ms of module loading)
+        $ups = @(Get-UpAdapters)
+        $a = if ($ups.Count -eq 1) { $ups[0] } elseif ($ups.Count) {
+            $g = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1
+            if ($g) { $ups | Where-Object { $_.ifIndex -eq $g.ifIndex } | Select-Object -First 1 } else { $null }
+        } else { $null }
+        $script:NicMsiKeyCache = if ($a -and "$($a.PnPDeviceID)" -like 'PCI\*') { "HKLM:\SYSTEM\CurrentControlSet\Enum\$($a.PnPDeviceID)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" } else { '' }
+    }
+    $script:NicMsiKeyCache
+}
+function Test-NicMsi { $k = Get-NicMsiKey; if (-not $k) { return $null }; (Get-RegValue $k 'MSISupported') -eq 1 }
+
+# --- Leftover filter drivers (ExitLag/NoPing WinpkFilter, WinDivert, Npcap, VirtualBox, VMware) and any non-Microsoft NDIS lightweight filter
+$NetFilterMs = 'WfpLwfs', 'Psched', 'NdisCap', 'NativeWifiP', 'MsBridge', 'NetBIOS', 'vwififlt', 'vmsmp', 'NdisImPlatform', 'NdisVirtualBus', 'MsLldp', 'mslldp', 'NdisWan', 'RasPppoe', 'Ndu', 'WdNisDrv'
+$NetFilterKnown = @(
+    @{ Rx = '^ndisrd$'; Name = 'Windows Packet Filter (WinpkFilter) - installed by ExitLag, NoPing and similar ping boosters' }
+    @{ Rx = '^WinDivert'; Name = 'WinDivert - used by WTFast, clumsy, GoodbyeDPI and some "ping reducers"' }
+    @{ Rx = '^(npcap|npf)$'; Name = 'Npcap / WinPcap - Wireshark and some overlay or capture tools' }
+    @{ Rx = '^VBoxNetLwf$'; Name = 'VirtualBox bridged networking filter' }
+    @{ Rx = '^vmnetbridge$'; Name = 'VMware Bridge Protocol' }
+)
+# lines describing leftover filter drivers; empty when none
+function Get-NetFilterLeftovers {
+    $out = @()
+    $svcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    foreach ($k in $NetFilterKnown) {
+        foreach ($s in @(Get-ChildItem $svcRoot -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match $k.Rx })) {
+            $start = Get-RegValue $s.PSPath 'Start'
+            $state = if ($start -eq 4) { 'disabled' } else { $r = Get-Service -Name $s.PSChildName -ErrorAction SilentlyContinue; if ($r -and $r.Status -eq 'Running') { 'loaded' } else { 'installed' } }
+            $out += "$($s.PSChildName): $($k.Name) ($state)"
+        }
+    }
+    $lwf = 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4d36e974-e325-11ce-bfc1-08002be10318}'
+    foreach ($c in @(Get-ChildItem $lwf -ErrorAction SilentlyContinue)) {
+        $svc = "$(Get-RegValue (Join-Path $c.PSPath 'Ndi') 'Service')"
+        if (-not $svc -or $NetFilterMs -contains $svc) { continue }
+        if ($out | Where-Object { $_ -like "$svc`:*" }) { continue }
+        $id = "$(Get-RegValue $c.PSPath 'ComponentId')"
+        if ($id -like 'ms_*') { continue }
+        $out += "$svc`: non-Microsoft network filter ($id)"
+    }
+    $out
+}
+
+
+# --- Research round 5 (1.14): dual-CCD Ryzen parking, firmware, memory and storage checks (hw)
+function Test-AmdCpu { (Get-CpuName) -match 'AMD|Ryzen' }
+# Ryzen 9 9900X / 9950X without V-Cache: AMD's chipset driver parks the second die for games on these too (never on 7900X/7950X)
+function Test-DualCcdRyzen { (Get-CpuName) -match 'Ryzen 9 (9900|9950)X\b' -and (Get-CpuName) -notmatch 'X3D' }
+# AM4 desktop and mobile Ryzen (1000 to 5000 series): the only ones AMD's fTPM stutter advisory covered
+function Test-Am4Ryzen { (Get-CpuName) -match 'Ryzen (3|5|7|9)( PRO)? [1-5]\d{3}' }
+# TPM facts read once (Get-Tpm needs elevation; without it every field is empty and Present stays $null = unknown)
+function Get-TpmInfo {
+    if ($null -eq $script:TpmInfo) {
+        $script:TpmInfo = @{ Present = $null; Ready = $null; Mfr = ''; Ver = ''; Spec = '' }
+        try { $t = Get-Tpm -ErrorAction Stop; if ($null -ne $t.TpmPresent) { $script:TpmInfo = @{ Present = [bool]$t.TpmPresent; Ready = [bool]$t.TpmReady; Mfr = "$($t.ManufacturerIdTxt)".Trim(); Ver = "$($t.ManufacturerVersion)".Trim(); Spec = "$($t.SpecVersion)".Trim() } } } catch {}
+    }
+    $script:TpmInfo
+}
+# BIOS version and date plus the board name, read once
+function Get-BiosInfo {
+    if ($null -eq $script:BiosInfo) {
+        $b = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue | Select-Object -First 1
+        $m = Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue | Select-Object -First 1
+        $d = $null; if ($b -and $b.ReleaseDate -is [datetime]) { $d = $b.ReleaseDate }
+        $script:BiosInfo = @{ Version = "$($b.SMBIOSBIOSVersion)".Trim(); Date = $d; Board = "$($m.Manufacturer) $($m.Product)".Trim(); Product = "$($m.Product)".Trim() }
+    }
+    $script:BiosInfo
+}
+# the PCI graphics card Windows uses (discrete first, integrated only when there is nothing else)
+function Get-DiscreteGpuPnp {
+    $all = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match '^PCI\\VEN_(10DE|1002|8086)' })
+    $d = $all | Where-Object { $_.FriendlyName -match $DiscreteGpuRx } | Select-Object -First 1
+    if (-not $d) { $d = $all | Select-Object -First 1 }
+    $d
+}
+# desktop or laptop, from the chassis type (laptops run their GPU at x8 by design)
+function Test-LaptopChassis { [bool](@((Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue).ChassisTypes) | Where-Object { $_ -in 8, 9, 10, 11, 14, 30, 31, 32 }) }
+# Fortnite's install folder from the Epic launcher manifests, falling back to the running exe's location
+function Get-FnInstallDir {
+    foreach ($m in Get-ChildItem "$env:ProgramData\Epic\EpicGamesLauncher\Data\Manifests" -Filter *.item -ErrorAction SilentlyContinue) {
+        try { $j = Get-Content $m.FullName -Raw | ConvertFrom-Json; if (($j.AppName -eq 'Fortnite' -or $j.DisplayName -eq 'Fortnite') -and $j.InstallLocation) { return "$($j.InstallLocation)".Trim().TrimEnd('\') } } catch {}
+    }
+    $exe = Find-FortniteExe
+    if ($exe) { return Split-Path (Split-Path (Split-Path (Split-Path $exe -Parent) -Parent) -Parent) -Parent }
+    $null
+}
+
+# --- Dual-CCD Ryzen: is AMD's core parking able to work? Everything slow runs in the worker.
+$script:CcdCheckBusy = $false
+function Start-CcdParkingCheck {
+    if ($script:CcdCheckBusy) { throw 'The parking check is already running.' }
+    $script:CcdCheckBusy = $true
+    Invoke-Worker @'
+param($balanced, $exeName, $x3d)
+$r = [pscustomobject]@{ Plan = ''; PlanGuid = ''; BalancedExists = $false; Ppm = $false; Vcache = $false; VcacheSvc = ''; GameBar = ''; GameMode = $true; AllowGM = $true; MinCores = -1; Prov = $false; Parked = -1; Cores = -1; ParkedNames = ''; Running = $false; Tools = @() }
+$line = "$(powercfg /getactivescheme)"
+if ($line -match '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\s+\((.*)\)') { $r.PlanGuid = $Matches[1]; $r.Plan = $Matches[2] }
+$r.BalancedExists = [bool](powercfg /list | Where-Object { $_ -match $balanced })
+$pnp = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'AMD PPM Provisioning|3D V-Cache Performance Optimizer' })
+$r.Ppm = [bool]($pnp | Where-Object { $_.FriendlyName -match 'PPM Provisioning' })
+$r.Vcache = [bool]($pnp | Where-Object { $_.FriendlyName -match 'V-Cache' })
+if ($x3d) { $s = Get-Service amd3dvcacheSvc -ErrorAction SilentlyContinue; $r.VcacheSvc = if ($s) { "$($s.Status)" } else { 'missing' } }
+$gb = Get-AppxPackage Microsoft.XboxGamingOverlay -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($gb) { $r.GameBar = "$($gb.Version)" }
+$gm = Get-ItemProperty 'HKCU:\Software\Microsoft\GameBar' -ErrorAction SilentlyContinue
+if ($gm -and $null -ne $gm.AutoGameModeEnabled) { $r.GameMode = [int]$gm.AutoGameModeEnabled -eq 1 }
+if ($gm -and $null -ne $gm.AllowAutoGameMode) { $r.AllowGM = [int]$gm.AllowAutoGameMode -eq 1 }
+$sub = '54533251-82be-4824-96c1-47b60b740d00'; $set = '0cc5b647-c1df-4637-891a-dec35c318583'
+$dk = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\$sub\$set\DefaultPowerSchemeValues\$balanced"
+$dv = Get-ItemProperty $dk -ErrorAction SilentlyContinue
+$r.Prov = [bool]($dv -and $null -ne $dv.ProvAcSettingIndex)
+if ($r.BalancedExists) {
+    $o = @(powercfg /qh $balanced $sub $set 2>$null)
+    foreach ($l in $o) { if ($l -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $r.MinCores = [Convert]::ToInt32($Matches[1], 16); break } }
+}
+if ($r.MinCores -lt 0) {
+    $uv = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$balanced\$sub\$set" -ErrorAction SilentlyContinue
+    if ($uv -and $null -ne $uv.ACSettingIndex) { $r.MinCores = [int]$uv.ACSettingIndex }
+    elseif ($dv -and $null -ne $dv.ProvAcSettingIndex) { $r.MinCores = [int]$dv.ProvAcSettingIndex }
+    elseif ($dv -and $null -ne $dv.AcSettingIndex) { $r.MinCores = [int]$dv.AcSettingIndex }
+}
+$r.Running = [bool](Get-Process ($exeName -replace '\.exe$') -ErrorAction SilentlyContinue)
+if ($r.Running) {
+    try {
+        $c = Get-Counter '\Processor Information(*)\Parking Status' -ErrorAction Stop
+        $smp = @($c.CounterSamples | Where-Object { $_.InstanceName -notmatch '_Total' })
+        $r.Cores = $smp.Count
+        $parked = @($smp | Where-Object { $_.CookedValue -eq 1 })
+        $r.Parked = $parked.Count
+        $r.ParkedNames = (($parked | ForEach-Object { $_.InstanceName -replace '^0,', '' } | Sort-Object { [int]$_ }) -join ', ')
+    } catch {}
+}
+$r.Tools = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(ProcessLasso|ProcessGovernor|CoreDirector|RazerCortex|Hone)' } | ForEach-Object { $_.ProcessName } | Sort-Object -Unique)
+$h = @{}; foreach ($p in $r.PSObject.Properties) { $h[$p.Name] = $p.Value }; $h
+'@ @($BalancedGuid, $FortniteExeName, [bool](Test-DualCcdX3D)) {
+        param($out, $errs)
+        $script:CcdCheckBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.ContainsKey('Plan')) { Show-Toast 'The parking check could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-CcdParkingReport $r) 'AMD core parking' 'OK' 'Information')
+    }
+}
+# turns the worker's facts into pass / fail lines with the documented repairs
+function Format-CcdParkingReport($r) {
+    $x3d = Test-DualCcdX3D
+    $bad = 0; $l = @()
+    if ($r.PlanGuid -eq $BalancedGuid) { $l += "Power plan: Balanced. OK" }
+    elseif (-not $r.BalancedExists) { $bad++; $l += "Power plan: $($r.Plan). FAIL: the Balanced plan itself is missing (another tool deleted it). The Balanced plan card recreates and selects it." }
+    else { $bad++; $l += "Power plan: $($r.Plan). FAIL: AMD's parking driver only works on Balanced; any high-performance plan keeps both dies awake. Switch on the Balanced plan card." }
+    if ($r.Ppm) { $l += 'AMD PPM Provisioning File driver: present. OK' } else { $bad++; $l += 'AMD PPM Provisioning File driver: MISSING. Install AMD Chipset Software from amd.com/support (the AMD chipset card has the steps).' }
+    if ($x3d) {
+        if ($r.Vcache) { $l += '3D V-Cache Performance Optimizer driver: present. OK' } else { $bad++; $l += '3D V-Cache Performance Optimizer driver: MISSING. It comes with AMD Chipset Software.' }
+        if ($r.VcacheSvc -eq 'Running') { $l += 'amd3dvcacheSvc service: running. OK' } else { $bad++; $l += "amd3dvcacheSvc service: $($r.VcacheSvc). Reinstall the chipset software." }
+    }
+    if ($r.GameBar) { $l += "Xbox Game Bar package: $($r.GameBar). OK (the overlay may stay off; only the package and its game detection are needed)" } else { $bad++; $l += 'Xbox Game Bar package: REMOVED. AMD''s driver uses its game detection; reinstall Xbox Game Bar from the Microsoft Store.' }
+    if ($r.GameMode -and $r.AllowGM) { $l += 'Windows Game Mode: on. OK' } else { $bad++; $l += 'Windows Game Mode: OFF. Switch on the Windows Game Mode card (Settings > Gaming > Game Mode).' }
+    if ($r.MinCores -ge 100 -and -not $r.Ppm) { $l += "Core parking minimum on Balanced: 100%, Windows' desktop default: no core can park until AMD's provisioning (the chipset driver above) lowers it." }
+    elseif ($r.MinCores -ge 100) { $bad++; $l += "Core parking minimum on Balanced: 100%. FAIL: no core can park. Either the chipset driver's provisioning is not applied (reinstall it) or a tool set Unpark all cores on the Balanced plan." }
+    elseif ($r.MinCores -ge 0) { $l += "Core parking minimum on Balanced: $($r.MinCores)%. OK$(if ($r.Prov) { ' (AMD provisioning present)' })" }
+    else { $l += 'Core parking minimum on Balanced: could not be read.' }
+    if ($r.Running) {
+        if ($r.Parked -gt 0) { $l += "Live: $($r.Parked) of $($r.Cores) logical processors are parked right now (CPUs $($r.ParkedNames)). Parking is working." }
+        elseif ($r.Cores -gt 0) { $bad++; $l += "Live: 0 of $($r.Cores) logical processors are parked while Fortnite runs. If you are already in a match (not the lobby), parking is not engaging: see the repairs below." }
+        else { $l += 'Live: the parking counter could not be read.' }
+    } else { $l += 'Live check: start a match and run this check again to see whether the second die really parks.' }
+    if (@($r.Tools).Count) { $l += "Running: $(@($r.Tools) -join ', '). These tools set their own affinity or power plan and are the usual reason parking does not stick; exclude Fortnite in them or close them." }
+    $head = if ($bad) { "$bad of the requirements for AMD's core parking are not met:" } else { 'Everything AMD requires for core parking is in place:' }
+    $tail = "`n`nRepairs AMD documents: reinstall AMD Chipset Software (its installer rewrites the Balanced plan); run  Rundll32.exe advapi32.dll,ProcessIdleTasks  from an administrator prompt and leave the PC idle for about 15 minutes to refresh the game list; in Win+G > Settings confirm 'Remember this is a game' for Fortnite. The Keep Fortnite on one CPU die card is the manual fallback when parking never engages."
+    "$head`n`n$($l -join "`n")$tail"
+}
+
+# --- AMD chipset package: present, version, and the drivers it should have installed (worker: Win32_PnPSignedDriver takes seconds)
+$script:ChipsetBusy = $false
+function Start-AmdChipsetCheck {
+    if ($script:ChipsetBusy) { throw 'The chipset check is already running.' }
+    $script:ChipsetBusy = $true
+    Invoke-Worker @'
+$pkg = $null
+foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
+    foreach ($k in Get-ChildItem $root -ErrorAction SilentlyContinue) {
+        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+        if ("$($p.DisplayName)" -like 'AMD Chipset Software*') { $pkg = [pscustomobject]@{ Name = "$($p.DisplayName)"; Version = "$($p.DisplayVersion)"; Date = "$($p.InstallDate)" }; break }
+    }
+    if ($pkg) { break }
+}
+$drv = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { $_.DeviceName -match 'AMD PPM Provisioning|AMD PSP|3D V-Cache' } | ForEach-Object { [pscustomobject]@{ Name = "$($_.DeviceName)"; Version = "$($_.DriverVersion)"; Date = $_.DriverDate } })
+$ppm = Get-Item "$env:WINDIR\System32\drivers\amdppm.sys" -ErrorAction SilentlyContinue
+@{ Pkg = $pkg; Drivers = $drv; PpmVer = "$($ppm.VersionInfo.FileVersion)"; PpmCo = "$($ppm.VersionInfo.CompanyName)" }
+'@ @() {
+        param($out, $errs)
+        $script:ChipsetBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.ContainsKey('Drivers')) { Show-Toast 'The chipset check could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-AmdChipsetReport $r) 'AMD chipset software' 'OK' 'Information')
+    }
+}
+function Format-AmdChipsetReport($r) {
+    $laptop = Test-LaptopChassis
+    $drivers = @($r.Drivers)
+    $dl = if ($drivers.Count) { ($drivers | ForEach-Object { "- $($_.Name) $($_.Version) ($(if ($_.Date -is [datetime]) { $_.Date.ToString('MMM yyyy') } else { '?' }))" }) -join "`n" } else { '- none of the AMD PPM Provisioning File, AMD PSP or 3D V-Cache drivers is installed' }
+    $inst = "Download: amd.com/en/support > Chipsets > your socket (AM5: X870E, X870, B850, B840, X670E, X670, B650E, B650, A620; AM4: X570, B550, B450...) > AMD Chipset Drivers. Install, restart, let it finish on the second boot. ZeroDelay does not download drivers.$(if ($laptop) { ' On a laptop use the laptop maker''s package instead.' })`n`nAfter installing, check the power plan again: the package adds an AMD Ryzen Balanced plan on some boards, and dual-CCD parking needs Windows' own Balanced."
+    if (-not $r.Pkg) {
+        return "AMD Chipset Software is NOT installed.`n`nWindows runs the CPU with its in-box processor driver (amdppm.sys $($r.PpmVer), $($r.PpmCo)) and generic power tables. The chipset package adds the AMD PPM Provisioning File driver (per-CPU boost and parking tables, the dual-CCD game parking on 9900X/9950X and X3D), the AMD PSP driver and the USB/GPIO/SMBus drivers.`n`nDrivers found:`n$dl`n`n$inst"
+    }
+    $old = $false; try { $old = [version]($r.Pkg.Version -replace '[^\d.].*$', '') -lt [version]'7.0' } catch {}
+    $when = if ($r.Pkg.Date -match '^(\d{4})(\d{2})(\d{2})$') { " (installed $($Matches[3]).$($Matches[2]).$($Matches[1]))" } else { '' }
+    "$($r.Pkg.Name) $($r.Pkg.Version)$when is installed.`n`nDrivers found:`n$dl`n`n" + $(if ($old) { "Version $($r.Pkg.Version) is from before the late-2024 packages that carry the Ryzen 9000 parking provisioning and 2025 fixes. $inst" } elseif (-not ($drivers | Where-Object { $_.Name -match 'PPM Provisioning' })) { "The package is installed but the AMD PPM Provisioning File driver is not: AMD says this happens when Windows does not apply the provisioning after an update. Reinstall the same package. $inst" } else { 'Current enough. Nothing to do.' })
+}
+
+# --- Memory: EXPO/XMP off, and channel layout, from SMBIOS (Win32_PhysicalMemory, a few ms)
+# rated speed encoded in a module part number: 6000 in CMK64GX5M2D6000C40 / F5-6000J3036, Kingston KF560 = 6000, Crucial CT16G56 = 5600, Patriot 600C30 = 6000
+function Get-RamRatedSpeed([string]$PartNumber) {
+    $best = 0
+    foreach ($m in [regex]::Matches($PartNumber, '(?<!\d)(\d{4})(?!\d)')) { $v = [int]$m.Groups[1].Value; if ($v -ge 2133 -and $v -le 9600 -and ($v % 100) -in 0, 33, 66 -and $v -gt $best) { $best = $v } }
+    if (-not $best -and $PartNumber -match '^(KF|HX)[345](\d{2})C') { $best = [int]$Matches[2] * 100 }
+    if (-not $best -and $PartNumber -match '^(CT|BL)\d+G(\d{2})C') { $best = [int]$Matches[2] * 100 }
+    if (-not $best -and $PartNumber -match '(?<!\d)([2-9]\d{2})C\d') { $best = [int]$Matches[1] * 10 }
+    if ($best -ge 2133 -and $best -le 9600) { $best } else { 0 }
+}
+function Get-RamXmpReport {
+    $dimms = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Where-Object { $_.Capacity -gt 0 })
+    if (-not $dimms.Count) { return 'Windows reports no memory modules (usual in virtual machines).' }
+    $type = switch ([int]$dimms[0].SMBIOSMemoryType) { 34 { 'DDR5' } 26 { 'DDR4' } 24 { 'DDR3' } 35 { 'LPDDR5' } 30 { 'LPDDR4' } default { 'memory' } }
+    if ($type -like 'LPDDR*') { return "$type soldered memory runs at the speed the laptop maker set; it has no EXPO/XMP profile to switch on." }
+    $conf = ($dimms | ForEach-Object { [int]$_.ConfiguredClockSpeed } | Measure-Object -Minimum).Minimum
+    $spd = ($dimms | ForEach-Object { [int]$_.Speed } | Measure-Object -Maximum).Maximum
+    $pn = "$($dimms[0].PartNumber)".Trim()
+    $rated = Get-RamRatedSpeed $pn; if ($spd -gt $rated) { $rated = $spd }
+    $total = [int](($dimms | Measure-Object Capacity -Sum).Sum / 1GB)
+    $head = "$($dimms.Count) x $type $([int]($dimms[0].Capacity / 1GB)) GB ($total GB), part number $pn.`nRunning at $conf MT/s" + $(if ($rated) { ", rated $rated MT/s." } else { '.' })
+    $amd = Test-AmdCpu
+    $where = "BIOS: ASUS Ai Tweaker > AI Overclock Tuner = EXPO I or XMP I (or DOCP); MSI OC > XMP/EXPO; Gigabyte Tweaker > Extreme Memory Profile; ASRock OC Tweaker > DRAM Profile. Save and boot; if the PC does not boot, clear CMOS. With four modules or 2 x 48 GB the full profile may not train: pick the next step down (5600 on AM5)."
+    $gain = if ($amd) { 'AMD''s own 9700X numbers: DDR5-6000 CL28 against JEDEC 5600 CL40 is +13% average and +15% 1% lows in games; 4800 to 6000 is roughly 5-15% in the 1% lows of CPU-bound games. AMD''s sweet spot on AM5 is DDR5-6000 with FCLK 2000 and UCLK = MEMCLK.' } else { 'Community tests put DDR5-4800 to 6000 at roughly 5-15% in the 1% lows of CPU-bound games; Fortnite at 200+ FPS in Performance mode is CPU-bound.' }
+    if ($conf -eq 0) { return "$head`n`nWindows could not read the configured speed." }
+    if ($rated -gt $conf + 50) {
+        return "$head`n`nEXPO/XMP is OFF (or the profile fell back): the kit is rated $rated MT/s but runs at the JEDEC default of $conf MT/s. $gain`n`n$where`n`nEXPO/XMP is a memory overclock: if the WHEA scan shows new event 19 errors or games crash afterwards, step one speed down."
+    }
+    $jedec = if ($type -eq 'DDR5') { @(4000, 4400, 4800, 5200, 5600) } else { @(2133, 2400, 2666, 2933, 3200) }
+    if (-not $rated -and $conf -in $jedec) { return "$head`n`nThe part number does not tell what the kit is rated for, and $conf MT/s is a standard JEDEC speed. If the kit's box or label says more (6000, 6400...), EXPO/XMP is off. $where" }
+    "$head`n`nThe profile is on: the memory runs at its rated speed. Nothing to change."
+}
+function Get-RamChannelReport {
+    $dimms = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Where-Object { $_.Capacity -gt 0 })
+    if (-not $dimms.Count) { return 'Windows reports no memory modules (usual in virtual machines).' }
+    $slots = [int](Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue | Select-Object -First 1).MemoryDevices
+    $n = $dimms.Count
+    $caps = @($dimms | ForEach-Object { [int64]$_.Capacity } | Sort-Object -Unique)
+    $banks = @($dimms | ForEach-Object { "$($_.BankLabel)".Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+    $ddr5 = [int]$dimms[0].SMBIOSMemoryType -eq 34
+    $total = [int](($dimms | Measure-Object Capacity -Sum).Sum / 1GB)
+    $list = ($dimms | ForEach-Object { "$([int]($_.Capacity / 1GB)) GB in $("$($_.DeviceLocator)".Trim())$(if ("$($_.BankLabel)".Trim()) { " ($("$($_.BankLabel)".Trim()))" })" }) -join ', '
+    $head = "$n module$(if ($n -ne 1) { 's' }), $total GB, $slots slots: $list."
+    $numbers = 'Measured: NoobFeed (9700X + RTX 5070) Fortnite 1080p High on a single stick 157 FPS average and 74 FPS 1% low, clearly better and steadier on two; TechSpot 2026 (9700X) Marvel Rivals 195 to 129 FPS, Spider-Man 2 -20% 1% lows; Tom''s Hardware -2.8% on a 9800X3D but -10.9% on a 7600X.'
+    if ($n -eq 1 -and $slots -ge 2) { return "$head`n`nSINGLE CHANNEL: one module halves memory bandwidth, which hits 1% lows hardest. $numbers$(if ($ddr5) { ' A DDR5 module has two 32-bit sub-channels but still counts as single channel.' })`n`nFix: add a matching second module in the other channel's slot (A2 + B2 on four-slot boards, the 2nd and 4th from the CPU). A single 32 GB stick is still slower than 2 x 8 GB." }
+    if ($n -eq 2 -and $banks.Count -eq 1 -and $slots -ge 4) { return "$head`n`nBoth modules report the same channel label ($($banks[0])), so they may sit in one channel (slots A1 + A2) and run single channel. $numbers`n`nCheck the board manual's memory table and use A2 + B2 (the 2nd and 4th slot from the CPU). Some boards label both slots the same even when they are in different channels; CPU-Z > Memory > Channel # settles it." }
+    if ($caps.Count -gt 1) { return "$head`n`nMismatched sizes: only the part that exists in both channels runs dual channel (flex mode), the rest is single channel. $numbers`n`nA matched pair fixes it." }
+    if ($n -ge 3 -and $ddr5) { return "$head`n`nDual channel with $n DDR5 modules: bandwidth is fine, but four DDR5 modules train at lower speeds (AMD rates 2 x 2-rank at 3600 MT/s, four modules at 3600 to 5200 on AM5). If the EXPO/XMP check shows the kit below its rating, that is why." }
+    "$head`n`nDual channel ($($banks -join ' + ')). Nothing to change."
+}
+
+# --- WHEA corrected/uncorrected errors and unexpected restarts in the last 14 days (worker: event-log scan)
+$script:WheaBusy = $false
+function Start-WheaScan {
+    if ($script:WheaBusy) { throw 'The WHEA scan is already running.' }
+    $script:WheaBusy = $true
+    Invoke-Worker @'
+param($days)
+$since = (Get-Date).AddDays(-$days)
+$w = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; Id = 17, 18, 19, 20, 47; StartTime = $since } -ErrorAction SilentlyContinue)
+$k = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $since } -ErrorAction SilentlyContinue)
+$rows = @(foreach ($g in ($w | Group-Object Id)) {
+    $m = "$($g.Group[0].Message)"
+    $dev = ''; if ($m -match 'Primary Device Name:\s*(\S+)') { $dev = $Matches[1] }
+    $sec = ''; if ($m -match 'Secondary Device Name:\s*(\S+)') { $sec = $Matches[1] }
+    $vd = ''; if ($m -match 'Vendor ID:Device ID:\s*(0x[0-9A-Fa-f]+):(0x[0-9A-Fa-f]+)') { $vd = "$($Matches[1]):$($Matches[2])" }
+    $et = ''; if ($m -match 'Error Type:\s*([^\r\n]+)') { $et = $Matches[1].Trim() }
+    $ap = ''; if ($m -match 'Processor APIC ID:\s*(\d+)') { $ap = $Matches[1] }
+    $src = ''; if ($m -match 'Error Source:\s*([^\r\n]+)') { $src = $Matches[1].Trim() }
+    $perDay = [math]::Round($g.Count / [math]::Max(1, $days), 1)
+    $perDayMax = @($g.Group | Group-Object { $_.TimeCreated.Date } | ForEach-Object { $_.Count } | Measure-Object -Maximum).Maximum
+    [pscustomobject]@{ Id = [int]$g.Name; Count = $g.Count; First = $g.Group[-1].TimeCreated; Last = $g.Group[0].TimeCreated; Device = $dev; Secondary = $sec; VendorDevice = $vd; Type = $et; Apic = $ap; Source = $src; PerDay = $perDay; WorstDay = [int]$perDayMax }
+})
+$kp = @(foreach ($e in $k) { $x = $e.ToXml(); $bc = ''; if ($x -match '<Data Name="BugcheckCode">(\d+)</Data>') { $bc = $Matches[1] }; [pscustomobject]@{ When = $e.TimeCreated; Bugcheck = $bc } })
+@{ Whea = $rows; Kp = $kp; Days = $days }
+'@ @(14) {
+        param($out, $errs)
+        $script:WheaBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.ContainsKey('Whea')) { Show-Toast 'The WHEA scan could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-WheaReport $r) 'Hardware errors (WHEA)' 'OK' 'Information')
+    }
+}
+$PciVendorNames = @{ '10DE' = 'NVIDIA'; '1002' = 'AMD Radeon'; '1022' = 'AMD (CPU/chipset root port)'; '8086' = 'Intel'; '144D' = 'Samsung SSD'; '1E95' = 'Maxio controller (Lexar/other SSD)'; '1987' = 'Phison controller (SSD)'; '15B7' = 'WD/SanDisk SSD'; '1C5C' = 'SK hynix SSD'; '126F' = 'Silicon Motion controller (SSD)'; '1E0F' = 'Kioxia SSD'; '1CC1' = 'ADATA SSD'; '10EC' = 'Realtek (network/audio)'; '14E4' = 'Broadcom'; '1B21' = 'ASMedia (USB/SATA)'; '1D6A' = 'Aquantia (network)'; '1A03' = 'ASPEED' }
+# names the device a WHEA event points at, from its PCI ids
+function Get-WheaDeviceLabel([string]$Dev, [string]$Sec, [string]$Vd) {
+    $out = @()
+    foreach ($d in @($Dev, $Sec) | Where-Object { $_ }) {
+        $v = if ($d -match 'VEN_([0-9A-Fa-f]{4})') { $Matches[1].ToUpper() } else { '' }
+        $out += "$d$(if ($v -and $PciVendorNames[$v]) { " = $($PciVendorNames[$v])" })"
+    }
+    if (-not $out.Count -and $Vd -match '^0x([0-9A-Fa-f]{4}):') { $v = $Matches[1].ToUpper(); $out += "vendor $v$(if ($PciVendorNames[$v]) { " = $($PciVendorNames[$v])" })" }
+    $out -join '; '
+}
+function Format-WheaReport($r) {
+    $w = @($r.Whea); $kp = @($r.Kp); $days = $r.Days
+    if (-not $w.Count -and -not $kp.Count) { return "No WHEA hardware errors (events 17, 18, 19, 20, 47) and no unexpected restarts (Kernel-Power 41) in the last $days days.`n`nYour CPU, memory and PCIe links are stable as far as Windows can see. Random stutter or crashes are not a hardware fault at this level." }
+    $l = @(); $adv = @()
+    foreach ($e in $w | Sort-Object Id) {
+        $dev = Get-WheaDeviceLabel $e.Device $e.Secondary $e.VendorDevice
+        $span = "$($e.Count) x event $($e.Id), last $($e.Last.ToString('d MMM HH:mm'))$(if ($e.Count -gt 1) { ", about $($e.PerDay) a day (worst day $($e.WorstDay))" })"
+        switch ($e.Id) {
+            17 { $l += "$span`: corrected PCIe error from $($e.Source)$(if ($dev) { " on $dev" })."
+                 if ($e.WorstDay -gt 50) { $adv += "Event 17 flood: a PCIe link is retrying constantly$(if ($dev) { " ($dev)" }). Each error costs a kernel error path and bad cases end in driver resets or freezes. Reseat that card or M.2 drive (no riser cable if you can), set the slot to PCIe Gen4 instead of Auto/Gen5 in the BIOS (costs 0-1%), update the BIOS." }
+                 else { $adv += "A few event 17s: a PCIe link corrected some errors$(if ($dev) { " ($dev)" }). Harmless at this rate; if the count climbs, reseat the device or fix the slot to Gen4 in the BIOS." } }
+            18 { $l += "$span`: UNCORRECTED hardware error$(if ($e.Type) { " ($($e.Type))" })$(if ($e.Apic) { ", processor $($e.Apic)" }). That is a crash."
+                 $adv += 'Event 18 is the crash itself, on the CPU or memory side. Remove any Curve Optimizer undervolt (set it to Auto or back it off by 5 per core), run the memory at one EXPO/XMP step lower or at JEDEC for a session, and update the BIOS. If it persists on stock settings, the CPU or memory is faulty.' }
+            19 { $l += "$span`: corrected CPU/memory error$(if ($e.Type) { " ($($e.Type))" })$(if ($e.Apic) { ", processor $($e.Apic)" })."
+                 $adv += 'Event 19 means the CPU or memory corrected an error: typical of an EXPO/XMP profile or a Curve Optimizer undervolt on the edge. Step the memory down one notch (6000 to 5600) or back the Curve Optimizer off by 5 per core; a corrected error today is often a crash or a stutter tomorrow.' }
+            20 { $l += "$span`: corrected PCI/bus error$(if ($dev) { " on $dev" })."
+                 $adv += 'Event 20 is a bus error on an older-format report: same fixes as event 17 (reseat, slot to Gen4, BIOS update).' }
+            47 { $l += "$span`: corrected error reported by the firmware$(if ($e.Type) { " ($($e.Type))" })."
+                 $adv += 'Event 47 is a corrected machine check: treat it like event 19 (memory profile or undervolt on the edge).' }
+        }
+    }
+    if ($kp.Count) {
+        $bc = @($kp | Where-Object { $_.Bugcheck -and $_.Bugcheck -ne '0' }).Count
+        $l += "$($kp.Count) x Kernel-Power 41 (the PC restarted without shutting down), last $($kp[0].When.ToString('d MMM HH:mm'))$(if ($bc) { ", $bc after a blue screen" } else { ', none with a blue screen' })."
+        if ($kp.Count -gt $bc) { $adv += 'A Kernel-Power 41 with no blue screen is a hard reset or power loss: the power button held down, a power cut, or a crash the CPU could not report (over-aggressive undervolt, memory profile, or power supply). If it was not you, the WHEA lines above and the Fortnite crash check narrow it down.' }
+    }
+    "In the last $days days:`n`n$($l -join "`n")`n`n$(@($adv | Select-Object -Unique) -join "`n`n")`n`nZeroDelay changes none of this: these are BIOS settings (EXPO/XMP, Curve Optimizer, PCIe slot speed) or hardware. The PCIe power-saving card handles the Windows side of ASPM."
+}
+
+# --- fTPM stutter on AM4: BIOS date against AMD's AGESA 1.2.0.7 fix
+function Get-FtpmReport {
+    $b = Get-BiosInfo; $t = Get-TpmInfo
+    $head = "Firmware TPM: AMD fTPM$(if ($t.Ver) { " $($t.Ver)" })$(if ($t.Spec) { ", TPM $($t.Spec)" }). BIOS $($b.Version)$(if ($b.Date) { " from $($b.Date.ToString('d MMM yyyy'))" }) on $($b.Board)."
+    if (-not $b.Date) { return "$head`n`nWindows does not report the BIOS date, so the AGESA version cannot be judged. AMD fixed the fTPM stutter in AGESA 1.2.0.7 (May 2022); if your BIOS is older than mid-2022, update it." }
+    if ($b.Date -lt [datetime]'2022-06-01') {
+        return "$head`n`nPROBLEM: this BIOS predates AMD's fix for the fTPM stutter (AGESA 1.2.0.7, released May 2022). Symptom: the whole PC freezes for about one to three seconds with crackling audio every few minutes, in menus as much as in matches; the Count real in-match stutters card shows them as rare, very long hitches.`n`nFix: update the BIOS from the support page for $($b.Product). Do not disable fTPM to work around it: Windows 11 and Fortnite tournaments require a TPM, and BitLocker would ask for its recovery key at the next boot."
+    }
+    "$head`n`nThe BIOS is newer than AMD's AGESA 1.2.0.7 fix (May 2022), so the known fTPM stutter should not occur. If you still get one to three second whole-PC freezes with crackling audio that do not depend on game load, some boards needed a later BIOS still, and a discrete TPM module is the last resort."
+}
+
+# --- Graphics card PCIe link (worker: Get-PnpDevice + Get-PnpDeviceProperty + nvidia-smi take ~0.7 s) and Resizable BAR (inline, ~0.2 s)
+$PcieGen = @{ 1 = '1.0'; 2 = '2.0'; 3 = '3.0'; 4 = '4.0'; 5 = '5.0'; 6 = '6.0' }
+$script:PcieBusy = $false
+function Start-PcieLinkCheck {
+    if ($script:PcieBusy) { throw 'The PCIe check is already running.' }
+    $script:PcieBusy = $true
+    Invoke-Worker @'
+param($gpuRx, $running)
+$all = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match '^PCI\\VEN_(10DE|1002|8086)' })
+$d = $all | Where-Object { $_.FriendlyName -match $gpuRx } | Select-Object -First 1
+if (-not $d) { $d = $all | Select-Object -First 1 }
+if (-not $d) { return @{ Name = ''; Err = 'No PCI graphics card found.' } }
+$p = @{}
+foreach ($x in @(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName DEVPKEY_PciDevice_CurrentLinkSpeed, DEVPKEY_PciDevice_CurrentLinkWidth, DEVPKEY_PciDevice_MaxLinkSpeed, DEVPKEY_PciDevice_MaxLinkWidth -ErrorAction SilentlyContinue)) { if ($null -ne $x.Data) { $p[$x.KeyName -replace '^DEVPKEY_PciDevice_', ''] = [int]$x.Data } }
+$r = @{ Name = "$($d.FriendlyName)"; Err = ''; Cw = [int]$p.CurrentLinkWidth; Mw = [int]$p.MaxLinkWidth; Cs = [int]$p.CurrentLinkSpeed; Ms = [int]$p.MaxLinkSpeed; SysMax = [int]$p.MaxLinkSpeed; Smi = $false; Running = [bool]$running }
+if (-not $r.Mw -or -not $r.Cw) { $r.Err = "Windows does not report a PCIe link for $($d.FriendlyName) (integrated graphics, or a driver that hides it)." }
+# NVIDIA: nvidia-smi knows the fastest generation this card AND this slot can do; the device key only knows the card
+$smi = "$env:WINDIR\System32\nvidia-smi.exe"
+if ($d.InstanceId -match 'VEN_10DE' -and (Test-Path $smi)) {
+    try { $q = "$(& $smi --query-gpu=pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader 2>$null | Select-Object -First 1)" -split ',\s*'; if ($q.Count -ge 3 -and $q[0] -match '^\d+$') { $r.SysMax = [int]$q[0]; $r.Cs = [int]$q[1]; $r.Cw = [int]$q[2]; $r.Smi = $true; $r.Err = '' } } catch {}
+}
+$r
+'@ @($DiscreteGpuRx, [bool](Test-FortniteRunning)) {
+        param($out, $errs)
+        $script:PcieBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.ContainsKey('Name')) { Show-Toast 'The PCIe check could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-PcieLinkReport $r) 'Graphics card PCIe link' 'OK' 'Information')
+    }
+}
+function Format-PcieLinkReport($r) {
+    if ($r.Err) { return $r.Err }
+    $cw = $r.Cw; $mw = $r.Mw; $cs = $r.Cs; $sysMax = $r.SysMax
+    $gen = if ($r.Running) { $cs } else { $sysMax }
+    $units = $cw * [math]::Pow(2, $gen - 1)   # relative to PCIe 1.0 x1: PCIe 4.0 x8 = 64 = PCIe 3.0 x16
+    $laptop = Test-LaptopChassis
+    $s = "$($r.Name): PCIe $($PcieGen[$cs]) x$cw right now; PCIe $($PcieGen[$sysMax]) x$mw is what $(if ($r.Smi) { 'this card and slot can do' } else { 'the card supports' }).`n"
+    if ($cs -lt $sysMax -and -not $r.Running) { $s += "The generation drops at idle to save power and comes back under load (run this check during a match to see the loaded speed). Width never changes: x$cw is what you get in a match.`n" }
+    $s += "`n"
+    if ($cw -lt $mw) {
+        if ($laptop) { $s += "x$cw on a laptop is normal: the GPU is wired with $cw lanes and nothing can change it." }
+        elseif ($units -lt 64) { $s += "PROBLEM: x$cw instead of x$mw, and PCIe $($PcieGen[$gen]) x$cw is below PCIe 4.0 x8 bandwidth. TechPowerUp's scaling tests on a fast card: PCIe 3.0 x8 costs about 5-6% average FPS, 2.0 x16 8-10%, with bigger losses in 1% lows and on texture uploads (stutter). Usually an M.2 SSD or a second card shares lanes with the top slot: check the board manual's bandwidth-sharing table, move that SSD to a chipset M.2 slot, or make sure the card sits fully in the top x16 slot. On old boards the slot itself may be x8." }
+        elseif ($units -eq 64) { $s += "x$cw instead of x${mw}: PCIe $($PcieGen[$gen]) x$cw equals PCIe 3.0 x16 bandwidth, which cost about 2% average FPS in TechPowerUp's scaling tests on a fast card, a little more in 1% lows. Usually an M.2 SSD in a CPU-attached slot splits the top slot to x8/x8 (the board manual's bandwidth-sharing table says which); moving that SSD to a chipset slot gives x16 back. Worth doing if you open the case anyway, not on its own." }
+        else { $s += "x$cw instead of x$mw, but at PCIe $($PcieGen[$gen]) that is still PCIe 4.0 x16-class bandwidth or more (about 1% in TechPowerUp's tests). Usually an M.2 SSD in a CPU-attached slot splits the top slot; not worth changing." }
+    } else { $s += 'Full width. Nothing to change.' }
+    $s
+}
+function Get-RebarReport {
+    if ("$env:firmware_type" -ne 'UEFI') { return "Windows boots in legacy BIOS (CSM) mode. Resizable BAR needs UEFI boot with CSM off and a GPT system disk, which this PC does not have yet. From an administrator prompt, mbr2gpt /validate /allowFullOS tells you whether the Windows disk can be converted (mbr2gpt /convert /allowFullOS does it, then switch the BIOS to UEFI boot with CSM disabled). Nothing else applies until then." }
+    $ids = @(Get-GpuIds)
+    $nv = $ids | Where-Object { $_ -match 'VEN_10DE' } | Select-Object -First 1
+    $amd = $ids | Where-Object { $_ -match 'VEN_1002' -and $_ -notmatch 'Graphics$' } | Select-Object -First 1
+    $arc = $ids | Where-Object { $_ -match 'VEN_8086' -and $_ -match 'Arc' } | Select-Object -First 1
+    $bios = "BIOS: Advanced > PCI Subsystem Settings > Above 4G Decoding = Enabled and Re-Size BAR Support = Auto or Enabled; Boot > CSM = Disabled (ASUS: Boot > CSM > Launch CSM: Disabled). Save, boot, run this check again. Some older boards hide Re-Size BAR until Above 4G Decoding is on."
+    $effect = 'Measured effect (Club386, 10 games on a 7600X + RX 7900 XT): Atomic Heart +17.5%, Assassin''s Creed Valhalla +16.6%, Arc Raiders (Unreal Engine 5) +8.5%, RDR2 +9.8%; small losses only in very old titles. No rigorous Fortnite on/off test exists: expect low single digits when GPU-bound in DirectX 12 and about nothing when CPU-bound.'
+    if ($nv) {
+        $smi = "$env:WINDIR\System32\nvidia-smi.exe"
+        if (-not (Test-Path $smi)) { return "nvidia-smi.exe is missing from System32, so the BAR size cannot be read; a current NVIDIA driver installs it." }
+        $q = try { (& $smi -q 2>$null) -join "`n" } catch { '' }
+        $bar = -1; if ($q -match 'BAR1 Memory Usage\s*\n\s*Total\s*:\s*(\d+) MiB') { $bar = [int]$Matches[1] }
+        $vram = -1; if ($q -match 'FB Memory Usage\s*\n\s*Total\s*:\s*(\d+) MiB') { $vram = [int]$Matches[1] }
+        $name = ($nv -replace '^\S+\s+', '')
+        if ($bar -lt 0) { return "nvidia-smi did not report the BAR1 size for $name. Update the NVIDIA driver and try again; GPU-Z shows 'Resizable BAR' as a fallback." }
+        $prof = ''
+        try { if (Test-NvAvailable) { $e = Get-NvEff 'Fortnite' ([uint32]0x000F00BA); if ($e.Found) { $prof = "`n`nNVIDIA enables ReBAR per game: the driver profile for Fortnite has the rBAR feature set to $($e.Value) (1 = on for Fortnite, 0 = off)$(if ($e.Predefined) { ', NVIDIA''s own default' } else { ', set by a user or tool' })." } } } catch {}
+        if ($bar -le 256) {
+            $old = $name -match 'GTX|RTX 20\d\d'
+            return "$name`: BAR1 is $bar MiB for $vram MiB of video memory. Resizable BAR is OFF.`n`n" + $(if ($old) { 'GTX and RTX 20 cards have no official Resizable BAR support from NVIDIA, so there is nothing to enable; leave it.' } else { "$effect`n`n$bios RTX 30 cards from early 2021 need a vBIOS update from the card maker first." }) + $prof
+        }
+        if ($vram -gt 0 -and $bar -lt $vram) { return "$name`: BAR1 is $bar MiB for $vram MiB of video memory: Resizable BAR is on but limited (the board only maps part of the memory). $effect`n`n$bios$prof" }
+        return "$name`: BAR1 is $bar MiB for $vram MiB of video memory: Resizable BAR is ON. Nothing to change.$prof"
+    }
+    if ($amd) { return "$($amd -replace '^\S+\s+', ''): Windows gives no reliable read of the BAR size on Radeon, so ZeroDelay does not guess. Look in Adrenalin > Performance > Tuning: 'Smart Access Memory' says Enabled or Disabled (GPU-Z shows 'Resizable BAR' too). If it is Disabled: $bios Needs an RX 6000 or newer card and a Ryzen 3000 (5000 for full support) or newer CPU.`n`n$effect" }
+    if ($arc) { return "Intel Arc depends on Resizable BAR far more than other cards (Intel: large losses without it). Intel Graphics Software / Arc Control shows whether it is active. If not: $bios" }
+    'No discrete graphics card found; integrated graphics do not use Resizable BAR.'
+}
+
+# --- Fortnite's drive: type, bus, free space, compression, Dev Drive (worker: Get-Partition + Get-PhysicalDisk take ~0.7 s)
+$script:FnDriveBusy = $false
+function Start-FnDriveCheck {
+    if ($script:FnDriveBusy) { throw 'The drive check is already running.' }
+    $dir = Get-FnInstallDir
+    if (-not $dir) { throw 'Fortnite is not installed through the Epic Games Launcher on this PC (no manifest found).' }
+    $script:FnDriveBusy = $true
+    Invoke-Worker @'
+param($dir)
+$r = [pscustomobject]@{ Dir = $dir; Exists = [bool](Test-Path -LiteralPath $dir); Letter = ''; Fs = ''; Size = [double]0; Free = [double]0; Media = ''; Bus = ''; Disk = ''; Spindle = 0; Health = ''; Attr = $false; CompN = 0; TotalN = 0; DevDrive = ''; Err = '' }
+try {
+    $letter = (Split-Path -Qualifier $dir).TrimEnd(':'); $r.Letter = $letter
+    $v = Get-Volume -DriveLetter $letter -ErrorAction Stop; $r.Fs = "$($v.FileSystemType)"; $r.Size = [double]$v.Size; $r.Free = [double]$v.SizeRemaining
+    $part = Get-Partition -DriveLetter $letter -ErrorAction Stop
+    $pd = Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.DeviceId -eq "$($part.DiskNumber)" } | Select-Object -First 1
+    if ($pd) { $r.Media = "$($pd.MediaType)"; $r.Bus = "$($pd.BusType)"; $r.Disk = "$($pd.FriendlyName)"; $r.Spindle = [int]$pd.SpindleSpeed; $r.Health = "$($pd.HealthStatus)" }
+} catch { $r.Err = $_.Exception.Message }
+if ($r.Exists) {
+    try { $r.Attr = [bool]((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::Compressed) } catch {}
+    $paks = Join-Path $dir 'FortniteGame\Content\Paks'
+    $target = if (Test-Path -LiteralPath $paks) { Join-Path $paks '*' } else { Join-Path $dir '*' }
+    try { $o = (& compact.exe /q $target 2>&1) -join "`n"; if ($o -match '([\d,]+) are compressed and ([\d,]+) are not compressed') { $r.CompN = [int]($Matches[1] -replace ','); $r.TotalN = $r.CompN + [int]($Matches[2] -replace ',') } } catch {}
+    if ($r.Fs -eq 'ReFS') { try { $o = (& fsutil.exe devdrv query "$($r.Letter):" 2>&1) -join "`n"; $r.DevDrive = if ($o -match 'untrusted') { 'untrusted' } elseif ($o -match 'trusted') { 'trusted' } elseif ($o -match 'not a developer|not a dev') { 'no' } else { 'unknown' } } catch { $r.DevDrive = 'unknown' } }
+}
+$h = @{}; foreach ($p in $r.PSObject.Properties) { $h[$p.Name] = $p.Value }; $h
+'@ @($dir) {
+        param($out, $errs)
+        $script:FnDriveBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.ContainsKey('Dir')) { Show-Toast 'The drive check could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-FnDriveReport $r) 'Fortnite''s drive' 'OK' 'Information')
+    }
+}
+function Format-FnDriveReport($r) {
+    if (-not $r.Exists) { return "The Epic manifest says Fortnite is in $($r.Dir), but that folder does not exist. Reinstall Fortnite from the Epic Games Launcher (Library > Fortnite) or point the launcher at the right folder." }
+    $pct = if ($r.Size -gt 0) { [math]::Round(100 * $r.Free / $r.Size) } else { -1 }
+    $l = @("Fortnite: $($r.Dir)")
+    if ($r.Disk) { $l += "Drive $($r.Letter): $($r.Disk) ($($r.Media), $($r.Bus)), $($r.Fs), $(Format-Size $r.Free) free of $(Format-Size $r.Size) ($pct%)$(if ($r.Health -and $r.Health -ne 'Healthy') { ", health: $($r.Health)" })" }
+    elseif ($r.Err) { $l += "Drive $($r.Letter): details not available ($($r.Err))" }
+    $v = @()
+    if ($r.Media -eq 'HDD' -or $r.Spindle -gt 0) { $v += 'PROBLEM: Fortnite is on a mechanical hard drive. Unreal Engine 5 streams textures and map pieces all match long; a hard drive cannot keep up, so you get late textures, hitches on the glider drop and 60-90 s load screens. Any SSD removes that whole class of stutter (NVMe against SATA only changes load times). The Epic launcher cannot move Fortnite: uninstall and reinstall it on the SSD, or move the folder and use Library > Fortnite > Manage > Locate.' }
+    elseif ($r.Bus -eq 'USB') { $v += 'Fortnite is on an external USB drive: USB sleep states and shared bandwidth cause hitches that an internal SSD does not have. Move it to an internal SSD if you can.' }
+    elseif ($r.Disk) { $v += "SSD: good. Epic recommends an SSD; NVMe is not required." }
+    if ($pct -ge 0 -and $pct -lt 15) { $v += "Only $pct% free: below about 15% an SSD loses its fast SLC write cache and background clean-up falls behind (igor'sLAB: a Sabrent Rocket's sustained writes fell from 1,233 to 1,052 MB/s at 90% full). That mostly hurts Fortnite patches (20-40 GB written) and shader-cache writes. Free up space; the Clear streamed-content cache card and Clear logs card help." }
+    if ($r.Attr -or $r.CompN -gt 0) { $v += "PROBLEM: $(if ($r.CompN -gt 0) { "$($r.CompN) of $($r.TotalN) game files" } else { 'the Fortnite folder' }) are NTFS-compressed (CompactGUI or compact /c, usually LZX). Every read is decompressed on the CPU while Fortnite streams content all match long, and each patch lands uncompressed so the saving shrinks anyway. Undo it with Fortnite closed: open a command prompt as administrator and run  compact /u /s:`"$($r.Dir)`" /exe /i /q  (takes minutes and needs the space back), or press Uncompress in CompactGUI." }
+    if ($r.Fs -eq 'ReFS') {
+        $dd = switch ($r.DevDrive) { 'trusted' { 'a trusted Dev Drive: Defender scans its files after they open (performance mode) and other filter drivers are detached, which is the same benefit the shader-cache exclusion card gives on NTFS' } 'untrusted' { 'an untrusted Dev Drive: Defender scans it synchronously like any drive, and you still lose the NTFS tooling. From an administrator prompt, fsutil devdrv trust ' + $r.Letter + ': makes it trusted (fsutil devdrv untrust reverses it)' } 'no' { 'a plain ReFS volume (not a Dev Drive)' } default { 'ReFS (Dev Drive status unknown: needs administrator)' } }
+        $v += "Fortnite is on $dd. Microsoft does not recommend installing applications on a Dev Drive and Epic does not test ReFS: if you see Easy Anti-Cheat or patch errors, that is why. ReFS cannot be converted back to NTFS without reformatting; on NTFS the Defender exclusion cards give the same effect."
+    }
+    "$($l -join "`n")`n`n$($v -join "`n`n")"
+}
+# clears Fortnite's streamed-content cache (IoStore + ias) after a size preview; Fortnite downloads what it needs again
+function Start-FnStreamCacheClear {
+    if (Test-FortniteRunning) { throw 'Close Fortnite first: it keeps these files open.' }
+    $pd = Join-Path $env:LOCALAPPDATA 'FortniteGame\Saved\PersistentDownloadDir'
+    $dirs = @('IoStore', 'ias' | ForEach-Object { Join-Path $pd $_ } | Where-Object { Test-Path -LiteralPath $_ })
+    $files = @(if ($dirs.Count) { Get-ChildItem -LiteralPath $dirs -Recurse -File -Force -ErrorAction SilentlyContinue })
+    if (-not $files.Count) { return 'Fortnite''s streamed-content cache is already empty.' }
+    $bytes = ($files | Measure-Object Length -Sum).Sum
+    $custom = (Get-ChildItem -LiteralPath (Join-Path $pd 'GameCustom') -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    $msg = "Fortnite's streamed-content cache holds $(Format-Size $bytes) in $($files.Count) files (IoStore and ias under $pd).`n`nFortnite downloads what it needs again as you play (cosmetics, map pieces, on-demand content), so the first matches afterwards load a little longer and use some bandwidth. Nothing you own or saved is in here.$(if ($custom) { " Creative and UEFN island content ($(Format-Size $custom) in GameCustom) is left alone." })`n`nDelete the cache now?"
+    if ((Show-ZdDialog $msg 'Clear streamed-content cache' 'YesNo' 'Question') -ne 'Yes') { return 'Nothing deleted.' }
+    $n = 0; $freed = [double]0
+    foreach ($f in $files) { try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $n++; $freed += $f.Length } catch {} }
+    foreach ($d in $dirs) { Get-ChildItem -LiteralPath $d -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {} } }
+    "Deleted $n files, $(Format-Size $freed) freed. Fortnite re-downloads what it needs."
+}
+
+# --- SSD health: SMART-style counters (admin) plus storage events 129/153/157 (worker)
+$script:SsdBusy = $false
+function Start-SsdHealthCheck {
+    if ($script:SsdBusy) { throw 'The drive health check is already running.' }
+    $script:SsdBusy = $true
+    Invoke-Worker @'
+param($days)
+$rows = @(foreach ($d in @(Get-PhysicalDisk -ErrorAction SilentlyContinue)) {
+    $c = $null; try { $c = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
+    [pscustomobject]@{ Id = "$($d.DeviceId)"; Name = "$($d.FriendlyName)"; Media = "$($d.MediaType)"; Bus = "$($d.BusType)"; Health = "$($d.HealthStatus)"; Counters = [bool]$c
+        Wear = $(if ($c -and $null -ne $c.Wear) { [int]$c.Wear } else { -1 }); Temp = $(if ($c -and $c.Temperature) { [int]$c.Temperature } else { -1 })
+        ReadErr = $(if ($c -and $null -ne $c.ReadErrorsUncorrected) { [int64]$c.ReadErrorsUncorrected } else { -1 }); WriteErr = $(if ($c -and $null -ne $c.WriteErrorsUncorrected) { [int64]$c.WriteErrorsUncorrected } else { -1 })
+        Hours = $(if ($c -and $null -ne $c.PowerOnHours) { [int64]$c.PowerOnHours } else { -1 }); LatMax = $(if ($c -and $null -ne $c.ReadLatencyMax) { [int64]$c.ReadLatencyMax } else { -1 }) }
+})
+$ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 129, 153, 157; StartTime = (Get-Date).AddDays(-$days) } -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'disk|stor|nvme|sata|ahci|raid' })
+$evRows = @(foreach ($g in ($ev | Group-Object Id, ProviderName)) {
+    $m = "$($g.Group[0].Message)"; $disk = ''; if ($m -match 'Disk (\d+)') { $disk = $Matches[1] }
+    [pscustomobject]@{ Id = [int]$g.Group[0].Id; Provider = "$($g.Group[0].ProviderName)"; Count = $g.Count; Last = $g.Group[0].TimeCreated; Disk = $disk; Sample = (($m -split "\r?\n")[0]).Trim() }
+})
+@{ Disks = $rows; Events = $evRows; Days = $days }
+'@ @(14) {
+        param($out, $errs)
+        $script:SsdBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.ContainsKey('Disks')) { Show-Toast 'The drive health check could not run.' '#FF9F0A'; return }
+        [void](Show-ZdDialog (Format-SsdHealthReport $r) 'Drive health' 'OK' 'Information')
+    }
+}
+function Format-SsdHealthReport($r) {
+    $disks = @($r.Disks); $ev = @($r.Events)
+    if (-not $disks.Count) { return 'Windows lists no physical disks (needs administrator, or a virtual machine).' }
+    $l = @(); $bad = @(); $noCounters = $false
+    foreach ($d in $disks) {
+        $parts = @("$($d.Health)")
+        if ($d.Counters) {
+            if ($d.Wear -ge 0) { $parts += "wear $($d.Wear)%" }
+            if ($d.Temp -ge 0) { $parts += "$($d.Temp) °C" }
+            if ($d.ReadErr -ge 0 -or $d.WriteErr -ge 0) { $parts += "$([math]::Max(0, $d.ReadErr) + [math]::Max(0, $d.WriteErr)) uncorrected errors" }
+            if ($d.Hours -ge 0) { $parts += "$($d.Hours.ToString('N0')) h on" }
+        } else { $noCounters = $true }
+        $l += "Disk $($d.Id): $($d.Name) ($($d.Media), $($d.Bus)): $($parts -join ', ')"
+        if ($d.Health -and $d.Health -ne 'Healthy') { $bad += "Disk $($d.Id) reports '$($d.Health)': Windows itself flags it. Back up what matters and plan a replacement." }
+        if ($d.Wear -ge 90) { $bad += "Disk $($d.Id) has used $($d.Wear)% of its rated write life: it will start retrying reads (hundreds of ms) before it fails. Replace it." }
+        if ($d.ReadErr -gt 0 -or $d.WriteErr -gt 0) { $bad += "Disk $($d.Id) has uncorrected read/write errors: that is data the drive could not recover and a stutter source during streaming. Back up and replace it; check the cable first if it is SATA." }
+        if ($d.Temp -ge 70) { $bad += "Disk $($d.Id) is at $($d.Temp) °C: NVMe drives throttle around 70-80 °C and then hitch. Fit the board's M.2 heatsink or improve airflow." }
+    }
+    foreach ($e in $ev) {
+        $what = switch ($e.Id) { 129 { 'controller reset (the drive stopped answering and was reset)' } 153 { 'I/O retried (a read or write had to be repeated)' } 157 { 'drive surprise-removed' } }
+        $bad += "$($e.Count) x event $($e.Id) from $($e.Provider)$(if ($e.Disk) { " on disk $($e.Disk)" }) in $($r.Days) days, last $($e.Last.ToString('d MMM HH:mm')): $what. Each one is a freeze of seconds. Causes: a loose or bad SATA cable, a drive power-saving state the firmware mishandles, drive firmware, or heat. Update the drive firmware (maker's tool), try another cable or slot, and keep the NVMe idle timeout card on."
+    }
+    $s = "$($l -join "`n")"
+    if ($noCounters) { $s += "`n`n(SMART counters need administrator rights, and some USB or RAID controllers do not expose them.)" }
+    $s + "`n`n" + $(if ($bad.Count) { $bad -join "`n`n" } else { "No drive resets, retried I/O or surprise removals in the last $($r.Days) days, and no drive reports wear, errors or heat. Storage is not your stutter source." })
+}
+
+# --- Third-party antivirus: when one is active, Defender is passive and the Defender cards do nothing
+$AvExclusionHints = @{ 'Kaspersky' = 'Settings > Threats and Exclusions > Manage exclusions'; 'Norton' = 'Settings > Antivirus > Scans and Risks > Exclusions / Low Risks > Items to Exclude from Scans'; 'Bitdefender' = 'Protection > Antivirus > Settings > Manage exceptions'; 'Avast' = 'Menu > Settings > General > Exceptions'; 'AVG' = 'Menu > Settings > General > Exceptions'; 'McAfee' = 'Settings > Real-Time Scanning > Excluded Files'; 'ESET' = 'Setup > Advanced setup > Detection engine > Exclusions'; 'Malwarebytes' = 'Settings > Allow list'; 'Avira' = 'Security > Protection options > Real-Time Protection settings > Exceptions'; 'Trend Micro' = 'Settings > Exception Lists'; 'Sophos' = 'Settings > General > Exclusions'; 'Webroot' = 'PC Security > Block/Allow Files'; 'F-Secure' = 'Settings > Excluded files and folders'; 'Panda' = 'Antivirus > Exclusions' }
+function Get-ThirdPartyAvReport {
+    $av = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue)
+    if (-not $av.Count) { return 'Windows Security Center lists no antivirus product (Windows Server, or a PC managed by work or school). ZeroDelay cannot tell which scanner is active here.' }
+    $rows = @(foreach ($a in $av) { $st = [int]$a.productState; [pscustomobject]@{ Name = "$($a.displayName)".Trim(); On = (($st -band 0x1000) -ne 0); Defender = ("$($a.displayName)" -match 'Windows Defender|Microsoft Defender') } })
+    $lines = ($rows | ForEach-Object { "$($_.Name): real-time protection $(if ($_.On) { 'on' } else { 'off' })" }) -join "`n"
+    $third = @($rows | Where-Object { -not $_.Defender -and $_.On })
+    if (-not $third.Count) { return "$lines`n`nOnly Windows Defender scans in real time, so ZeroDelay's Defender cards (shader-cache exclusion, scan CPU cap, low scan priority) apply. Nothing to change." }
+    $name = $third[0].Name
+    $hint = 'its settings, under exclusions or exceptions'; foreach ($k in $AvExclusionHints.Keys) { if ($name -match [regex]::Escape($k)) { $hint = $AvExclusionHints[$k]; break } }
+    $fn = Get-FnInstallDir
+    $paths = @(); if ($fn) { $paths += $fn }
+    $paths += (Join-Path $env:LOCALAPPDATA 'FortniteGame'), (Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'), (Join-Path $env:LOCALAPPDATA 'D3DSCache'), (Join-Path $env:LOCALAPPDATA 'AMD\DxCache')
+    "$lines`n`n$name is the active real-time scanner, so Windows Defender runs passive and ZeroDelay's Defender cards (shader-cache exclusion, scan CPU cap, low scan priority) do nothing on this PC. The same scan-on-open cost now comes from $name`: it checks every content chunk and shader-cache file Fortnite opens, and its 'game mode' only mutes pop-ups.`n`nAdd these folders as exclusions in $name ($hint):`n$(($paths | ForEach-Object { "- $_" }) -join "`n")`n`nZeroDelay never changes another vendor's antivirus. If you do not need $name, uninstalling it hands real-time protection back to Defender, and the Defender cards work again."
+}
+
+# --- BIOS age: older than 18 months means missing AGESA / microcode fixes
+function Get-BiosAgeReport {
+    $b = Get-BiosInfo
+    if (-not $b.Date) { return "BIOS $($b.Version) on $($b.Board): Windows does not report its date, so its age cannot be judged. Check the board maker's support page for a newer version." }
+    $months = [int](((Get-Date) - $b.Date).TotalDays / 30.44)
+    $amd = Test-AmdCpu
+    $mc = ''
+    if ($amd) { try { $ur = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction Stop).'Update Revision'; if ($ur -and $ur.Count -ge 4) { $mc = "`nCPU microcode patch level: 0x{0:X8}" -f [BitConverter]::ToUInt32($ur, 0) } } catch {} }
+    $head = "BIOS $($b.Version) from $($b.Date.ToString('d MMM yyyy')) on $($b.Board): $months months old.$mc"
+    $what = if ($amd) { 'On AMD the BIOS carries AGESA: the fTPM stutter fix (AM4), the Ryzen 9000 cross-die latency and parking fixes, the 2025 Zen 5 microcode security fixes and memory-training fixes.' } else { 'On Intel 13th/14th gen the BIOS carries microcode 0x12B (September 2024) and 0x12F (May 2025) against Vmin-shift damage plus the Intel Default Settings power profile; Intel measured no performance loss from them. On other CPUs it carries memory-training and stability fixes.' }
+    $how = "Where: the support page for $($b.Product) at the board maker (ASUS: asus.com/supportonly/$($b.Product -replace ' ', '-')/helpdesk_bios; MSI, Gigabyte, ASRock: the model's Support > BIOS page). Flash from the BIOS's own tool (EZ Flash, M-Flash, Q-Flash) with the file on a USB stick, never through a vendor auto-updater while playing, and write down your BIOS settings first: a flash resets them (EXPO/XMP, fan curves). If BitLocker is on, suspend it first or the next boot asks for the recovery key."
+    if ($months -gt 18) { return "$head`n`nMore than 18 months old. $what Check whether a newer BIOS exists; the release notes say what it fixes.`n`n$how" }
+    "$head`n`nRecent enough: no reason to flash unless the release notes name a problem you have. $what`n`n$how"
+}
+
+# --- Epic's PC tournament requirement since 19 February 2026: Secure Boot, TPM 2.0, IOMMU
+function Get-TournamentReport {
+    $fw = "$env:firmware_type"
+    $sb = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled'
+    $tpm = Get-TpmInfo
+    $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+    $iommu = if ($dg) { [bool](@($dg.AvailableSecurityProperties) -contains 3) } else { $null }
+    $sbOk = ($sb -eq 1); $tpmOk = ($tpm.Present -eq $true -and $tpm.Spec -match '(^|,\s*)2\.0'); $ioOk = ($iommu -eq $true)
+    $l = @()
+    $l += "Secure Boot: " + $(if ($sbOk) { 'on' } elseif ($fw -eq 'Legacy') { 'OFF, and Windows boots in legacy BIOS (CSM) mode, so it cannot be switched on yet' } else { 'OFF' })
+    $l += "TPM 2.0: " + $(if ($null -eq $tpm.Present) { 'unknown (needs administrator)' } elseif ($tpmOk) { "on ($($tpm.Mfr) $($tpm.Ver))" } elseif ($tpm.Present) { "a TPM is present but reports version $($tpm.Spec), not 2.0" } else { 'NOT FOUND (fTPM/PTT is off in the BIOS)' })
+    $l += "IOMMU (DMA protection): " + $(if ($null -eq $iommu) { 'unknown' } elseif ($ioOk) { 'on' } else { 'OFF (SVM/AMD-Vi or VT-d is disabled in the BIOS)' })
+    $head = "Epic requires Secure Boot, TPM 2.0 and IOMMU for every PC tournament since 19 February 2026 (normal play is not affected).`n`n$($l -join "`n")"
+    if ($sbOk -and $tpmOk -and $ioOk) { return "$head`n`nThis PC meets the requirement. Nothing to change. IOMMU on its own costs no FPS; only Memory Integrity (HVCI) does, and that has its own card." }
+    $steps = @()
+    if (-not $sbOk) { $steps += if ($fw -eq 'Legacy') { "Secure Boot: first convert Windows to UEFI boot (administrator prompt: mbr2gpt /validate /allowFullOS, then mbr2gpt /convert /allowFullOS), then BIOS > Boot > CSM: Disabled, Secure Boot > OS Type: Windows UEFI mode." } else { "Secure Boot: BIOS > Boot > Secure Boot > OS Type: Windows UEFI mode (CSM must be Disabled). If it says 'Setup mode', choose Install default Secure Boot keys / Restore factory keys." } }
+    if (-not $tpmOk -and $null -ne $tpm.Present) { $steps += 'TPM 2.0: BIOS > Advanced > AMD fTPM configuration: Firmware TPM (AMD), or PCH-FW / Security > PTT: Enabled (Intel). Needs a Ryzen 2000 / Intel 8th gen or newer.' }
+    if (-not $ioOk -and $null -ne $iommu) { $steps += 'IOMMU: BIOS > Advanced > CPU Configuration > SVM Mode: Enabled and (under AMD CBS or NBIO) IOMMU: Enabled, or Intel VT-d: Enabled. IOMMU alone does not slow games; do not turn on Memory Integrity to get it, the check reads the firmware.' }
+    if (-not $steps.Count) { return "$head`n`nSecure Boot and IOMMU are in place; the TPM can only be read with administrator rights, so run ZeroDelay as administrator to finish the check." }
+    $steps += 'If BitLocker or Device Encryption is on, suspend it first (Settings > Privacy & security > Device encryption, or manage-bde -protectors -disable C:), or the next boot asks for the recovery key.'
+    "$head`n`n$($steps -join "`n`n")`n`nZeroDelay cannot change firmware settings; these are the BIOS steps."
+}
+
+
+# --- Research round 5 (1.14), area sys: Windows build, GameInput, default audio device, mixed refresh rates,
+#     Administrator protection, kernel-driver sensor tools, EcoQoS, idle spike test, task audit, hypervisor, mitigations
+
+# Native helpers for this round, compiled on first use (Core Audio default endpoint, process power throttling, DisplayConfig).
+function Initialize-SysTypes {
+    if ('ZdQos' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+// Default playback device through Core Audio: name, PnP instance path (BTHENUM = Bluetooth) and the shared-mode format.
+public static class ZdAudio {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)] struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+    [StructLayout(LayoutKind.Explicit, Size = 24)] struct PROPVARIANT { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public uint ulVal; [FieldOffset(8)] public IntPtr ptr; [FieldOffset(8)] public uint cbBlob; [FieldOffset(16)] public IntPtr pBlob; }
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore { int GetCount(out uint c); int GetAt(uint i, out PROPERTYKEY k); int GetValue(ref PROPERTYKEY k, out PROPVARIANT v); int SetValue(ref PROPERTYKEY k, ref PROPVARIANT v); int Commit(); }
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice { int Activate(ref Guid iid, uint ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o); int OpenPropertyStore(uint access, out IPropertyStore ps); int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id); int GetState(out uint s); }
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection { int GetCount(out uint c); int Item(uint i, out IMMDevice d); }
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator { int EnumAudioEndpoints(int flow, uint mask, out IMMDeviceCollection c); int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice d); }
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumerator { }
+    static PROPERTYKEY FriendlyName = new PROPERTYKEY { fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), pid = 14 };
+    static PROPERTYKEY InstanceId = new PROPERTYKEY { fmtid = new Guid("b3f8fa53-0004-438e-9003-51a46e139bfc"), pid = 2 };     // PKEY_Device_InstanceId: "{1}.USB\VID_..." or "{1}.BTHENUM\..."
+    static PROPERTYKEY DeviceFormat = new PROPERTYKEY { fmtid = new Guid("f19f064d-082c-4e27-bc73-6882a1bb8e4c"), pid = 0 };   // PKEY_AudioEngine_DeviceFormat (WAVEFORMATEXTENSIBLE blob)
+    static string Str(IPropertyStore ps, PROPERTYKEY k) { PROPVARIANT v; return ps.GetValue(ref k, out v) == 0 && v.vt == 31 ? Marshal.PtrToStringUni(v.ptr) : ""; }
+    // "name|instance path|sample rate|bits|channels" for the default playback device of a role (0 = eConsole: games and system sounds), "" when there is none
+    public static string DefaultRender(int role) {
+        var en = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+        IMMDevice d; if (en.GetDefaultAudioEndpoint(0, role, out d) != 0 || d == null) return "";
+        IPropertyStore ps; if (d.OpenPropertyStore(0, out ps) != 0) return "";
+        string name = Str(ps, FriendlyName), inst = Str(ps, InstanceId);
+        int rate = 0, bits = 0, ch = 0;
+        PROPVARIANT v;
+        if (ps.GetValue(ref DeviceFormat, out v) == 0 && v.vt == 65 && v.cbBlob >= 16) {
+            ch = Marshal.ReadInt16(v.pBlob, 2); rate = Marshal.ReadInt32(v.pBlob, 4); bits = Marshal.ReadInt16(v.pBlob, 14);
+            if (v.cbBlob >= 24 && Marshal.ReadInt16(v.pBlob, 0) == -2) { int valid = Marshal.ReadInt16(v.pBlob, 18); if (valid > 0) bits = valid; }
+        }
+        return name + "|" + inst + "|" + rate + "|" + bits + "|" + ch;
+    }
+}
+// Per-process power throttling (EcoQoS), the "Efficiency mode" leaf in Task Manager. Nothing is written into the process.
+public static class ZdQos {
+    [StructLayout(LayoutKind.Sequential)] public struct S { public uint Version, ControlMask, StateMask; }
+    [DllImport("kernel32", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32", SetLastError = true)] static extern bool GetProcessInformation(IntPtr h, int cls, ref S s, int size);
+    [DllImport("kernel32", SetLastError = true)] static extern bool SetProcessInformation(IntPtr h, int cls, ref S s, int size);
+    [DllImport("kernel32")] static extern bool CloseHandle(IntPtr h);
+    // {ControlMask, StateMask}, or {-1, Win32 error} (87 = Windows build too old to report it, 5 = access denied)
+    public static int[] Get(int pid) {
+        IntPtr h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+        if (h == IntPtr.Zero) return new int[] { -1, Marshal.GetLastWin32Error() };
+        try { var s = new S { Version = 1 }; if (!GetProcessInformation(h, 4 /* ProcessPowerThrottling */, ref s, 12)) return new int[] { -1, Marshal.GetLastWin32Error() }; return new int[] { (int)s.ControlMask, (int)s.StateMask }; }
+        finally { CloseHandle(h); }
+    }
+    // 0 on success, else the Win32 error. Control 1 / State 0 = High QoS; Control 0 = back to Windows' own heuristics.
+    public static int Set(int pid, uint control, uint state) {
+        IntPtr h = OpenProcess(0x1000 | 0x0200 /* PROCESS_SET_INFORMATION */, false, pid);
+        if (h == IntPtr.Zero) return Marshal.GetLastWin32Error();
+        try { var s = new S { Version = 1, ControlMask = control, StateMask = state }; return SetProcessInformation(h, 4, ref s, 12) ? 0 : Marshal.GetLastWin32Error(); }
+        finally { CloseHandle(h); }
+    }
+}
+// Exact refresh rate of every active display path (QueryDisplayConfig), with the monitor's EDID name and the main-screen flag.
+public static class ZdDisplayCfg {
+    [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)] struct PATH_SOURCE { public LUID adapterId; public uint id; public uint modeInfoIdx; public uint statusFlags; }
+    [StructLayout(LayoutKind.Sequential)] struct PATH_TARGET { public LUID adapterId; public uint id; public uint modeInfoIdx; public uint outputTechnology; public uint rotation; public uint scaling; public uint rrNum; public uint rrDen; public uint scanLineOrdering; public int targetAvailable; public uint statusFlags; }
+    [StructLayout(LayoutKind.Sequential)] struct PATH_INFO { public PATH_SOURCE sourceInfo; public PATH_TARGET targetInfo; public uint flags; }
+    [StructLayout(LayoutKind.Sequential)] struct HEADER { public uint type; public uint size; public LUID adapterId; public uint id; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct SOURCE_NAME { public HEADER header; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string viewGdiDeviceName; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct TARGET_NAME { public HEADER header; public uint flags; public uint outputTechnology; public ushort edidManufactureId; public ushort edidProductCodeId; public uint connectorInstance; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct DISPLAY_DEVICE { public int cb; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString; public int StateFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey; }
+    [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
+    [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint numPaths, [Out] PATH_INFO[] paths, ref uint numModes, IntPtr modes, IntPtr topology);
+    [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref SOURCE_NAME req);
+    [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref TARGET_NAME req);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string dev, uint i, ref DISPLAY_DEVICE dd, uint flags);
+    static bool IsPrimary(string gdi) {
+        var dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        for (uint i = 0; EnumDisplayDevices(null, i, ref dd, 0); i++) { if (dd.DeviceName == gdi) return (dd.StateFlags & 4) != 0; dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE)); }
+        return false;
+    }
+    // "\\.\DISPLAYn|monitor name|numerator|denominator|output technology|primary" per active path; empty on error
+    public static string[] Paths() {
+        var list = new System.Collections.Generic.List<string>();
+        uint np, nm;
+        if (GetDisplayConfigBufferSizes(2 /* QDC_ONLY_ACTIVE_PATHS */, out np, out nm) != 0 || np == 0) return list.ToArray();
+        var paths = new PATH_INFO[np];
+        IntPtr modes = Marshal.AllocHGlobal((int)(nm * 64 + 64));
+        try {
+            if (QueryDisplayConfig(2, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) return list.ToArray();
+            for (int i = 0; i < np; i++) {
+                var p = paths[i];
+                var s = new SOURCE_NAME(); s.header.type = 1; s.header.size = (uint)Marshal.SizeOf(typeof(SOURCE_NAME)); s.header.adapterId = p.sourceInfo.adapterId; s.header.id = p.sourceInfo.id;
+                string gdi = DisplayConfigGetDeviceInfo(ref s) == 0 ? s.viewGdiDeviceName : "";
+                var t = new TARGET_NAME(); t.header.type = 2; t.header.size = (uint)Marshal.SizeOf(typeof(TARGET_NAME)); t.header.adapterId = p.targetInfo.adapterId; t.header.id = p.targetInfo.id;
+                string mon = DisplayConfigGetDeviceInfo(ref t) == 0 ? t.monitorFriendlyDeviceName : "";
+                list.Add(gdi + "|" + mon + "|" + p.targetInfo.rrNum + "|" + p.targetInfo.rrDen + "|" + p.targetInfo.outputTechnology + "|" + (IsPrimary(gdi) ? "1" : "0"));
+            }
+        } finally { Marshal.FreeHGlobal(modes); }
+        return list.ToArray();
+    }
+}
+'@
+}
+
+# --- Windows build: KB5127648 mouse-stutter fix, 24H2 end of updates, the KB5066835 NVIDIA regression, Core Ultra 200S and Ryzen 7000/9000 fixes
+function Get-WinUpdateReport {
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $build = [int]"$($cv.CurrentBuild)"; $ubr = [int]"$($cv.UBR)"; $ver = "$($cv.DisplayVersion)"; $ed = "$($cv.EditionID)"
+    if (-not $build) { return 'Could not read the Windows version.' }
+    $out = @(); $bad = @()
+    $out += "Windows 11 $ver, build $build.$ubr ($ed)"
+    $consumer = $ed -notmatch 'Enterprise|Education|IoT|LTSC|Server'
+    if ($build -in 26100, 26200, 26300) {
+        if ($ubr -lt 9711) { $bad += "You are missing the 13 October 2026 update (KB5127648, build $build.9711). Its release notes say under Gaming: it fixes an issue that could cause mouse input to stutter in some games. Microsoft did not name the games or the cause; users saw it with 125 Hz as well as 8000 Hz mice, so changing the mouse did not help. Install it: Settings > Windows Update > Check for updates." }
+        else { $out += 'The October 2026 update with the mouse-stutter fix (KB5127648) is installed.' }
+    } elseif ($build -lt 26100) {
+        $bad += "This Windows version ($ver) no longer gets updates (23H2 ended in November 2025). Later builds have the mouse-stutter fix and, for Ryzen 7000/9000, the branch-prediction optimisation. Settings > Windows Update offers 25H2/26H2."
+    }
+    if ($ver -eq '24H2' -and $consumer) { $bad += 'Windows 11 24H2 Home/Pro reached the end of updates on 13 October 2026; KB5127648 was its last one. Later fixes need 25H2 or 26H2, which installs as a small enablement package (same files, a few minutes, can be rolled back for 10 days): Settings > Windows Update.' }
+    # NVIDIA: KB5066835 (14 October 2025, 26100.6899 / 26200.6899) lowered FPS until GeForce Hotfix 581.94 (19 November 2025)
+    $nv = $null; try { $nv = Get-NvDriverInfo } catch {}
+    if ($nv -and $nv.Installed -match '^\d+\.\d+$') {
+        $after = ($build -ge 26200) -or ($build -eq 26100 -and $ubr -ge 6899)
+        $drv = [double]::Parse($nv.Installed, [Globalization.CultureInfo]::InvariantCulture)
+        if ($after -and $drv -lt 581.94) { $bad += "NVIDIA driver $($nv.Installed) with the October 2025 Windows update (KB5066835) or later: NVIDIA's hotfix 581.94 (19 November 2025) addresses lower performance in some games after that update, and every later Game Ready driver includes the fix. Reported losses reached 20-50% in some games. Update the driver in the NVIDIA App." }
+        else { $out += "NVIDIA driver $($nv.Installed): not affected by the KB5066835 slowdown." }
+    }
+    $cpu = ''; try { $cpu = "$(Get-CpuName)" } catch {}
+    if ($cpu -match 'Core Ultra [579] 2\d\d') {
+        if ($build -eq 26100 -and $ubr -lt 2161) { $bad += "Intel Core Ultra 200S: Intel's field update lists Windows build 26100.2161 (KB5044384) or newer as the fix for odd scheduling and the Balanced-plan problem at launch. You have 26100.$ubr. Install the pending updates, and the BIOS with microcode 0x114 plus the latest Intel chipset and APO drivers from your board maker." }
+        elseif ($build -lt 26100) { $bad += 'Intel Core Ultra 200S: the scheduling fixes need Windows 11 24H2 build 26100.2161 or newer. Update Windows.' }
+        else { $out += 'Intel Core Ultra 200S: the Windows build has the scheduling fixes. Also install the BIOS with microcode 0x114 and the latest Intel chipset and APO drivers.' }
+    }
+    if ($cpu -match 'Ryzen [3579] [79]\d{3}') {
+        if ($build -lt 26100 -and -not ($build -eq 22631 -and $ubr -ge 4112)) { $bad += "Ryzen 7000/9000 on $ver`: the branch-prediction optimisation that 24H2 shipped (Hardware Unboxed and TechSpot measured about +10% average FPS across 40+ games) is missing. Windows 11 23H2 got it with KB5041587 (August 2024); 24H2 and later have it built in. Update Windows." }
+        else { $out += 'Ryzen 7000/9000: the branch-prediction optimisation (24H2, about +10% in CPU-bound games) is active. It works with the Balanced plan as well as the ZeroDelay plan.' }
+    }
+    $s = ($out -join "`n") + "`n`n"
+    if ($bad.Count) { $s + ($bad -join "`n`n") + "`n`nZeroDelay does not install updates; the Windows Update cards only control when restarts happen." }
+    else { $s + 'Nothing to do: the known gaming regressions of 2025-2026 are fixed on this build.' }
+}
+
+# --- Duplicate Microsoft GameInput installs (the 2023 runtime left behind next to the 2025 redistributable)
+function Get-GameInputReport {
+    $rows = @()
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
+        foreach ($e in @(Get-ChildItem $k -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty $e.PSPath -ErrorAction SilentlyContinue
+            if ("$($p.DisplayName)" -like 'Microsoft GameInput*') { $rows += [pscustomobject]@{ Name = "$($p.DisplayName)"; Version = "$($p.DisplayVersion)"; Date = "$($p.InstallDate)"; Key = $e.PSChildName } }
+        }
+    }
+    $rows = @($rows | Sort-Object Key -Unique)
+    $svc = foreach ($n in 'GameInputSvc', 'GameInputRedistService') { $s = Get-Service -Name $n -ErrorAction SilentlyContinue; if ($s) { "$($s.DisplayName): $($s.Status), start type $($s.StartType)" } }
+    $svcText = if ($svc) { "`n`nServices: $($svc -join '; ')" } else { '' }
+    if (-not $rows.Count) { return "Microsoft GameInput is not installed as a separate app, so there is nothing to clean up.$svcText" }
+    $list = ($rows | ForEach-Object { "- $($_.Name) $($_.Version)$(if ($_.Date -match '^\d{8}$') { " (installed $($_.Date.Substring(6, 2)).$($_.Date.Substring(4, 2)).$($_.Date.Substring(0, 4)))" })" }) -join "`n"
+    if ($rows.Count -eq 1) { return "One GameInput install: fine.`n$list`n`nSince September 2025 severe FPS drops and audio distortion minutes after touching a controller were traced to two GameInput versions installed side by side. You have only one, so this is not your problem.$svcText" }
+    $old = ($rows | Sort-Object { try { [version]($_.Version -replace '[^\d.]', '') } catch { [version]'0.0' } } | Select-Object -First 1)
+    "Two or more GameInput versions are installed:`n$list`n`nSince September 2025 PC players reported severe FPS drops, stutter and crackling audio minutes after touching a controller (keyboard and mouse unaffected). The widely reported fix is removing the older copy so only one GameInput service stack runs.`n`nGuided fix:`n1. Settings > Apps > Installed apps, search GameInput.`n2. Uninstall the older entry ($($old.Name) $($old.Version)); keep the newest.`n3. Restart Windows.`n`nIf it was still needed, reinstall it with: winget install Microsoft.GameInput. Do not disable the GameInput service itself: Store and Game Pass titles need it for controller input and vibration.$svcText"
+}
+
+# --- Default playback device: Bluetooth latency and a sample rate Fortnite has to resample
+function Get-AudioDefaultReport {
+    Initialize-SysTypes
+    $raw = try { [ZdAudio]::DefaultRender(0) } catch { '' }
+    if (-not $raw) { return 'No default playback device (nothing plugged in, or audio is disabled).' }
+    $f = $raw -split '\|'
+    $name = $f[0]; $inst = $f[1]; $rate = [int]$f[2]; $bits = [int]$f[3]; $ch = [int]$f[4]
+    $bt = $inst -match '(^|\.)(BTHENUM|BTHHFENUM|BTHLE|BTHLEDEVICE)\\' -or $name -match 'Hands-Free|Bluetooth'
+    $bus = if ($bt) { 'Bluetooth' } elseif ($inst -match '\.USB\\') { 'USB (cable or 2.4 GHz dongle)' } elseif ($inst -match '\.HDAUDIO\\') { 'onboard audio jack' } elseif ($inst -match 'DISPLAY|HDMI|NVIDIA|AMD') { 'the monitor (HDMI/DisplayPort)' } else { 'unknown' }
+    $out = @("Default playback device: $name`nConnection: $bus`nShared-mode format: $(if ($rate) { "$bits-bit, $rate Hz, $ch channels" } else { 'not reported' })")
+    $bad = @()
+    if ($bt) { $bad += 'Bluetooth audio runs well behind the game: RTINGS measured about 173 ms with SBC and 166 ms with aptX, 34 ms with aptX Low Latency and 30-40 ms with LE Audio (LC3), against 12-20 ms on a 2.4 GHz dongle and about 0 on a cable. Footsteps and shots arrive a tenth of a second late. For matches use the dongle or a cable, and keep the Bluetooth link for the phone. When Discord opens the microphone, Windows can also drop the headset into the mono Hands-Free profile.' }
+    if ($rate -in 88200, 96000, 176400, 192000) { $bad += "The device is set to $rate Hz. Fortnite's audio mixer runs at 48 kHz, so Windows (audiodg.exe) resamples every buffer, which costs CPU and on weak USB DACs causes crackle. Set it to 24-bit, 48000 Hz: Settings > System > Sound > the device > Format (or Control Panel Sound > Properties > Advanced). It makes no audible difference to game sound." }
+    elseif ($rate -eq 44100) { $bad += 'The device is set to 44.1 kHz; Fortnite mixes at 48 kHz, so every buffer is resampled. Setting 48000 Hz (Settings > System > Sound > the device > Format) removes that step; the gain is small unless the device crackles.' }
+    if (-not $bad.Count) { return ($out -join "`n") + "`n`nNothing to change: a wired or dongle device at 48 kHz is the low-latency setup for Fortnite." }
+    ($out -join "`n") + "`n`n" + ($bad -join "`n`n") + "`n`nZeroDelay changes nothing here; the setting lives in Windows Sound and in the headset."
+}
+
+# --- Every active monitor's exact refresh rate; warns about a second screen at a different rate for borderless players
+function Get-MixedRefreshReport {
+    Initialize-SysTypes
+    $paths = @(try { [ZdDisplayCfg]::Paths() } catch { @() })
+    $rows = @(foreach ($p in $paths) {
+        $f = $p -split '\|'; if ($f.Count -lt 6) { continue }
+        $num = [double]$f[2]; $den = [double]$f[3]; if ($den -le 0) { continue }
+        [pscustomobject]@{ Gdi = $f[0]; Name = $(if ($f[1]) { $f[1] } else { $f[0] }); Hz = [math]::Round($num / $den, 2); Primary = ($f[5] -eq '1'); Internal = ($f[4] -in '11', '13', '14') }
+    })
+    $rows = @($rows | Sort-Object { -not $_.Primary }, Gdi)
+    if (-not $rows.Count) { return 'Could not read the display configuration.' }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $lines = ($rows | ForEach-Object { "- $($_.Name): $($_.Hz.ToString('0.##', $inv)) Hz$(if ($_.Primary) { ' (main screen)' })" }) -join "`n"
+    if ($rows.Count -lt 2) { return "One active monitor:`n$lines`n`nNothing to check: mixed refresh rates only matter with two or more screens." }
+    $main = $rows | Where-Object Primary | Select-Object -First 1; if (-not $main) { $main = $rows[0] }
+    $diff = @($rows | Where-Object { $_.Gdi -ne $main.Gdi -and [math]::Abs($_.Hz - $main.Hz) -gt 0.01 })
+    $mode = $null
+    if (Test-Path $IniPath) { try { $mode = Get-IniValue ([IO.File]::ReadAllLines($IniPath)) 'FullscreenMode' } catch {} }
+    $modeText = switch ("$mode") { '0' { 'Fortnite is set to true fullscreen, so the game owns its screen and the other monitor''s rate does not touch its frame pacing while you play.' } '1' { 'Fortnite is set to windowed fullscreen (borderless), where the desktop compositor is involved.' } '2' { 'Fortnite is set to windowed mode, where the desktop compositor is involved.' } default { '' } }
+    if (-not $diff.Count) { return "All monitors run at the same rate:`n$lines`n`nGood: no mixed-rate timing between screens. $modeText" }
+    $worst = $diff | Sort-Object { [math]::Abs($_.Hz - $main.Hz) } -Descending | Select-Object -First 1
+    $ratio = [math]::Max($main.Hz, $worst.Hz) / [math]::Min($main.Hz, $worst.Hz)
+    $mult = [math]::Abs($ratio - [math]::Round($ratio)) -lt 0.02
+    $tiny = [math]::Abs($worst.Hz - $main.Hz) -lt 1.5
+    $s = "Your monitors run at different rates:`n$lines`n`n"
+    $s += if ($tiny) { "$($worst.Name) runs at $($worst.Hz.ToString('0.##', $inv)) Hz against $($main.Hz.ToString('0.##', $inv)) Hz on the main screen: a timing mismatch like 59.94 against 60 is the exact case users on the AMD forum traced borderless stutter to. Set both to the same listed rate in Settings > System > Display > Advanced display." }
+    elseif ($mult) { "The rates are whole multiples of each other ($($main.Hz.ToString('0.##', $inv)) and $($worst.Hz.ToString('0.##', $inv))), the best case when they cannot be equal." }
+    else { "Since Windows 10 2004 the desktop composes each monitor on its own, so a 60 Hz screen no longer drags a 240 Hz one down. Stutter is still widely reported when a video or Discord stream plays on the slower screen while the game runs borderless. The safe options: set the second screen to the same rate or a whole multiple ($($main.Hz.ToString('0.##', $inv)) with $([math]::Round($main.Hz / 2).ToString('0', $inv)) or $([math]::Round($main.Hz / 3).ToString('0', $inv))) in Settings > System > Display > Advanced display, pause video on the other screen in matches, or play true fullscreen (the Fortnite tab has a card for it)." }
+    if ($modeText) { $s += "`n`n$modeText" }
+    $s + "`n`nIf you see flicker or stutter when both screens show motion, the multiplane overlay card (Graphics tab) is NVIDIA's documented fix. ZeroDelay changes no display setting here."
+}
+
+# --- Administrator protection (Windows 11 24H2+): elevated apps get a separate, hidden profile for HKCU and %LOCALAPPDATA%
+function Get-AdminProtectionReport {
+    $v = Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'TypeOfAdminApprovalMode'
+    $elev = try { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators') } catch { $null }
+    if ("$v" -ne '2') { return "Administrator protection is off (TypeOfAdminApprovalMode = $(if ($null -eq $v) { 'not set' } else { $v }), legacy UAC).`n`nElevated apps such as ZeroDelay write their per-user settings (HKCU, %LOCALAPPDATA%) to your own profile, so every card reaches the game. Nothing to do." }
+    "Administrator protection is ON (TypeOfAdminApprovalMode = 2).`n`nWindows then runs every elevated app under a hidden, separate system-managed admin account with its own profile. Microsoft: settings data for applications do not carry over between the unelevated and the elevated profiles. So when ZeroDelay (or any optimizer) runs as administrator, its per-user changes land in that hidden profile, not yours:`n- HKCU registry cards: mouse acceleration, keyboard repeat, Game Bar and Game DVR, menu delay, accessibility shortcuts, browser background settings`n- files under %LOCALAPPDATA%: Fortnite's GameUserSettings.ini cards`nThe game runs in your real profile and never sees them, although the cards show as applied. Machine-wide cards (HKLM, services, power plans, boot settings, NVIDIA profile) still work.`n`nWhat to do: switch it off while you tune: Windows Security > Account protection > Administrator protection: Off (needs a restart), apply the cards, then switch it back on if you want the extra protection. ZeroDelay does not change this setting itself.`n`nAlso expect a Windows Hello prompt on every elevation and launchers that self-elevate for installs (Epic) to lose signed-in sessions inside the elevated profile.$(if ($elev -eq $true) { "`n`nThis ZeroDelay session is elevated, so its HKCU cards are affected right now." })"
+}
+
+# --- Kernel port-I/O drivers and the sensor/RGB pollers that use them (DPC/SMI stalls, the Microsoft EAC crash note)
+$script:KernelToolDrivers = @(
+    @{ N = 'inpoutx64'; What = 'inpoutx64 (legacy port I/O; RGB and fan tools, some MSI/ASRock utilities)' }
+    @{ N = 'inpout32'; What = 'inpout32 (32-bit sibling of inpoutx64)' }
+    @{ N = 'WinRing0x64'; What = 'WinRing0 (OpenHardwareMonitor, LibreHardwareMonitor, FanControl, older OpenRGB)' }
+    @{ N = 'WinRing0_1_2_0'; What = 'WinRing0 1.2 (LibreHardwareMonitor, FanControl, Thermaltake and others)' }
+    @{ N = 'AsIO3'; What = 'ASUS AsIO3 (Armoury Crate, AI Suite, Aura)' }
+    @{ N = 'AsIO2'; What = 'ASUS AsIO2 (AI Suite, Aura)' }
+    @{ N = 'AsUpIO'; What = 'ASUS AsUpIO (ASUS update and lighting tools)' }
+    @{ N = 'gdrv'; What = 'Gigabyte gdrv (RGB Fusion, APP Center; on Microsoft''s vulnerable-driver blocklist)' }
+    @{ N = 'gdrv2'; What = 'Gigabyte gdrv2 (Gigabyte Control Center)' }
+    @{ N = 'RwDrv'; What = 'RwDrv (RW-Everything; on Microsoft''s vulnerable-driver blocklist)' }
+    @{ N = 'NTIOLib_X64'; What = 'MSI NTIOLib (MSI Center, Afterburner helpers)' }
+    @{ N = 'AMDRyzenMasterDriverV'; What = 'AMD Ryzen Master driver' }
+)
+$script:KernelToolProcs = @(
+    @{ Rx = '^iCUE$|^Corsair\.Service'; Name = 'Corsair iCUE'; Tip = 'in iCUE turn off the SDK, dashboard sensor widgets and game-profile switching; the Vendor tab can stop its services' }
+    @{ Rx = '^ArmouryCrate|^ArmourySocketServer|^AsusSystemAnalysis|^LightingService$'; Name = 'ASUS Armoury Crate / Aura'; Tip = 'the Vendor tab can stop the Armoury Crate and Aura services' }
+    @{ Rx = '^MSI_Center|^MSI\.CentralServer|^MSI Center|^Dragon Center|^MSIService$'; Name = 'MSI Center'; Tip = 'the Vendor tab can stop its services' }
+    @{ Rx = '^NZXT CAM'; Name = 'NZXT CAM'; Tip = 'close it in matches or lower its polling in its settings' }
+    @{ Rx = '^HWiNFO64'; Name = 'HWiNFO64'; Tip = 'set its polling to 2000 ms and switch off EC and drive (SMART) sensors (Settings > Safety); NVIDIA states its driver was not meant for external polling while gaming' }
+    @{ Rx = '^MSIAfterburner$'; Name = 'MSI Afterburner'; Tip = 'set the monitoring period to 1000 ms' }
+    @{ Rx = '^RTSS$|^RTSSHooksLoader'; Name = 'RivaTuner Statistics Server'; Tip = 'fine as an overlay; if it caps FPS, move the cap into Fortnite' }
+    @{ Rx = '^aida64'; Name = 'AIDA64'; Tip = 'close its sensor panel in matches' }
+    @{ Rx = '^OpenRGB'; Name = 'OpenRGB'; Tip = 'close it after setting the colours; most controllers keep them' }
+    @{ Rx = '^SignalRgb'; Name = 'SignalRGB'; Tip = 'close it in matches, or exclude Fortnite in its settings' }
+    @{ Rx = '^LibreHardwareMonitor|^OpenHardwareMonitor|^FanControl$'; Name = 'LibreHardwareMonitor / FanControl'; Tip = 'raise the update interval to 2 s or more' }
+    @{ Rx = '^GCC$|^GigabyteUpdateService|^RGBFusion'; Name = 'Gigabyte Control Center / RGB Fusion'; Tip = 'close it after setting the colours' }
+)
+function Get-KernelDriverToolsReport {
+    $drv = @(foreach ($d in $script:KernelToolDrivers) {
+        $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$($d.N)"
+        if (-not (Test-Path $k)) { continue }
+        $start = Get-RegValue $k 'Start'; $img = "$(Get-RegValue $k 'ImagePath')"
+        $svc = Get-Service -Name $d.N -ErrorAction SilentlyContinue
+        [pscustomobject]@{ N = $d.N; What = $d.What; Start = $start; Img = $img; Running = ($svc -and $svc.Status -eq 'Running') }
+    })
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName } | Select-Object -Unique)
+    $pol = @(foreach ($p in $script:KernelToolProcs) { if ($procs | Where-Object { $_ -match $p.Rx }) { $p } })
+    $out = @()
+    if ($drv.Count) {
+        $out += "Low-level hardware drivers installed:`n" + (($drv | ForEach-Object { "- $($_.What): $(if ($_.Start -eq 4) { 'disabled' } elseif ($_.Running) { 'loaded now' } else { 'installed, loads on demand' })$(if ($_.Img) { "  [$($_.Img -replace '^\\\?\?\\', '')]" })" }) -join "`n")
+    } else { $out += 'No low-level port I/O drivers (inpoutx64, WinRing0, AsIO, gdrv, RwDrv, NTIOLib) are installed.' }
+    if ($pol.Count) { $out += "Sensor and RGB pollers running now:`n" + (($pol | ForEach-Object { "- $($_.Name): $($_.Tip)" }) -join "`n") }
+    else { $out += 'No sensor or RGB poller (iCUE, Armoury Crate, MSI Center, NZXT CAM, HWiNFO64, Afterburner, AIDA64, OpenRGB, SignalRGB) is running right now.' }
+    $hw = Get-ItemProperty 'HKCU:\Software\HWiNFO64\Settings' -ErrorAction SilentlyContinue
+    if ($hw -and $null -ne $hw.SensorInterval -and [int]$hw.SensorInterval -lt 1000) { $out += "HWiNFO64 polls sensors every $($hw.SensorInterval) ms; 2000 ms is enough for temperatures and takes most of its stall away." }
+    $s = ($out -join "`n`n") + "`n`n"
+    $why = 'Why it matters: these tools read temperatures, fan speeds and RGB chips through the embedded controller, SMBus or raw port I/O, work that runs with every core blocked (DPC or SMI context). Each poll can stall the whole PC for 0.1 to several milliseconds, a few times per second: the ACPI.sys and Wdf01000.sys spikes LatencyMon shows. ASUS and MSI forum users traced in-game stutter to iCUE and HWiNFO polling. The idle spike test (System tab) measures the stalls.'
+    $inp = $drv | Where-Object { $_.N -eq 'inpoutx64' } | Select-Object -First 1
+    if ($inp) { $s += "inpoutx64 and anti-cheat: Microsoft's Windows release health (opened 19 August 2026, after KB5121003) says some PCs could not run certain games (ARC Raiders, MARVEL Tokon, THE FINALS: hang, silent close, EXCEPTION_ACCESS_VIOLATION or a reboot) and that the cause is the inpoutx64 driver shipped by RGB and peripheral software, not Windows. All three are Easy Anti-Cheat games like Fortnite; Microsoft's workaround is to set the driver's Start value to 4 and restart, and it states that its investigation does not indicate that disabling the key causes unintended behaviour. The card 'Stop the inpoutx64 driver loading' does exactly that, reversibly. Fan or RGB tools that depend on it lose their sensors.`n`n" }
+    $s + $why + "`n`nZeroDelay changes nothing here except through that separate card."
+}
+
+# --- Fortnite's power-throttling state (EcoQoS, Task Manager's "Efficiency mode"); per launch, nothing is written into the game
+function Get-FnEcoQosState {
+    Initialize-SysTypes
+    $p = Get-Process ($FortniteExeName -replace '\.exe$') -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { return $null }
+    $r = [ZdQos]::Get($p.Id)
+    $prio = try { "$($p.PriorityClass)" } catch { '' }
+    [pscustomobject]@{ Pid = $p.Id; Ok = ($r[0] -ge 0); Err = $(if ($r[0] -lt 0) { $r[1] } else { 0 }); Control = $r[0]; State = $r[1]; Eco = ($r[0] -ge 0 -and ($r[0] -band 1) -and ($r[1] -band 1)); ForcedHigh = ($r[0] -ge 0 -and ($r[0] -band 1) -and -not ($r[1] -band 1)); Priority = $prio }
+}
+function Invoke-FnEcoQosCheck {
+    $st = Get-FnEcoQosState
+    if (-not $st) { [void](Show-ZdDialog 'Fortnite is not running. Start it, then run this check: the state is per launch and goes back to normal when the game closes.' 'Fortnite Efficiency mode' 'OK' 'Information'); return 'Fortnite is not running.' }
+    if (-not $st.Ok) {
+        $why = switch ($st.Err) { 87 { 'this Windows build does not report it (Windows 11 22H2 or newer is needed)' } 5 { 'access was denied (run ZeroDelay as administrator)' } default { "Windows error $($st.Err)" } }
+        [void](Show-ZdDialog "Could not read Fortnite's throttling state: $why." 'Fortnite Efficiency mode' 'OK' 'Information'); return 'Could not read it.'
+    }
+    $prioNote = if ($st.Priority -in 'Idle', 'BelowNormal') { "`n`nIts CPU priority is also $($st.Priority) (Task Manager's Efficiency mode lowers it). The 'Run Fortnite at high CPU priority' card on the Fortnite tab raises it." } else { '' }
+    if ($st.Eco) {
+        $ans = Show-ZdDialog "Fortnite is in Efficiency mode (EcoQoS) right now: Windows lowers its CPU frequency and, on Intel hybrid CPUs, prefers the efficiency cores for it. Microsoft says EcoQoS should not be used for performance-critical or foreground experiences. Fortnite never asks for it; Task Manager's Efficiency mode or another optimizer set it.$prioNote`n`nClear it now? ZeroDelay sets the process to High QoS (a Windows per-process setting, nothing is injected). It lasts until Fortnite closes." 'Fortnite Efficiency mode' 'YesNo' 'Warning'
+        if ($ans -ne 'Yes') { return 'Left as it is.' }
+        $rc = [ZdQos]::Set($st.Pid, 1, 0)
+        if ($rc -ne 0) { throw "Windows refused to change it (error $rc)." }
+        $after = Get-FnEcoQosState
+        if ($after -and -not $after.Eco) { [void](Show-ZdDialog 'Done: Fortnite now runs at High QoS. This is per launch; if it comes back next time, find what sets it: Task Manager > Details > right-click Fortnite > Efficiency mode, or a booster that applies Efficiency mode to everything.' 'Fortnite Efficiency mode' 'OK' 'Information'); return 'Efficiency mode cleared.' }
+        throw 'Windows reported success but the state did not change.'
+    }
+    $txt = if ($st.ForcedHigh) { 'Fortnite is explicitly set to High QoS: full CPU frequency and performance cores. Nothing to do.' } else { 'Fortnite runs with normal Windows scheduling (no Efficiency mode): a focused game gets High QoS automatically. Nothing to do.' }
+    [void](Show-ZdDialog "$txt$prioNote" 'Fortnite Efficiency mode' 'OK' 'Information'); 'Checked.'
+}
+
+# --- Idle spike test: 5 s of 1 kHz wake-ups on a high-priority thread (worst gap = DPC/ISR/SMI stall) plus DPC and interrupt time
+$script:IdleSpikeBusy = $false
+function Start-IdleSpikeTest {
+    if ($script:IdleSpikeBusy) { throw 'The idle spike test is already running.' }
+    if (Test-FortniteRunning) { throw 'Close Fortnite first: the test measures the idle PC.' }
+    $script:IdleSpikeBusy = $true
+    Invoke-Worker @'
+param($seconds)
+if (-not ('ZdIdle' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Threading;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+public static class ZdIdle {
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+    [DllImport("kernel32.dll")] static extern bool SetThreadPriority(IntPtr h, int prio);
+    // Sleeps 1 ms in a loop on a time-critical thread (only DPCs, interrupts and SMIs can delay it); returns {max gap us, gaps > 2 ms, gaps > 5 ms, samples, p99 gap us, median gap us}
+    public static long[] Run(int seconds) {
+        long[] res = new long[6];
+        var th = new Thread(() => {
+            SetThreadPriority(GetCurrentThread(), 15 /* THREAD_PRIORITY_TIME_CRITICAL */);
+            timeBeginPeriod(1);
+            try {
+                double f = Stopwatch.Frequency / 1000000.0;
+                var gaps = new System.Collections.Generic.List<long>(seconds * 1100);
+                long end = Stopwatch.GetTimestamp() + Stopwatch.Frequency * seconds, last = Stopwatch.GetTimestamp();
+                while (true) {
+                    Thread.Sleep(1);
+                    long now = Stopwatch.GetTimestamp();
+                    gaps.Add((long)((now - last) / f)); last = now;
+                    if (now >= end) break;
+                }
+                long max = 0, c2 = 0, c5 = 0;
+                foreach (var g in gaps) { if (g > max) max = g; if (g > 2000) c2++; if (g > 5000) c5++; }
+                gaps.Sort();
+                res[0] = max; res[1] = c2; res[2] = c5; res[3] = gaps.Count; res[4] = gaps[(int)(gaps.Count * 0.99)]; res[5] = gaps[gaps.Count / 2];
+            } finally { timeEndPeriod(1); }
+        });
+        th.Priority = ThreadPriority.Highest; th.IsBackground = true; th.Start(); th.Join();
+        return res;
+    }
+}
+"@
+}
+$g = [ZdIdle]::Run($seconds)
+$dpc = -1.0; $int = -1.0
+try {
+    $c = Get-Counter '\Processor Information(_Total)\% DPC Time', '\Processor Information(_Total)\% Interrupt Time' -SampleInterval 1 -MaxSamples 5 -ErrorAction Stop
+    $d = @(); $i = @()
+    foreach ($s in $c) { foreach ($x in $s.CounterSamples) { if ($x.Path -match 'dpc') { $d += [double]$x.CookedValue } else { $i += [double]$x.CookedValue } } }
+    if ($d.Count) { $dpc = ($d | Measure-Object -Average).Average }; if ($i.Count) { $int = ($i | Measure-Object -Average).Average }
+} catch {}
+# a hashtable: Get-WorkerResult unwraps the top-level object, which strips a pscustomobject's properties
+@{ MaxUs = $g[0]; Over2 = $g[1]; Over5 = $g[2]; Samples = $g[3]; P99Us = $g[4]; MedUs = $g[5]; Dpc = $dpc; Int = $int }
+'@ @(5) {
+        param($out, $errs)
+        $script:IdleSpikeBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable]) -or -not $r.Samples) { Show-Toast 'The idle spike test could not run.' '#FF9F0A'; return }
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $maxMs = [math]::Round($r.MaxUs / 1000, 2); $p99 = [math]::Round($r.P99Us / 1000, 2); $pct2 = [math]::Round(100 * $r.Over2 / $r.Samples, 1)
+        $s = "5 seconds of 1 ms wake-ups ($($r.Samples) samples):`n`nWorst gap: $($maxMs.ToString('0.00', $inv)) ms`nGaps over 2 ms: $($r.Over2) ($($pct2.ToString('0.#', $inv))%), over 5 ms: $($r.Over5)`n99% of wake-ups within $($p99.ToString('0.00', $inv)) ms (median $([math]::Round($r.MedUs / 1000, 2).ToString('0.00', $inv)) ms)`n"
+        if ($r.Dpc -ge 0) { $s += "CPU time in driver callbacks (DPC): $([math]::Round($r.Dpc, 2).ToString('0.00', $inv))%, in interrupts: $([math]::Round($r.Int, 2).ToString('0.00', $inv))% (5 s average, all cores)`n" }
+        $s += "`n"
+        $verdict = if ($r.MaxUs -ge 10000) { "Problem: something blocked the CPU for $($maxMs.ToString('0.#', $inv)) ms at idle. A 1 ms timer on a high-priority thread only waits that long when a driver callback, interrupt storm or firmware (SMI) stalls every core: that is audio-crackle and stutter territory in a match." }
+                   elseif ($r.MaxUs -ge 3000 -or $r.Over5 -gt 0) { 'Some stalls: a few wake-ups came 3 ms or more late. With 1 ms timer resolution a wake-up normally lands within 1-2 ms, so these are real interruptions, short enough that most players will not see them; worth fixing if you get periodic hitches.' }
+                   else { 'Clean: every wake-up landed within 3 ms, which is what a healthy idle PC does with a 1 ms timer. Stutter you see in matches is not a background driver stall.' }
+        $s += $verdict
+        $tips = @()
+        if ($r.Dpc -ge 2 -or $r.Int -ge 1) { $tips += 'Driver callback or interrupt time is high for an idle PC (healthy is under 0.5% DPC and 0.2% interrupts): a driver is busy doing nothing. Usual sources: Wi-Fi scanning (Network tab: roaming and Wi-Fi power cards, or use a cable), the GPU driver after an update (clean reinstall), USB audio or RGB controllers.' }
+        if ($r.MaxUs -ge 3000) { $tips += 'Where to look: sensor and RGB pollers (System tab: Find kernel-driver sensor tools), Wi-Fi on a cable-capable PC, NVMe power states (nvme-idle card), audio enhancements, VPN or firewall filter drivers. Run the test again after each change; LatencyMon shows the driver by name if you want to go deeper.' }
+        if ($tips.Count) { $s += "`n`n" + ($tips -join "`n`n") }
+        $s += "`n`nThis is a user-mode measurement (no kernel tracing): it shows that stalls happen and how long, not which driver. Results are only meaningful with the PC idle."
+        [void](Show-ZdDialog $s 'Idle spike test' 'OK' 'Information')
+    }
+}
+
+# --- Scheduled tasks from the known updater/telemetry list that are enabled and fire within the next 3 hours
+$script:TaskAuditPatterns = @(
+    @{ Rx = '^\\Microsoft\\Windows\\\.NET Framework\\\.NET Framework NGEN'; Group = '.NET NGEN (compiles assemblies at full CPU for minutes after updates, idle trigger)' }
+    @{ Rx = '^\\MicrosoftEdgeUpdate'; Group = 'Microsoft Edge updater (hourly check)' }
+    @{ Rx = '^\\GoogleUpdate|^\\Google(System|User)\\GoogleUpdater\\'; Group = 'Google Chrome updater (hourly check)' }
+    @{ Rx = '^\\BraveSoftwareUpdate'; Group = 'Brave updater (hourly check)' }
+    @{ Rx = '^\\Opera .*Autoupdate'; Group = 'Opera updater' }
+    @{ Rx = '^\\Firefox (Default Browser Agent|Background Update)'; Group = 'Firefox agent and updater' }
+    @{ Rx = '^\\Nv(Tm|Profile|Driver|Node)|^\\NVIDIA '; Group = 'NVIDIA telemetry, profile and driver-check tasks' }
+    @{ Rx = '^\\(Launch )?Adobe|^\\AdobeGC'; Group = 'Adobe updaters and helpers' }
+    @{ Rx = '^\\OneDrive '; Group = 'OneDrive update and reporting tasks' }
+    @{ Rx = '^\\Microsoft\\Office\\Office (Automatic Updates|ClickToRun|Feature Updates|Serviceability)'; Group = 'Office update tasks' }
+    @{ Rx = '^\\IntelSUR|^\\Intel (SUR|PTT|System Usage)'; Group = 'Intel System Usage Report (telemetry)' }
+    @{ Rx = '^\\Dell|^\\SupportAssist'; Group = 'Dell SupportAssist tasks' }
+    @{ Rx = '^\\HP(Cee|Analytics| )|^\\HPSA'; Group = 'HP support and analytics tasks' }
+    @{ Rx = '^\\Lenovo|^\\ImController'; Group = 'Lenovo Vantage tasks' }
+    @{ Rx = '^\\ASUS|^\\Armoury|^\\MSI|^\\Gigabyte|^\\GCC|^\\AcerCloud'; Group = 'Motherboard or laptop maker tasks' }
+    @{ Rx = '^\\(AMD|StartCN|StartDVR|AMDLinkUpdate|ModifyLinkUpdate)'; Group = 'AMD Adrenalin tasks' }
+    @{ Rx = '^\\CCleaner|^\\Avast|^\\Overwolf|^\\klcp'; Group = 'Other updaters' }
+)
+$script:TaskAuditBusy = $false
+function Start-TaskAudit {
+    if ($script:TaskAuditBusy) { throw 'The task audit is already running.' }
+    $script:TaskAuditBusy = $true
+    Invoke-Worker @'
+param($patterns)
+$rows = @()
+$all = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { "$($_.State)" -ne 'Disabled' })
+foreach ($t in $all) {
+    $full = "$($t.TaskPath)$($t.TaskName)"
+    $grp = $null; foreach ($p in $patterns) { if ($full -match $p.Rx) { $grp = $p.Group; break } }
+    if (-not $grp) { continue }
+    $i = $null; try { $i = $t | Get-ScheduledTaskInfo -ErrorAction Stop } catch {}
+    $next = if ($i -and $i.NextRunTime -is [datetime]) { $i.NextRunTime } else { $null }
+    $last = if ($i -and $i.LastRunTime -is [datetime] -and $i.LastRunTime.Year -gt 2000) { $i.LastRunTime } else { $null }
+    $rows += [pscustomobject]@{ Full = $full; Name = $t.TaskName; Group = $grp; State = "$($t.State)"; Next = $next; Last = $last }
+}
+@{ Rows = $rows; Total = $all.Count }
+'@ @(, $script:TaskAuditPatterns) {
+        param($out, $errs)
+        $script:TaskAuditBusy = $false
+        $res = Get-WorkerResult $out
+        if (-not ($res -is [hashtable])) { Show-Toast 'Could not read the scheduled tasks.' '#FF9F0A'; return }
+        $rows = @($res.Rows)
+        if (-not $rows.Count) { [void](Show-ZdDialog 'None of the known updater, telemetry and vendor tasks is enabled on this PC. Windows'' own maintenance tasks are covered by the other cards on this tab.' 'Tasks that can fire mid-match' 'OK' 'Information'); return }
+        $now = Get-Date; $soon = @($rows | Where-Object { $_.Next -and $_.Next -gt $now -and ($_.Next - $now).TotalHours -le 3 } | Sort-Object Next)
+        $s = "$($rows.Count) enabled task$(if ($rows.Count -ne 1) { 's' }) from the known updater and telemetry list:`n`n"
+        foreach ($g in $rows | Group-Object Group | Sort-Object Name) {
+            $names = ($g.Group | ForEach-Object { $_.Name -replace '[_-]?\{[0-9A-Fa-f-]{36}\}$', '' -replace '-S-1-5-21-[\d-]+$', '' } | Select-Object -Unique) -join ', '
+            $s += "- $($g.Name): $names`n"
+        }
+        if ($soon.Count) {
+            $s += "`nDue within 3 hours:`n" + (($soon | ForEach-Object { "- $($_.Next.ToString('HH:mm')): $($_.Name -replace '[_-]?\{[0-9A-Fa-f-]{36}\}$', '' -replace '-S-1-5-21-[\d-]+$', '')" }) -join "`n") + "`n"
+        } else { $s += "`nNone of them is due within the next 3 hours (idle-triggered tasks such as NGEN have no fixed time and start when you stop using the PC).`n" }
+        $s += "`nEach one wakes a core and the disk, sometimes for minutes (NGEN, Office and Adobe updaters), which lands as a hitch when it happens mid-match. Updates then simply run when you open the app. This card only reports. To switch one off: Task Scheduler (taskschd.msc) > right-click > Disable; the cards 'Turn off extra diagnostic tasks', 'Turn off telemetry tasks' and the Startup tab cover Windows' own tasks and the auto-start apps. For NGEN, running it now while you are not playing drains the queue instead: open an administrator prompt and run `"%windir%\Microsoft.NET\Framework64\v4.0.30319\ngen.exe executeQueuedItems`"."
+        [void](Show-ZdDialog $s 'Tasks that can fire mid-match' 'OK' 'Information')
+    }
+}
+
+# --- Hypervisor: is Windows running as a VM root partition, and which feature keeps it that way?
+$script:HyperVBusy = $false
+function Start-HypervisorReport {
+    if ($script:HyperVBusy) { throw 'Already checking.' }
+    $script:HyperVBusy = $true
+    Invoke-Worker @'
+$cs = Get-CimInstance Win32_ComputerSystem -Property HypervisorPresent -ErrorAction SilentlyContinue
+$dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+$launch = $null; try { $l = (bcdedit /enum '{current}' 2>$null) | Where-Object { $_ -match '^\s*hypervisorlaunchtype\s' } | Select-Object -First 1; if ($l) { $launch = ($l -split '\s+', 2)[1].Trim() } } catch {}
+$feat = @{}
+try { foreach ($f in @(Get-CimInstance Win32_OptionalFeature -Filter "Name='Microsoft-Hyper-V-All' OR Name='Microsoft-Hyper-V' OR Name='Microsoft-Hyper-V-Hypervisor' OR Name='VirtualMachinePlatform' OR Name='Microsoft-Windows-Subsystem-Linux' OR Name='Containers-DisposableClientVM' OR Name='HypervisorPlatform' OR Name='Windows-Defender-ApplicationGuard'" -ErrorAction Stop)) { $feat[$f.Name] = [int]$f.InstallState } } catch {}
+$svc = @{}
+foreach ($n in 'vmcompute', 'vmms', 'LxssManager', 'WslService', 'WslInstaller', 'docker', 'com.docker.service', 'CmService') { $s = Get-Service -Name $n -ErrorAction SilentlyContinue; if ($s) { $svc[$n] = "$($s.Status)" } }
+$reg = @{}
+foreach ($e in @(@('HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard', 'EnableVirtualizationBasedSecurity'), @('HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard', 'Locked'), @('HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity', 'Enabled'), @('HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity', 'Locked'), @('HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\KernelShadowStacks', 'Enabled'), @('HKLM:\SYSTEM\CurrentControlSet\Control\Lsa', 'LsaCfgFlags'))) {
+    $k = Get-Item -LiteralPath $e[0] -ErrorAction SilentlyContinue; if ($k) { $v = $k.GetValue($e[1], $null); if ($null -ne $v) { $reg["$($e[0] -replace '^.*\\', '')\$($e[1])"] = [int]$v } }
+}
+$docker = [bool](Get-Process 'Docker Desktop', 'com.docker.backend' -ErrorAction SilentlyContinue)
+# a hashtable: Get-WorkerResult unwraps the top-level object, which strips a pscustomobject's properties
+@{ Present = [bool]$cs.HypervisorPresent; Vbs = $(if ($dg) { [int]$dg.VirtualizationBasedSecurityStatus } else { -1 }); Running = @($(if ($dg) { $dg.SecurityServicesRunning | ForEach-Object { [int]$_ } | Where-Object { $_ -gt 0 } })); Launch = $launch; Feat = $feat; Svc = $svc; Reg = $reg; Docker = $docker }
+'@ @() {
+        param($out, $errs)
+        $script:HyperVBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'Could not read the virtualization state.' '#FF9F0A'; return }
+        $feat = $r.Feat; $svc = $r.Svc; $reg = $r.Reg   # hashtables: the worker runs in-process, nothing is serialized
+        $fv = { param($n) [int]"$(if ($null -eq $feat[$n]) { 0 } else { $feat[$n] })" }
+        $rv = { param($n) $reg[$n] }
+        $sv = { param($n) $svc[$n] }
+        $run = @($r.Running)
+        $causes = @()
+        if ($r.Vbs -eq 2 -or $r.Vbs -eq 1) { $causes += "Virtualization-based Security is $(if ($r.Vbs -eq 2) { 'running' } else { 'enabled (starts at next boot)' })$(if ($run -contains 2) { ' with Memory Integrity' } else { ' without Memory Integrity' }): the 'Turn off Virtualization-based Security' card (System tab) switches it off; Memory Integrity alone is only one of its tenants." }
+        if ($run -contains 1 -or ((& $rv 'Lsa\LsaCfgFlags') -gt 0)) { $causes += 'Credential Guard is on: usually a work policy (Intune / Group Policy). It needs VBS and will be re-enabled by the policy; ask your admin or leave it.' }
+        if ($run -contains 5 -or (& $rv 'KernelShadowStacks\Enabled') -eq 1) { $causes += 'Kernel-mode Hardware-enforced Stack Protection is on: it needs VBS and goes away with it.' }
+        $fnames = @{ 'Microsoft-Hyper-V-All' = 'Hyper-V'; 'Microsoft-Hyper-V' = 'Hyper-V'; 'Microsoft-Hyper-V-Hypervisor' = 'Hyper-V hypervisor'; 'VirtualMachinePlatform' = 'Virtual Machine Platform (WSL2, Docker, Android emulators)'; 'Microsoft-Windows-Subsystem-Linux' = 'Windows Subsystem for Linux'; 'Containers-DisposableClientVM' = 'Windows Sandbox'; 'HypervisorPlatform' = 'Windows Hypervisor Platform (VMware, VirtualBox, some emulators)'; 'Windows-Defender-ApplicationGuard' = 'Application Guard' }
+        $on = @(foreach ($n in $fnames.Keys) { if ((& $fv $n) -eq 1) { $fnames[$n] } })
+        $on = @($on | Select-Object -Unique)
+        if ($on.Count) { $causes += "Windows features that need the hypervisor: $($on -join ', '). Turn them off in Settings > System > Optional features > More Windows features (or Control Panel > Programs > Turn Windows features on or off) and restart, only if you do not use them." }
+        if ((& $sv 'LxssManager') -or (& $sv 'WslService')) { $causes += 'WSL is installed (Store version or Windows feature): WSL2 distributions run on the hypervisor. Keep it if you use Linux tools; otherwise uninstall WSL from Settings > Apps.' }
+        if ($r.Docker -or (& $sv 'docker') -or (& $sv 'com.docker.service')) { $causes += 'Docker Desktop is installed: it uses WSL2 or Hyper-V, both on the hypervisor.' }
+        if ((& $sv 'vmcompute') -eq 'Running' -or (& $sv 'vmms')) { $causes += 'The Hyper-V host services are present (virtual machines or Sandbox).' }
+        $launchText = if ($r.Launch) { $r.Launch } else { 'Auto (not set)' }
+        $s = "Hypervisor present: $(if ($r.Present) { 'YES, Windows runs as a virtual machine on top of Hyper-V' } else { 'no, Windows runs on the bare hardware' })`nVBS status: $(switch ($r.Vbs) { 0 { 'off' } 1 { 'enabled, not running' } 2 { 'running' } default { 'unknown' } })$(if ($run.Count) { " (services running: $(($run | ForEach-Object { switch ($_) { 1 { 'Credential Guard' } 2 { 'Memory Integrity' } 3 { 'System Guard' } 4 { 'SMM firmware measurement' } 5 { 'kernel stack protection' } 6 { 'kernel stack protection (audit)' } 7 { 'hypervisor-protected paging' } default { "code $_" } } }) -join ', '))" })`nBoot setting hypervisorlaunchtype: $launchText`n`n"
+        if (-not $r.Present) {
+            $s += 'Nothing to do: no hypervisor overhead. ' + $(if ($r.Launch -eq 'Off') { "The 'Don''t start the Windows hypervisor' card is active; WSL2, Docker, Sandbox and Hyper-V will not work until it is switched off again." } else { 'Interrupts and timers reach the hardware directly.' })
+        } else {
+            $s += if ($causes.Count) { "Why it is on:`n" + (($causes | ForEach-Object { "- $_" }) -join "`n") } else { 'Why it is on: no VBS tenant or Windows feature explains it, so a policy, firmware setting or the boot setting keeps it loaded. Check DeviceGuard > Locked (a UEFI lock set by a policy) and Settings > Privacy & security > Windows Security > Device security > Core isolation.' }
+            if ($run -notcontains 2 -and ($r.Vbs -eq 2 -or $on.Count -or (& $sv 'LxssManager') -or (& $sv 'WslService'))) { $s += "`n`nWhy 'Memory Integrity off' changed nothing: Memory Integrity is only one service that runs on the hypervisor. VBS itself, Credential Guard, WSL2, Docker, Sandbox, Virtual Machine Platform or Hyper-V each keep the hypervisor loaded on their own, and Windows stays a VM until every one of them is off (or the hypervisor is switched off at boot)." }
+            $s += "`n`nWhat it costs: with the hypervisor loaded, every interrupt and some privileged operations take a VM exit. On modern CPUs (with MBEC: Intel 7th gen and Zen 2 or newer) measured losses are small, about 2-7% in synthetic CPU tests and mostly in 1% lows and timer/interrupt latency rather than average FPS; pre-2017 CPUs lose far more. The last resort is the 'Don't start the Windows hypervisor' card (System tab), which turns everything above off until you re-enable it, and breaks WSL2, Docker, Sandbox, Hyper-V and Android emulators meanwhile. After the restart run this check again: if the hypervisor is still present, a policy or firmware lock re-enabled it."
+            if ((& $rv 'DeviceGuard\Locked') -eq 1 -or (& $rv 'HypervisorEnforcedCodeIntegrity\Locked') -eq 1) { $s += "`n`nA UEFI lock is set (DeviceGuard Locked = 1): VBS cannot be turned off from Windows alone; it needs the policy removed and a firmware-level unlock. Typical on work-managed PCs." }
+        }
+        [void](Show-ZdDialog $s 'Hypervisor check' 'OK' 'Information')
+    }
+}
+
+# --- Per-exe exploit-protection overrides (IFEO MitigationOptions) on Fortnite, its launcher and Easy Anti-Cheat
+$script:FnMitigationExes = @('FortniteClient-Win64-Shipping.exe', 'FortniteLauncher.exe', 'EpicGamesLauncher.exe', 'EasyAntiCheat_EOS.exe', 'EasyAntiCheat_EOS_Setup.exe', 'EasyAntiCheat.exe')
+$script:FnMitigationResettable = @('FortniteClient-Win64-Shipping.exe', 'FortniteLauncher.exe')
+function Get-FnMitigationOverrides {
+    $rows = @()
+    foreach ($exe in $script:FnMitigationExes) {
+        $k = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$exe"
+        $opt = Get-RegValue $k 'MitigationOptions'; $aud = Get-RegValue $k 'MitigationAuditOptions'
+        $set = @()
+        if ($null -ne $opt -or $null -ne $aud) {
+            $m = $null; try { $m = Get-ProcessMitigation -Name $exe -ErrorAction Stop } catch {}
+            if ($m) {
+                foreach ($grp in $m.PSObject.Properties) {
+                    if ($grp.Name -in 'ProcessName', 'Source', 'Id') { continue }
+                    $g = $grp.Value; if ($null -eq $g -or $g -is [string]) { continue }
+                    # the cmdlet also prints OFF for sub-options that merely follow a main switch (EmulateAtlThunks, RequireInfo, SuppressExports...): only real overrides are listed
+                    foreach ($p in $g.PSObject.Properties) { $v = "$($p.Value)"; if ($v -eq 'ON' -or ($v -eq 'OFF' -and $p.Name -in 'Enable', 'BottomUp', 'HighEntropy', 'ForceRelocateImages')) { $set += "$($grp.Name).$($p.Name) = $v" } }
+                }
+            }
+            if (-not $set.Count) { $set += 'a MitigationOptions value is set but decodes to no override' }
+        }
+        if ($set.Count) { $rows += [pscustomobject]@{ Exe = $exe; Key = $k; Set = $set; Opt = $opt; Aud = $aud } }
+    }
+    @($rows)
+}
+function Get-FnMitigationReport {
+    $rows = @(Get-FnMitigationOverrides)
+    if (-not $rows.Count) { return "No per-program exploit-protection overrides on Fortnite, its launcher or Easy Anti-Cheat.`n`nThey run with Windows' system defaults, which is what Epic tests against. Nothing to do." }
+    $lines = foreach ($r in $rows) { "$($r.Exe):`n" + (($r.Set | ForEach-Object { "  - $_" }) -join "`n") }
+    $all = ($rows | ForEach-Object { $_.Set }) -join ' '
+    $notes = @()
+    if ($all -match '(DynamicCode|StrictHandle|ExtensionPoint|ImageLoad|Payload|ChildProcess|SystemCall|UserShadowStack|FontDisable|Heap)\.\w+ = ON') { $notes +='Mitigations were ADDED by a hardening guide or script. Arbitrary Code Guard, child-process blocking and the EMET-era checks (EAF, IAF, SimExec, CallerCheck, StackPivot) can crash Fortnite at start or on shader compile and add a real per-call cost; Microsoft notes the EMET-era ones are incompatible with Arbitrary Code Guard.' }
+    if ($all -match '(Cfg|Dep|Sehop)\.Enable = OFF|Aslr\.(BottomUp|HighEntropy|ForceRelocateImages) = OFF') { $notes +='Mitigations were REMOVED by an FPS guide (Control Flow Guard, DEP, SEHOP or ASLR off). CFG checks are compiled into the game binary and cost a couple of instructions per indirect call; there is no measurement showing a Fortnite gain, and the override only lowers protection.' }
+    $resettable = @($rows | Where-Object { $_.Exe -in $script:FnMitigationResettable })
+    $s = "Per-program exploit-protection overrides found:`n`n$($lines -join "`n`n")`n`n"
+    if ($notes.Count) { $s += ($notes -join "`n`n") + "`n`n" }
+    $s + $(if ($resettable.Count) { "ZeroDelay can remove the overrides on $(($resettable | ForEach-Object { $_.Exe }) -join ' and ') so they follow the system defaults again (Windows Security > App & browser control > Exploit protection > Program settings shows the same list). The Easy Anti-Cheat and Epic launcher entries are listed only; ZeroDelay never touches anti-cheat files or settings." } else { 'Only the Easy Anti-Cheat or Epic launcher entries carry overrides. ZeroDelay does not change those; remove them yourself in Windows Security > App & browser control > Exploit protection > Program settings if you added them.' })
+}
+function Invoke-FnMitigationCheck {
+    $rows = @(Get-FnMitigationOverrides)
+    $rep = Get-FnMitigationReport
+    $resettable = @($rows | Where-Object { $_.Exe -in $script:FnMitigationResettable })
+    if (-not $resettable.Count) { [void](Show-ZdDialog $rep 'Exploit protection on Fortnite' 'OK' 'Information'); return 'Checked.' }
+    $ans = Show-ZdDialog "$rep`n`nRemove the Fortnite overrides now? The previous values are saved in ZeroDelay's backup file. Restart Fortnite afterwards." 'Exploit protection on Fortnite' 'YesNo' 'Warning'
+    if ($ans -ne 'Yes') { return 'Left as it is.' }
+    $saved = @(foreach ($r in $resettable) { @{ Exe = $r.Exe; Opt = $(if ($null -ne $r.Opt) { [Convert]::ToBase64String([byte[]]$(if ($r.Opt -is [byte[]]) { $r.Opt } else { [BitConverter]::GetBytes([int64]$r.Opt) })) } else { $null }); Aud = $(if ($null -ne $r.Aud) { [Convert]::ToBase64String([byte[]]$(if ($r.Aud -is [byte[]]) { $r.Aud } else { [BitConverter]::GetBytes([int64]$r.Aud) })) } else { $null }) } })
+    $script:Backup.Custom['fn-mitigations'] = $saved
+    foreach ($r in $resettable) {
+        try { Set-ProcessMitigation -Name $r.Exe -Remove -Force -ErrorAction Stop }
+        catch { Remove-RegValue $r.Key 'MitigationOptions'; Remove-RegValue $r.Key 'MitigationAuditOptions' }
+    }
+    $left = @(Get-FnMitigationOverrides | Where-Object { $_.Exe -in $script:FnMitigationResettable })
+    if ($left.Count) { throw 'Windows kept some of the overrides (needs administrator).' }
+    [void](Show-ZdDialog 'Done: Fortnite and its launcher follow the system exploit-protection defaults again. Restart Fortnite.' 'Exploit protection on Fortnite' 'OK' 'Information'); 'Overrides removed.'
+}
+
 # --- Helpers for the research round 3 cards (1.11)
 $CopilotAppKey = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Microsoft.Copilot_8wekyb3d8bbwe'
 function Get-CopilotStartup { @(Get-ChildItem -LiteralPath $CopilotAppKey -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.GetValue('State') }) }
@@ -2429,6 +4310,8 @@ function Get-LinkReport {
         if ($mbps -le 100 -and $canGig) { $bad = $true; $lines += "Problem: your card supports 1 Gbit/s or more but connected at $mbps Mbit/s. That usually means a damaged cable or a bad wire pair (gigabit needs all 8 wires, 100 Mbit/s only 4). Try another Cat5e/Cat6 cable and another router port, and reseat both ends. An old router or switch with 100 Mbit/s ports causes this too." }
         if ($a.FullDuplex -eq $false) { $bad = $true; $lines += 'Problem: half duplex means the link cannot send and receive at the same time. Set Speed & Duplex back to Auto Negotiation (Device Manager > your adapter > Advanced) and check the cable.' }
         if ($sd -and "$($sd.RegistryValue[0])" -ne '0' -and "$($sd.DisplayValue)" -notmatch 'Auto') { $lines += "Note: Speed & Duplex is forced to '$($sd.DisplayValue)'. Auto Negotiation is safer; a forced speed can cause a duplex mismatch." }
+        $gl = Get-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword 'GigaLite' -ErrorAction SilentlyContinue
+        if ($gl -and "$($gl.RegistryValue[0])" -eq '1') { $lines += "Note: Realtek's Gigabit Lite is on, so this card may quietly settle for 500 Mbit/s on a marginal cable$(if ($mbps -eq 500) { ' (it is at 500 Mbit/s right now)' }). The Realtek: turn off Gigabit Lite card makes a bad cable show up here instead." }
         if ($pkts -gt 10000 -and $errs / [double]$pkts -gt 0.0001) { $bad = $true; $lines += 'Problem: the error count is high, which points to a bad cable, a bad port, or interference. Swap the cable first.' }
         if (-not $bad) { $lines += 'This link looks healthy.' }
         $lines -join "`n"
@@ -2523,10 +4406,13 @@ function Get-NetFilterReport {
             $lines += "$($a.Name): $($x.DisplayName)$(if ($isShaper) { '   <- traffic shaper' })"
         }
     }
-    if (-not $lines.Count) { return 'No add-on network filters are attached to your connection. Nothing here can slow your packets down.' }
+    $left = @(Get-NetFilterLeftovers)
+    $leftText = if ($left.Count) { "Filter drivers installed by other software (loaded even when their app is gone):`n" + ($left -join "`n") + "`n`nEvery filter adds a hook to each packet, and a ping booster's filter left behind after an uninstall has been reported to add ping. Run the program's own uninstaller first. If the driver is still listed afterwards, open an administrator command prompt and run: sc.exe config <name> start= disabled, then restart (sc.exe config <name> start= system undoes it). Only use pnputil /delete-driver after that. Npcap, VirtualBox and VMware filters are harmless while you use those programs." } else { '' }
+    if (-not $lines.Count) { if ($leftText) { return $leftText }; return 'No add-on network filters are attached to your connection. Nothing here can slow your packets down.' }
     $s = "Add-on drivers attached to your connection:`n" + ($lines -join "`n") + "`n`n"
     if ($shapers) { $s += 'Traffic shapers re-order and throttle traffic and have been reported to throttle upload or add lag. Turn off the shaping in their app first (Killer Intelligence Center: Prioritization Engine and Advanced Stream Detect off; cFosSpeed / MSI LAN Manager / ASUS GameFirst: traffic shaping off), or uninstall the app. Then compare with the Ping check.' }
     else { $s += 'None of these is a known traffic shaper. VPNs, antivirus, virtual machines and capture tools (Npcap) also attach here; leave them unless you suspect one.' }
+    if ($leftText) { $s += "`n`n" + $leftText }
     $s + "`n`nTo test one item: Control Panel > Network Connections > right-click your adapter > Properties > untick it > OK, then run the Ping check. Tick it again to undo."
 }
 
@@ -2859,9 +4745,9 @@ $Tweaks = @(
        Title = 'Turn off Energy-Efficient Ethernet'
        Desc  = 'Stops the Ethernet link from dozing between packets, which adds small, random delays.'
        Warn  = 'You only use Wi-Fi (not available). Applying briefly reconnects the adapter.'
-       Test  = { Test-AdvProp '*EEE' 0 }
-       On    = { Set-AdvProp 'eee' '*EEE' 0 }
-       Off   = { Reset-AdvProp 'eee' '*EEE' 1 } }
+       Test  = { Test-AdvPropsOff @('*EEE', 'EEELinkAdvertisement') 0 }
+       On    = { Set-AdvProp 'eee' '*EEE' 0; Set-AdvPropHidden 'eee-la' 'EEELinkAdvertisement' 0 }
+       Off   = { Reset-AdvProp 'eee' '*EEE' 1; Reset-AdvPropEach 'eee-la' 'EEELinkAdvertisement' { param($n) Get-EeeLinkAdvDefault $n } } }
 
     @{ Id = 'intmod'; Cat = 'Network'; Icon = [char]0xE81C; Rec = $false; Badge = 'advanced'
        Title = 'Turn off interrupt moderation'
@@ -2978,7 +4864,7 @@ $Tweaks = @(
 
     @{ Id = 'reflex'; Cat = 'Fortnite'; Icon = [char]0xE945; Rec = $true
        Title = 'NVIDIA Reflex: On + Boost'
-       Desc  = 'The biggest single latency win on NVIDIA GPUs. Keeps the render queue empty and clocks high.'
+       Desc  = 'The biggest single latency win on NVIDIA GPUs. Keeps the render queue empty and clocks high. Writes LatencyTweak2=2, which Fortnite''s own log confirms as "Reflex Low Latency mode: On+Boost" (0 = Off, 1 = On); the renderer check card shows it.'
        Warn  = 'You have an AMD or Intel GPU (use Anti-Lag / XeLL in their driver instead). Fortnite must be closed.'
        Ini   = @{ LatencyTweak2 = @('2', '0') } }
 
@@ -3149,8 +5035,8 @@ $Tweaks = @(
     # ---------------------------------------------- flat textures (NVIDIA driver)
     @{ Id = 'shadercache'; Cat = 'Potato'; Icon = [char]0xE74D; Action = 'Clear'; Potato = $true
        Title = 'Clear shader caches'
-       Desc  = 'Deletes NVIDIA and DirectX shader caches so texture-blur changes take effect. They rebuild on the next launch.'
-       Warn  = ''
+       Desc  = 'Deletes the NVIDIA, AMD (Adrenalin''s Reset Shader Cache does the same) and DirectX shader caches so texture-blur changes take effect, or when stutter after a driver or Fortnite update will not go away. They rebuild on the next launch.'
+       Warn  = 'Every game, not just Fortnite, recompiles its shaders afterwards: the first matches stutter while they rebuild. Do not do this routinely.'
        Run   = { if (Test-FortniteRunning) { throw 'Close Fortnite first.' }; "Cleared $(Clear-ShaderCaches) shader cache files. The first match may stutter while they rebuild." } }
     @{ Id = 'nvlod-soft'; Cat = 'Potato'; Icon = [char]0xE790; Rec = $false; Potato = $true; LodValue = 24
        Title = 'Soft textures (NVIDIA)'
@@ -3511,20 +5397,20 @@ $Tweaks = @(
        Off   = { netsh int udp set global uro=enabled | Out-Null; $script:Backup.Custom.Remove('uro') } }
 
     @{ Id = 'itr'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Lat = $true; Badge = 'advanced'
-       Title = 'Intel: minimal interrupt throttling'
-       Desc  = 'Intel Ethernet waits less before reporting packets (Interrupt Moderation Rate: Minimal).'
-       Warn  = 'You already turned interrupt moderation off (this is then redundant). Intel adapters only. Briefly reconnects.'
-       Test  = { Test-AdvDisplay 'ITR' 'Minimal' }
-       On    = { Set-AdvDisplay 'itr' 'ITR' 'Minimal' }
-       Off   = { Reset-AdvProp 'itr' 'ITR' 65535 } }
+       Title = 'Intel / Marvell: minimal interrupt throttling'
+       Desc  = 'The card waits less before reporting packets (Interrupt Moderation Rate: Minimal, or Low on Marvell AQtion). Intel: a higher rate means more latency handling packets.'
+       Warn  = 'You already turned interrupt moderation off (this is then redundant). Intel and Marvell AQtion adapters only. Briefly reconnects.'
+       Test  = { Test-ItrMin }
+       On    = { Set-ItrMin 'itr' }
+       Off   = { Reset-AdvPropEach 'itr' 'ITR' { param($n) Get-ItrDefault $n } } }
 
     @{ Id = 'wol'; Cat = 'Network'; Icon = [char]0xE7E8; Rec = $false
        Title = 'Turn off Wake-on-LAN'
        Desc  = 'Stops network traffic waking your PC from sleep. Housekeeping, no effect on ping.'
        Warn  = 'You wake this PC remotely (Parsec, Steam Link, remote desktop). Briefly reconnects the adapter.'
-       Test  = { $a = Test-AdvProp '*WakeOnMagicPacket' 0; $b = Test-AdvProp '*WakeOnPattern' 0; if ($null -eq $a -and $null -eq $b) { return $null }; $a -ne $false -and $b -ne $false }
-       On    = { Set-AdvProp 'wol-magic' '*WakeOnMagicPacket' 0; Set-AdvProp 'wol-pattern' '*WakeOnPattern' 0; $script:Backup.Custom['wol'] = $true }
-       Off   = { Reset-AdvProp 'wol-magic' '*WakeOnMagicPacket' 1; Reset-AdvProp 'wol-pattern' '*WakeOnPattern' 1; $script:Backup.Custom.Remove('wol') } }
+       Test  = { Test-AdvPropsOff @('*WakeOnMagicPacket', '*WakeOnPattern', 'S5WakeOnLan') 0 }
+       On    = { Set-AdvProp 'wol-magic' '*WakeOnMagicPacket' 0; Set-AdvProp 'wol-pattern' '*WakeOnPattern' 0; Set-AdvProp 'wol-s5' 'S5WakeOnLan' 0; $script:Backup.Custom['wol'] = $true }
+       Off   = { Reset-AdvProp 'wol-magic' '*WakeOnMagicPacket' 1; Reset-AdvProp 'wol-pattern' '*WakeOnPattern' 1; Reset-AdvProp 'wol-s5' 'S5WakeOnLan' 1; $script:Backup.Custom.Remove('wol') } }
 
     @{ Id = 'onedrivecap'; Cat = 'Network'; Icon = [char]0xE753; Rec = $false; Lat = $true
        Title = 'Cap OneDrive upload speed'
@@ -4955,6 +6841,330 @@ $Tweaks = @(
        Warn  = 'You leave the lobby running as a stream background and want full FPS while away. Fortnite must be closed.'
        Ini   = @{ bIsEnergySavingEnabledIdle = @('True', 'False') } }
 
+    # ======================================================= research round 5 (1.14)
+    # ---- fngpu (1.14)
+
+    @{ Id = 'epic-autostart'; Cat = 'Startup'; Icon = [char]0xE768; Rec = $false
+       Requires = { Test-EpicLauncherInstalled }
+       Title = 'Stop the Epic launcher starting with Windows'
+       Desc  = 'The Epic Games Launcher''s "Run when my computer starts" keeps about 11 processes in the tray (launcher, overlay renderers, web helpers: about 690 MB and a few percent of one core on the test PC). This removes its autostart entry; the launcher opens normally and Fortnite starts from it as before.'
+       Warn  = 'The launcher switches autostart back on after some of its own updates; the card then shows Off again and you switch it on once more. Or you want the launcher up at sign-in to patch Fortnite early.'
+       Remove = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'; N = 'EpicGamesLauncher' } ) }
+
+    @{ Id = 'fn-displaycheck'; Cat = 'Fortnite'; Icon = [char]0xE7F4; Action = 'Check'; Lat = $true
+       Title = 'Check which monitor Fortnite targets'
+       Desc  = 'Fortnite remembers the monitor it last ran on (DisplayID in its settings). On a two-monitor PC that can be the slow side screen or one on the CPU graphics. This compares Fortnite''s saved display with the refresh rates and GPUs Windows reports.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnDisplayReport) 'Fortnite''s display' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'fn-argaudit'; Cat = 'Fortnite'; Icon = [char]0xE756; Action = 'Check'
+       Requires = { Test-EpicLauncherInstalled }
+       Title = 'Audit your Fortnite launch arguments'
+       Desc  = 'Reads the Epic launcher''s argument box for Fortnite and says what each argument really does: harmful, does nothing, or a real Epic-documented switch. Then shows the command line Fortnite itself logged at its last start, which is the proof of what reached the game.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FnLaunchArgReport) 'Fortnite launch arguments' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'nv-drivercheck'; Cat = 'Graphics'; Icon = [char]0xE896; Action = 'Check'; Requires = { Test-NvAvailable }
+       Title = 'NVIDIA driver: where yours stands'
+       Desc  = 'Reads your installed NVIDIA driver and card generation and tells you where that stands: the current Game Ready driver and its RTX 50 hotfix, the 610.74 build with Fortnite crash reports, the security-only branch for GTX 10 and older, and the end of Windows 10 support. Downloads nothing.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-NvDriverReport) 'NVIDIA driver' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'nv-gsyncwindowed'; Cat = 'Graphics'; Icon = [char]0xE7F4; Rec = $false; Lat = $true
+       Requires = { (Test-NvAvailable) -and @(Get-VrrMonitors).Count -gt 0 }
+       Title = 'NVIDIA: G-SYNC in windowed Fortnite too'
+       Desc  = 'NVIDIA''s default is G-SYNC for full screen only, so Fortnite in windowed fullscreen (DirectX 12) runs at fixed refresh and the G-SYNC FPS cap only tears. This sets the driver to full screen and windowed, and clears any G-SYNC block another tool left on the Fortnite profile.'
+       Warn  = 'Your desktop or a second monitor flickers with windowed G-SYNC (then keep full screen only and play true fullscreen). Takes effect when Fortnite next starts.'
+       Test  = { Test-NvVrrWindowed }
+       On    = { Enable-NvVrrWindowed $t.Id }
+       Off   = { Disable-NvVrrWindowed $t.Id } }
+
+    @{ Id = 'nv-bgfps'; Cat = 'Graphics'; Icon = [char]0xE9D9; Rec = $false; Lat = $true
+       Requires = { Test-NvBgCapPresent }
+       Title = 'NVIDIA: no background FPS cap for Fortnite'
+       Desc  = 'Your driver has a Background Application Max Frame Rate. It throttles any 3D app that loses focus, so Fortnite on one screen drops to that cap the moment you click Discord on the other, on top of Fortnite''s own focus saving. This switches the cap off for Fortnite only; browsers keep it.'
+       Warn  = 'You want Fortnite to idle at low FPS while you are tabbed out. Applies live, no restart.'
+       Nv    = @{ Profile = 'Fortnite'; Id = 0x10835016; V = 0 } }
+
+    # ---- net (1.14)
+
+    @{ Id = 'wifi-mtk-lowpower'; Cat = 'Network'; Icon = [char]0xE701; Rec = $true; Lat = $true
+       Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'LowPowerEnable' }) }
+       Title = 'MediaTek Wi-Fi: turn off driver power saving'
+       Desc  = 'MediaTek Wi-Fi 6/6E/7 cards (MT7921/7922/7925, common on AMD boards and laptops) ship with their own power saving on. It stays on even when the Windows plan says maximum performance, so the radio keeps dozing between packets. This switches it off in the driver.'
+       Warn  = 'You are on a laptop on battery: the Wi-Fi card uses a little more power. Applying briefly reconnects Wi-Fi.'
+       Test  = { Test-AdvProp 'LowPowerEnable' 0 }
+       On    = { Set-AdvProp 'wifi-mtk-lowpower' 'LowPowerEnable' 0 }
+       Off   = { Reset-AdvProp 'wifi-mtk-lowpower' 'LowPowerEnable' 1 } }
+
+    @{ Id = 'wifi-mtk-roam'; Cat = 'Network'; Icon = [char]0xE701; Rec = $true
+       Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'RoamNeedIndicateTh' }) }
+       Title = 'MediaTek Wi-Fi: lowest roaming aggressiveness'
+       Desc  = 'MediaTek''s driver ships with roaming at Medium-High, so it starts looking for a "better" access point while the signal is still fine, and a scan mid-match is a ping spike. Lowest only roams when the signal is really weak. Twin of the Intel roaming card.'
+       Warn  = 'You walk around a large home with several access points or a mesh. Applying briefly reconnects Wi-Fi.'
+       Test  = { Test-AdvProp 'RoamNeedIndicateTh' 85 }
+       On    = { Set-AdvProp 'wifi-mtk-roam' 'RoamNeedIndicateTh' 85 }
+       Off   = { Reset-AdvProp 'wifi-mtk-roam' 'RoamNeedIndicateTh' 70 } }
+
+    @{ Id = 'wifi-intel-bgscan'; Cat = 'Network'; Icon = [char]0xE701; Rec = $false; Lat = $true
+       Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'BgScanGlobalBlocking' }) }
+       Title = 'Intel Wi-Fi: no background scans while connected'
+       Desc  = 'Intel Wi-Fi periodically scans other channels for access points even while connected; during each scan the radio is off your channel and game packets wait, which shows as a short ping spike. The roaming card only raises the bar for switching; this blocks the scheduled scan itself.'
+       Warn  = 'You move between access points: roaming gets slower, so set it back before you leave the desk. Applying briefly reconnects Wi-Fi.'
+       Test  = { Test-AdvProp 'BgScanGlobalBlocking' 2 }
+       On    = { Set-AdvProp 'wifi-intel-bgscan' 'BgScanGlobalBlocking' 2 }
+       Off   = { Reset-AdvProp 'wifi-intel-bgscan' 'BgScanGlobalBlocking' 0 } }
+
+    @{ Id = 'vnic-metric'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false
+       Requires = { Test-VirtualNicPresent }
+       Title = 'Virtual adapters behind your real network card'
+       Desc  = 'Hyper-V''s Default Switch, WSL, Docker, VMware and VirtualBox adapters report 10 Gbit/s, so Windows can rank them level with your real card and send name lookups to their fake DNS first, with a 2 second timeout each. That slows login, matchmaking and voice setup, not in-match ping. This moves them behind the real card.'
+       Warn  = 'You use a VM with its own route to the internet. Hyper-V recreates the Default Switch at every boot, so switch this off and on again if it reappears in front.'
+       Test  = { try { Test-VnicDemoted } catch { $null } }
+       On    = { Set-VnicDemoted $t.Id }
+       Off   = { Restore-VnicMetric $t.Id } }
+
+    @{ Id = 'repair-tcpleftovers'; Cat = 'Repair'; Icon = [char]0xE90F; Rec = $true
+       Title = 'Undo netsh TCP tweaks from tweak packs'
+       Desc  = 'Puts TCP globals that tweak packs change (auto-tuning disabled, task offload off, odd congestion control, ECN, neighbour cache) back to the Windows defaults. Honest note: Fortnite''s match traffic is UDP, which none of these touch. Disabled auto-tuning does cap every download, launcher and browser at a 64 KB window though.'
+       Warn  = 'You set one of these yourself and measured a benefit. The old values are backed up and come back if you switch this off.'
+       Test  = { try { @(Get-TcpLeftovers).Count -eq 0 } catch { $null } }
+       On    = { Repair-TcpDefaults $t.Id }
+       Off   = { Restore-TcpDefaults $t.Id } }
+
+    @{ Id = 'nat-check'; Cat = 'Network'; Icon = [char]0xE774; Action = 'Test'
+       Title = 'Check your NAT type and double NAT'
+       Desc  = 'Asks two public STUN servers how your router maps this PC (open, moderate or strict in console terms) and looks at the first hops for a second router or carrier-grade NAT. NAT type affects party invites, joining friends and voice, which connect PC to PC. It never changes your ping to the match server.'
+       Warn  = ''
+       Run   = { Start-NatCheck; 'Checking your NAT type...' } }
+
+    @{ Id = 'nic-msi'; Cat = 'Repair'; Icon = [char]0xE839; Rec = $false; Badge = 'restart'
+       Requires = { (Get-NicMsiKey) -and ((Test-NicMsi) -eq $false -or $script:Backup.Custom.ContainsKey('nic-msi')) }
+       Title = 'Network card: message-signalled interrupts'
+       Desc  = 'Lets the network card signal the CPU with a message instead of a shared interrupt line, as the graphics card option does. Current Intel, Realtek and Marvell drivers already do this themselves; it is only shown when yours does not. One author measured ping 21 to 19 ms and less loss; no controlled test exists.'
+       Warn  = 'If the network card stops working after the restart, switch this off again (safe mode works if needed). A driver reinstall can reset it. Not for USB adapters.'
+       Test  = { Test-NicMsi }
+       On    = {
+           $k = Get-NicMsiKey; if (-not $k) { throw 'No PCI network card carries your internet traffic.' }
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Key = $k; Value = (Get-RegValue $k 'MSISupported') } }
+           if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
+           Set-RegValue $k 'MSISupported' 1 'DWord'
+       }
+       Off   = {
+           $b = $script:Backup.Custom[$t.Id]
+           if ($b -and $b.Key) { if ($null -eq $b.Value) { Remove-RegValue $b.Key 'MSISupported' } else { Set-RegValue $b.Key 'MSISupported' ([int]$b.Value) 'DWord' } }
+           $script:Backup.Custom.Remove($t.Id)
+       } }
+
+    @{ Id = 'rtl-gigalite-off'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false
+       Requires = { [bool](Get-AdvPropsAll | Where-Object { $_.RegistryKeyword -eq 'GigaLite' }) }
+       Title = 'Realtek: turn off Gigabit Lite'
+       Desc  = 'Gigabit Lite lets a Realtek card quietly settle for a 500 Mbit/s link on a marginal cable instead of full gigabit. It does not change per-packet delay; switching it off makes a bad cable show up as a real problem in Check your cable connection instead of a hidden slowdown.'
+       Warn  = 'Your cable is marginal and you prefer a slower link over drops. Applying briefly reconnects the adapter.'
+       Test  = { Test-AdvProp 'GigaLite' 0 }
+       On    = { Set-AdvProp 'rtl-gigalite-off' 'GigaLite' 0 }
+       Off   = { Reset-AdvProp 'rtl-gigalite-off' 'GigaLite' 1 } }
+
+    # ---- hw (1.14)
+    # ---------------------------------------------------------- Power / AMD
+    @{ Id = 'ccd-balanced'; Cat = 'Power'; Icon = [char]0xE945; Rec = $false; Lat = $true
+       Requires = { Test-DualCcdRyzen }
+       Title = '9900X / 9950X: Balanced plan for die parking'
+       Desc  = 'On the Ryzen 9 9900X and 9950X, AMD''s chipset driver parks the second die while a game runs, but only on the Balanced plan with Game Mode on and Xbox Game Bar installed. High-performance plans keep both dies awake, so Fortnite''s threads spread across them (about 210 ns between dies on Zen 5). Reviewers expect a few percent.'
+       Warn  = 'Use instead of the ZeroDelay or Ultimate plan cards, not with them, and leave Unpark all cores off. Set Windows'' Power mode to Best performance. Does nothing without AMD''s chipset driver (the AMD chipset card checks).'
+       Test  = { (Get-ActivePowerScheme).Guid -eq $BalancedGuid }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = (Get-ActivePowerScheme).Guid }
+           $b = Get-FallbackPlan; if ($b -ne $BalancedGuid) { throw 'Windows could not recreate the Balanced plan.' }
+           powercfg /setactive $BalancedGuid; if ($LASTEXITCODE -ne 0) { throw 'Windows refused to switch to Balanced.' }
+       }
+       Off   = { $p = $script:Backup.Custom[$t.Id]; if ($p -and (powercfg /list | Where-Object { $_ -match $p })) { powercfg /setactive $p }; $script:Backup.Custom.Remove($t.Id) } }
+
+    @{ Id = 'ccd-parking'; Cat = 'Power'; Icon = [char]0xE964; Action = 'Check'
+       Requires = { (Test-DualCcdX3D) -or (Test-DualCcdRyzen) }
+       Title = 'Check AMD core parking'
+       Desc  = 'On dual-die Ryzen (9900X, 9950X and the X3D versions) checks everything AMD needs to park the second die for games: Balanced plan, chipset driver, Xbox Game Bar, Game Mode, the plan''s parking minimum, and while Fortnite runs, how many cores are really parked. Lists AMD''s documented repairs.'
+       Warn  = ''
+       Run   = { Start-CcdParkingCheck; 'Checking AMD core parking...' } }
+
+    @{ Id = 'amd-chipset'; Cat = 'Vendor'; Icon = [char]0xE896; Action = 'Check'
+       Requires = { Test-AmdCpu }
+       Title = 'Check the AMD chipset software'
+       Desc  = 'Checks whether AMD''s chipset package and its PPM Provisioning driver are installed and how old they are. Without it Windows runs a Ryzen on its generic processor driver and power tables; with it you get AMD''s boost and parking tables, including dual-die game parking. Shows where to get it; ZeroDelay never downloads drivers.'
+       Warn  = ''
+       Run   = { Start-AmdChipsetCheck; 'Checking the AMD chipset software...' } }
+
+    @{ Id = 'ftpm-stutter'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'
+       Requires = { (Test-Am4Ryzen) -and ((Get-TpmInfo).Mfr -eq 'AMD') }
+       Title = 'AM4: check for the fTPM stutter'
+       Desc  = 'Ryzen 1000 to 5000 PCs using the firmware TPM froze for one to three seconds every few minutes, with crackling audio, until AMD''s AGESA 1.2.0.7 fix (May 2022). Compares your BIOS date with that fix. Hidden on AM5, which shipped after the fix, and when a discrete TPM is used.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-FtpmReport) 'fTPM stutter' 'OK' 'Information'); 'Checked.' } }
+
+    # -------------------------------------------------------------- Memory
+    @{ Id = 'ram-xmp'; Cat = 'System'; Icon = [char]0xE9D9; Action = 'Check'; Lat = $true
+       Title = 'Check whether EXPO / XMP is on'
+       Desc  = 'Compares the speed your memory runs at with what the kit is rated for. Without EXPO/XMP a DDR5-6000 kit runs at 4800 or 5600, which costs 1% lows in CPU-bound games (AMD''s 9700X numbers: 6000 CL28 against 5600 CL40 is +13% average, +15% lows). Reports only; the profile is a BIOS setting.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-RamXmpReport) 'EXPO / XMP' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'ram-channels'; Cat = 'System'; Icon = [char]0xE964; Action = 'Check'
+       Title = 'Check memory channels'
+       Desc  = 'Finds a single memory stick, two sticks in one channel, or mismatched sizes. Single channel halves bandwidth: on a 9700X one stick gave Fortnite 1080p High 74 FPS 1% lows (NoobFeed), and Marvel Rivals fell from 195 to 129 FPS (TechSpot). Reports only.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-RamChannelReport) 'Memory channels' 'OK' 'Information'); 'Checked.' } }
+
+    # -------------------------------------------------------------- Repair
+    @{ Id = 'whea-scan'; Cat = 'Repair'; Icon = [char]0xE7BA; Action = 'Check'
+       Title = 'Scan for hardware errors (WHEA)'
+       Desc  = 'Reads 14 days of Windows'' hardware-error log: corrected PCIe errors (17, 20), CPU or memory errors (18, 19, 47) and restarts without a shutdown (Kernel-Power 41), with the device each one points at. These are the fingerprints of an unstable EXPO/XMP profile, Curve Optimizer undervolt or bad PCIe link that no Windows tweak fixes.'
+       Warn  = ''
+       Run   = { Start-WheaScan; 'Scanning the hardware-error log...' } }
+
+    # ------------------------------------------------------------ Services
+    (New-SvcTweak 'amd-uep-off' 'AUEPLauncher' 2 'Turn off the AMD User Experience Program' 'AMD''s driver installs a telemetry launcher (AUEPLauncher, which runs AUEPMaster.exe periodically) that sends usage data to AMD. Stopping it removes that background work; there is no FPS claim. AMD External Events (hotkeys, FreeSync, overlay) and Crash Defender stay untouched.' 'You opted into AMD''s program on purpose. The supported way is Adrenalin > Settings > Preferences > AMD User Experience Program: Off, which uninstalls it. Hidden when it is not installed.' $false $null)
+
+    @{ Id = 'amd-uep-task'; Cat = 'Services'; Icon = [char]0xE823; Rec = $false
+       Requires = { (Get-TaskStates).ContainsKey('\AMDInstallLauncher') }
+       Title = 'Stop AMD re-adding its telemetry program'
+       Desc  = 'Adrenalin adds a scheduled task (AMDInstallLauncher) that runs AMD''s installer components in the background and brings the User Experience Program back after it was removed. This disables the task; a driver update may add it again.'
+       Warn  = 'You want AMD''s program. Hidden when the task does not exist.'
+       Tasks = @('\AMDInstallLauncher') }
+
+    # ------------------------------------------------------------ Graphics
+    @{ Id = 'rebar-check'; Cat = 'Graphics'; Icon = [char]0xE7F4; Action = 'Check'; Lat = $true
+       Title = 'Check Resizable BAR'
+       Desc  = 'Reads the graphics card''s BAR size (NVIDIA: 256 MiB means Resizable BAR is off) and whether the PC boots in UEFI mode, the prerequisite. Club386 measured 0 to +17% in DirectX 12 games with it on (Arc Raiders, also Unreal Engine 5, +8.5%); nothing rigorous exists for Fortnite. On Radeon it tells you where Adrenalin shows it.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-RebarReport) 'Resizable BAR' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'pcie-link'; Cat = 'Graphics'; Icon = [char]0xE964; Action = 'Check'
+       Title = 'Check the graphics card''s PCIe link'
+       Desc  = 'Reads the PCIe width and generation your graphics card negotiated against what it supports. Boards split the top slot to x8 when certain M.2 slots are used; PCIe 3.0 x8 or less costs about 5% average FPS and more in 1% lows (TechPowerUp). Run it during a match to see the loaded speed.'
+       Warn  = ''
+       Run   = { Start-PcieLinkCheck; 'Reading the PCIe link...' } }
+
+    # ------------------------------------------------------------- Storage
+    @{ Id = 'fn-drive'; Cat = 'Storage'; Icon = [char]0xEDA2; Action = 'Check'
+       Title = 'Check Fortnite''s drive'
+       Desc  = 'Finds where Fortnite is installed and checks the drive: hard drive or SSD, USB, free space under 15%, NTFS or LZX compression of the game files (CompactGUI), and whether it sits on a Dev Drive (ReFS). Each one is a known cause of streaming hitches or long loads.'
+       Warn  = ''
+       Run   = { Start-FnDriveCheck; 'Checking Fortnite''s drive...' } }
+
+    @{ Id = 'fn-streamcache'; Cat = 'Storage'; Icon = [char]0xE74D; Action = 'Clear'
+       Title = 'Clear Fortnite''s streamed-content cache'
+       Desc  = 'Fortnite keeps on-demand content it streamed (cosmetics, map pieces) in a cache that grows to several GB on the Windows drive. Shows the size, then deletes it after you confirm; Fortnite downloads what it needs again. Useful when the Windows drive is nearly full. Fortnite must be closed.'
+       Warn  = 'You have a slow or metered connection: the first matches afterwards download again. Saved replays, settings and Creative islands are not touched.'
+       Run   = { Start-FnStreamCacheClear } }
+
+    @{ Id = 'ssd-health'; Cat = 'Storage'; Icon = [char]0xEDA2; Action = 'Check'
+       Title = 'Check drive health'
+       Desc  = 'Reads each drive''s wear, temperature and uncorrected-error counters, plus Windows'' storage events of the last 14 days (controller resets, retried I/O, surprise removals). A worn, overheating or dropping drive retries reads for hundreds of milliseconds long before it fails, and Windows never tells you.'
+       Warn  = ''
+       Run   = { Start-SsdHealthCheck; 'Checking drive health...' } }
+
+    # ---------------------------------------------------------- Background
+    @{ Id = 'thirdparty-av'; Cat = 'Background'; Icon = [char]0xE83D; Action = 'Check'
+       Title = 'Check which antivirus really scans'
+       Desc  = 'If Kaspersky, Norton, Bitdefender, Avast, McAfee or another product is the active real-time scanner, Windows Defender is passive and ZeroDelay''s Defender cards do nothing. This tells you which one is active and where that product''s exclusions live, so Fortnite''s folders can be excluded there instead.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-ThirdPartyAvReport) 'Active antivirus' 'OK' 'Information'); 'Checked.' } }
+
+    # -------------------------------------------------------------- System
+    @{ Id = 'bios-age'; Cat = 'System'; Icon = [char]0xE823; Action = 'Check'
+       Title = 'Check the BIOS age'
+       Desc  = 'Shows your BIOS version and date. Older than 18 months usually means missing AGESA (AMD) or microcode (Intel 13th/14th gen) fixes: the fTPM stutter, Ryzen 9000 parking and cross-die fixes, Intel''s Vmin-shift microcode. Plain facts and where to look; ZeroDelay never flashes anything.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-BiosAgeReport) 'BIOS age' 'OK' 'Information'); 'Checked.' } }
+
+    # ------------------------------------------------------------ Fortnite
+    @{ Id = 'tournament-ready'; Cat = 'Fortnite'; Icon = [char]0xE72E; Action = 'Check'
+       Title = 'Check Fortnite tournament readiness'
+       Desc  = 'Since 19 February 2026 Epic requires Secure Boot, TPM 2.0 and IOMMU for every PC tournament. Checks all three and gives the BIOS steps for any that is off. Normal matches do not need them, and none of the three costs FPS on its own.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-TournamentReport) 'Tournament readiness' 'OK' 'Information'); 'Checked.' } }
+
+    # ---- sys (1.14)
+
+    @{ Id = 'win-updatecheck'; Cat = 'System'; Icon = [char]0xE777; Action = 'Check'; Lat = $true
+       Title = 'Is this Windows build safe for gaming?'
+       Desc  = 'Checks your build against the 2025-2026 gaming regressions: the October 2026 mouse-stutter fix (KB5127648), the end of 24H2 updates, the NVIDIA slowdown after KB5066835, the Core Ultra 200S scheduling fix and the Ryzen 7000/9000 branch-prediction optimisation. Reports only.'
+       Warn  = ''
+       Run   = { Start-BackgroundReport 'Get-WinUpdateReport'; 'Checking the Windows build...' } }
+
+    @{ Id = 'gameinput-dup'; Cat = 'Input'; Icon = [char]0xE7FC; Action = 'Check'
+       Requires = { Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\GameInputSvc' }
+       Title = 'Two GameInput versions installed?'
+       Desc  = 'Since September 2025, FPS drops and crackling audio a few minutes after touching a controller were traced to two Microsoft GameInput versions installed side by side. This finds the duplicate and shows which one to remove. The GameInput service itself is never disabled.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-GameInputReport) 'Microsoft GameInput' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'audio-default'; Cat = 'Input'; Icon = [char]0xE767; Action = 'Check'; Lat = $true
+       Title = 'Check your default playback device'
+       Desc  = 'Shows which device Fortnite''s sound goes to, how it is connected and its sample rate. Bluetooth headsets run 30-170 ms behind the game (RTINGS codec measurements), and a 96 or 192 kHz setting makes Windows resample everything, because Fortnite mixes at 48 kHz.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-AudioDefaultReport) 'Default playback device' 'OK' 'Information'); 'Checked.' } }
+
+    (New-VendorTweak 'nahimic-off' 'A-Volute / Sonic Studio audio services' 'Stops the A-Volute audio services (Sonic Studio 3, Sonic Radar, older Nahimic builds) that hook an audio effect into every process and are a long-standing stutter report on ASUS, MSI and Alienware boards. The separate Nahimic card covers NahimicService.' 'You use Sonic Studio or Nahimic mic noise cancelling or their virtual surround. The Realtek/OEM driver update reinstalls them.' @(
+        @{ N = 'SS3Svc'; D = 2 }, @{ N = 'SonicStudio3'; D = 2 }, @{ N = 'SonicRadar3'; D = 2 }, @{ N = 'A-Volute.SS3Svc'; D = 2 }, @{ N = 'NahimicSvc'; D = 2 }, @{ N = 'Nahimic Service'; D = 2 }) 'restart')
+
+    @{ Id = 'mixed-refresh'; Cat = 'Graphics'; Icon = [char]0xE7F4; Action = 'Check'; Lat = $true
+       Requires = { @(Get-Displays).Count -ge 2 }
+       Title = 'Second monitor at a different refresh rate?'
+       Desc  = 'Reads every monitor''s exact refresh rate. A second screen at a different rate (or 59.94 against 60) is a widely reported stutter source for borderless players when video plays on it. Tells you whether to match the rates, use a whole multiple or play true fullscreen. Reports only.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-MixedRefreshReport) 'Monitor refresh rates' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'admin-protection'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'
+       Requires = { [int]"$((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).CurrentBuild)" -ge 26100 }
+       Title = 'Does Administrator protection block my tweaks?'
+       Desc  = 'Windows 11''s Administrator protection runs elevated apps, ZeroDelay included, in a hidden separate profile. Per-user cards (mouse, Game Bar, keyboard, Fortnite''s settings file) then land there and the game never sees them. This tells you whether it is on and what to do.'
+       Warn  = ''
+       Run   = { [void](Show-ZdDialog (Get-AdminProtectionReport) 'Administrator protection' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'kerneldriver-tools'; Cat = 'System'; Icon = [char]0xE9F9; Action = 'Check'; Lat = $true
+       Title = 'Find kernel-driver sensor and RGB tools'
+       Desc  = 'Lists the port I/O drivers (inpoutx64, WinRing0, AsIO, gdrv, RwDrv, NTIOLib) and the sensor and RGB apps using them (iCUE, Armoury Crate, MSI Center, NZXT CAM, HWiNFO64, Afterburner, AIDA64, OpenRGB, SignalRGB). Their polling stalls every core for up to milliseconds, and Microsoft ties inpoutx64 to anti-cheat game crashes.'
+       Warn  = ''
+       Run   = { Start-BackgroundReport 'Get-KernelDriverToolsReport'; 'Looking for sensor drivers and pollers...' } }
+
+    @{ Id = 'inpoutx64-off'; Cat = 'System'; Icon = [char]0xE83D; Rec = $false; Badge = 'restart'
+       Requires = { Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\inpoutx64' }
+       Title = 'Stop the inpoutx64 driver loading'
+       Desc  = 'Microsoft''s own workaround (release health, August 2026) for games that hang, close silently or reboot the PC when the inpoutx64 port I/O driver from RGB or fan software is present (ARC Raiders, THE FINALS and other Easy Anti-Cheat games). Sets the driver to disabled; your Start value is backed up.'
+       Warn  = 'A fan or RGB tool that needs it (FanControl, older OpenRGB, some MSI and ASRock utilities) loses its sensors or lighting control. Microsoft states its investigation shows no unintended behaviour from disabling it.'
+       Reg   = @( @{ P = 'HKLM:\SYSTEM\CurrentControlSet\Services\inpoutx64'; N = 'Start'; V = 4; D = 3; M = 3 } ) }
+
+    @{ Id = 'fn-ecoqos'; Cat = 'Fortnite'; Icon = [char]0xE7E8; Action = 'Check'; Lat = $true
+       Title = 'Is Fortnite stuck in Efficiency mode?'
+       Desc  = 'Reads whether Windows is throttling the running Fortnite process (EcoQoS, Task Manager''s Efficiency mode: lower CPU clocks and efficiency cores on Intel hybrid CPUs). Fortnite never asks for it; a booster or Task Manager sets it. If it is on, ZeroDelay offers to clear it for this launch.'
+       Warn  = 'Fortnite must be running. Nothing is injected: it is the same per-process Windows setting Task Manager uses.'
+       Run   = { Invoke-FnEcoQosCheck } }
+
+    @{ Id = 'idle-spikes'; Cat = 'System'; Icon = [char]0xE823; Action = 'Test'; Lat = $true
+       Title = 'Idle spike test'
+       Desc  = 'Measures for 5 seconds how late a 1 ms high-priority wake-up arrives on your idle PC, plus the CPU time spent in driver callbacks and interrupts. A gap over 3 ms means a driver, interrupt storm or firmware stalled every core: the stutter and audio-crackle you cannot blame on the game. No kernel tracing.'
+       Warn  = 'Run it with Fortnite closed and the PC idle; results with downloads or video playing mean nothing.'
+       Run   = { Start-IdleSpikeTest; 'Measuring wake-up gaps for 5 seconds...' } }
+
+    @{ Id = 'task-audit'; Cat = 'Services'; Icon = [char]0xE823; Action = 'Check'
+       Title = 'Tasks that can fire mid-match'
+       Desc  = 'Lists the enabled scheduled tasks from the known updater and telemetry list (.NET NGEN, Edge, Chrome, Brave and Opera updaters, NVIDIA Nv* tasks, Office, Adobe and OneDrive updaters, Intel SUR, Dell, HP, Lenovo and board makers) and which are due within 3 hours. Reports only; nothing is disabled.'
+       Warn  = ''
+       Run   = { Start-TaskAudit; 'Reading the scheduled tasks...' } }
+
+    @{ Id = 'hyperv-check'; Cat = 'System'; Icon = [char]0xE83D; Action = 'Check'; Lat = $true
+       Title = 'Is Windows running under Hyper-V?'
+       Desc  = 'Shows whether Windows runs as a virtual machine on its own hypervisor and what keeps it there: VBS, Credential Guard, WSL2, Docker, Windows Sandbox, Virtual Machine Platform or Hyper-V. Explains why turning Memory Integrity off alone changed nothing. Reports only; the fixes are existing cards.'
+       Warn  = ''
+       Run   = { Start-HypervisorReport; 'Checking the virtualization state...' } }
+
+    @{ Id = 'fn-mitigations'; Cat = 'Repair'; Icon = [char]0xE90F; Action = 'Check'
+       Title = 'Exploit-protection overrides on Fortnite'
+       Desc  = 'Finds per-program exploit-protection settings (Windows Security > Exploit protection) that a hardening or FPS guide put on Fortnite, its launcher or Easy Anti-Cheat: added ones can crash the game, removed ones (CFG, DEP) gain nothing measurable. Offers to put the Fortnite entries back to the system defaults.'
+       Warn  = 'The Easy Anti-Cheat and Epic launcher entries are only listed; ZeroDelay never changes anti-cheat settings. Previous values go to the backup file.'
+       Run   = { Invoke-FnMitigationCheck } }
+
     # ======================================================= Creator tab (1.7)
     @{ Id = 'cr-autosave'; Cat = 'Creator'; Icon = [char]0xE74E; Rec = $true; Requires = { [bool](Get-PrPrefsFile) }
        Title = 'Premiere: auto-save every 15 minutes'
@@ -5483,10 +7693,12 @@ $Gtx1080Ids = @('perfmode', 'meshquality', 'nanite', 'reflex', 'vsync', 'fullscr
 foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
 
 # Cards added in the latest research round, shown together in the "New tweaks" tab (they stay in their own tabs too)
-$NewIds = @('fn-focussave', 'fn-showfps', 'fn-inireadonly', 'fn-renderercheck', 'fn-hitchreport', 'fn-crashcheck', 'fn-engineini', 'fn-replays',
-            'fn-subping', 'fn-linetest', 'fn-routecheck', 'fn-netreport', 'fn-epicstatus', 'fn-netdebug', 'sqmguide', 'nic-dmacoalesce',
-            'in-accessoff', 'ctrl-conn', 'x3d-balanced', 'interference', 'wpbt-off',
-            'memcompress-on', 'memmgr-defaults', 'repair-spectre', 'repair-platformclock', 'nv-overrides', 'fn-idlesave')
+$NewIds = @('epic-autostart', 'fn-displaycheck', 'fn-argaudit', 'fn-ecoqos', 'fn-mitigations', 'fn-drive', 'fn-streamcache', 'tournament-ready',
+            'nv-drivercheck', 'nv-gsyncwindowed', 'nv-bgfps', 'rebar-check', 'pcie-link', 'mixed-refresh',
+            'wifi-mtk-lowpower', 'wifi-mtk-roam', 'wifi-intel-bgscan', 'vnic-metric', 'repair-tcpleftovers', 'nat-check', 'nic-msi', 'rtl-gigalite-off',
+            'ccd-balanced', 'ccd-parking', 'amd-chipset', 'ftpm-stutter', 'ram-xmp', 'ram-channels', 'whea-scan', 'amd-uep-off', 'amd-uep-task',
+            'ssd-health', 'thirdparty-av', 'bios-age', 'win-updatecheck', 'gameinput-dup', 'audio-default', 'admin-protection',
+            'kerneldriver-tools', 'inpoutx64-off', 'idle-spikes', 'task-audit', 'hyperv-check')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
@@ -7207,7 +9419,7 @@ $Categories = @(
     @{ Name = 'Latency';    Icon = [char]0xE916; Title = 'Latency & delay'
        Note = 'Only the tweaks that change input delay, frame time or ping. Green icons mark them in every tab.' }
     @{ Name = 'New';        Icon = [char]0xE735; Title = 'New tweaks'
-       Note = 'The cards added in 1.13: subregion ping, reports from your real Fortnite matches, network tests and repairs. Each one also stays in its usual tab. Nothing here is switched on for you.' }
+       Note = 'The cards added in 1.14: hardware checks (RAM, PCIe, Resizable BAR, drives), G-SYNC in borderless, Windows bug checks, Wi-Fi and network fixes. Each one also stays in its usual tab. Nothing here is switched on for you.' }
     @{ Name = 'GameMode';   Icon = [char]0xE768; Title = 'Game Mode'; Page = 'GameMode' }
     @{ Name = 'Events';     Icon = [char]0xE7C1; Title = 'Tournaments'; Page = 'Events' }
     @{ Name = 'Potato';     Icon = [char]0xE7F4; Title = 'Potato graphics'
@@ -9168,6 +11380,13 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '1.14.0' = @(
+        @{ T = 'Live view on Home'; D = 'CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a one-minute graph, plus the apps using the most CPU right now. It only measures while Home is open.' }
+        @{ T = '43 new cards from 8 research passes'; D = 'All in the New tweaks tab, and each also in its usual tab. Nothing is switched on for you.' }
+        @{ T = 'Hardware checks'; D = 'EXPO/XMP off, single-channel memory, a graphics card running at fewer PCIe lanes, Resizable BAR, hardware errors, SSD health, BIOS age, a missing AMD chipset driver, and tournament readiness (Secure Boot, TPM, IOMMU).' }
+        @{ T = 'NVIDIA and Windows'; D = 'G-SYNC for borderless Fortnite, no background FPS cap for Fortnite, a driver check, a check for Windows'' October 2026 mouse-stutter fix, Fortnite stuck in Efficiency mode, an idle stutter test and a Hyper-V check.' }
+        @{ T = 'Network'; D = 'NAT type and double-NAT check, VPN and virtual adapters moved behind your real connection, MediaTek and Intel Wi-Fi fixes, and corrected Intel and Marvell interrupt and power-saving cards.' }
+    )
     '1.13.1' = @(
         @{ T = 'New tweaks tab'; D = 'Every card added in 1.13 is now together in its own tab under Tweaks, so you can find them in one place. Each card also stays in its usual tab.' }
         @{ T = '27 new cards from 8 research passes'; D = 'Researched what Atlas, ReviOS, WinUtil, Hone, Process Lasso, Razer Cortex, ExitLag and the measured tuning guides change, and kept only what has evidence. Nothing is switched on for you.' }
@@ -11272,6 +13491,154 @@ function Update-ThisPCPage {
 }
 
 # =============================================================== Home: one place, one button
+# --- "Right now" on Home: live CPU, memory, GPU, disk and internet load plus the busiest apps.
+#     [LiveStats] samples on a background thread, and only while Home is on screen (the timer below starts and stops it).
+$LiveTileDefs = @(
+    @{ Key = 'cpu';  Label = 'PROCESSOR';     Icon = '&#xE950;'; Accent = '#0A84FF'; Unit = '%'; Chips = 2 }
+    @{ Key = 'mem';  Label = 'MEMORY';        Icon = '&#xE964;'; Accent = '#BF5AF2'; Unit = '%'; Chips = 1 }
+    @{ Key = 'gpu';  Label = 'GRAPHICS CARD'; Icon = '&#xE7F4;'; Accent = '#30D158'; Unit = '%'; Chips = 3 }
+    @{ Key = 'disk'; Label = 'DISK ACTIVITY'; Icon = '&#xEDA2;'; Accent = '#FF9F0A'; Unit = '%'; Chips = 2 }
+    @{ Key = 'net';  Label = 'INTERNET';      Icon = '&#xE839;'; Accent = '#64D2FF'; Unit = '';  Chips = 1 }
+)
+function New-LiveTile($d) {
+    $b = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Card}' Padding='20,18' Margin='14,14,-2,-2'>
+  <StackPanel>
+    <Grid>
+      <TextBlock Text='$($d.Label)' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+      <TextBlock Text='$($d.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#98989D' HorizontalAlignment='Right'/>
+    </Grid>
+    <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
+      <TextBlock x:Name='Val' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/>
+      <TextBlock x:Name='Unit' Text='$($d.Unit)' FontSize='15' Foreground='#A1A1A6' VerticalAlignment='Bottom' Margin='3,0,0,6'/>
+    </StackPanel>
+    <TextBlock x:Name='Sub' FontSize='12' Foreground='#A1A1A6' Margin='0,-2,0,0' Visibility='Collapsed'/>
+    <Grid Height='5' Margin='0,8,0,0'>
+      <Grid.ColumnDefinitions><ColumnDefinition x:Name='C0' Width='0*'/><ColumnDefinition x:Name='C1' Width='100*'/></Grid.ColumnDefinitions>
+      <Border Grid.ColumnSpan='2' CornerRadius='2.5' Background='#3A3A3C'/>
+      <Border CornerRadius='2.5' Background='$($d.Accent)'/>
+    </Grid>
+    <Grid x:Name='Spark' Height='46' Margin='0,12,0,0' ClipToBounds='True'>
+      <Polygon x:Name='Area' StrokeThickness='0'/>
+      <Polyline x:Name='Line' Stroke='$($d.Accent)' StrokeThickness='1.6' StrokeLineJoin='Round'/>
+    </Grid>
+    <WrapPanel x:Name='Chips' Margin='0,10,0,-6'/>
+  </StackPanel>
+</Border>
+"@)
+    $t = @{ Root = $b; Max = 100 }
+    foreach ($n in 'Val', 'Unit', 'Sub', 'C0', 'C1', 'Spark', 'Area', 'Line', 'Chips') { $t[$n] = $b.FindName($n) }
+    $c = $t.Line.Stroke.Color
+    $g = New-Object Windows.Media.LinearGradientBrush; $g.StartPoint = '0,0'; $g.EndPoint = '0,1'
+    $g.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.Color]::FromArgb(90, $c.R, $c.G, $c.B)), 0))
+    $g.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B)), 1))
+    $t.Area.Fill = $g
+    $t.ChipList = @(for ($i = 0; $i -lt $d.Chips; $i++) {
+        $chip = [ZdTheme]::Parse("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' CornerRadius='9' BorderBrush='#3A3A3C' BorderThickness='1' Padding='8,2' Margin='0,0,6,6' Visibility='Collapsed'><TextBlock FontSize='11.5' Foreground='#A1A1A6'/></Border>")
+        [void]$t.Chips.Children.Add($chip); $chip })
+    $t
+}
+function New-LiveAppsTile {
+    $b = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Card}' Padding='20,18' Margin='14,14,-2,-2'>
+  <StackPanel>
+    <Grid>
+      <TextBlock Text='BUSIEST APPS' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+      <TextBlock Text='&#xE71D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#98989D' HorizontalAlignment='Right'/>
+    </Grid>
+    <StackPanel x:Name='Rows' Margin='0,10,0,0'/>
+    <TextBlock Text='Share of the whole CPU. Apps with the same name are added together; anti-cheat and system processes cannot be read.' FontSize='11' Foreground='#98989D' TextWrapping='Wrap' Margin='0,6,0,0'/>
+  </StackPanel>
+</Border>
+"@)
+    $t = @{ Root = $b; Rows = @() }
+    $rows = $b.FindName('Rows')
+    $t.Rows = @(for ($i = 0; $i -lt 5; $i++) {
+        $r = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,0,7'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='58'/><ColumnDefinition Width='70'/></Grid.ColumnDefinitions>
+  <TextBlock FontSize='13' TextTrimming='CharacterEllipsis'/>
+  <TextBlock Grid.Column='1' FontSize='13' FontWeight='SemiBold' HorizontalAlignment='Right' Typography.NumeralAlignment='Tabular'/>
+  <TextBlock Grid.Column='2' FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Right' VerticalAlignment='Center' Typography.NumeralAlignment='Tabular'/>
+</Grid>
+"@)
+        [void]$rows.Children.Add($r); $r })
+    $t
+}
+# process names people recognise in the busiest-apps tile (anything else is shown with a capital first letter)
+$LiveAppNames = @{
+    'FortniteClient-Win64-Shipping' = 'Fortnite'; 'FortniteLauncher' = 'Fortnite launcher'; 'EpicGamesLauncher' = 'Epic Games Launcher'; 'EpicWebHelper' = 'Epic web helper'
+    'cs2' = 'Counter-Strike 2'; 'steamwebhelper' = 'Steam (web helper)'; 'msedge' = 'Microsoft Edge'; 'msedgewebview2' = 'Edge WebView'; 'chrome' = 'Google Chrome'
+    'firefox' = 'Firefox'; 'explorer' = 'Windows Explorer'; 'StartMenuExperienceHost' = 'Start menu'; 'SearchHost' = 'Windows Search'; 'dwm' = 'Desktop Window Manager'
+    'audiodg' = 'Windows audio'; 'svchost' = 'Windows services'; 'MsMpEng' = 'Microsoft Defender'; 'obs64' = 'OBS Studio'; 'javaw' = 'Java'; 'java' = 'Java'
+    'ShellExperienceHost' = 'Windows shell'; 'TextInputHost' = 'Windows text input'; 'Widgets' = 'Windows Widgets'; 'ms-teams' = 'Microsoft Teams'
+}
+# bytes per second as people read it: 850 KB/s, 12.4 MB/s
+function Format-Rate([double]$Bps) {
+    if ($Bps -lt 0) { return '-' }
+    if ($Bps -ge 1048576) { '{0:0.0} MB/s' -f ($Bps / 1048576) } elseif ($Bps -ge 1024) { '{0:0} KB/s' -f ($Bps / 1024) } else { '{0:0} B/s' -f $Bps }
+}
+function Set-LiveTile($t, [double]$v, $hist, [double]$max, $chips, [string]$text) {
+    $t.Val.Text = if ($text) { $text } elseif ($v -ge 0) { "$([int]$v)" } else { '-' }
+    $pct = if ($v -ge 0 -and $max -gt 0) { [Math]::Min(100, 100 * $v / $max) } else { 0 }
+    $t.C0.Width = [Windows.GridLength]::new($pct, [Windows.GridUnitType]::Star)
+    $t.C1.Width = [Windows.GridLength]::new(100 - $pct, [Windows.GridUnitType]::Star)
+    # sparkline: newest sample at the right edge, 60 seconds across
+    $w = $t.Spark.ActualWidth; $h = $t.Spark.ActualHeight
+    $line = [Windows.Media.PointCollection]::new(); $area = [Windows.Media.PointCollection]::new()
+    $vals = @($hist); $n = $vals.Count
+    if ($w -gt 0 -and $h -gt 0 -and $n -ge 2 -and $max -gt 0) {
+        $step = $w / 59
+        for ($i = 0; $i -lt $n; $i++) {
+            $p = [Windows.Point]::new($w - ($n - 1 - $i) * $step, $h - 2 - ([Math]::Min($max, [double]$vals[$i]) / $max) * ($h - 4))
+            $line.Add($p); $area.Add($p)
+        }
+        $area.Add([Windows.Point]::new($w, $h)); $area.Add([Windows.Point]::new($w - ($n - 1) * $step, $h))
+    }
+    $t.Line.Points = $line; $t.Area.Points = $area
+    $c = @($chips | Where-Object { $_ })
+    for ($i = 0; $i -lt $t.ChipList.Count; $i++) {
+        $chip = $t.ChipList[$i]
+        if ($i -lt $c.Count) { $chip.Child.Text = $c[$i]; $chip.Visibility = 'Visible' } else { $chip.Visibility = 'Collapsed' }
+    }
+}
+function Update-LiveTiles {
+    $L = $script:LiveUi; if (-not $L) { return }
+    $s = [LiveStats]::Latest
+    Set-LiveTile $L.cpu $s.Cpu ([LiveStats]::History('cpu')) 100 @($(if ($s.CpuGhz -gt 0) { "Speed $($s.CpuGhz) GHz" }), "$([Environment]::ProcessorCount) threads")
+    Set-LiveTile $L.mem $s.Mem ([LiveStats]::History('mem')) 100 @($(if ($s.MemTotalGb -gt 0) { "$($s.MemUsedGb) of $([Math]::Round($s.MemTotalGb)) GB in use" }))
+    Set-LiveTile $L.gpu $s.Gpu ([LiveStats]::History('gpu')) 100 @(
+        $(if ($s.GpuTemp -ge 0) { "Temp $([int]$s.GpuTemp) $([char]0x00B0)C" }),
+        $(if ($s.GpuMhz -gt 0) { "Speed $([int]$s.GpuMhz) MHz" }),
+        $(if ($s.VramGb -ge 0) { "VRAM $($s.VramGb)$(if ($s.VramTotalGb -gt 0) { " of $($s.VramTotalGb)" }) GB" }))
+    Set-LiveTile $L.disk $s.Disk ([LiveStats]::History('disk')) 100 @($(if ($s.DiskRead -ge 0) { "Read $(Format-Rate $s.DiskRead)" }), $(if ($s.DiskWrite -ge 0) { "Write $(Format-Rate $s.DiskWrite)" }))
+    $nh = @([LiveStats]::History('net')); $nmax = [Math]::Max(131072, ($nh | Measure-Object -Maximum).Maximum)
+    Set-LiveTile $L.net $s.NetDown $nh $nmax @($(if ($s.NetUp -ge 0) { "Upload $(Format-Rate $s.NetUp)" })) (Format-Rate $s.NetDown)
+    $L.net.Sub.Text = 'Downloading'; $L.net.Sub.Visibility = 'Visible'
+    for ($i = 0; $i -lt $L.apps.Rows.Count; $i++) {
+        $r = $L.apps.Rows[$i]
+        if ($i -lt $s.TopName.Count) {
+            $nm = $s.TopName[$i]; $friendly = $LiveAppNames[$nm]
+            $r.Children[0].Text = if ($friendly) { $friendly } elseif ($nm.Length -gt 1) { $nm.Substring(0, 1).ToUpper() + $nm.Substring(1) } else { $nm }
+            $r.Children[1].Text = '{0:0.0}%' -f $s.TopCpu[$i]
+            $r.Children[2].Text = if ($s.TopMb[$i] -ge 1024) { '{0:0.0} GB' -f ($s.TopMb[$i] / 1024) } else { '{0:0} MB' -f $s.TopMb[$i] }
+            $r.Visibility = 'Visible'
+        } else { $r.Visibility = $(if ($i -eq 0) { 'Visible' } else { 'Collapsed' }); if ($i -eq 0) { $r.Children[0].Text = 'Measuring...'; $r.Children[1].Text = ''; $r.Children[2].Text = '' } }
+    }
+}
+function Start-LiveTimer {
+    if ($script:LiveTimer) { return }
+    $script:LiveTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:LiveTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
+    $script:LiveTimer.Add_Tick({
+        try {
+            $show = $script:CurrentCat.Name -eq 'Home' -and -not $ui.Search.Text -and $window.IsVisible -and $window.WindowState -ne 'Minimized'
+            if (-not $show) { [LiveStats]::Stop(); return }
+            [LiveStats]::Start(); Update-LiveTiles
+        } catch { $script:LiveTimer.Stop(); [LiveStats]::Stop(); Write-CrashLog $_.Exception 'live tiles' }
+    })
+    $script:LiveTimer.Start()
+}
 function New-HomePage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
@@ -11304,6 +13671,11 @@ function New-HomePage {
       <Button x:Name='WarmOk' Grid.Column='2' Content='Got it' Style='{DynamicResource Btn}' VerticalAlignment='Center' Margin='12,0,0,0'/>
     </Grid>
   </Border>
+  <Grid Margin='0,0,12,0'>
+    <TextBlock Text='Right now' FontSize='15' FontWeight='SemiBold'/>
+    <TextBlock Text='Live while this page is open' FontSize='12' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Bottom'/>
+  </Grid>
+  <UniformGrid x:Name='Live' Columns='3' Margin='-14,-6,-2,22'/>
   <UniformGrid Columns='3' Margin='-14,-14,-2,-14'>
     <Border Style='{DynamicResource Card}' Padding='22,20' Margin='14,14,-2,-2'>
       <StackPanel>
@@ -11347,6 +13719,10 @@ function New-HomePage {
     $h = @{}; foreach ($n in 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Gm', 'GmText', 'HealthTile', 'HealthText', 'MatchTile', 'MatchText', 'PcTile', 'PcText', 'CleanTile', 'TweaksTile', 'TweaksText', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk') { $h[$n] = $root.FindName($n) }
     $h.WarmOk.Add_Click({ $script:Backup.Custom.Remove('shaderwarm'); Save-Backup; Hide-Animated $script:HomeUi.Warm 200 })
     $script:HomeUi = $h
+    $live = $root.FindName('Live'); $script:LiveUi = @{}
+    foreach ($d in $LiveTileDefs) { $script:LiveUi[$d.Key] = New-LiveTile $d; [void]$live.Children.Add($script:LiveUi[$d.Key].Root) }
+    $script:LiveUi.apps = New-LiveAppsTile; [void]$live.Children.Add($script:LiveUi.apps.Root)
+    Update-LiveTiles; Start-LiveTimer
     $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
     $h.Gm.Add_Click({ param($s, $e)
         $window.Cursor = [Windows.Input.Cursors]::Wait

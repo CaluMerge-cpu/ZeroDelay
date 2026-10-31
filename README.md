@@ -9,15 +9,19 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
   apps, and adapts its recommendations: laptops, streamers, Wi-Fi vs Ethernet, X3D and hybrid CPUs, GPU model.
   **Tools > This PC** shows everything it found and what it changed. Nothing is sent anywhere.
 - **Clean, simple design**: a Home page with an Optimize button that lists what is still off so you choose what to switch on, folding menu groups, and frosted glass on Windows 11.
+- **Live view on Home**: CPU, memory, graphics card (temperature and clock on NVIDIA), disk and internet, each with a
+  one-minute graph, plus the apps using the most CPU. It only measures while Home is open.
 - **Creator tab** for Premiere Pro, After Effects, Photoshop, Media Encoder and OBS: auto-save hitches, Adobe RAM
   reserve, Multi-Frame Rendering, Adobe apps on the dedicated GPU, OBS priority, staying awake during renders, and
   Adobe cache cleanup. Each setting is changed one value at a time, only while the app is closed.
 - **GTX 1080 Ti tab** on PCs with that card: the right renderer and settings, the 580 security driver branch, and
   advice for undervolting and cooling an older card.
 
-- **240+ tweaks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
+- **280+ tweaks and checks** grouped by Latency & delay, Power & CPU, Graphics, Input & audio, Network, Background & privacy,
   Services & tasks, Storage, Desktop visuals and Startup apps. Each card says what it does and when *not* to use it.
   A **New tweaks** tab collects the cards added in the latest version.
+- **Hardware checks**: EXPO/XMP off, single-channel memory, a graphics card on fewer PCIe lanes, Resizable BAR,
+  hardware errors, SSD health, BIOS age, a missing AMD chipset driver, and tournament readiness (Secure Boot, TPM, IOMMU).
 - **Network checks**: your cable's link speed and errors, Wi-Fi signal and band, a 20-second test of the link to your router
   (home network or internet line?), VPN routing, traffic shapers such as Killer or cFosSpeed, and the Intel 2.5G driver bug.
 - **Guided cards** for settings no program can change safely: AMD Anti-Lag and Fluid Motion Frames, Intel Arc Low Latency
