@@ -7192,6 +7192,75 @@ $Ifeo  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Executio
 $GpuPrefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
 $LayersKey  = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
 
+# ================================================================ research round 2.0 helpers
+# Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11
+function Test-WifiOn6Ghz {
+    $o = try { netsh wlan show interfaces 2>$null | Out-String } catch { '' }
+    [bool]($o -match '(?m)^\s*Band\s*:\s*6(\.\d+)?\s*GHz')
+}
+# wired adapters that dropped incoming packets for lack of receive buffers: at least 100 discards and at least 0.01% of
+# what they received since start-up (a few discards are normal, for example packets for protocols Windows does not run)
+function Get-RxDropAdapters {
+    @(Get-UpAdapters | Where-Object { $_.NdisPhysicalMedium -ne 9 } | ForEach-Object {
+        $st = Get-NetAdapterStatistics -Name $_.Name -ErrorAction SilentlyContinue
+        $rb = Get-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword '*ReceiveBuffers' -ErrorAction SilentlyContinue
+        if ($st -and $rb) {
+            $rx = [double]$st.ReceivedUnicastPackets + [double]$st.ReceivedMulticastPackets + [double]$st.ReceivedBroadcastPackets
+            $d = [double]$st.ReceivedDiscardedPackets
+            if ($d -ge 100 -and $rx -gt 0 -and $d / $rx -ge 0.0001) { [pscustomobject]@{ Name = $_.Name; Discards = $d; Received = $rx; Prop = $rb } }
+        }
+    })
+}
+# doubles Receive Buffers on the adapters that drop packets, up to the most the driver allows; the old values are saved first
+function Set-RxBuffersUp([string]$Id) {
+    $hit = @(Get-RxDropAdapters)
+    if (-not $hit.Count) { throw 'No network card is dropping packets for lack of buffers right now, so there is nothing to change.' }
+    if (-not $script:Backup.Custom.ContainsKey($Id)) {
+        $script:Backup.Custom[$Id] = @($hit | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = "$($_.Prop.RegistryValue[0])" } })
+    }
+    foreach ($a in $hit) {
+        $cur = 0; [void][int]::TryParse("$($a.Prop.RegistryValue[0])", [ref]$cur)
+        $max = 0; [void][int]::TryParse("$($a.Prop.NumericParameterMaxValue)", [ref]$max)
+        if ($cur -le 0) { continue }
+        $new = $cur * 2; if ($max -gt 0) { $new = [Math]::Min($new, $max) }
+        if ($new -gt $cur) { Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*ReceiveBuffers' -RegistryValue $new }
+    }
+}
+# what Windows' own Wi-Fi log saw in the last 24 hours: disconnects (8003), failed connects (8002) and connects (8001)
+function Get-WifiDropReport {
+    if (-not (Get-WifiAdapters).Count) { return 'No Wi-Fi adapter found. On a cable this check has nothing to look at.' }
+    $since = (Get-Date).AddHours(-24)
+    $ev = @(try { Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = 8001, 8002, 8003; StartTime = $since } -ErrorAction Stop } catch { @() })
+    $drop = @($ev | Where-Object { $_.Id -eq 8003 }); $fail = @($ev | Where-Object { $_.Id -eq 8002 })
+    $l = @("Last 24 hours: $($drop.Count) disconnect$(if ($drop.Count -ne 1) { 's' }), $($fail.Count) failed reconnect$(if ($fail.Count -ne 1) { 's' }).")
+    if ($drop.Count) { $l += "Most recent: $((@($drop | Select-Object -First 5) | ForEach-Object { $_.TimeCreated.ToString('ddd HH:mm') }) -join ', ')." }
+    if ($drop.Count -ge 3 -or $fail.Count) {
+        $l += ''
+        $l += 'Several drops mean the PC keeps losing the network and joining again, a lag spike of a few seconds each time that a ping test between drops never shows. Common causes:'
+        $l += '- The router steers you between 2.4 and 5 GHz ("Smart Connect" / band steering) or a mesh system moves you between nodes. Fix: give 5 GHz its own network name, or turn band steering off, and connect to that.'
+        $l += '- A weak signal where you play. Fix: move closer, or use a cable.'
+    } else { $l += ''; $l += 'That looks stable. Sleep and shutdown also count as disconnects, so a few are normal.' }
+    $l -join "`n"
+}
+# Rainbow Six Siege: the DataCenterHint line and the data centers its own file lists in its comments
+function Get-R6DataCenterReport {
+    $p = Get-GameCfgPath 'r6siege'
+    if (-not $p) { return 'Siege has not saved its settings on this PC yet. Start it once, close it, then look again.' }
+    $c = Read-GameCfg $p
+    $cur = ''; $list = New-Object Collections.Generic.List[string]
+    foreach ($ln in $c.Lines) {
+        $t = "$ln".Trim()
+        if ($t -match '^DataCenterHint\s*=\s*(.+)$') { $cur = $Matches[1].Trim() }
+        elseif ($t -match '^;.*?\b(playfab/[a-z0-9]+)\b') { if (-not $list.Contains($Matches[1])) { $list.Add($Matches[1]) } }
+    }
+    $l = @("Your file: $p", '', "DataCenterHint is now: $(if ($cur) { $cur } else { 'not set' })")
+    if ($list.Count) { $l += "The data centers your file lists: $($list -join ', ')." }
+    $l += ''
+    $l += 'To play on one data center: close Siege, open the file above in Notepad, set DataCenterHint= to the one closest to you (for example playfab/westeurope), save, start Siege. Put back playfab/default to return to automatic.'
+    $l += 'Ubisoft staff describe this setting for PC. It has not been confirmed for Siege X; if the game ignores it, it does no harm.'
+    $l -join "`n"
+}
+
 $Tweaks = @(
     # ---------------------------------------------------------------- System
     @{ Id = 'zdplan'; Cat = 'Power'; Icon = [char]0xE945; Rec = $true; Lat = $true
@@ -8699,6 +8768,7 @@ $Tweaks = @(
     (New-SvcTweak 'inventorysvc' 'InventorySvc' 2 'Turn off compatibility inventory service' 'Windows 11 24H2 runs app inventory and compatibility scans for about 5 minutes every 30 to 60 minutes. This stops them.' 'Windows may offer you the next big feature update later. Monthly security updates are not affected.' $false 'restart')
 
     @{ Id = 'wifi5ghz'; Cat = 'Network'; Icon = [char]0xE701; Rec = $false; Lat = $true
+       Requires = { -not (Test-WifiOn6Ghz) -or (Test-TweakHasBackup 'wifi5ghz') }   # on 6 GHz this would pull you down to 5 GHz
        Title = 'Wi-Fi: prefer the 5 GHz band'
        Desc  = 'Tells Intel Wi-Fi to prefer 5 GHz, which usually has less interference and lower jitter than 2.4 GHz.'
        Warn  = 'You connect on 6 GHz (Wi-Fi 6E/7): this would pull you down to 5 GHz. Or your 5 GHz signal is weak where you play. Applying briefly reconnects Wi-Fi.'
@@ -11473,6 +11543,92 @@ $Tweaks = @(
                if ($cur.Trim() -in '', '~') { Remove-RegValue $LayersKey $script:FortniteExe } else { Set-RegValue $LayersKey $script:FortniteExe $cur 'String' }
            }
        } }
+
+    # ======================================================= research round 2.0 (sources in each card's Source / text)
+    # ---------------------------------------------------------------- Windows and graphics
+    @{ Id = 'colorfilter'; Cat = 'Visuals'; Icon = [char]0xE790; Rec = $false; Lat = $true; Badge = 'signout'
+       Requires = { ([Environment]::OSVersion.Version.Build -lt 26100 -and (Get-RegValue 'HKCU:\Software\Microsoft\ColorFiltering' 'Active') -eq 1) -or (Test-TweakHasBackup 'colorfilter') }
+       Title = 'Turn off the colour filter'
+       Desc  = 'Windows accessibility colour filters are on. Before Windows 11 24H2 they could add a frame of delay and block fullscreen optimizations (Microsoft DirectX team). This turns the filter off.'
+       Warn  = 'You use a colour filter on purpose, for example for colour blindness. On Windows 11 24H2 and newer the filter no longer adds delay, so keep it.'
+       Source = 'https://devblogs.microsoft.com/directx/?p=8541'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\ColorFiltering'; N = 'Active'; V = 0; D = 0; M = 0 } ) }
+
+    @{ Id = 'nvllm-global'; Cat = 'Graphics'; Icon = [char]0xEC4A; Rec = $false; Lat = $true
+       Requires = { Test-NvAvailable }
+       Title = 'NVIDIA: Low Latency Mode On for games without Reflex'
+       Desc  = 'Sets maximum pre-rendered frames to 1 in the driver''s global profile ("Low Latency Mode: On"). Helps DirectX 9 and 11 games without Reflex, such as League of Legends, when the graphics card is the limit.'
+       Warn  = 'Every game you play has Reflex (Reflex overrides this) or runs DirectX 12 / Vulkan (the game decides the queue there). Do not use Ultra with an FPS cap: it can add delay.'
+       Source = 'https://www.nvidia.com/en-gb/geforce/news/gamescom-2019-game-ready-driver/'
+       Nv    = @{ Profile = 'Base Profile'; Id = 0x007BA09E; V = 1 } }
+
+    @{ Id = 'laptop-mux'; Cat = 'Graphics'; Icon = [char]0xE7F8; Action = 'Show how'; Lat = $true; Badge = 'restart'
+       Requires = { (Test-LaptopChassis) -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' }) }
+       Title = 'Laptop: let the NVIDIA graphics card drive the screen'
+       Desc  = 'Most gaming laptops copy every frame through the processor''s graphics first. Switching the screen to the NVIDIA card (MUX switch or Advanced Optimus) skips that copy: NVIDIA measured up to 22% lower latency.'
+       Warn  = 'You game on battery (battery life drops a lot), or you rely on a USB-C display output that only works in hybrid mode.'
+       Source = 'https://www.nvidia.com/en-gb/geforce/news/rtx-laptops-advanced-optimus/'
+       Run   = { [void](Show-ZdDialog ("Where the switch is (it depends on the maker):`n`n- NVIDIA Control Panel > Manage Display Mode > NVIDIA GPU only (Advanced Optimus).`n- ASUS Armoury Crate: GPU Mode > Ultimate.`n- Lenovo Vantage / Legion Space: GPU Working Mode > Discrete GPU.`n- MSI Center: GPU Switch > Discrete Graphics Mode.`n- HP OMEN Gaming Hub: Graphics Switcher > Discrete.`n- Acer NitroSense / PredatorSense: GPU mode > Discrete.`n`nA hardware MUX needs a restart; Advanced Optimus switches with a short black screen. To undo, pick Optimus / Hybrid / Standard again.`n`nIf none of these exist on your laptop, it has no MUX and the screen always goes through the processor's graphics.") 'Laptop display mode' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'intel-apo'; Cat = 'Power'; Icon = [char]0xE950; Action = 'Show how'; Lat = $false
+       Requires = { (Get-CpuName) -match 'Intel' -and (Get-CpuName) -match '1[34]\d{3}[A-Z]*|Core\(TM\) Ultra|Core Ultra' }
+       Title = 'Intel: Application Optimization (APO)'
+       Desc  = 'Intel APO spreads a game''s threads over performance and efficiency cores better on supported Intel chips. Hardware Unboxed measured up to about 20% more FPS where the processor is the limit. Intel lists CS2 and Dota 2.'
+       Warn  = 'Your processor or game is not on Intel''s list (then APO does nothing). Test with and without: Intel notes some settings can lower performance on chips with 6 or more P-cores.'
+       Source = 'https://www.intel.com/content/www/us/en/support/articles/000098266.html'
+       Run   = { [void](Show-ZdDialog ("1. Install Intel Dynamic Tuning Technology (DTT) from your PC or motherboard maker, or from Intel. APO does nothing without it.`n2. Install Intel Application Optimization from the Microsoft Store.`n3. Open it, switch it on, and check that your game is listed and switched on.`n`nIntel's list of supported processors and games: intel.com, article 000098266. To undo, switch APO off in the same app.") 'Intel Application Optimization' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'laptop-nvcaps'; Cat = 'Power'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { (Test-LaptopChassis) -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' }) }
+       Title = 'Laptop: NVIDIA WhisperMode and Battery Boost off'
+       Desc  = 'Two NVIDIA laptop features cap your FPS without saying so: WhisperMode (quiet fans, 60 FPS in competitive games, also when plugged in) and Battery Boost (about 30 FPS on battery).'
+       Warn  = 'You want a quiet laptop or longer battery life more than FPS.'
+       Source = 'https://www.nvidia.com/en-us/geforce/news/nvidia-geforce-gtx-whispermode-for-laptops/'
+       Run   = { [void](Show-ZdDialog ("In the NVIDIA App (or GeForce Experience on older drivers), open Settings or Graphics and look for:`n`n- WhisperMode: Off.`n- Battery Boost: Off, or raise its frame limit.`n`nThe exact place differs between driver versions; if your laptop has neither, nothing caps FPS here. Restart the game afterwards. To undo, switch them on again.") 'NVIDIA laptop FPS caps' 'OK' 'Information'); 'Shown.' } }
+
+    # ---------------------------------------------------------------- games (in-game settings the publishers document)
+    @{ Id = 'apex-datacenter'; Cat = 'ApexLegends'; Icon = [char]0xE968; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'apex' }
+       Title = 'Apex Legends: choose your data center'
+       Desc  = 'Apex lists every data center with its ping and packet loss on the title screen. Picking the nearest one with 0% loss avoids being placed far away. Nothing is changed by ZeroDelay.'
+       Warn  = 'You queue with friends in another region.'
+       Source = 'https://help.ea.com/en/help/apex-legends/apex-legends/ping-data-center/'
+       Run   = { [void](Show-ZdDialog ("1. Start Apex and stay on the title screen (do not press Continue).`n2. Click Data Center at the bottom left.`n3. Pick the lowest ping with 0% packet loss.`n`nEA Help: a far data center causes high ping and packet loss. To undo, pick another one the same way.") 'Apex Legends data center' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'val-netbuffer'; Cat = 'Valorant'; Icon = [char]0xE968; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'valorant' }
+       Title = 'VALORANT: Network Buffering on Minimum'
+       Desc  = 'Network Buffering sets how many movement updates the game holds before showing them. A Riot developer: prefer Minimum as long as your connection is stable, because more buffering shows enemies later.'
+       Warn  = 'Your connection has packet loss or jitter: then Moderate smooths movement at the cost of some delay.'
+       Source = 'https://devtrackers.gg/valorant/p/ea44f53c-network-buffering-setting-does-nothing'
+       Run   = { [void](Show-ZdDialog ("Settings > General > Network Buffering: Minimum.`n`nTo see whether your connection allows it: Settings > Video > Stats > Network Round Trip Time and Packet Loss: Text Only. If packet loss shows up during matches, go back to Moderate.`n`nThe setting is saved to your Riot account, so ZeroDelay shows where it is instead of changing it (Vanguard is never touched).") 'VALORANT network buffering' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'r6-datacenter'; Cat = 'R6Siege'; Icon = [char]0xE968; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'r6siege' }
+       Title = 'Siege: play on your lowest-ping data center'
+       Desc  = 'Siege can pin you to one data center instead of picking automatically. Ubisoft staff describe the DataCenterHint setting in GameSettings.ini. ZeroDelay shows your current value and the data centers your file lists.'
+       Warn  = 'You travel or play with a party in another region. Not confirmed for Siege X yet: if the game ignores it, nothing changes.'
+       Source = 'https://devtrackers.gg/r6-siege/p/bb8a00f7-connectivity-multiplayer-server-issues'
+       Run   = { [void](Show-ZdDialog (Get-R6DataCenterReport) 'Siege data center' 'OK' 'Information'); 'Shown.' } }
+
+    # ---------------------------------------------------------------- network
+    @{ Id = 'wifi-drops'; Cat = 'Network'; Icon = [char]0xE701; Action = 'Check'; Lat = $true
+       Requires = { [bool](Get-WifiAdapters).Count }
+       Title = 'Check Wi-Fi drops during play'
+       Desc  = 'Reads Windows'' own Wi-Fi log for the last 24 hours. Repeated disconnects (router band steering, a mesh node switch, a weak signal) cause lag spikes of a few seconds that a ping test between drops never shows.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/advanced-troubleshooting-wireless-network-connectivity'
+       Run   = { [void](Show-ZdDialog (Get-WifiDropReport) 'Wi-Fi drops' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'rxbuffers'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Lat = $true; Badge = 'advanced'
+       Requires = { [bool](Get-RxDropAdapters).Count -or (Test-TweakHasBackup 'rxbuffers') }
+       Title = 'Network card dropping packets: more receive buffers'
+       Desc  = 'Your network card threw away incoming packets because its receive buffers were full. This doubles Receive Buffers (up to what the driver allows), so bursts of game traffic are not dropped. Shown only when it happens.'
+       Warn  = 'You are on a laptop on battery. Bigger buffers do not lower delay by themselves; they only stop drops. Applying briefly reconnects the adapter.'
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/network/keywords-that-can-be-edited'
+       Test  = { if ($script:Backup.Custom.ContainsKey('rxbuffers')) { $true } elseif ((Get-RxDropAdapters).Count) { $false } else { $null } }
+       On    = { Set-RxBuffersUp 'rxbuffers' }
+       Off   = { Reset-AdvPropEach 'rxbuffers' '*ReceiveBuffers' { param($n) $null } } }
 )
 
 # --- NVIDIA driver profile DWORD settings: Nv = @{ Profile; Id; V }. Originals are backed up and restored.
@@ -11659,7 +11815,8 @@ foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
 $NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn-matchdc', 'fn-pingtruth', 'starlink-check',
             'fn-presentmode', 'fn-latencytest', 'fn-gpubound', 'fn-extlimiters', 'fn-aimreadout', 'fn-inputpool',
             'pack-scan', 'repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services',
-            'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready')
+            'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready',
+            'colorfilter', 'nvllm-global', 'laptop-mux', 'intel-apo', 'laptop-nvcaps', 'apex-datacenter', 'val-netbuffer', 'r6-datacenter', 'wifi-drops', 'rxbuffers')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
