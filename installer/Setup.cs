@@ -3,6 +3,8 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("ZeroDelay Setup")]
@@ -10,8 +12,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Installer for ZeroDelay, a Fortnite latency optimizer for Windows")]
 [assembly: AssemblyCompany("ZeroDelay contributors")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.19.0.0")]
-[assembly: AssemblyFileVersion("1.19.0.0")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 
 static class Setup
 {
@@ -28,16 +30,20 @@ static class Setup
         {
             var answer = MessageBox.Show(
                 "Install ZeroDelay, the Fortnite latency optimizer?\n\n" +
-                "It is installed for your Windows account only and adds Desktop and Start menu shortcuts. " +
+                "It is installed to Program Files and adds Desktop and Start menu shortcuts. " +
                 "ZeroDelay is free software under the MIT License and comes with no warranty.",
                 "ZeroDelay Setup", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (answer != DialogResult.Yes) return 1;
         }
 
-        string dir = Path.Combine(Path.GetTempPath(), "ZeroDelaySetup_" + Guid.NewGuid().ToString("N"));
+        // Unpack into Windows' own temp folder, in a new folder only administrators can change. The user's %TEMP% is
+        // writable by every program the user runs, so a file there could be swapped before install.ps1 copies it
+        // into Program Files.
+        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp", "ZeroDelaySetup_" + Guid.NewGuid().ToString("N"));
         try
         {
-            Directory.CreateDirectory(dir);
+            if (Directory.Exists(dir)) throw new Exception("The setup folder already exists: " + dir);
+            Directory.CreateDirectory(dir, AdminOnlyDirectory());
             var asm = Assembly.GetExecutingAssembly();
             foreach (var name in Files)
             {
@@ -66,5 +72,18 @@ static class Setup
         {
             try { Directory.Delete(dir, true); } catch { }
         }
+    }
+
+    // SYSTEM and Administrators: full control; nobody else: no access. Not inherited from the parent folder.
+    static DirectorySecurity AdminOnlyDirectory()
+    {
+        var sec = new DirectorySecurity();
+        sec.SetAccessRuleProtection(true, false);
+        var inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
+            sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
+                                                       inherit, PropagationFlags.None, AccessControlType.Allow));
+        sec.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
+        return sec;
     }
 }

@@ -3,7 +3,7 @@
   ZeroDelay - Fortnite low-latency optimizer
   Card-based toggles for Windows, input, graphics, network and Fortnite tweaks.
   Every toggle is reversible: the first time a setting is changed, its original value is
-  saved to %LOCALAPPDATA%\FortniteLatencyOptimizer\backup-v2.json and switching the card
+  saved to %ProgramData%\ZeroDelay\backup-<account SID>.json (administrators only) and switching the card
   off (or "Restore all") puts it back.
 #>
 
@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.19.0'
+$AppVersion = '2.0.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -50,7 +50,7 @@ if (-not $Snapshot -and -not $Tray) {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="ZeroDelay" Width="420" Height="260" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         ResizeMode="NoResize" WindowStartupLocation="CenterScreen" ShowInTaskbar="True" Opacity="0">
-  <Border CornerRadius="24" Background="#050507" BorderBrush="#26FFFFFF" BorderThickness="1" ClipToBounds="True">
+  <Border CornerRadius="16" Background="#07080A" BorderBrush="#1F242B" BorderThickness="1" ClipToBounds="True">
     <Border.Clip><RectangleGeometry Rect="0,0,420,260" RadiusX="24" RadiusY="24"/></Border.Clip>
     <Grid>
       <Ellipse x:Name="G1" Width="420" Height="420" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="-170,-240,0,0">
@@ -992,7 +992,44 @@ public static class NativeDisplay {
 try { [void][AppIdentity]::SetCurrentProcessExplicitAppUserModelID('ZeroDelay.FortniteLatencyOptimizer') } catch {}
 $FortniteExeName = 'FortniteClient-Win64-Shipping.exe'
 $DataDir    = Join-Path $env:LOCALAPPDATA 'FortniteLatencyOptimizer'
-$BackupFile = Join-Path $DataDir 'backup-v2.json'
+$IsAdmin    = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# --- Protected data folder (%ProgramData%\ZeroDelay). ZeroDelay runs as administrator, and Restore writes the backup's
+#     values back into HKLM. %LOCALAPPDATA% can be changed by every program the user runs, so a backup kept there could
+#     be edited to make Restore write any value as administrator. This folder can only be changed by administrators.
+#     Any user can create folders in ProgramData, so one ZeroDelay did not create (another owner, or a link) is replaced.
+function Initialize-SecureDir([string]$Path) {
+    $adminsSid = 'S-1-5-32-544'; $systemSid = 'S-1-5-18'
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item) {
+        $isLink = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        $owner = try { (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $null }
+        if (-not $item.PSIsContainer -or $isLink -or ($owner -ne $adminsSid -and $owner -ne $systemSid)) {
+            if ($isLink) { [IO.Directory]::Delete($Path) }               # removes the link, not its target
+            else {
+                # set it aside (not deleted, in case it holds something you want) and start a fresh folder
+                $aside = "$Path.untrusted-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+                if ($item.PSIsContainer) { [IO.Directory]::Move($Path, $aside) } else { [IO.File]::Move($Path, $aside) }
+            }
+            $item = $null
+        }
+    }
+    $sec = New-Object Security.AccessControl.DirectorySecurity
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in $systemSid, $adminsSid) {
+        $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $sid),
+            'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+    }
+    $sec.SetOwner((New-Object Security.Principal.SecurityIdentifier $adminsSid))
+    if ($item) { [IO.Directory]::SetAccessControl($Path, $sec) } else { [void][IO.Directory]::CreateDirectory($Path, $sec) }
+}
+$SecureDir = Join-Path $env:ProgramData 'ZeroDelay'
+if ($IsAdmin -and -not $Snapshot) {
+    try { Initialize-SecureDir $SecureDir } catch { $SecureDir = $null; $script:SecureDirError = $_.Exception.Message }
+} else { $SecureDir = $null }   # dev runs without admin rights (-NoElevate, -Snapshot) only read the old location
+$LegacyBackupFile = Join-Path $DataDir 'backup-v2.json'
+# one backup per Windows account, as before
+$BackupFile = if ($SecureDir) { Join-Path $SecureDir "backup-$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value).json" } else { $LegacyBackupFile }
 $IniPath    = Join-Path $env:LOCALAPPDATA 'FortniteGame\Saved\Config\WindowsClient\GameUserSettings.ini'
 $IniSection = '[/Script/FortniteGame.FortGameUserSettings]'
 $GuidRx     = '[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}'
@@ -1022,20 +1059,56 @@ New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
 # ================================================================ backup ===
 
-function Load-Backup {
+function Read-BackupFile([string]$Path) {
+    $j = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if (-not $j) { throw 'The file is empty.' }
     $b = @{ Registry = @(); CreatedKeys = @(); Custom = @{} }
-    if (Test-Path $BackupFile) {
-        try {
-            $j = Get-Content $BackupFile -Raw | ConvertFrom-Json
-            $b.Registry    = @($j.Registry | Where-Object { $_ })
-            $b.CreatedKeys = @($j.CreatedKeys | Where-Object { $_ })
-            if ($j.Custom) { $j.Custom.PSObject.Properties | ForEach-Object { $b.Custom[$_.Name] = $_.Value } }
-        } catch {}
-    }
+    $b.Registry    = @($j.Registry | Where-Object { $_ })
+    $b.CreatedKeys = @($j.CreatedKeys | Where-Object { $_ })
+    if ($j.Custom) { $j.Custom.PSObject.Properties | ForEach-Object { $b.Custom[$_.Name] = $_.Value } }
     $b
 }
+function Load-Backup {
+    # First start after the move to the protected folder: bring the old backup along once.
+    # (It was in a folder other programs could change; that is why it moves.)
+    if ($BackupFile -ne $LegacyBackupFile -and -not (Test-Path -LiteralPath $BackupFile) -and (Test-Path -LiteralPath $LegacyBackupFile)) {
+        try {
+            Copy-Item -LiteralPath $LegacyBackupFile $BackupFile -ErrorAction Stop
+            Move-Item -LiteralPath $LegacyBackupFile "$LegacyBackupFile.moved" -Force -ErrorAction SilentlyContinue
+        } catch {}
+    }
+    if (-not (Test-Path -LiteralPath $BackupFile) -and -not (Test-Path -LiteralPath "$BackupFile.bak")) { return @{ Registry = @(); CreatedKeys = @(); Custom = @{} } }
+    try { return Read-BackupFile $BackupFile } catch { $err = $_.Exception.Message }
+    # The file is damaged (for example the PC lost power while it was saved): use the copy from the save before.
+    try {
+        $b = Read-BackupFile "$BackupFile.bak"
+        $script:BackupWarning = "ZeroDelay's backup file was damaged ($err), so the copy from the save before it was used. Settings changed in the last few minutes before that may not be restorable."
+        return $b
+    } catch {}
+    # Neither copy can be read. Keep the damaged file (renamed) instead of saving an empty backup over it.
+    $kept = "$BackupFile.damaged-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+    try { Move-Item -LiteralPath $BackupFile $kept -Force -ErrorAction Stop } catch { $kept = $BackupFile }
+    $script:BackupWarning = "ZeroDelay's backup file could not be read ($err). The original values of settings changed before now are not known, so Restore cannot put them back. The damaged file was kept as:`n$kept"
+    @{ Registry = @(); CreatedKeys = @(); Custom = @{} }
+}
 
-function Save-Backup { if ($Snapshot) { return }; $script:Backup | ConvertTo-Json -Depth 8 | Set-Content -Path $BackupFile -Encoding UTF8 }   # dev renders never touch the real file
+# Writes to a temporary file first (straight to disk), then swaps it in and keeps the previous version as .bak,
+# so a crash or power cut while saving never leaves a half-written backup.
+function Save-Backup {
+    if ($Snapshot) { return }   # dev renders never touch the real file
+    $json = $script:Backup | ConvertTo-Json -Depth 8
+    if (-not $json) { return }
+    $tmp = "$BackupFile.tmp"
+    $fs = New-Object IO.FileStream($tmp, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try {
+        $sw = New-Object IO.StreamWriter($fs, (New-Object Text.UTF8Encoding $true))
+        $sw.Write($json); $sw.Flush(); $fs.Flush($true)
+    } finally { $fs.Dispose() }
+    if (Test-Path -LiteralPath $BackupFile) {
+        try { [IO.File]::Replace($tmp, $BackupFile, "$BackupFile.bak") }
+        catch { Copy-Item -LiteralPath $BackupFile "$BackupFile.bak" -Force; Move-Item -LiteralPath $tmp $BackupFile -Force }
+    } else { Move-Item -LiteralPath $tmp $BackupFile -Force }
+}
 
 function Test-TweakHasBackup([string]$Id) {
     [bool]($script:Backup.Registry | Where-Object { $_.Tweak -eq $Id }) -or $script:Backup.Custom.ContainsKey($Id)
@@ -2576,7 +2649,7 @@ function Update-PresetChips {
     }
     $h.PresetChips.Visibility = 'Visible'
     foreach ($name in $script:PresetNames) {
-        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$name' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
+        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$name' Padding='14,5' Margin='0' FontSize='13' MinHeight='28'/>")
         $c.Tag = $name
         $c.Add_Click({ param($s, $e)
             $g = $script:GameSel; if (-not $g) { return }
@@ -2586,7 +2659,7 @@ function Update-PresetChips {
             Update-PresetChips; Update-GameTools
         })
         $sel = $name -eq $state
-        $c.Background = ConvertTo-Brush $(if ($sel) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($sel) { '#FDFDFD' } else { '#F5F5F7' })
+        $c.Background = ConvertTo-Brush $(if ($sel) { '#2B323B' } else { '#00000000' }); $c.Foreground = ConvertTo-Brush $(if ($sel) { '#F2F4F7' } else { '#9AA3AF' }); if ($sel) { $c.FontWeight = 'SemiBold' }
         [void]$h.PresetChips.Children.Add($c)
     }
     $h.PresetNote.Text = if ($waiting) { "Waiting for $($g.Title) to close: $waiting setting$(if ($waiting -ne 1) { 's' }) of $($rec.Name) will be applied then." }
@@ -7119,6 +7192,75 @@ $Ifeo  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Executio
 $GpuPrefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
 $LayersKey  = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
 
+# ================================================================ research round 2.0 helpers
+# Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11
+function Test-WifiOn6Ghz {
+    $o = try { netsh wlan show interfaces 2>$null | Out-String } catch { '' }
+    [bool]($o -match '(?m)^\s*Band\s*:\s*6(\.\d+)?\s*GHz')
+}
+# wired adapters that dropped incoming packets for lack of receive buffers: at least 100 discards and at least 0.01% of
+# what they received since start-up (a few discards are normal, for example packets for protocols Windows does not run)
+function Get-RxDropAdapters {
+    @(Get-UpAdapters | Where-Object { $_.NdisPhysicalMedium -ne 9 } | ForEach-Object {
+        $st = Get-NetAdapterStatistics -Name $_.Name -ErrorAction SilentlyContinue
+        $rb = Get-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword '*ReceiveBuffers' -ErrorAction SilentlyContinue
+        if ($st -and $rb) {
+            $rx = [double]$st.ReceivedUnicastPackets + [double]$st.ReceivedMulticastPackets + [double]$st.ReceivedBroadcastPackets
+            $d = [double]$st.ReceivedDiscardedPackets
+            if ($d -ge 100 -and $rx -gt 0 -and $d / $rx -ge 0.0001) { [pscustomobject]@{ Name = $_.Name; Discards = $d; Received = $rx; Prop = $rb } }
+        }
+    })
+}
+# doubles Receive Buffers on the adapters that drop packets, up to the most the driver allows; the old values are saved first
+function Set-RxBuffersUp([string]$Id) {
+    $hit = @(Get-RxDropAdapters)
+    if (-not $hit.Count) { throw 'No network card is dropping packets for lack of buffers right now, so there is nothing to change.' }
+    if (-not $script:Backup.Custom.ContainsKey($Id)) {
+        $script:Backup.Custom[$Id] = @($hit | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = "$($_.Prop.RegistryValue[0])" } })
+    }
+    foreach ($a in $hit) {
+        $cur = 0; [void][int]::TryParse("$($a.Prop.RegistryValue[0])", [ref]$cur)
+        $max = 0; [void][int]::TryParse("$($a.Prop.NumericParameterMaxValue)", [ref]$max)
+        if ($cur -le 0) { continue }
+        $new = $cur * 2; if ($max -gt 0) { $new = [Math]::Min($new, $max) }
+        if ($new -gt $cur) { Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*ReceiveBuffers' -RegistryValue $new }
+    }
+}
+# what Windows' own Wi-Fi log saw in the last 24 hours: disconnects (8003), failed connects (8002) and connects (8001)
+function Get-WifiDropReport {
+    if (-not (Get-WifiAdapters).Count) { return 'No Wi-Fi adapter found. On a cable this check has nothing to look at.' }
+    $since = (Get-Date).AddHours(-24)
+    $ev = @(try { Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = 8001, 8002, 8003; StartTime = $since } -ErrorAction Stop } catch { @() })
+    $drop = @($ev | Where-Object { $_.Id -eq 8003 }); $fail = @($ev | Where-Object { $_.Id -eq 8002 })
+    $l = @("Last 24 hours: $($drop.Count) disconnect$(if ($drop.Count -ne 1) { 's' }), $($fail.Count) failed reconnect$(if ($fail.Count -ne 1) { 's' }).")
+    if ($drop.Count) { $l += "Most recent: $((@($drop | Select-Object -First 5) | ForEach-Object { $_.TimeCreated.ToString('ddd HH:mm') }) -join ', ')." }
+    if ($drop.Count -ge 3 -or $fail.Count) {
+        $l += ''
+        $l += 'Several drops mean the PC keeps losing the network and joining again, a lag spike of a few seconds each time that a ping test between drops never shows. Common causes:'
+        $l += '- The router steers you between 2.4 and 5 GHz ("Smart Connect" / band steering) or a mesh system moves you between nodes. Fix: give 5 GHz its own network name, or turn band steering off, and connect to that.'
+        $l += '- A weak signal where you play. Fix: move closer, or use a cable.'
+    } else { $l += ''; $l += 'That looks stable. Sleep and shutdown also count as disconnects, so a few are normal.' }
+    $l -join "`n"
+}
+# Rainbow Six Siege: the DataCenterHint line and the data centers its own file lists in its comments
+function Get-R6DataCenterReport {
+    $p = Get-GameCfgPath 'r6siege'
+    if (-not $p) { return 'Siege has not saved its settings on this PC yet. Start it once, close it, then look again.' }
+    $c = Read-GameCfg $p
+    $cur = ''; $list = New-Object Collections.Generic.List[string]
+    foreach ($ln in $c.Lines) {
+        $t = "$ln".Trim()
+        if ($t -match '^DataCenterHint\s*=\s*(.+)$') { $cur = $Matches[1].Trim() }
+        elseif ($t -match '^;.*?\b(playfab/[a-z0-9]+)\b') { if (-not $list.Contains($Matches[1])) { $list.Add($Matches[1]) } }
+    }
+    $l = @("Your file: $p", '', "DataCenterHint is now: $(if ($cur) { $cur } else { 'not set' })")
+    if ($list.Count) { $l += "The data centers your file lists: $($list -join ', ')." }
+    $l += ''
+    $l += 'To play on one data center: close Siege, open the file above in Notepad, set DataCenterHint= to the one closest to you (for example playfab/westeurope), save, start Siege. Put back playfab/default to return to automatic.'
+    $l += 'Ubisoft staff describe this setting for PC. It has not been confirmed for Siege X; if the game ignores it, it does no harm.'
+    $l -join "`n"
+}
+
 $Tweaks = @(
     # ---------------------------------------------------------------- System
     @{ Id = 'zdplan'; Cat = 'Power'; Icon = [char]0xE945; Rec = $true; Lat = $true
@@ -8626,6 +8768,7 @@ $Tweaks = @(
     (New-SvcTweak 'inventorysvc' 'InventorySvc' 2 'Turn off compatibility inventory service' 'Windows 11 24H2 runs app inventory and compatibility scans for about 5 minutes every 30 to 60 minutes. This stops them.' 'Windows may offer you the next big feature update later. Monthly security updates are not affected.' $false 'restart')
 
     @{ Id = 'wifi5ghz'; Cat = 'Network'; Icon = [char]0xE701; Rec = $false; Lat = $true
+       Requires = { -not (Test-WifiOn6Ghz) -or (Test-TweakHasBackup 'wifi5ghz') }   # on 6 GHz this would pull you down to 5 GHz
        Title = 'Wi-Fi: prefer the 5 GHz band'
        Desc  = 'Tells Intel Wi-Fi to prefer 5 GHz, which usually has less interference and lower jitter than 2.4 GHz.'
        Warn  = 'You connect on 6 GHz (Wi-Fi 6E/7): this would pull you down to 5 GHz. Or your 5 GHz signal is weak where you play. Applying briefly reconnects Wi-Fi.'
@@ -11400,6 +11543,92 @@ $Tweaks = @(
                if ($cur.Trim() -in '', '~') { Remove-RegValue $LayersKey $script:FortniteExe } else { Set-RegValue $LayersKey $script:FortniteExe $cur 'String' }
            }
        } }
+
+    # ======================================================= research round 2.0 (sources in each card's Source / text)
+    # ---------------------------------------------------------------- Windows and graphics
+    @{ Id = 'colorfilter'; Cat = 'Visuals'; Icon = [char]0xE790; Rec = $false; Lat = $true; Badge = 'signout'
+       Requires = { ([Environment]::OSVersion.Version.Build -lt 26100 -and (Get-RegValue 'HKCU:\Software\Microsoft\ColorFiltering' 'Active') -eq 1) -or (Test-TweakHasBackup 'colorfilter') }
+       Title = 'Turn off the colour filter'
+       Desc  = 'Windows accessibility colour filters are on. Before Windows 11 24H2 they could add a frame of delay and block fullscreen optimizations (Microsoft DirectX team). This turns the filter off.'
+       Warn  = 'You use a colour filter on purpose, for example for colour blindness. On Windows 11 24H2 and newer the filter no longer adds delay, so keep it.'
+       Source = 'https://devblogs.microsoft.com/directx/?p=8541'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\ColorFiltering'; N = 'Active'; V = 0; D = 0; M = 0 } ) }
+
+    @{ Id = 'nvllm-global'; Cat = 'Graphics'; Icon = [char]0xEC4A; Rec = $false; Lat = $true
+       Requires = { Test-NvAvailable }
+       Title = 'NVIDIA: Low Latency Mode On for games without Reflex'
+       Desc  = 'Sets maximum pre-rendered frames to 1 in the driver''s global profile ("Low Latency Mode: On"). Helps DirectX 9 and 11 games without Reflex, such as League of Legends, when the graphics card is the limit.'
+       Warn  = 'Every game you play has Reflex (Reflex overrides this) or runs DirectX 12 / Vulkan (the game decides the queue there). Do not use Ultra with an FPS cap: it can add delay.'
+       Source = 'https://www.nvidia.com/en-gb/geforce/news/gamescom-2019-game-ready-driver/'
+       Nv    = @{ Profile = 'Base Profile'; Id = 0x007BA09E; V = 1 } }
+
+    @{ Id = 'laptop-mux'; Cat = 'Graphics'; Icon = [char]0xE7F8; Action = 'Show how'; Lat = $true; Badge = 'restart'
+       Requires = { (Test-LaptopChassis) -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' }) }
+       Title = 'Laptop: let the NVIDIA graphics card drive the screen'
+       Desc  = 'Most gaming laptops copy every frame through the processor''s graphics first. Switching the screen to the NVIDIA card (MUX switch or Advanced Optimus) skips that copy: NVIDIA measured up to 22% lower latency.'
+       Warn  = 'You game on battery (battery life drops a lot), or you rely on a USB-C display output that only works in hybrid mode.'
+       Source = 'https://www.nvidia.com/en-gb/geforce/news/rtx-laptops-advanced-optimus/'
+       Run   = { [void](Show-ZdDialog ("Where the switch is (it depends on the maker):`n`n- NVIDIA Control Panel > Manage Display Mode > NVIDIA GPU only (Advanced Optimus).`n- ASUS Armoury Crate: GPU Mode > Ultimate.`n- Lenovo Vantage / Legion Space: GPU Working Mode > Discrete GPU.`n- MSI Center: GPU Switch > Discrete Graphics Mode.`n- HP OMEN Gaming Hub: Graphics Switcher > Discrete.`n- Acer NitroSense / PredatorSense: GPU mode > Discrete.`n`nA hardware MUX needs a restart; Advanced Optimus switches with a short black screen. To undo, pick Optimus / Hybrid / Standard again.`n`nIf none of these exist on your laptop, it has no MUX and the screen always goes through the processor's graphics.") 'Laptop display mode' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'intel-apo'; Cat = 'Power'; Icon = [char]0xE950; Action = 'Show how'; Lat = $false
+       Requires = { (Get-CpuName) -match 'Intel' -and (Get-CpuName) -match '1[34]\d{3}[A-Z]*|Core\(TM\) Ultra|Core Ultra' }
+       Title = 'Intel: Application Optimization (APO)'
+       Desc  = 'Intel APO spreads a game''s threads over performance and efficiency cores better on supported Intel chips. Hardware Unboxed measured up to about 20% more FPS where the processor is the limit. Intel lists CS2 and Dota 2.'
+       Warn  = 'Your processor or game is not on Intel''s list (then APO does nothing). Test with and without: Intel notes some settings can lower performance on chips with 6 or more P-cores.'
+       Source = 'https://www.intel.com/content/www/us/en/support/articles/000098266.html'
+       Run   = { [void](Show-ZdDialog ("1. Install Intel Dynamic Tuning Technology (DTT) from your PC or motherboard maker, or from Intel. APO does nothing without it.`n2. Install Intel Application Optimization from the Microsoft Store.`n3. Open it, switch it on, and check that your game is listed and switched on.`n`nIntel's list of supported processors and games: intel.com, article 000098266. To undo, switch APO off in the same app.") 'Intel Application Optimization' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'laptop-nvcaps'; Cat = 'Power'; Icon = [char]0xE945; Action = 'Show how'; Lat = $true
+       Requires = { (Test-LaptopChassis) -and [bool](Get-GpuIds | Where-Object { $_ -match 'VEN_10DE' }) }
+       Title = 'Laptop: NVIDIA WhisperMode and Battery Boost off'
+       Desc  = 'Two NVIDIA laptop features cap your FPS without saying so: WhisperMode (quiet fans, 60 FPS in competitive games, also when plugged in) and Battery Boost (about 30 FPS on battery).'
+       Warn  = 'You want a quiet laptop or longer battery life more than FPS.'
+       Source = 'https://www.nvidia.com/en-us/geforce/news/nvidia-geforce-gtx-whispermode-for-laptops/'
+       Run   = { [void](Show-ZdDialog ("In the NVIDIA App (or GeForce Experience on older drivers), open Settings or Graphics and look for:`n`n- WhisperMode: Off.`n- Battery Boost: Off, or raise its frame limit.`n`nThe exact place differs between driver versions; if your laptop has neither, nothing caps FPS here. Restart the game afterwards. To undo, switch them on again.") 'NVIDIA laptop FPS caps' 'OK' 'Information'); 'Shown.' } }
+
+    # ---------------------------------------------------------------- games (in-game settings the publishers document)
+    @{ Id = 'apex-datacenter'; Cat = 'ApexLegends'; Icon = [char]0xE968; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'apex' }
+       Title = 'Apex Legends: choose your data center'
+       Desc  = 'Apex lists every data center with its ping and packet loss on the title screen. Picking the nearest one with 0% loss avoids being placed far away. Nothing is changed by ZeroDelay.'
+       Warn  = 'You queue with friends in another region.'
+       Source = 'https://help.ea.com/en/help/apex-legends/apex-legends/ping-data-center/'
+       Run   = { [void](Show-ZdDialog ("1. Start Apex and stay on the title screen (do not press Continue).`n2. Click Data Center at the bottom left.`n3. Pick the lowest ping with 0% packet loss.`n`nEA Help: a far data center causes high ping and packet loss. To undo, pick another one the same way.") 'Apex Legends data center' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'val-netbuffer'; Cat = 'Valorant'; Icon = [char]0xE968; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'valorant' }
+       Title = 'VALORANT: Network Buffering on Minimum'
+       Desc  = 'Network Buffering sets how many movement updates the game holds before showing them. A Riot developer: prefer Minimum as long as your connection is stable, because more buffering shows enemies later.'
+       Warn  = 'Your connection has packet loss or jitter: then Moderate smooths movement at the cost of some delay.'
+       Source = 'https://devtrackers.gg/valorant/p/ea44f53c-network-buffering-setting-does-nothing'
+       Run   = { [void](Show-ZdDialog ("Settings > General > Network Buffering: Minimum.`n`nTo see whether your connection allows it: Settings > Video > Stats > Network Round Trip Time and Packet Loss: Text Only. If packet loss shows up during matches, go back to Moderate.`n`nThe setting is saved to your Riot account, so ZeroDelay shows where it is instead of changing it (Vanguard is never touched).") 'VALORANT network buffering' 'OK' 'Information'); 'Shown.' } }
+
+    @{ Id = 'r6-datacenter'; Cat = 'R6Siege'; Icon = [char]0xE968; Action = 'Show how'; Lat = $true
+       Requires = { Test-GameInstalled 'r6siege' }
+       Title = 'Siege: play on your lowest-ping data center'
+       Desc  = 'Siege can pin you to one data center instead of picking automatically. Ubisoft staff describe the DataCenterHint setting in GameSettings.ini. ZeroDelay shows your current value and the data centers your file lists.'
+       Warn  = 'You travel or play with a party in another region. Not confirmed for Siege X yet: if the game ignores it, nothing changes.'
+       Source = 'https://devtrackers.gg/r6-siege/p/bb8a00f7-connectivity-multiplayer-server-issues'
+       Run   = { [void](Show-ZdDialog (Get-R6DataCenterReport) 'Siege data center' 'OK' 'Information'); 'Shown.' } }
+
+    # ---------------------------------------------------------------- network
+    @{ Id = 'wifi-drops'; Cat = 'Network'; Icon = [char]0xE701; Action = 'Check'; Lat = $true
+       Requires = { [bool](Get-WifiAdapters).Count }
+       Title = 'Check Wi-Fi drops during play'
+       Desc  = 'Reads Windows'' own Wi-Fi log for the last 24 hours. Repeated disconnects (router band steering, a mesh node switch, a weak signal) cause lag spikes of a few seconds that a ping test between drops never shows.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/advanced-troubleshooting-wireless-network-connectivity'
+       Run   = { [void](Show-ZdDialog (Get-WifiDropReport) 'Wi-Fi drops' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'rxbuffers'; Cat = 'Network'; Icon = [char]0xE839; Rec = $false; Lat = $true; Badge = 'advanced'
+       Requires = { [bool](Get-RxDropAdapters).Count -or (Test-TweakHasBackup 'rxbuffers') }
+       Title = 'Network card dropping packets: more receive buffers'
+       Desc  = 'Your network card threw away incoming packets because its receive buffers were full. This doubles Receive Buffers (up to what the driver allows), so bursts of game traffic are not dropped. Shown only when it happens.'
+       Warn  = 'You are on a laptop on battery. Bigger buffers do not lower delay by themselves; they only stop drops. Applying briefly reconnects the adapter.'
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/network/keywords-that-can-be-edited'
+       Test  = { if ($script:Backup.Custom.ContainsKey('rxbuffers')) { $true } elseif ((Get-RxDropAdapters).Count) { $false } else { $null } }
+       On    = { Set-RxBuffersUp 'rxbuffers' }
+       Off   = { Reset-AdvPropEach 'rxbuffers' '*ReceiveBuffers' { param($n) $null } } }
 )
 
 # --- NVIDIA driver profile DWORD settings: Nv = @{ Profile; Id; V }. Originals are backed up and restored.
@@ -11468,10 +11697,16 @@ function Set-Applied([string]$Id, [bool]$On) {
     $script:Backup.Custom['applied'] = $list
 }
 
+# Sticky/Filter/Toggle Keys: Windows keeps a live copy of the registry flags. The live copy is set from the registry
+# AFTER the registry change, so the backup holds the user's real original (writing it first also writes the registry).
+function Sync-AccessKeysLive {
+    $f = foreach ($k in 'StickyKeys', 'Keyboard Response', 'ToggleKeys') { $v = 0; [void][uint32]::TryParse("$(Get-RegValue "HKCU:\Control Panel\Accessibility\$k" 'Flags')", [ref]$v); $v }
+    if ($f -notcontains 0) { try { [void][AccessKeys]::Write($f[0], $f[1], $f[2]) } catch {} }
+}
 function Invoke-TweakOn($t) {
-    if ($t.Id -eq 'sticky') { try { [void][AccessKeys]::Write(506, 122, 58) } catch {} }
     if ($t.On) { & $t.On } elseif ($t.Reg) { Enable-RegTweak $t } elseif ($t.Ini) { Enable-IniTweak $t }
     elseif ($t.Power) { Enable-PowerTweak $t } elseif ($t.Dx) { Enable-DxTweak $t } elseif ($t.Tasks) { Enable-TaskTweak $t } elseif ($t['Remove']) { Enable-RemoveTweak $t } elseif ($t.Nv) { Enable-NvTweak $t } elseif ($t.Cs) { Enable-CsTweak $t }
+    if ($t.Id -eq 'sticky') { Sync-AccessKeysLive }
     if ($t.After) { & $t.After }
     Set-Applied $t.Id $true
     Save-Backup
@@ -11480,9 +11715,9 @@ function Invoke-TweakOn($t) {
     Clear-ReadCache
 }
 function Invoke-TweakOff($t) {
-    if ($t.Id -eq 'sticky') { try { [void][AccessKeys]::Write(510, 126, 62) } catch {} }
     if ($t.Off) { & $t.Off } elseif ($t.Reg) { Disable-RegTweak $t } elseif ($t.Ini) { Disable-IniTweak $t }
     elseif ($t.Power) { Disable-PowerTweak $t } elseif ($t.Dx) { Disable-DxTweak $t } elseif ($t.Tasks) { Disable-TaskTweak $t } elseif ($t['Remove']) { Disable-RemoveTweak $t } elseif ($t.Nv) { Disable-NvTweak $t } elseif ($t.Cs) { Disable-CsTweak $t }
+    if ($t.Id -eq 'sticky') { Sync-AccessKeysLive }
     if ($t.After) { & $t.After }
     Set-Applied $t.Id $false
     Save-Backup
@@ -11586,7 +11821,8 @@ foreach ($t in $Tweaks) { if ($Gtx1080Ids -contains $t.Id) { $t.Gtx = $true } }
 $NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn-matchdc', 'fn-pingtruth', 'starlink-check',
             'fn-presentmode', 'fn-latencytest', 'fn-gpubound', 'fn-extlimiters', 'fn-aimreadout', 'fn-inputpool',
             'pack-scan', 'repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services',
-            'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready')
+            'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready',
+            'colorfilter', 'nvllm-global', 'laptop-mux', 'intel-apo', 'laptop-nvcaps', 'apex-datacenter', 'val-netbuffer', 'r6-datacenter', 'wifi-drops', 'rxbuffers')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
@@ -11597,21 +11833,32 @@ $script:FortniteExe = Find-FortniteExe
 
 # --- Appearance. Dark is the design palette; light mode maps each dark colour to its light partner.
 #     Accent = [text/icon colour, button fill (white text on it), soft tint behind icons].
+#     2.0 design tokens (design\DESIGN.md): six accents; dark-mode buttons carry near-black text, because white text
+#     fails 4.5:1 on every one of them. Light mode uses darker partners (>= 5:1 on white) with white button text.
 $Accents = [ordered]@{
-    blue     = @{ Name = 'Blue';     Dark = '0A84FF', '0071E3', '273A4F'; Light = '0071E3', '0071E3', 'DCEBFB' }
-    indigo   = @{ Name = 'Indigo';   Dark = '7D7AFF', '5856D6', '2E2D52'; Light = '5856D6', '5856D6', 'E6E5FB' }
-    purple   = @{ Name = 'Purple';   Dark = 'BF5AF2', '9A3FD0', '3F2A4F'; Light = '9A3FD0', '9A3FD0', 'F1E4FA' }
-    pink     = @{ Name = 'Pink';     Dark = 'FF5C7A', 'D6204A', '4F2630'; Light = 'D6204A', 'D6204A', 'FBE1E7' }
-    teal     = @{ Name = 'Teal';     Dark = '40C8E0', '0B7F93', '1F4048'; Light = '0B7F93', '0B7F93', 'D9F1F5' }
-    graphite = @{ Name = 'Graphite'; Dark = 'AEAEB2', '636366', '3A3A3C'; Light = '6E6E73', '636366', 'E5E5EA' }
+    cyan    = @{ Name = 'Cyan';            Dark = '2EE6D6', '2EE6D6', '133232'; Light = '0E7469', '0E7469', 'E2EEED' }
+    blue    = @{ Name = 'Electric blue';   Dark = '3D8BFF', '3D8BFF', '162439'; Light = '2459E0', '2459E0', 'E5EBFB' }
+    volt    = @{ Name = 'Volt green';      Dark = 'B6F23D', 'B6F23D', '29341A'; Light = '4D7007', '4D7007', 'EAEEE1' }
+    orange  = @{ Name = 'Orange';          Dark = 'FF8A3D', 'FF8A3D', '35241A'; Light = 'B34700', 'B34700', 'F6E9E0' }
+    magenta = @{ Name = 'Magenta';         Dark = 'FF4FD8', 'FF4FD8', '351A33'; Light = 'BF0A98', 'BF0A98', 'F7E2F3' }
+    purple  = @{ Name = 'Fortnite purple'; Dark = '9D5CFF', '9D5CFF', '251C39'; Light = '7B33EC', '7B33EC', 'EFE7FD' }
 }
+# accent values saved by 1.19 and earlier (the 'accent' setting key is unchanged)
+$AccentMigration = @{ teal = 'cyan'; pink = 'magenta'; indigo = 'blue'; graphite = 'cyan' }
+# Text on an accent button. '0A0B0C' is a placeholder colour in the XAML that only this map resolves.
+$OnAccentDark = '07080A'; $OnAccentLight = 'FFFFFF'
+# Light mode: every design-palette colour (left) to its light token. The second block maps the 2.0 dark token values,
+# which new components write directly, to their light partners.
 $LightMap = @{
-    '1C1C1E' = 'F2F2F7'; '262628' = 'EBEBF0'; '2C2C2E' = 'FFFFFF'; '3A3A3C' = 'E8E8ED'; '48484A' = 'D2D2D7'; '38383A' = 'E0E0E5'
-    'F5F5F7' = '1D1D1F'; 'A1A1A6' = '6E6E73'; '98989D' = '86868B'; '8E8E93' = '86868B'; 'D1D1D6' = '3A3A3C'; 'E5E5EA' = '2C2C2E'
-    '5A5A5E' = 'B0B0B5'; '6E6E73' = 'A1A1A6'; '4D4D50' = 'C4C4C9'; '636366' = 'C7C7CC'; '4A4A4D' = 'C7C7CC'; '444446' = 'DADADF'
-    '3D3D41' = 'DCDCE1'; '38383B' = 'D8D8DD'; '303033' = 'EDEDF2'; '2C2C2F' = 'FFFFFF'; '3A3A3D' = 'FFFFFF'; '48484B' = 'D2D2D7'
-    '30D158' = '1FA34A'; 'FF9F0A' = 'D97706'; 'FF453A' = 'DC2626'; 'FFD60A' = 'B58900'
-    '2D4635' = 'D7F2DF'; '22382A' = 'E6F6EA'; '2F5A3D' = 'B9E3C6'; '4E3E28' = 'FCEBD2'
+    '1C1C1E' = 'F6F7F9'; '262628' = 'EEF0F3'; '2C2C2E' = 'FFFFFF'; '3A3A3C' = 'ECEEF2'; '48484A' = 'CDD2D9'; '38383A' = 'E3E6EA'
+    'F5F5F7' = '0B0D10'; 'A1A1A6' = '5A6472'; '98989D' = '626B77'; '8E8E93' = '626B77'; 'D1D1D6' = '2B323B'; 'E5E5EA' = '1A1E24'
+    '5A5A5E' = 'B4BBC4'; '6E6E73' = '9AA3AF'; '4D4D50' = 'C4CAD2'; '636366' = 'C4CAD2'; '4A4A4D' = 'CDD2D9'; '444446' = 'DDE1E6'
+    '3D3D41' = 'E3E6EA'; '38383B' = 'E8EBEF'; '303033' = 'F0F2F5'; '2C2C2F' = 'FFFFFF'; '3A3A3D' = 'E3E6EA'; '48484B' = 'CDD2D9'
+    '30D158' = '157A43'; 'FF9F0A' = '8A5E06'; 'FF453A' = 'C81E1E'; 'FFD60A' = '8A6A00'
+    '2D4635' = 'E3F1E9'; '22382A' = 'EEF7F1'; '2F5A3D' = 'C7E4D3'; '4E3E28' = 'F6EBD6'
+    '07080A' = 'F6F7F9'; '0A0B0E' = 'EEF0F3'; '0E1013' = 'FFFFFF'; '15181D' = 'F0F2F5'; '1A1E24' = 'ECEEF2'; '1F242B' = 'E3E6EA'
+    '2B323B' = 'CDD2D9'; 'F2F4F7' = '0B0D10'; '9AA3AF' = '5A6472'; '7A8390' = '626B77'
+    '3DDC84' = '157A43'; 'F5B83D' = '8A5E06'; 'FF5C5C' = 'C81E1E'; '6CA8FF' = '1D63D6'
 }
 function Get-SystemTheme {
     $v = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue).AppsUseLightTheme
@@ -11619,23 +11866,30 @@ function Get-SystemTheme {
 }
 $script:ThemeMode = if ($env:ZD_THEME) { $env:ZD_THEME } elseif ($script:Backup.Custom['theme']) { "$($script:Backup.Custom['theme'])" } else { 'dark' }
 $script:Theme = switch ($script:ThemeMode) { 'light' { 'light' } 'system' { Get-SystemTheme } default { 'dark' } }
-$script:Accent = if ($env:ZD_ACCENT) { $env:ZD_ACCENT } elseif ($script:Backup.Custom['accent']) { "$($script:Backup.Custom['accent'])" } else { 'blue' }
-if (-not $Accents.Contains($script:Accent)) { $script:Accent = 'blue' }
+$script:Accent = if ($env:ZD_ACCENT) { $env:ZD_ACCENT } elseif ($script:Backup.Custom['accent']) { "$($script:Backup.Custom['accent'])" } else { 'cyan' }
+if ($AccentMigration.ContainsKey($script:Accent)) { $script:Accent = $AccentMigration[$script:Accent] }
+if (-not $Accents.Contains($script:Accent)) { $script:Accent = 'cyan' }
 [ZdTheme]::Map.Clear()
 if ($script:Theme -eq 'light') { foreach ($k in $LightMap.Keys) { [ZdTheme]::Map[$k] = $LightMap[$k] } }
 else {
-    # Dark is true black: black window, near-black panels, very dark greys for controls
-    $DarkMap = @{ '1C1C1E' = '000000'; '262628' = '0A0A0B'; '2C2C2E' = '131314'; '3A3A3C' = '1F1F21'; '48484A' = '2C2C2F'; '38383A' = '1E1E20'
-                  '303033' = '18181A'; '38383B' = '121214'; '3D3D41' = '242427'; '444446' = '28282B'; '4D4D50' = '3A3A3D'; '4A4A4D' = '303033'
-                  '2C2C2F' = '0F0F10'; '3A3A3D' = '1A1A1C'; '48484B' = '2A2A2D'; '5A5A5E' = '3A3A3E'; '6E6E73' = '4A4A4E' }
+    # Dark (2.0 tokens): true-black base, tone-on-tone surfaces with 1-px borders, cool-grey text
+    $DarkMap = @{ '1C1C1E' = '07080A'; '262628' = '0A0B0E'; '2C2C2E' = '0E1013'; '3A3A3C' = '1A1E24'; '48484A' = '2B323B'; '38383A' = '1F242B'
+                  '303033' = '15181D'; '38383B' = '121519'; '3D3D41' = '1A1E24'; '444446' = '22272E'; '4D4D50' = '2B323B'; '4A4A4D' = '262C34'
+                  '2C2C2F' = '0E1013'; '3A3A3D' = '1F242B'; '48484B' = '2B323B'; '5A5A5E' = '3A424C'; '6E6E73' = '4A535E'
+                  'F5F5F7' = 'F2F4F7'; 'A1A1A6' = '9AA3AF'; '98989D' = '7A8390'; '8E8E93' = '7A8390'; 'D1D1D6' = 'C5CCD5'; 'E5E5EA' = 'DCE1E7'
+                  '30D158' = '3DDC84'; 'FF9F0A' = 'F5B83D'; 'FF453A' = 'FF5C5C'
+                  '2D4635' = '12271D'; '22382A' = '101F18'; '2F5A3D' = '1A4030'; '4E3E28' = '2A2215' }
     foreach ($k in $DarkMap.Keys) { [ZdTheme]::Map[$k] = $DarkMap[$k] }
 }
 $acc = if ($script:Theme -eq 'light') { $Accents[$script:Accent].Light } else { $Accents[$script:Accent].Dark }
 [ZdTheme]::Map['0A84FF'] = $acc[0]; [ZdTheme]::Map['0071E3'] = $acc[1]; [ZdTheme]::Map['273A4F'] = $acc[2]
+[ZdTheme]::Map['0A0B0C'] = $(if ($script:Theme -eq 'light') { $OnAccentLight } else { $OnAccentDark })
+# motion for the 2.0 components: one duration, zero when Windows animations are off
+[ZdTheme]::Literal.Add((New-Object 'Collections.Generic.KeyValuePair[string,string]' '{MotionFast}', $(if ([Windows.SystemParameters]::ClientAreaAnimation) { '0:0:0.14' } else { '0:0:0' })))
 
 # --- Glass: the window shows Windows 11's frosted (acrylic) backdrop and every panel becomes translucent glass with a light
 #     top edge. Windows 10 and older Windows 11 builds keep the solid look.
-$glassPref = if ($env:ZD_GLASS) { $env:ZD_GLASS -ne '0' } elseif ($script:Backup.Custom.ContainsKey('glass')) { [bool]$script:Backup.Custom['glass'] } else { $true }
+$glassPref = if ($env:ZD_GLASS) { $env:ZD_GLASS -ne '0' } elseif ($script:Backup.Custom.ContainsKey('glass')) { [bool]$script:Backup.Custom['glass'] } else { $false }   # 2.0: depth by tone, glass is opt-in
 $script:GlassSetting = [bool]$glassPref
 $script:Glass = $script:GlassSetting -and [Environment]::OSVersion.Version.Build -ge 22621 -and -not [Windows.SystemParameters]::HighContrast
 if ($script:Glass) {
@@ -11677,6 +11931,98 @@ if ($script:Glass) {
     <SolidColorBrush x:Key="GreenTint" Color="#2D4635"/>
     <SolidColorBrush x:Key="Orange" Color="#FF9F0A"/>
     <SolidColorBrush x:Key="Red" Color="#FF453A"/>
+    <!-- ===== 2.0 design tokens (design\DESIGN.md). Written in dark values; the light map converts them. ===== -->
+    <SolidColorBrush x:Key="Bg.Base" Color="#07080A"/>
+    <SolidColorBrush x:Key="Bg.Surface" Color="#0E1013"/>
+    <SolidColorBrush x:Key="Bg.Raised" Color="#15181D"/>
+    <SolidColorBrush x:Key="Border.Subtle" Color="#1F242B"/>
+    <SolidColorBrush x:Key="Border.Strong" Color="#2B323B"/>
+    <SolidColorBrush x:Key="Text.Primary" Color="#F2F4F7"/>
+    <SolidColorBrush x:Key="Text.Secondary" Color="#9AA3AF"/>
+    <SolidColorBrush x:Key="Text.Muted" Color="#7A8390"/>
+    <SolidColorBrush x:Key="Good" Color="#3DDC84"/>
+    <SolidColorBrush x:Key="Warn" Color="#F5B83D"/>
+    <SolidColorBrush x:Key="Bad" Color="#FF5C5C"/>
+    <SolidColorBrush x:Key="Info" Color="#6CA8FF"/>
+    <SolidColorBrush x:Key="Good.Soft" Color="#1F3DDC84"/>
+    <SolidColorBrush x:Key="Warn.Soft" Color="#1FF5B83D"/>
+    <SolidColorBrush x:Key="Bad.Soft" Color="#1FFF5C5C"/>
+    <SolidColorBrush x:Key="Info.Soft" Color="#1F6CA8FF"/>
+    <SolidColorBrush x:Key="Accent.Soft" Color="#273A4F"/>
+    <SolidColorBrush x:Key="Accent.OnAccent" Color="#0A0B0C"/>
+    <FontFamily x:Key="Font.UI">Segoe UI Variable Text, Segoe UI</FontFamily>
+    <FontFamily x:Key="Font.Display">Segoe UI Variable Display, Segoe UI</FontFamily>
+    <FontFamily x:Key="Font.Mono">Cascadia Mono, Consolas</FontFamily>
+    <FontFamily x:Key="Font.Icons">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+    <Style x:Key="Zd.FocusRing">
+      <Setter Property="Control.Template"><Setter.Value><ControlTemplate>
+        <Border Margin="-3" CornerRadius="11" BorderThickness="2" BorderBrush="{DynamicResource AccentFill}"/>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <!-- 2.0 primary button: accent fill, on-accent text, 36 px, hover/press overlays, no glow -->
+    <Style x:Key="Zd.Button.Primary" TargetType="Button">
+      <Setter Property="Background" Value="{DynamicResource AccentFill}"/>
+      <Setter Property="Foreground" Value="{DynamicResource Accent.OnAccent}"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Padding" Value="16,0"/>
+      <Setter Property="MinHeight" Value="36"/>
+      <Setter Property="MinWidth" Value="36"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource Zd.FocusRing}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Grid x:Name="Root">
+              <Border CornerRadius="8" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"/>
+              <Border x:Name="Hover" CornerRadius="8" Background="#1AFFFFFF" Opacity="0"/>
+              <Border x:Name="Press" CornerRadius="8" Background="#26000000" Opacity="0"/>
+              <ContentPresenter Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Hover" Storyboard.TargetProperty="Opacity" To="1" Duration="{MotionFast}"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+                <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Hover" Storyboard.TargetProperty="Opacity" To="0" Duration="{MotionFast}"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True"><Setter TargetName="Press" Property="Opacity" Value="1"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Root" Property="Opacity" Value="0.4"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Zd.Button.Secondary" TargetType="Button" BasedOn="{StaticResource Zd.Button.Primary}">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{DynamicResource Text.Primary}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource Border.Strong}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+    </Style>
+    <Style x:Key="Zd.Button.Ghost" TargetType="Button" BasedOn="{StaticResource Zd.Button.Primary}">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{DynamicResource Text.Secondary}"/>
+      <Setter Property="FontWeight" Value="Medium"/>
+      <Setter Property="Padding" Value="10,0"/>
+      <Setter Property="MinHeight" Value="32"/>
+    </Style>
+    <!-- 2.0 card: tone + 1 px border, no shadow; hover only brightens the border -->
+    <Style x:Key="Zd.Card" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource Bg.Surface}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource Border.Subtle}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="12"/>
+      <Setter Property="Padding" Value="16"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="BorderBrush" Value="{DynamicResource Border.Strong}"/></Trigger></Style.Triggers>
+    </Style>
+    <Style x:Key="Zd.Chip" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource Bg.Raised}"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="8,3,9,4"/>
+      <Setter Property="Margin" Value="0,0,6,6"/>
+      <Setter Property="TextElement.FontSize" Value="12"/>
+      <Setter Property="TextElement.Foreground" Value="{DynamicResource Text.Secondary}"/>
+    </Style>
     <!-- Glass panels: a soft top-to-bottom fill and a lit top edge. Replaced with real gradients when glass is on. -->
     <LinearGradientBrush x:Key="GlassFill" StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#2C2C2F" Offset="0"/><GradientStop Color="#2C2C2F" Offset="1"/></LinearGradientBrush>
     <LinearGradientBrush x:Key="GlassEdge" StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#3A3A3D" Offset="0"/><GradientStop Color="#3A3A3D" Offset="1"/></LinearGradientBrush>
@@ -11706,7 +12052,7 @@ if ($script:Glass) {
             <Viewbox Stretch="Uniform">
               <Grid Width="40" Height="24" Background="Transparent">
                 <Border x:Name="Track" CornerRadius="12" Background="{StaticResource FillStrong}"/>
-                <Border x:Name="OnTrack" CornerRadius="12" Background="{StaticResource Green}" Opacity="0"/>
+                <Border x:Name="OnTrack" CornerRadius="12" Background="{StaticResource AccentFill}" Opacity="0"/>
                 <Grid x:Name="Knob" Width="20" Height="20" HorizontalAlignment="Left" Margin="2,0,0,0">
                   <Grid.RenderTransform><TranslateTransform X="0"/></Grid.RenderTransform>
                   <Ellipse Fill="#40000000" Margin="0,1,0,-1"/>
@@ -11823,30 +12169,22 @@ if ($script:Glass) {
               <Border x:Name="Bg" CornerRadius="8" Background="{TemplateBinding Background}"/>
               <Border x:Name="Hover" CornerRadius="8" Background="White" Opacity="0"/>
               <Border x:Name="Press" CornerRadius="8" Background="Black" Opacity="0"/>
-              <ContentPresenter Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              <ContentPresenter x:Name="CP" Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Grid>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Hover" Property="Opacity" Value="0.08"/></Trigger>
               <Trigger Property="IsPressed" Value="True"><Setter TargetName="Press" Property="Opacity" Value="0.2"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Root" Property="Opacity" Value="0.4"/></Trigger>
+              <!-- 2.0: text on an accent fill uses the on-accent colour (near-black in dark mode: white fails 4.5:1 on
+                   every accent). A template setter outranks the Foreground the code sets on the button itself. -->
+              <DataTrigger Binding="{Binding Background.Color, RelativeSource={RelativeSource TemplatedParent}}" Value="#0071E3">
+                <Setter TargetName="CP" Property="TextElement.Foreground" Value="#0A0B0C"/>
+              </DataTrigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
       </Setter>
-      <!-- accent ("do it") buttons glow, brighter under the mouse, none while disabled -->
-      <Style.Triggers>
-        <DataTrigger Binding="{Binding Background.Color, RelativeSource={RelativeSource Self}}" Value="#0071E3">
-          <Setter Property="Effect"><Setter.Value><DropShadowEffect Color="#0071E3" BlurRadius="26" ShadowDepth="0" Opacity="0.7" RenderingBias="Performance"/></Setter.Value></Setter>
-        </DataTrigger>
-        <MultiDataTrigger>
-          <MultiDataTrigger.Conditions>
-            <Condition Binding="{Binding Background.Color, RelativeSource={RelativeSource Self}}" Value="#0071E3"/>
-            <Condition Binding="{Binding IsMouseOver, RelativeSource={RelativeSource Self}}" Value="True"/>
-          </MultiDataTrigger.Conditions>
-          <Setter Property="Effect"><Setter.Value><DropShadowEffect Color="#0071E3" BlurRadius="34" ShadowDepth="0" Opacity="1" RenderingBias="Performance"/></Setter.Value></Setter>
-        </MultiDataTrigger>
-        <Trigger Property="IsEnabled" Value="False"><Setter Property="Effect" Value="{x:Null}"/></Trigger>
-      </Style.Triggers>
+      <!-- 2.0: accent buttons no longer glow (no neon; depth comes from tone) -->
     </Style>
 
     <!-- (i) affordance on cards for 'Not recommended if...': quiet grey, brightens on hover. Used by New-Card (x:Name Warn). -->
@@ -12311,8 +12649,17 @@ if ($script:Glass) {
       </Grid>
       <StackPanel Grid.Row="1">
       <StackPanel x:Name="ChipBar" Margin="32,0,32,4" Visibility="Collapsed">
-        <WrapPanel x:Name="ChipViews"/>
-        <WrapPanel x:Name="ChipAreas" Margin="0,2,0,0"/>
+        <!-- 2.0: views as a segmented control, the result count and "Turn on all shown" on the right, area chips below -->
+        <Grid Margin="0,0,0,10">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <Border x:Name="ChipViewsBox" HorizontalAlignment="Left" Background="{DynamicResource Bg.Surface}" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1" CornerRadius="10" Padding="3">
+            <WrapPanel x:Name="ChipViews"/>
+          </Border>
+          <TextBlock x:Name="ResultCount" Grid.Column="1" FontSize="13" Foreground="{DynamicResource Text.Muted}" VerticalAlignment="Center" Margin="16,0,12,0"/>
+          <Button x:Name="ShowAllOn" Grid.Column="2" Content="Turn on all shown" Style="{StaticResource Zd.Button.Secondary}" MinHeight="32" FontSize="13" Padding="12,0" Visibility="Collapsed"
+                  ToolTip="Opens Boost now with every card shown here that is off. You still see the list and choose before anything changes."/>
+        </Grid>
+        <WrapPanel x:Name="ChipAreas"/>
       </StackPanel>
       <Border x:Name="UpdateBar" Margin="32,0,32,12" Background="#2C2C2E" BorderBrush="#38383A" BorderThickness="1" CornerRadius="12" Padding="12,12,16,12" Visibility="Collapsed">
         <Grid>
@@ -12367,20 +12714,31 @@ if ($script:Glass) {
       <ScrollViewer x:Name="Scroller" Grid.Row="2" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="18,0,2,18">
         <WrapPanel x:Name="Cards" Margin="14,14,14,14"/>
       </ScrollViewer>
+      <!-- 2.0: shown when filters or search match no card -->
+      <Border x:Name="EmptyState" Grid.Row="2" Visibility="Collapsed" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="32,14,32,0" MaxWidth="520"
+              Background="{DynamicResource Bg.Surface}" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1" CornerRadius="12" Padding="20">
+        <StackPanel>
+          <TextBlock Text="&#xE721;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="20" Foreground="{DynamicResource Text.Muted}"/>
+          <TextBlock x:Name="EmptyTitle" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource Text.Primary}" Margin="0,10,0,0" TextWrapping="Wrap"/>
+          <TextBlock x:Name="EmptyText" FontSize="13" Foreground="{DynamicResource Text.Secondary}" Margin="0,4,0,14" TextWrapping="Wrap"/>
+          <Button x:Name="EmptyReset" Content="Show everything" Style="{StaticResource Zd.Button.Secondary}" HorizontalAlignment="Left"/>
+        </StackPanel>
+      </Border>
       <ContentControl x:Name="PageHost" Grid.Row="2" Visibility="Collapsed"/>
       <Grid Grid.Row="3" Margin="32,2,26,12">
         <TextBlock x:Name="StripNote" FontSize="11" Foreground="#98989D" VerticalAlignment="Center"/>
         <StackPanel x:Name="StripItems" Orientation="Horizontal" HorizontalAlignment="Right"/>
       </Grid>
 
-      <Grid x:Name="Toast" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,28" Visibility="Collapsed">
-        <Border CornerRadius="14" Background="#3A3A3D">
+      <Grid x:Name="Toast" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Right" Margin="0,0,28,24" Visibility="Collapsed">
+        <Border CornerRadius="12" Background="#15181D">
           <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.45" Color="Black"/></Border.Effect>
         </Border>
-        <Border CornerRadius="14" Background="#3A3A3D" BorderBrush="#48484B" BorderThickness="1" Padding="14,10,18,10">
+        <Border CornerRadius="12" Background="#15181D" BorderBrush="#2B323B" BorderThickness="1" Padding="14,10,14,10">
           <StackPanel Orientation="Horizontal">
             <TextBlock x:Name="ToastIcon" Text="&#xE73E;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="15" Foreground="#30D158" VerticalAlignment="Center" Margin="0,0,10,0" Visibility="Collapsed"/>
             <TextBlock x:Name="ToastText" FontSize="13" FontWeight="Medium" Foreground="#F5F5F7" TextWrapping="Wrap" MaxWidth="560" VerticalAlignment="Center" LineHeight="18" LineStackingStrategy="BlockLineHeight"/>
+            <Button x:Name="ToastUndo" Content="Undo" Style="{StaticResource Zd.Button.Ghost}" Foreground="{DynamicResource Accent}" MinHeight="28" Margin="12,-4,-6,-4" Visibility="Collapsed"/>
           </StackPanel>
         </Border>
       </Grid>
@@ -12488,9 +12846,9 @@ if (Test-Path $LogoIco) {
     try { $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$LogoIco, 'None', 'OnLoad') } catch {}
 }
 $ui = @{}
-foreach ($n in 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
+foreach ($n in 'ChipViewsBox', 'ResultCount', 'ShowAllOn', 'EmptyState', 'EmptyTitle', 'EmptyText', 'EmptyReset', 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
-            'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon',
+            'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon', 'ToastUndo',
             'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
@@ -12646,57 +13004,60 @@ function New-SectionHeader($t) {
 function New-Card($t) {
     if ($t.Header) { return New-SectionHeader $t }
     if ($t.Extra -eq 'builder') { return New-PotatoStudio $t }
-    $badge = ''
+    # 2.0 TweakCard (design\DESIGN.md): icon, title and control on one line; what it does; "Don't use if" on the card
+    # face, not in a tooltip; tags. Named parts other code uses: Toggle, ActionBtn, Extra, Warn, ActivePill, RecTag.
+    $tags = New-Object Collections.Generic.List[string]
+    if ($t.Lat) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' ToolTip='Affects input delay, frame time or ping'><StackPanel Orientation='Horizontal'><Ellipse Width='6' Height='6' Fill='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock Text='Input delay'/></StackPanel></Border>") }
+    if ($t.Rec) { $tags.Add("<Border x:Name='RecTag' Style='{DynamicResource Zd.Chip}' ToolTip='Included when you press Boost now'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource AccentFill}' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended'/></StackPanel></Border>") }
+    if ($t.New) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource Info.Soft}'><TextBlock Text='New' Foreground='{DynamicResource Info}'/></Border>") }
     if ($t.Badge) {
         $b = $BadgeInfo[$t.Badge]
-        $badge = "<StackPanel Orientation='Horizontal' Margin='0,12,14,0' Background='Transparent' Cursor='Help' ToolTip='$(Esc $b.Tip)'><Ellipse Width='7' Height='7' Fill='$($b.Color)' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock Text='$(Esc $b.Label)' FontSize='12' Foreground='#A1A1A6' VerticalAlignment='Center'/></StackPanel>"
+        $tone = if ($t.Badge -eq 'advanced') { 'Info' } else { 'Warn' }
+        $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $tone.Soft}' Cursor='Help' ToolTip='$(Esc $b.Tip)'><TextBlock Text='$(Esc $b.Label)' Foreground='{DynamicResource $tone}'/></Border>")
     }
+    $src = if ("$($t.Source)" -match '^https?://') { "$($t.Source)" } else { '' }
+    if ($src) { $tags.Add("<Border x:Name='SrcChip' Style='{DynamicResource Zd.Chip}' Cursor='Hand' ToolTip='$(Esc $src)'><TextBlock Text='Source &#x2197;'/></Border>") }
     if ($t.Id -eq 'vrrcap') { $c = Get-VrrCap; if ($c) { $t.Action = "Set $c FPS" } }
-    $pill = if ($t.Preset) { "<Border x:Name='ActivePill' Background='#2D4635' CornerRadius='10' Padding='8,2,9,3' Margin='0,0,8,0' VerticalAlignment='Center' Visibility='Collapsed'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Foreground='#30D158' VerticalAlignment='Center' Margin='0,1,4,0'/><TextBlock Text='Active' FontSize='11.5' FontWeight='SemiBold' Foreground='#30D158'/></StackPanel></Border>" } else { '' }
+    $pill = if ($t.Preset) { "<Border x:Name='ActivePill' Background='{DynamicResource Good.Soft}' CornerRadius='6' Padding='8,2,9,3' Margin='0,0,8,0' VerticalAlignment='Center' Visibility='Collapsed'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,4,0'/><TextBlock Text='Active' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Good}'/></StackPanel></Border>" } else { '' }
     $control = $pill + $(if ($t.Picker) { '' } elseif ($t.Action) {
-        "<Button x:Name='ActionBtn' Content='$(Esc $t.Action)' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12.5'/>"
+        "<Button x:Name='ActionBtn' Content='$(Esc $t.Action)' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='32' Padding='12,0' FontSize='13'/>"
     } else {
-        "<ToggleButton x:Name='Toggle' Style='{DynamicResource Switch}'/>"
+        "<ToggleButton x:Name='Toggle' Style='{DynamicResource Switch}' AutomationProperties.Name='$(Esc $t.Title)'/>"
     })
-    $recTag = if ($t.Rec) { "<StackPanel x:Name='RecTag' Orientation='Horizontal' Margin='0,12,14,0' VerticalAlignment='Center' Background='Transparent' ToolTip='Included when you press Apply recommended'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#30D158' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended' FontSize='12' FontWeight='Medium' Foreground='#A1A1A6' VerticalAlignment='Center'/></StackPanel>" } else { '' }
+    $glyph = '&#x{0:X};' -f [int][char]$t.Icon
     $cardXaml = @"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-        Style='{DynamicResource Card}' Width='342' Height='220' VerticalAlignment='Top' Margin='0,0,16,16' Padding='20'>
+        Style='{DynamicResource Zd.Card}' Width='342' Height='252' VerticalAlignment='Top' Margin='0,0,16,16' AutomationProperties.Name='$(Esc $t.Title)'>
   <Grid>
     <Grid.RowDefinitions>
-      <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/>
+      <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/>
     </Grid.RowDefinitions>
     <Grid>
-      <Border Width='32' Height='32' CornerRadius='8' HorizontalAlignment='Left' VerticalAlignment='Center' Background='$(if ($t.Lat) { '{DynamicResource GreenTint}' } else { '{DynamicResource Fill}' })' $(if ($t.Lat) { "ToolTip='Affects input delay, frame time or ping'" })>
-        <TextBlock Text='$([int][char]$t.Icon | ForEach-Object { '&#x{0:X};' -f $_ })' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='$(if ($t.Lat) { '{DynamicResource Green}' } else { '#D1D1D6' })' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <Border Width='32' Height='32' CornerRadius='8' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Top'>
+        <TextBlock Text='$glyph' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='$(if ($t.Lat) { '{DynamicResource Good}' } else { '{DynamicResource Text.Secondary}' })' HorizontalAlignment='Center' VerticalAlignment='Center'/>
       </Border>
-      <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' VerticalAlignment='Center'>$control</StackPanel>
+      <TextBlock Grid.Column='1' Text='$(Esc $t.Title)' ToolTip='$(Esc $t.Title)' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'
+                 TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='42' LineHeight='21' LineStackingStrategy='BlockLineHeight' VerticalAlignment='Center' Margin='12,0,10,0'/>
+      <StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Top'>$control</StackPanel>
     </Grid>
-    <TextBlock Grid.Row='1' Text='$(Esc $t.Title)' ToolTip='$(Esc $t.Title)' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Label}' TextTrimming='CharacterEllipsis' Margin='0,16,0,0'/>
-    <TextBlock Grid.Row='2' Text='$(Esc $t.Desc)' ToolTip='$(Esc $t.Desc)' Foreground='{DynamicResource Label2}' FontSize='13' LineHeight='18' LineStackingStrategy='BlockLineHeight'
-               TextWrapping='Wrap' TextTrimming='CharacterEllipsis' VerticalAlignment='Top' MaxHeight='55' Margin='0,4,0,0'/>
-    <ContentControl x:Name='Extra' Grid.Row='3' Margin='0,12,0,0'/>
-    <Grid Grid.Row='4'>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-      <StackPanel Orientation='Horizontal' VerticalAlignment='Bottom' ClipToBounds='True'>$recTag$badge</StackPanel>
-      <Border x:Name='Warn' Grid.Column='1' Style='{DynamicResource InfoLink}' VerticalAlignment='Bottom' Margin='8,12,-3,-3'
-              AutomationProperties.Name='Not recommended if' ToolTipService.InitialShowDelay='100' ToolTipService.ShowDuration='20000'>
-        <Border.ToolTip>
-          <StackPanel MaxWidth='300'>
-            <TextBlock Text='Not recommended if' FontWeight='SemiBold' Foreground='#FF9F0A'/>
-            <TextBlock Text='$(Esc $t.Warn)' Foreground='#D1D1D6' Margin='0,4,0,0' TextWrapping='Wrap' LineHeight='17' LineStackingStrategy='BlockLineHeight'/>
-          </StackPanel>
-        </Border.ToolTip>
-        <TextBlock Text='&#xE946;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15'/>
-      </Border>
+    <TextBlock Grid.Row='1' Text='$(Esc $t.Desc)' ToolTip='$(Esc $t.Desc)' Foreground='{DynamicResource Text.Secondary}' FontSize='13.5' LineHeight='19' LineStackingStrategy='BlockLineHeight'
+               TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='57' Margin='0,10,0,0'/>
+    <Grid x:Name='Warn' Grid.Row='2' Margin='0,8,0,0' ToolTip='$(Esc "Don't use if: $($t.Warn)")' AutomationProperties.Name='$(Esc "Don't use if: $($t.Warn)")'>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+      <TextBlock Text='&#xE946;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,6,0'/>
+      <TextBlock Grid.Column='1' FontSize='12' LineHeight='17' LineStackingStrategy='BlockLineHeight' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='34'>
+        <Run Text="Don't use if:" FontWeight='SemiBold'/> <Run Text='$(Esc $t.Warn)'/>
+      </TextBlock>
     </Grid>
+    <ContentControl x:Name='Extra' Grid.Row='3' Margin='0,10,0,0'/>
+    <WrapPanel Grid.Row='4' VerticalAlignment='Bottom' Margin='0,10,0,-6' ClipToBounds='True' MaxHeight='30'>$($tags -join '')</WrapPanel>
   </Grid>
 </Border>
 "@
     $card = [ZdTheme]::Parse($cardXaml)
-    $card.RenderTransform = New-Object Windows.Media.TranslateTransform
-    $card.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim -and $s.RenderTransform -is [Windows.Media.TranslateTransform]) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
-    $card.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim -and $s.RenderTransform -is [Windows.Media.TranslateTransform]) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
+    $sc = $card.FindName('SrcChip')
+    if ($sc) { $sc.Tag = $src; $sc.Add_MouseLeftButtonUp({ param($s, $e) Start-Process $s.Tag }) }
     $card.Tag = $t
     $t.Card = $card
     $t.Toggle = $card.FindName('Toggle')
@@ -12776,26 +13137,25 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
     $danger = $Icon -in 'Warning', 'Error' -and $btns.Count -gt 1
     $bx = ($btns | ForEach-Object {
         $isMain = $_ -eq $main
-        $bg = if ($isMain) { if ($danger) { " Background='#FF453A' Foreground='#FFFFFF'" } else { " Background='#0071E3' Foreground='#FFFFFF'" } } else { '' }
-        "<Button x:Name='B_$_' Content='$_' Style='{DynamicResource Btn}' MinWidth='96' Padding='16,8' Margin='8,0,0,0'$bg/>"
+        # 2.0: the main button is the accent (or Bad red for a risky yes); its text uses the on-accent colour, which
+        # passes 4.5:1 on both (white on the dark theme's red is only 3:1)
+        $bg = if ($isMain -and $danger) { " Background='#FF453A' Foreground='#0A0B0C'" } else { '' }   # Zd.Button.Primary is the accent already
+        $st = if ($isMain) { 'Zd.Button.Primary' } else { 'Zd.Button.Secondary' }
+        "<Button x:Name='B_$_' Content='$_' Style='{DynamicResource $st}' MinWidth='96' Margin='8,0,0,0'$bg/>"
     }) -join ''
     $dlg = [ZdTheme]::Parse(@"
 <Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
         Title='$(Esc $Title)' Width='480' SizeToContent='Height' WindowStyle='None' AllowsTransparency='True' Background='Transparent'
-        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='Segoe UI'>
+        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='Segoe UI Variable Text, Segoe UI'>
   <Grid Margin='24'>
-    <Border CornerRadius='20' Background='#2C2C2F'>
-      <Border.Effect><DropShadowEffect BlurRadius='40' ShadowDepth='10' Direction='270' Opacity='0.6' Color='Black'/></Border.Effect>
+    <Border CornerRadius='16' Background='#15181D'>
+      <Border.Effect><DropShadowEffect BlurRadius='32' ShadowDepth='8' Direction='270' Opacity='0.5' Color='Black'/></Border.Effect>
     </Border>
-    <Border x:Name='Card' CornerRadius='20' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' ClipToBounds='True'>
+    <Border x:Name='Card' CornerRadius='16' Background='#15181D' BorderBrush='#2B323B' BorderThickness='1' ClipToBounds='True'>
       <Grid>
-        <Ellipse Width='300' Height='300' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-120,-150,0,0' IsHitTestVisible='False'>
-          <Ellipse.Fill><RadialGradientBrush><GradientStop Color='$($look[1] -replace '^#', '#40')' Offset='0'/><GradientStop Color='$($look[1] -replace '^#', '#00')' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-        </Ellipse>
         <StackPanel Margin='26,24,24,20'>
           <StackPanel Orientation='Horizontal'>
-            <Border Width='42' Height='42' CornerRadius='12' Background='$($look[1] -replace '^#', '#33')'>
-              <Border.Effect><DropShadowEffect Color='$($look[1])' BlurRadius='18' ShadowDepth='0' Opacity='0.45'/></Border.Effect>
+            <Border Width='40' Height='40' CornerRadius='10' Background='$($look[1] -replace '^#', '#24')'>
               <TextBlock Text='&#x$('{0:X}' -f $look[0]);' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='19' Foreground='$($look[1])' HorizontalAlignment='Center' VerticalAlignment='Center'/>
             </Border>
             <TextBlock Text='$(Esc $Title)' FontSize='18' FontWeight='SemiBold' Foreground='{DynamicResource Label}' VerticalAlignment='Center' Margin='14,0,0,0' TextWrapping='Wrap' MaxWidth='330'/>
@@ -12811,7 +13171,7 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
 </Window>
 "@)
     $dlg.Resources.MergedDictionaries.Add($window.Resources)
-    Set-RoundClip $dlg.FindName('Card') 20
+    Set-RoundClip $dlg.FindName('Card') 16
     $dlg.FindName('Msg').Text = $Message
     $script:DlgResult = $escape
     foreach ($b in $btns) {
@@ -12849,8 +13209,11 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
 $script:ToastTimer = New-Object Windows.Threading.DispatcherTimer
 $script:ToastTimer.Interval = [TimeSpan]::FromSeconds(4.5)
 $script:ToastTimer.Add_Tick({ $script:ToastTimer.Stop(); Hide-Animated $ui.Toast 220 })
-function Show-Toast([string]$msg, [string]$color = '#F5F5F7') {
+# $Undo: an action that reverses what the toast reports; shows an Undo button and keeps the toast up for at least 8 s
+function Show-Toast([string]$msg, [string]$color = '#F5F5F7', [scriptblock]$Undo) {
     $ui.ToastText.Text = $msg
+    $script:ToastUndo = $Undo
+    $ui.ToastUndo.Visibility = if ($Undo) { 'Visible' } else { 'Collapsed' }
     $k = switch ($color) {
         { $_ -in '#30D158', '#30D158' } { @(0xE73E, '#30D158') }
         { $_ -in '#FF9F0A', '#FF9F0A' } { @(0xE7BA, '#FF9F0A') }
@@ -12864,9 +13227,11 @@ function Show-Toast([string]$msg, [string]$color = '#F5F5F7') {
     $ui.Toast.BeginAnimation([Windows.UIElement]::OpacityProperty, $null); $ui.Toast.Opacity = 1
     $ui.Toast.Visibility = 'Visible'
     if ($wasHidden) { Show-Animated $ui.Toast 16 280 }
-    $script:ToastTimer.Interval = [TimeSpan]::FromSeconds([Math]::Max(4.5, $msg.Length / 16))
+    $script:ToastTimer.Interval = [TimeSpan]::FromSeconds([Math]::Max($(if ($Undo) { 8 } else { 4.5 }), $msg.Length / 16))
     $script:ToastTimer.Stop(); $script:ToastTimer.Start()
 }
+
+$ui.ToastUndo.Add_Click({ $u = $script:ToastUndo; $script:ToastUndo = $null; $script:ToastTimer.Stop(); Hide-Animated $ui.Toast 160; if ($u) { try { & $u } catch { Show-Toast $_.Exception.Message '#FF9F0A' } } })
 
 # --------------------------------------------------------------- state ----
 # How "potato" a set of graphics values is: 0% = best looking Performance mode, 100% = lowest everything.
@@ -13018,49 +13383,40 @@ function New-PotatoStudio($t) {
         "<Border Background='#0DFFFFFF' CornerRadius='14' Padding='14,12' Margin='0,0,0,8'><Grid>" +
         "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
         "<Border Width='36' Height='36' CornerRadius='10' Background='$($tint -replace '^#', '#33')' VerticalAlignment='Top'><TextBlock Text='$icon' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='$tint' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
-        "<StackPanel Grid.Column='1' Margin='14,0,0,0'><Grid><TextBlock Text='$label' FontSize='13.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>" +
-        "<Border HorizontalAlignment='Right' Background='#1AFFFFFF' CornerRadius='8' Padding='9,1,9,2'><TextBlock x:Name='${name}Text' FontSize='12' FontWeight='SemiBold' Foreground='#FFFFFF'/></Border></Grid>" +
+        "<StackPanel Grid.Column='1' Margin='14,0,0,0'><Grid><TextBlock Text='$label' FontSize='13.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>" +
+        "<Border HorizontalAlignment='Right' Background='#1AFFFFFF' CornerRadius='8' Padding='9,1,9,2'><TextBlock x:Name='${name}Text' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/></Border></Grid>" +
         "<Slider x:Name='$name' Minimum='$min' Maximum='$max' Style='{DynamicResource ZSlider}' Margin='0,8,0,0'/>" +
-        "<TextBlock Text='$hint' FontSize='11.5' Foreground='#8A8A94' Margin='0,2,0,0'/></StackPanel></Grid></Border>"
+        "<TextBlock Text='$hint' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0'/></StackPanel></Grid></Border>"
     }
     $nv = if (Test-NvAvailable) { 'NVIDIA driver setting: blurs textures into flat colours' } else { 'Needs an NVIDIA graphics card' }
     $root = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-        Width='1058' Height='430' CornerRadius='26' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,16,22' HorizontalAlignment='Left'>
+        Width='1058' Height='430' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Margin='0,0,16,22' HorizontalAlignment='Left'>
   <Grid>
-    <Ellipse Width='620' Height='620' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-300,0,0' IsHitTestVisible='False'>
-      <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#4DFFD60A' Offset='0'/><GradientStop Color='#00FFD60A' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-    </Ellipse>
-    <Ellipse Width='700' Height='700' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-240,-360' IsHitTestVisible='False'>
-      <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#4430D158' Offset='0'/><GradientStop Color='#0030D158' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-    </Ellipse>
-    <Ellipse Width='380' Height='380' HorizontalAlignment='Center' VerticalAlignment='Bottom' Margin='0,0,300,-200' IsHitTestVisible='False'>
-      <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#33FF9F0A' Offset='0'/><GradientStop Color='#00FF9F0A' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-    </Ellipse>
     <Grid Margin='40,34,22,22'>
       <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='440'/></Grid.ColumnDefinitions>
       <DockPanel Margin='0,0,28,0'>
         <StackPanel DockPanel.Dock='Top'>
           <StackPanel Orientation='Horizontal'>
             <TextBlock Text='&#xE70F;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#FFD60A' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/>
-            <TextBlock Text='CUSTOM POTATO' FontSize='12' FontWeight='Bold' Foreground='#C9C9D1'/>
+            <TextBlock Text='CUSTOM POTATO' FontSize='12' FontWeight='Bold' Foreground='{DynamicResource Text.Secondary}'/>
           </StackPanel>
           <StackPanel Orientation='Horizontal' Margin='0,6,0,0' x:Name='ScoreText'>
             <StackPanel.Effect><DropShadowEffect Color='#FFD60A' BlurRadius='30' ShadowDepth='0' Opacity='0.55'/></StackPanel.Effect>
-            <TextBlock x:Name='Score' FontSize='88' FontWeight='Black' FontFamily='Segoe UI Black, Segoe UI' Typography.NumeralAlignment='Tabular'/>
-            <TextBlock Text='potato' FontSize='20' Foreground='#B8B8C2' VerticalAlignment='Bottom' Margin='10,0,0,22'/>
+            <TextBlock x:Name='Score' FontSize='56' FontFamily='{DynamicResource Font.Mono}' Typography.NumeralAlignment='Tabular'/>
+            <TextBlock Text='potato' FontSize='20' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Bottom' Margin='10,0,0,22'/>
           </StackPanel>
-          <TextBlock x:Name='Verdict' FontSize='14' Foreground='#E6E6EC' Margin='0,-4,0,0'/>
+          <TextBlock x:Name='Verdict' FontSize='14' Foreground='{DynamicResource Text.Secondary}' Margin='0,-4,0,0'/>
           <Border x:Name='BarTrack' Width='420' Height='10' CornerRadius='5' Background='#1FFFFFFF' HorizontalAlignment='Left' Margin='0,18,0,0'>
             <Border x:Name='Bar' Height='10' CornerRadius='5' HorizontalAlignment='Left'/>
           </Border>
-          <TextBlock Text='Everything else in Fortnite is set to low. Fortnite must be closed.' FontSize='12.5' Foreground='#9A9AA5' Margin='0,14,0,0' TextWrapping='Wrap'/>
+          <TextBlock Text='Everything else in Fortnite is set to low. Fortnite must be closed.' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' Margin='0,14,0,0' TextWrapping='Wrap'/>
         </StackPanel>
         <StackPanel DockPanel.Dock='Bottom' Orientation='Horizontal' VerticalAlignment='Bottom'>
           <Button x:Name='ActionBtn' Height='58' Width='240' Cursor='Hand'>
             <Button.Template>
               <ControlTemplate TargetType='Button'>
-                <Border x:Name='B' CornerRadius='29'>
+                <Border x:Name='B' CornerRadius='16'>
                   <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,1'><GradientStop Color='#FFE14D' Offset='0'/><GradientStop Color='#7EDB5A' Offset='1'/></LinearGradientBrush></Border.Background>
                   <Border.Effect><DropShadowEffect Color='#C8E04A' BlurRadius='32' ShadowDepth='0' Opacity='0.55'/></Border.Effect>
                   <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
@@ -13078,7 +13434,7 @@ function New-PotatoStudio($t) {
           </Button>
         </StackPanel>
       </DockPanel>
-      <Border Grid.Column='1' CornerRadius='20' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='16,16,16,8'>
+      <Border Grid.Column='1' CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,16,16,8'>
         <StackPanel>
           $(Ctl '&#xE7F4;' '#0A84FF' '3D resolution' 'Res' '25' '100' 'Lower is blurrier and much faster')
           $(Ctl '&#xE7B3;' '#BF5AF2' 'View distance' 'View' '0' '3' 'How far away things are drawn')
@@ -13088,8 +13444,8 @@ function New-PotatoStudio($t) {
               <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
               <Border Width='36' Height='36' CornerRadius='10' Background='#3330D158'><TextBlock Text='&#xE913;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='#30D158' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
               <StackPanel Grid.Column='1' Margin='14,0,0,0' VerticalAlignment='Center'>
-                <TextBlock Text='Grass' FontSize='13.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>
-                <TextBlock Text='Off hides players less and saves a little FPS' FontSize='11.5' Foreground='#8A8A94'/>
+                <TextBlock Text='Grass' FontSize='13.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+                <TextBlock Text='Off hides players less and saves a little FPS' FontSize='11.5' Foreground='{DynamicResource Text.Muted}'/>
               </StackPanel>
               <ToggleButton x:Name='Grass' Grid.Column='2' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
             </Grid>
@@ -13100,7 +13456,7 @@ function New-PotatoStudio($t) {
   </Grid>
 </Border>
 "@)
-    Set-RoundClip $root 26
+    Set-RoundClip $root 16
     $t.Card = $root
     $root.Tag = $t
     Initialize-Builder $root
@@ -13269,7 +13625,8 @@ function Switch-Tweak($t, [bool]$enable) {
     try {
         if ($enable) { Invoke-TweakOn $t } else { Invoke-TweakOff $t }
         $note = switch ($t.Badge) { 'restart' { ' Restart your PC to finish.' } 'signout' { ' Sign out and back in to finish.' } default { '' } }
-        Show-Toast ("$($t.Title): " + $(if ($enable) { 'on.' } else { 'restored.' }) + $note) '#30D158'
+        $script:LastSwitch = @{ T = $t; On = -not $enable }
+        Show-Toast ("$($t.Title): " + $(if ($enable) { 'on.' } else { 'restored.' }) + $note) '#30D158' { Switch-Tweak $script:LastSwitch.T $script:LastSwitch.On }
     } catch {
         Show-Toast "$($t.Title): $($_.Exception.Message)" '#FF9F0A'
     }
@@ -13726,27 +14083,33 @@ function Get-HealthIssues {
 }
 
 function New-HealthPage {
+    # 2.0 Checks > Run all checks: one summary card ("2 problems, 1 to check, 3 notes"), then the findings grouped by
+    # severity. Each row: status icon + word (never colour alone), title, the finding in one line, and its action.
     $root = [ZdTheme]::Parse(@"
-<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='24,20' Margin='0,0,0,16'>
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='900' HorizontalAlignment='Left'>
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24,20' Margin='0,0,0,20'>
     <Grid>
-      <StackPanel Orientation='Horizontal' VerticalAlignment='Center'>
-        <TextBlock x:Name='Score' Text='?' FontSize='40' FontWeight='Bold' Foreground='#A1A1A6'/>
-        <StackPanel Margin='16,0,0,0' VerticalAlignment='Center'>
-          <TextBlock x:Name='Summary' Text='Press Scan to check your PC.' FontSize='15' FontWeight='SemiBold'/>
-          <TextBlock x:Name='Sub' Text='Takes a few seconds. Nothing is changed until you press Fix.' FontSize='12' Foreground='#A1A1A6' Margin='0,3,0,0'/>
-        </StackPanel>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel VerticalAlignment='Center' Margin='0,0,20,0' ToolTip='Health score: 100 minus 10 per problem, 5 per item to check and 1 per note. It counts findings, not FPS.'>
+        <TextBlock x:Name='Score' Text='--' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Muted}' Typography.NumeralAlignment='Tabular' HorizontalAlignment='Center'/>
+        <TextBlock Text='score' FontSize='11' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/>
       </StackPanel>
-      <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' VerticalAlignment='Center'>
-        <Button x:Name='Scan' Content='Scan' Style='{DynamicResource Btn}' Margin='0,0,10,0'/>
-        <Button x:Name='FixAll' Content='Fix all' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' IsEnabled='False'/>
+      <StackPanel Grid.Column='1' VerticalAlignment='Center'>
+        <TextBlock x:Name='Summary' Text='Run all checks to see how your PC is set up' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+        <TextBlock x:Name='Sub' Text='Takes a few seconds. Checks only look; nothing changes until you press Fix.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,3,0,0'/>
       </StackPanel>
+      <WrapPanel Grid.Column='2' VerticalAlignment='Center'>
+        <Button x:Name='Scan' Style='{DynamicResource Zd.Button.Primary}' Margin='0,0,8,0'>
+          <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE9D9;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock x:Name='ScanText' Text='Run all checks'/></StackPanel>
+        </Button>
+        <Button x:Name='FixAll' Content='Fix all' Style='{DynamicResource Zd.Button.Secondary}' IsEnabled='False'/>
+      </WrapPanel>
     </Grid>
   </Border>
   <StackPanel x:Name='List'/>
 </StackPanel>
 "@)
-    $script:Health = @{}; foreach ($n in 'Score', 'Summary', 'Sub', 'Scan', 'FixAll', 'List') { $script:Health[$n] = $root.FindName($n) }
+    $script:Health = @{}; foreach ($n in 'Score', 'Summary', 'Sub', 'Scan', 'ScanText', 'FixAll', 'List') { $script:Health[$n] = $root.FindName($n) }
     $script:Health.Scan.Add_Click({ Invoke-HealthScan })
     $script:Health.FixAll.Add_Click({
         $window.Cursor = [Windows.Input.Cursors]::Wait
@@ -13771,49 +14134,64 @@ function Invoke-HealthFix($i) {
 function Invoke-HealthScan {
     $h = $script:Health
     $window.Cursor = [Windows.Input.Cursors]::Wait
-    $h.Summary.Text = 'Scanning...'; $h.Sub.Text = ''
+    $h.Summary.Text = 'Checking...'; $h.Sub.Text = ''
     $window.Dispatcher.Invoke([action] {}, 'Render')
     $script:HealthIssues = Get-HealthIssues
     $window.Cursor = $null
     $issues = $script:HealthIssues
     $score = [Math]::Max(0, 100 - (($issues | ForEach-Object { switch ($_.Sev) { 3 { 10 } 2 { 5 } default { 1 } } }) | Measure-Object -Sum).Sum)
     Start-CountUp $h.Score $score
-    $h.Score.Foreground = ConvertTo-Brush $(if ($score -ge 85) { '#30D158' } elseif ($score -ge 60) { '#FFD60A' } else { '#FF453A' })
+    $h.Score.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($score -ge 85) { 'Good' } elseif ($score -ge 60) { 'Warn' } else { 'Bad' }))
+    $bad = @($issues | Where-Object { $_.Sev -eq 3 }).Count; $warn = @($issues | Where-Object { $_.Sev -eq 2 }).Count; $info = @($issues | Where-Object { $_.Sev -lt 2 }).Count
     $fixable = @($issues | Where-Object { $_.Tweak -or ($_.Fix -and $_.FixLabel -ne 'How') }).Count
-    $h.Summary.Text = if ($issues.Count) { "$($issues.Count) things to look at" } else { 'Everything looks good' }
-    $h.Sub.Text = "$fixable can be fixed with one click. Last scan $(Get-Date -Format 'HH:mm')."
+    $parts = @($(if ($bad) { "$bad problem$(if ($bad -ne 1) { 's' })" }), $(if ($warn) { "$warn to check" }), $(if ($info) { "$info note$(if ($info -ne 1) { 's' })" })) | Where-Object { $_ }
+    $h.Summary.Text = if ($issues.Count) { $parts -join ', ' } else { 'Everything looks good' }
+    $h.Sub.Text = "$(if ($fixable) { "$fixable can be fixed with one click. " })Last run $(Get-Date -Format 'HH:mm')."
+    $h.ScanText.Text = 'Run again'
     $h.FixAll.IsEnabled = $fixable -gt 0
+    $h.FixAll.Content = if ($fixable) { "Fix all $fixable" } else { 'Fix all' }
     $h.List.Children.Clear()
-    foreach ($i in $issues) {
-        $color = switch ($i.Sev) { 3 { '#FF453A' } 2 { '#FFD60A' } default { '#0A84FF' } }
-        $sevWord = switch ($i.Sev) { 3 { 'High impact' } 2 { 'Medium' } default { 'Info' } }
-        $row = [ZdTheme]::Parse(@"
+    if (-not $issues.Count) {
+        [void]$h.List.Children.Add([ZdTheme]::Parse("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Background='{DynamicResource Good.Soft}' CornerRadius='12' Padding='18,14'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,10,0'/><TextBlock Text='No problems found. ZeroDelay keeps watching for settings that change back.' FontSize='13' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/></StackPanel></Border>"))
+        return
+    }
+    $groups = @(@{ Sev = 3; Head = 'Problems'; Key = 'Bad'; Glyph = '&#xEA39;'; Word = 'Problem' },
+                @{ Sev = 2; Head = 'Worth a look'; Key = 'Warn'; Glyph = '&#xE7BA;'; Word = 'Check' },
+                @{ Sev = 1; Head = 'Notes'; Key = 'Info'; Glyph = '&#xE946;'; Word = 'Note' })
+    foreach ($gr in $groups) {
+        $these = @($issues | Where-Object { if ($gr.Sev -eq 1) { $_.Sev -lt 2 } else { $_.Sev -eq $gr.Sev } })
+        if (-not $these.Count) { continue }
+        [void]$h.List.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='$($gr.Head.ToUpper())  ·  $($these.Count)' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' Margin='2,6,0,8'/>"))
+        foreach ($i in $these) {
+            $label = if ($i.FixLabel -eq 'How') { 'Show me how' } else { $i.FixLabel }
+            $row = [ZdTheme]::Parse(@"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-        Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='18,14' Margin='0,0,0,10'>
+        Style='{DynamicResource Zd.Card}' Padding='16,14' Margin='0,0,0,8' AutomationProperties.Name='$(Esc "$($gr.Word): $($i.Title)")'>
   <Grid>
     <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-    <Ellipse Width='10' Height='10' Fill='$color' VerticalAlignment='Top' Margin='0,6,14,0'/>
-    <StackPanel Grid.Column='1'>
-      <StackPanel Orientation='Horizontal'>
-        <TextBlock Text='$(Esc $i.Title)' FontSize='14' FontWeight='SemiBold'/>
-        <TextBlock Text='$sevWord' FontSize='11' Foreground='$color' Margin='10,2,0,0'/>
-      </StackPanel>
-      <TextBlock Text='$(Esc $i.Detail)' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,20,0'/>
+    <StackPanel Width='74' Orientation='Horizontal' VerticalAlignment='Top' Margin='0,2,12,0'>
+      <TextBlock Text='$($gr.Glyph)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='13' Foreground='{DynamicResource $($gr.Key)}' VerticalAlignment='Center' Margin='0,1,6,0'/>
+      <TextBlock Text='$($gr.Word)' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource $($gr.Key)}' VerticalAlignment='Center'/>
     </StackPanel>
-    <Button x:Name='Fix' Grid.Column='2' Content='$(Esc $i.FixLabel)' Style='{DynamicResource Btn}' Padding='14,7' FontSize='12' VerticalAlignment='Center'/>
+    <StackPanel Grid.Column='1'>
+      <TextBlock Text='$(Esc $i.Title)' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+      <TextBlock Text='$(Esc $i.Detail)' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,3,16,0'/>
+    </StackPanel>
+    <Button x:Name='Fix' Grid.Column='2' Content='$(Esc $label)' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='32' Padding='14,0' FontSize='13' VerticalAlignment='Center'/>
   </Grid>
 </Border>
 "@)
-        $btn = $row.FindName('Fix')
-        if (-not $i.Tweak -and -not $i.Fix) { $btn.Visibility = 'Collapsed' }
-        $btn.Tag = @{ Issue = $i; Row = $row }
-        $btn.Add_Click({
-            param($s, $e)
-            try { $msg = Invoke-HealthFix $s.Tag.Issue; Show-Toast $msg '#30D158'; if ($s.Tag.Issue.FixLabel -ne 'How') { Start-Anim $s.Tag.Row ([Windows.UIElement]::OpacityProperty) $null 0.45 300; $s.IsEnabled = $false; $s.Content = 'Done' } }
-            catch { Show-Toast "$($s.Tag.Issue.Title): $($_.Exception.Message)" '#FF9F0A' }
-        })
-        [void]$h.List.Children.Add($row)
-        Show-Animated $row 10 260 ([Math]::Min(600, 45 * ($h.List.Children.Count - 1)))
+            $btn = $row.FindName('Fix')
+            if (-not $i.Tweak -and -not $i.Fix) { $btn.Visibility = 'Collapsed' }
+            $btn.Tag = @{ Issue = $i; Row = $row }
+            $btn.Add_Click({
+                param($s, $e)
+                try { $msg = Invoke-HealthFix $s.Tag.Issue; Show-Toast $msg '#30D158'; if ($s.Tag.Issue.FixLabel -ne 'How') { Start-Anim $s.Tag.Row ([Windows.UIElement]::OpacityProperty) $null 0.45 300; $s.IsEnabled = $false; $s.Content = 'Done' } }
+                catch { Show-Toast "$($s.Tag.Issue.Title): $($_.Exception.Message)" '#FF9F0A' }
+            })
+            [void]$h.List.Children.Add($row)
+            Show-Animated $row 10 260 ([Math]::Min(600, 45 * ($h.List.Children.Count - 1)))
+        }
     }
 }
 
@@ -14020,7 +14398,8 @@ function Invoke-DriftCheck {
 
 # =============================================================== Benchmark (Intel PresentMon)
 $PresentMonUrl = 'https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe'
-$ToolsDir      = Join-Path $DataDir 'tools'
+# PresentMon runs with ZeroDelay's admin rights, so it is kept where only administrators can swap it after its check
+$ToolsDir      = if ($SecureDir) { Join-Path $SecureDir 'tools' } else { Join-Path $DataDir 'tools' }
 $PresentMonExe = Join-Path $ToolsDir 'PresentMon.exe'
 $BenchFile     = Join-Path $DataDir 'benchmarks.json'
 function Get-BenchRuns { @(Read-JsonList $BenchFile) }
@@ -14612,9 +14991,9 @@ function Complete-ProveRecording {
 function New-ProvePage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
-  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='26,22' Margin='0,0,0,16'>
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24,20' Margin='0,0,0,16'>
     <StackPanel>
-      <TextBlock Text='Before and after' FontSize='22' FontWeight='Bold'/>
+      <TextBlock Text='Before and after' FontFamily='{DynamicResource Font.Display}' FontSize='22' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
       <TextBlock FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,0' MaxWidth='860' HorizontalAlignment='Left'
                  Text='Record two minutes of your game as it is, switch the recommended tweaks on, record two minutes again. Both runs side by side, and a difference only counts when it is bigger than the noise of two runs.'/>
       <TextBlock x:Name='GameLine' FontSize='13' FontWeight='SemiBold' Margin='0,12,0,0' TextWrapping='Wrap'/>
@@ -14623,54 +15002,55 @@ function New-ProvePage {
   </Border>
   <Grid Margin='0,0,0,16'>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-    <Border Style='{DynamicResource Card}' Padding='20,18' Margin='0,0,8,0'>
+    <Border x:Name='Step1' Style='{DynamicResource Zd.Card}' Padding='18' Margin='0,0,8,0'>
       <StackPanel>
-        <TextBlock Text='1  Record as it is now' FontSize='15' FontWeight='SemiBold'/>
-        <TextBlock Text='Get into a match first, not the lobby. Play normally until the sound tells you it is done.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,10' MinHeight='34'/>
-        <Button x:Name='Rec1' Content='Record 2 minutes' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Left'/>
+        <StackPanel Orientation='Horizontal'><Border x:Name='Dot1' Width='24' Height='24' CornerRadius='12' Background='{DynamicResource Bg.Raised}' Margin='0,0,10,0'><TextBlock x:Name='Num1' Text='1' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><TextBlock Text='Record as it is now' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center'/></StackPanel>
+        <TextBlock Text='Get into a match first, not the lobby. Play normally until the sound tells you it is done.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,8,0,12' MinHeight='36'/>
+        <Button x:Name='Rec1' Content='Record 2 minutes' Style='{DynamicResource Zd.Button.Primary}' HorizontalAlignment='Left'/>
         <TextBlock x:Name='St1' FontSize='12.5' Margin='0,10,0,0' TextWrapping='Wrap'/>
       </StackPanel>
     </Border>
-    <Border Grid.Column='1' Style='{DynamicResource Card}' Padding='20,18' Margin='8,0,8,0'>
+    <Border x:Name='Step2' Grid.Column='1' Style='{DynamicResource Zd.Card}' Padding='18' Margin='8,0,8,0'>
       <StackPanel>
-        <TextBlock Text='2  Boost' FontSize='15' FontWeight='SemiBold'/>
-        <TextBlock Text='Switch on the recommended tweaks that work while the game runs, or pick them one by one. Undo puts them back.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,10' MinHeight='34'/>
+        <StackPanel Orientation='Horizontal'><Border x:Name='Dot2' Width='24' Height='24' CornerRadius='12' Background='{DynamicResource Bg.Raised}' Margin='0,0,10,0'><TextBlock x:Name='Num2' Text='2' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><TextBlock Text='Boost' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center'/></StackPanel>
+        <TextBlock Text='Switch on the recommended tweaks that work while the game runs, or pick them one by one. Undo puts them back.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,8,0,12' MinHeight='36'/>
         <WrapPanel>
-          <Button x:Name='Apply' Content='Switch on recommended' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='0,0,6,6'/>
-          <Button x:Name='Pick' Content='Pick from the list' Style='{DynamicResource Btn}' Margin='0,0,6,6'/>
-          <Button x:Name='Undo' Content='Undo' Style='{DynamicResource Btn}' Margin='0,0,0,6'/>
+          <Button x:Name='Apply' Content='Switch on recommended' Style='{DynamicResource Zd.Button.Primary}' Margin='0,0,6,6'/>
+          <Button x:Name='Pick' Content='Pick from the list' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,6,6'/>
+          <Button x:Name='Undo' Content='Undo' Style='{DynamicResource Zd.Button.Ghost}' Margin='0,0,0,6'/>
         </WrapPanel>
         <TextBlock x:Name='St2' FontSize='12.5' Margin='0,4,0,0' TextWrapping='Wrap'/>
       </StackPanel>
     </Border>
-    <Border Grid.Column='2' Style='{DynamicResource Card}' Padding='20,18' Margin='8,0,0,0'>
+    <Border x:Name='Step3' Grid.Column='2' Style='{DynamicResource Zd.Card}' Padding='18' Margin='8,0,0,0'>
       <StackPanel>
-        <TextBlock Text='3  Record again' FontSize='15' FontWeight='SemiBold'/>
-        <TextBlock Text='Same game, same length, and the same kind of play as the first run for a fair pair.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,10' MinHeight='34'/>
-        <Button x:Name='Rec2' Content='Record 2 minutes' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Left'/>
+        <StackPanel Orientation='Horizontal'><Border x:Name='Dot3' Width='24' Height='24' CornerRadius='12' Background='{DynamicResource Bg.Raised}' Margin='0,0,10,0'><TextBlock x:Name='Num3' Text='3' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><TextBlock Text='Record again' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center'/></StackPanel>
+        <TextBlock Text='Same game, same length, and the same kind of play as the first run for a fair pair.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,8,0,12' MinHeight='36'/>
+        <Button x:Name='Rec2' Content='Record 2 minutes' Style='{DynamicResource Zd.Button.Primary}' HorizontalAlignment='Left'/>
         <TextBlock x:Name='St3' FontSize='12.5' Margin='0,10,0,0' TextWrapping='Wrap'/>
       </StackPanel>
     </Border>
   </Grid>
   <StackPanel Orientation='Horizontal' Margin='0,0,0,16'>
-    <Button x:Name='Cancel' Content='Stop recording' Style='{DynamicResource Btn}' Margin='0,0,8,0' Visibility='Collapsed'/>
-    <Button x:Name='Reset' Content='Start over' Style='{DynamicResource Btn}' Visibility='Collapsed'/>
+    <Button x:Name='Cancel' Content='Stop recording' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0' Visibility='Collapsed'/>
+    <Button x:Name='Reset' Content='Start over' Style='{DynamicResource Zd.Button.Ghost}' Visibility='Collapsed'/>
   </StackPanel>
-  <Border x:Name='ResultBox' Style='{DynamicResource Card}' CornerRadius='16' Padding='22,18' Margin='0,0,0,16' Visibility='Collapsed'>
+  <Border x:Name='ResultBox' Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24,20' Margin='0,0,0,16' Visibility='Collapsed'>
     <StackPanel>
       <Grid>
         <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
         <StackPanel>
-          <TextBlock x:Name='ResHead' FontSize='17' FontWeight='SemiBold' TextWrapping='Wrap'/>
+          <Border x:Name='Badge' HorizontalAlignment='Left' CornerRadius='6' Padding='10,4' Margin='0,0,0,10'><StackPanel Orientation='Horizontal'><TextBlock x:Name='BadgeIcon' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock x:Name='BadgeText' FontSize='13' FontWeight='SemiBold'/></StackPanel></Border>
+          <TextBlock x:Name='ResHead' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
           <TextBlock x:Name='ResDetail' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,0' MaxWidth='760' HorizontalAlignment='Left'/>
         </StackPanel>
-        <Button x:Name='Share' Grid.Column='1' Content='Copy as text' Style='{DynamicResource Btn}' VerticalAlignment='Top' Margin='12,0,0,0'/>
+        <Button x:Name='Share' Grid.Column='1' Content='Copy as text' Style='{DynamicResource Zd.Button.Secondary}' VerticalAlignment='Top' Margin='12,0,0,0'/>
       </Grid>
       <StackPanel x:Name='Rows' Margin='0,14,0,0'/>
       <TextBlock x:Name='ResNotes' FontSize='11.5' Foreground='#98989D' TextWrapping='Wrap' Margin='0,10,0,0'/>
     </StackPanel>
   </Border>
-  <Border Style='{DynamicResource Card}' CornerRadius='16' Padding='22,18' Margin='0,0,0,16'>
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24,20' Margin='0,0,0,16'>
     <StackPanel>
       <TextBlock Text='Past results' FontSize='15' FontWeight='SemiBold'/>
       <StackPanel x:Name='Past' Margin='0,10,0,0'/>
@@ -14679,7 +15059,7 @@ function New-ProvePage {
 </StackPanel>
 "@)
     $h = @{ Root = $root }
-    foreach ($n in 'GameLine', 'FpsLine', 'Rec1', 'St1', 'Apply', 'Pick', 'Undo', 'St2', 'Rec2', 'St3', 'Cancel', 'Reset', 'ResultBox', 'ResHead', 'ResDetail', 'Share', 'Rows', 'ResNotes', 'Past') { $h[$n] = $root.FindName($n) }
+    foreach ($n in 'Step1', 'Step2', 'Step3', 'Dot1', 'Dot2', 'Dot3', 'Num1', 'Num2', 'Num3', 'Badge', 'BadgeIcon', 'BadgeText', 'GameLine', 'FpsLine', 'Rec1', 'St1', 'Apply', 'Pick', 'Undo', 'St2', 'Rec2', 'St3', 'Cancel', 'Reset', 'ResultBox', 'ResHead', 'ResDetail', 'Share', 'Rows', 'ResNotes', 'Past') { $h[$n] = $root.FindName($n) }
     $script:ProveUi = $h
     $h.Rec1.Add_Click({ [void](Start-ProveCountdown 'before') })
     $h.Rec2.Add_Click({ [void](Start-ProveCountdown 'after') })
@@ -14753,15 +15133,35 @@ function Update-ProvePage {
     $h.Pick.IsEnabled = -not $busy
     $h.Cancel.Visibility = if ($busy) { 'Visible' } else { 'Collapsed' }
     $h.Reset.Visibility = if ($p -and -not $busy) { 'Visible' } else { 'Collapsed' }
+    # 2.0 stepper: done steps get a check, the current one the accent dot and an accent edge
+    $done = @{ 1 = [bool]($p -and $p.Runs.before); 2 = [bool]$applied.Count; 3 = [bool]($p -and $p.Runs.after) }
+    $cur = if (-not $done[1]) { 1 } elseif (-not $done[3] -and -not $done[2] -and $plan.Now.Count) { 2 } elseif (-not $done[3]) { 3 } else { 0 }
+    foreach ($i in 1..3) {
+        $dot = $h["Dot$i"]; $num = $h["Num$i"]; $card = $h["Step$i"]
+        if ($done[$i]) {
+            $dot.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'Good.Soft'); $num.Text = [string][char]0xE73E
+            $num.FontFamily = 'Segoe Fluent Icons, Segoe MDL2 Assets'; $num.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+        } else {
+            $dot.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($i -eq $cur) { 'AccentFill' } else { 'Bg.Raised' })); $num.Text = "$i"
+            $num.ClearValue([Windows.Controls.TextBlock]::FontFamilyProperty); $num.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($i -eq $cur) { 'Accent.OnAccent' } else { 'Text.Muted' }))
+        }
+        if ($i -eq $cur) { $card.SetResourceReference([Windows.Controls.Border]::BorderBrushProperty, 'AccentFill') } else { $card.ClearValue([Windows.Controls.Border]::BorderBrushProperty) }
+    }
     # result
     if ($p -and $p.Result) {
         $v = $p.Result.Verdict
         $h.ResHead.Text = $v.Head; $h.ResDetail.Text = $v.Detail
-        $h.ResHead.Foreground = ConvertTo-Brush $(switch ($v.Kind) { 'better' { '#30D158' } 'worse' { '#FF453A' } 'mixed' { '#FF9F0A' } default { '#F5F5F7' } })
+        # the verdict in one badge: a word and an icon, never colour alone, and never more than the numbers say
+        $bd = switch ($v.Kind) { 'better' { @('Real improvement', 'Good', 0xE73E) } 'worse' { @('Worse: consider restoring', 'Bad', 0xE7BA) } 'mixed' { @('Mixed result', 'Warn', 0xE7BA) }
+                                 'same' { @('No meaningful change', 'Text.Secondary', 0xE738) } default { @('Nothing measured', 'Text.Muted', 0xE946) } }
+        $h.BadgeText.Text = $bd[0]; $h.BadgeIcon.Text = [string][char]$bd[2]
+        $h.BadgeText.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $bd[1]); $h.BadgeIcon.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $bd[1])
+        $h.Badge.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(switch ($v.Kind) { 'better' { 'Good.Soft' } 'worse' { 'Bad.Soft' } 'mixed' { 'Warn.Soft' } default { 'Bg.Raised' } }))
+        $h.Badge.Visibility = 'Visible'
         $h.Rows.Children.Clear(); [void]$h.Rows.Children.Add((New-ProveRowsPanel $p.Result))
         $h.ResNotes.Text = (@($p.Result.Notes) + @("Rule: $($p.Result.Rule)")) -join "`n"
         $h.ResultBox.Visibility = 'Visible'
-    } elseif ($p -and $p.Error) { $h.ResHead.Text = $p.Error; $h.ResDetail.Text = ''; $h.Rows.Children.Clear(); $h.ResNotes.Text = ''; $h.ResHead.Foreground = ConvertTo-Brush '#FF9F0A'; $h.ResultBox.Visibility = 'Visible' }
+    } elseif ($p -and $p.Error) { $h.ResHead.Text = $p.Error; $h.ResDetail.Text = ''; $h.Rows.Children.Clear(); $h.ResNotes.Text = ''; $h.Badge.Visibility = 'Collapsed'; $h.ResHead.Foreground = ConvertTo-Brush '#FF9F0A'; $h.ResultBox.Visibility = 'Visible' }
     else { $h.ResultBox.Visibility = 'Collapsed' }
     # past results (newest first)
     $h.Past.Children.Clear()
@@ -14790,21 +15190,35 @@ function Update-ProvePage {
 }
 # the side-by-side table: metric, before, after, change, verdict
 function New-ProveRowsPanel($Cmp) {
-    $cols = "<Grid.ColumnDefinitions><ColumnDefinition Width='190'/><ColumnDefinition Width='110'/><ColumnDefinition Width='110'/><ColumnDefinition Width='130'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>"
+    # 2.0: before, after, change, and a small strip that shows the change against the noise band of two runs
+    # (shaded = what two runs of the same setup differ by anyway; the dot only counts outside it)
+    $cols = "<Grid.ColumnDefinitions><ColumnDefinition Width='170'/><ColumnDefinition Width='100'/><ColumnDefinition Width='100'/><ColumnDefinition Width='120'/><ColumnDefinition Width='156'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>"
     $x = foreach ($r in @($Cmp.Rows)) {
         $u = if ($r.Unit) { " $($r.Unit)" } else { '' }
-        $c = if (-not $r.Real) { '#A1A1A6' } elseif ($r.Better) { '#30D158' } else { '#FF453A' }
+        $c = if (-not $r.Real) { 'Text.Secondary' } elseif ($r.Better) { 'Good' } else { 'Bad' }
         # FPS rows show the percent and the frames: "+11% (+15.2)"
         $delta = if ($null -eq $r.Delta) { '-' } else { "$(Format-ProveDelta $r)$(if ($r.Key -in 'FpsAvg', 'Low1') { " ($(if ($r.Delta -ge 0) { '+' })$(Format-ProveNumber $r.Delta 1))" })" }
-        "<Grid Margin='0,0,0,6'>$cols" +
-        "<TextBlock Text='$(Esc $r.Label)' FontSize='13' FontWeight='SemiBold'/>" +
-        "<TextBlock Grid.Column='1' Text='$(Esc "$(Format-ProveNumber $r.Before $r.Dec)$(if ($null -ne $r.Before) { $u })")' FontSize='12.5' Typography.NumeralAlignment='Tabular'/>" +
-        "<TextBlock Grid.Column='2' Text='$(Esc "$(Format-ProveNumber $r.After $r.Dec)$(if ($null -ne $r.After) { $u })")' FontSize='12.5' Typography.NumeralAlignment='Tabular'/>" +
-        "<TextBlock Grid.Column='3' Text='$(Esc $delta)' FontSize='12.5' Foreground='$c' Typography.NumeralAlignment='Tabular'/>" +
-        "<TextBlock Grid.Column='4' Text='$(Esc $r.Text)' FontSize='12.5' Foreground='$c' TextWrapping='Wrap'/></Grid>"
+        $band = if ($null -ne $r.Delta -and $null -ne $r.Noise -and [double]$r.Noise -gt 0) {
+            $half = 68.0; $scale = [Math]::Max([Math]::Abs([double]$r.Delta), [double]$r.Noise) * 1.3
+            $bw = [Math]::Max(2, 2 * $half * [double]$r.Noise / $scale)
+            $dx = $half + $half * [double]$r.Delta / $scale
+            $inv = [Globalization.CultureInfo]::InvariantCulture
+            "<Grid Grid.Column='4' Width='140' Height='14' HorizontalAlignment='Left' VerticalAlignment='Center' ToolTip='$(Esc "Shaded: the noise band ($([Math]::Round([double]$r.Noise, 2))$u). A change only counts outside it.")'>" +
+            "<Border Height='4' CornerRadius='2' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Center'/>" +
+            "<Border Height='10' Width='$($bw.ToString('0.#', $inv))' CornerRadius='3' Background='{DynamicResource Border.Strong}' HorizontalAlignment='Center'/>" +
+            "<Border Width='1' Height='14' Background='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/>" +
+            "<Ellipse Width='9' Height='9' Fill='{DynamicResource $c}' HorizontalAlignment='Left' Margin='$(($dx - 4.5).ToString('0.#', $inv)),0,0,0'/></Grid>"
+        } else { "<TextBlock Grid.Column='4' Text='-' FontSize='12' Foreground='{DynamicResource Text.Muted}'/>" }
+        "<Grid Margin='0,0,0,8'>$cols" +
+        "<TextBlock Text='$(Esc $r.Label)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center'/>" +
+        "<TextBlock Grid.Column='1' Text='$(Esc "$(Format-ProveNumber $r.Before $r.Dec)$(if ($null -ne $r.Before) { $u })")' FontFamily='{DynamicResource Font.Mono}' FontSize='13' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Typography.NumeralAlignment='Tabular'/>" +
+        "<TextBlock Grid.Column='2' Text='$(Esc "$(Format-ProveNumber $r.After $r.Dec)$(if ($null -ne $r.After) { $u })")' FontFamily='{DynamicResource Font.Mono}' FontSize='13' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' Typography.NumeralAlignment='Tabular'/>" +
+        "<TextBlock Grid.Column='3' Text='$(Esc $delta)' FontFamily='{DynamicResource Font.Mono}' FontSize='13' Foreground='{DynamicResource $c}' VerticalAlignment='Center' Typography.NumeralAlignment='Tabular'/>" +
+        $band +
+        "<TextBlock Grid.Column='5' Text='$(Esc $r.Text)' FontSize='13' Foreground='{DynamicResource $c}' TextWrapping='Wrap' VerticalAlignment='Center' Margin='12,0,0,0'/></Grid>"
     }
-    $hc = { param($i, $t) "<TextBlock Grid.Column='$i' Text='$t' FontSize='11' Foreground='#98989D'/>" }
-    $head = "<Grid Margin='0,0,0,8'>$cols$(& $hc 0 'What')$(& $hc 1 'Before')$(& $hc 2 'After')$(& $hc 3 'Change')$(& $hc 4 'Verdict')</Grid>"
+    $hc = { param($i, $t) "<TextBlock Grid.Column='$i' Text='$t' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'$(if ($i -eq 5) { " Margin='12,0,0,0'" })/>" }
+    $head = "<Grid Margin='0,0,0,10'>$cols$(& $hc 0 'WHAT')$(& $hc 1 'BEFORE')$(& $hc 2 'AFTER')$(& $hc 3 'CHANGE')$(& $hc 4 'VS. NOISE')$(& $hc 5 'VERDICT')</Grid>"
     [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>$head$($x -join '')</StackPanel>")
 }
 
@@ -15614,56 +16028,129 @@ function Get-HardwareSummary {
     [pscustomobject]@{ Cpu = $cpu; Gpu = $gpu; RamGb = $gb; RamMts = $mts; Hz = $hz; Laptop = $laptop; Nvidia = ($gpu -match 'NVIDIA|GeForce|RTX|GTX') }
 }
 function Show-Wizard {
+    # 2.0 first run: four short screens, skippable from any of them. 1 Welcome (the three promises), 2 Your PC (what was
+    # really found), 3 Your setup (main game + the three questions), 4 Ready (Boost now = Invoke-Wizard, or look around).
     $hw = Get-HardwareSummary
     $script:WizHw = $hw
+    $games = @($GameDefs | Where-Object { try { [bool](& $_.Installed) } catch { $false } })
+    if (-not $games.Count) { $games = @($GameDefs | Where-Object { $_.Id -eq 'fortnite' }) }
+    $gi = 0
+    $gameRadios = ($games | ForEach-Object { $gi++; "<RadioButton x:Name='MG_$gi' GroupName='mg' Content='$(Esc $_.Title)' Tag='$($_.Id)' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,0,20,6'$(if ($_.Id -eq 'fortnite' -or $gi -eq 1) { " IsChecked='True'" })/>" }) -join ''
+    $promise = { param($glyph, $title, $text) "<Grid Margin='0,0,0,14'><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions><Border Width='36' Height='36' CornerRadius='9' Background='{DynamicResource Bg.Surface}' VerticalAlignment='Top'><TextBlock Text='$glyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' Foreground='{DynamicResource Accent}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><StackPanel Grid.Column='1' Margin='14,0,0,0'><TextBlock Text='$title' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/><TextBlock Text='$text' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,0,0'/></StackPanel></Grid>" }
+    $hwRow = { param($k, $v) "<Grid Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='90'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions><TextBlock Text='$k' FontSize='12' Foreground='{DynamicResource Text.Muted}'/><TextBlock Grid.Column='1' Text='$(Esc $v)' FontFamily='{DynamicResource Font.Mono}' FontSize='12.5' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/></Grid>" }
     $body = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-  <TextBlock Text='Welcome to ZeroDelay' FontSize='24' FontWeight='Bold'/>
-  <TextBlock Text='Three quick questions and ZeroDelay sets up your PC. You can change everything afterwards.' Foreground='#A1A1A6' FontSize='13' Margin='0,6,0,18' TextWrapping='Wrap'/>
-  <Border Background='#1C1C1E' BorderThickness='0' CornerRadius='8' Padding='16,12' Margin='0,0,0,18'>
-    <StackPanel>
-      <TextBlock Text='$(Esc "CPU      $($hw.Cpu)")' FontFamily='Consolas' FontSize='12' Foreground='#D1D1D6'/>
-      <TextBlock Text='$(Esc "GPU      $($hw.Gpu)")' FontFamily='Consolas' FontSize='12' Foreground='#D1D1D6'/>
-      <TextBlock Text='$(Esc "RAM      $($hw.RamGb) GB at $($hw.RamMts) MT/s")' FontFamily='Consolas' FontSize='12' Foreground='#D1D1D6'/>
-      <TextBlock Text='$(Esc "Monitor  $($hw.Hz) Hz")' FontFamily='Consolas' FontSize='12' Foreground='#D1D1D6'/>
+  <Grid Margin='0,0,0,18'>
+    <StackPanel x:Name='Dots' Orientation='Horizontal' VerticalAlignment='Center'>
+      <Border Width='24' Height='4' CornerRadius='2' Margin='0,0,6,0'/><Border Width='24' Height='4' CornerRadius='2' Margin='0,0,6,0'/><Border Width='24' Height='4' CornerRadius='2' Margin='0,0,6,0'/><Border Width='24' Height='4' CornerRadius='2'/>
     </StackPanel>
-  </Border>
-  <TextBlock x:Name='PcLine' Text='Scanning your PC: hardware, drivers, Windows and installed apps...' FontSize='12' Foreground='#98989D' Margin='0,-8,0,18' TextWrapping='Wrap'/>
-  <TextBlock Text='1. What kind of PC is this?' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
-  <StackPanel Orientation='Horizontal' Margin='0,0,0,16'>
-    <RadioButton x:Name='Desk' GroupName='pc' Content='Desktop' Foreground='#D1D1D6' FontSize='13' Margin='0,0,24,0'/>
-    <RadioButton x:Name='Lap' GroupName='pc' Content='Laptop' Foreground='#D1D1D6' FontSize='13'/>
+    <Button x:Name='Skip' Content='Skip setup' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Right' ToolTip='Look around first. Settings &gt; Run the setup wizard again brings this back.'/>
+  </Grid>
+
+  <StackPanel x:Name='W1'>
+    <TextBlock Text='Welcome to ZeroDelay' FontFamily='{DynamicResource Font.Display}' FontSize='26' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+    <TextBlock Text='Less input delay. No placebo.' FontSize='15' Foreground='{DynamicResource Accent}' Margin='0,4,0,22'/>
+    $(& $promise '&#xE9D9;' 'Measured, not guessed' 'Every tweak says what it does and when not to use it. Tweaks that tests show do nothing are labelled as such.')
+    $(& $promise '&#xE7A7;' 'Everything comes back' 'The original value of every setting is saved first, a restore point comes before changes, and Restore undoes it all.')
+    $(& $promise '&#xE72E;' 'Anti-cheat stays untouched' 'No injection, no game files changed while a game runs, no memory reading.')
   </StackPanel>
-  <TextBlock Text='2. How should Fortnite look?' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
-  <StackPanel Margin='0,0,0,16'>
-    <RadioButton x:Name='LookComp' GroupName='look' Content='Competitive: sharp and clear, high FPS' Foreground='#D1D1D6' FontSize='13' Margin='0,0,0,6' IsChecked='True'/>
-    <RadioButton x:Name='LookFlat' GroupName='look' Content='Flat potato: solid colours, maximum FPS (NVIDIA)' Foreground='#D1D1D6' FontSize='13' Margin='0,0,0,6'/>
-    <RadioButton x:Name='LookKeep' GroupName='look' Content='Keep my current graphics settings' Foreground='#D1D1D6' FontSize='13'/>
+
+  <StackPanel x:Name='W2' Visibility='Collapsed'>
+    <TextBlock Text='Your PC' FontFamily='{DynamicResource Font.Display}' FontSize='26' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+    <TextBlock Text='What ZeroDelay found. Its recommendations adapt to this.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' Margin='0,4,0,16'/>
+    <Border Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='12' Padding='16,14,16,8'>
+      <StackPanel>
+        $(& $hwRow 'Processor' "$($hw.Cpu)")
+        $(& $hwRow 'Graphics' "$($hw.Gpu)")
+        $(& $hwRow 'Memory' "$($hw.RamGb) GB at $($hw.RamMts) MT/s")
+        $(& $hwRow 'Monitor' "$($hw.Hz) Hz")
+        $(& $hwRow 'Type' $(if ($hw.Laptop) { 'Laptop' } else { 'Desktop' }))
+      </StackPanel>
+    </Border>
+    <TextBlock x:Name='PcLine' Text='Scanning your PC: hardware, drivers, Windows and installed apps...' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,12,0,0' TextWrapping='Wrap'/>
   </StackPanel>
-  <TextBlock Text='3. Do you stream or record while you play?' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
-  <StackPanel Orientation='Horizontal' Margin='0,0,0,22'>
-    <RadioButton x:Name='StreamNo' GroupName='st' Content='No' Foreground='#D1D1D6' FontSize='13' Margin='0,0,24,0' IsChecked='True'/>
-    <RadioButton x:Name='StreamYes' GroupName='st' Content='Yes' Foreground='#D1D1D6' FontSize='13'/>
+
+  <StackPanel x:Name='W3' Visibility='Collapsed'>
+    <TextBlock Text='Your setup' FontFamily='{DynamicResource Font.Display}' FontSize='26' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,0,0,16'/>
+    <TextBlock Text='Your main game' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,0,0,8'/>
+    <WrapPanel Margin='0,0,0,16'>$gameRadios</WrapPanel>
+    <TextBlock Text='What kind of PC is this?' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,0,0,8'/>
+    <StackPanel Orientation='Horizontal' Margin='0,0,0,16'>
+      <RadioButton x:Name='Desk' GroupName='pc' Content='Desktop' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,0,24,0'/>
+      <RadioButton x:Name='Lap' GroupName='pc' Content='Laptop' Foreground='{DynamicResource Text.Secondary}' FontSize='13'/>
+    </StackPanel>
+    <TextBlock Text='How should Fortnite look?' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,0,0,8'/>
+    <StackPanel Margin='0,0,0,16'>
+      <RadioButton x:Name='LookComp' GroupName='look' Content='Competitive: sharp and clear, high FPS' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,0,0,6' IsChecked='True'/>
+      <RadioButton x:Name='LookFlat' GroupName='look' Content='Flat potato: solid colours, maximum FPS (NVIDIA)' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,0,0,6'/>
+      <RadioButton x:Name='LookKeep' GroupName='look' Content='Keep my current graphics settings' Foreground='{DynamicResource Text.Secondary}' FontSize='13'/>
+    </StackPanel>
+    <TextBlock Text='Do you stream or record while you play?' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,0,0,8'/>
+    <StackPanel Orientation='Horizontal'>
+      <RadioButton x:Name='StreamNo' GroupName='st' Content='No' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,0,24,0' IsChecked='True'/>
+      <RadioButton x:Name='StreamYes' GroupName='st' Content='Yes' Foreground='{DynamicResource Text.Secondary}' FontSize='13'/>
+    </StackPanel>
   </StackPanel>
-  <TextBlock x:Name='Progress' FontSize='12.5' Foreground='#30D158' Margin='0,0,0,10' TextWrapping='Wrap'/>
-  <Grid>
-    <Button x:Name='Skip' Content='Skip, I will set it up myself' Style='{DynamicResource Btn}' HorizontalAlignment='Left'/>
-    <Button x:Name='Go' Content='Set up my PC' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' HorizontalAlignment='Right'/>
+
+  <StackPanel x:Name='W4' Visibility='Collapsed'>
+    <TextBlock Text='Ready' FontFamily='{DynamicResource Font.Display}' FontSize='26' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+    <TextBlock Text='Boost now creates a restore point, then switches on the recommended tweaks that fit your answers. Every one can be switched off again, and Restore on Home undoes them all.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,16'/>
+    <TextBlock x:Name='Progress' FontSize='13' Foreground='{DynamicResource Good}' TextWrapping='Wrap' Margin='0,0,0,12'/>
+    <WrapPanel>
+      <Button x:Name='Go' Style='{DynamicResource Zd.Button.Primary}' Margin='0,0,8,8'>
+        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Boost now'/></StackPanel>
+      </Button>
+      <Button x:Name='Later' Content='Look around first' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,0,8'/>
+    </WrapPanel>
+  </StackPanel>
+
+  <Grid x:Name='Nav' Margin='0,22,0,0'>
+    <Button x:Name='Back' Content='Back' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Visibility='Hidden'/>
+    <Button x:Name='Next' Content='Next' Style='{DynamicResource Zd.Button.Primary}' HorizontalAlignment='Right' MinWidth='110'/>
   </Grid>
 </StackPanel>
 "@)
-    $wz = @{}; foreach ($n in 'Desk', 'Lap', 'LookComp', 'LookFlat', 'LookKeep', 'StreamNo', 'StreamYes', 'Progress', 'Skip', 'Go', 'PcLine') { $wz[$n] = $body.FindName($n) }
+    $wz = @{ Page = 1; Games = $games }
+    foreach ($n in 'Dots', 'W1', 'W2', 'W3', 'W4', 'Desk', 'Lap', 'LookComp', 'LookFlat', 'LookKeep', 'StreamNo', 'StreamYes', 'Progress', 'Skip', 'Go', 'Later', 'Back', 'Next', 'Nav', 'PcLine') { $wz[$n] = $body.FindName($n) }
+    $wz.GameRadios = @(for ($i = 1; $i -le $games.Count; $i++) { $body.FindName("MG_$i") })
     $script:Wiz = $wz
     if ($hw.Laptop) { $wz.Lap.IsChecked = $true } else { $wz.Desk.IsChecked = $true }
     if (-not $hw.Nvidia) { $wz.LookFlat.IsEnabled = $false }
-    $wz.Skip.Add_Click({ $script:Backup.Custom['wizarddone'] = $true; Save-Backup; $ui.Wizard.Visibility = 'Collapsed' })
-    $wz.Go.Add_Click({ Invoke-Wizard })
+    $done = { Save-WizardMainGame; $script:Backup.Custom['wizarddone'] = $true; Save-Backup; $ui.Wizard.Visibility = 'Collapsed' }
+    $script:WizDone = $done
+    $wz.Skip.Add_Click({ & $script:WizDone })
+    $wz.Later.Add_Click({ & $script:WizDone })
+    $wz.Go.Add_Click({ $script:Wiz.Later.IsEnabled = $false; $script:Wiz.Back.IsEnabled = $false; Save-WizardMainGame; Invoke-Wizard })
+    $wz.Next.Add_Click({ if ($script:Wiz.Page -lt 4) { $script:Wiz.Page++; Update-WizardPage } })
+    $wz.Back.Add_Click({ if ($script:Wiz.Page -gt 1) { $script:Wiz.Page--; Update-WizardPage } })
+    Update-WizardPage
     if ($script:SysProfile) { Update-WizardProfileLine }
     $ui.WizardBody.Content = $body
     $ui.Wizard.Visibility = 'Visible'
     if ($script:Anim) {
         Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220
         Show-Animated $ui.WizardBody 24 380 60
+    }
+}
+# which of the four screens shows, the progress dots, and Back / Next
+function Update-WizardPage {
+    $wz = $script:Wiz; if (-not $wz) { return }
+    foreach ($i in 1..4) {
+        $wz["W$i"].Visibility = if ($i -eq $wz.Page) { 'Visible' } else { 'Collapsed' }
+        $wz.Dots.Children[$i - 1].SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($i -le $wz.Page) { 'AccentFill' } else { 'Border.Strong' }))
+    }
+    $wz.Back.Visibility = if ($wz.Page -gt 1) { 'Visible' } else { 'Hidden' }
+    $wz.Next.Visibility = if ($wz.Page -lt 4) { 'Visible' } else { 'Collapsed' }
+    $wz.Skip.Visibility = if ($wz.Page -lt 4) { 'Visible' } else { 'Hidden' }
+    if ($wz.Page -lt 4) { [void]$wz.Next.Focus() } else { [void]$wz.Go.Focus() }
+}
+# the main game picked on screen 3: remembered ('maingame') and used as the first game on Tournaments
+function Save-WizardMainGame {
+    $wz = $script:Wiz; if (-not $wz -or -not $wz.GameRadios) { return }
+    $sel = @($wz.GameRadios | Where-Object { $_ -and $_.IsChecked } | Select-Object -First 1)
+    if ($sel.Count) {
+        $id = "$($sel[0].Tag)"; $script:Backup.Custom['maingame'] = $id
+        if (Get-TourGames | Where-Object { $_.Id -eq $id }) { $script:Backup.Custom['tourgame'] = $id }
     }
 }
 function Invoke-Wizard {
@@ -15713,14 +16200,14 @@ function New-SettingsPage {
         @{ Key = 'gmauto';     Title = 'Game Mode starts with any game'; Desc = 'When a game ZeroDelay knows starts, Game Mode turns on by itself and the message says which game. Each game page can say no for that one game.' }
     )
     $xr = ($rows | ForEach-Object {
-        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'><Grid>" +
+        "<Border Style='{DynamicResource Zd.Card}' Padding='20,16' Margin='0,0,0,10'><Grid>" +
         "<Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
         "<StackPanel><TextBlock Text='$(Esc $_.Title)' FontSize='14' FontWeight='SemiBold'/><TextBlock Text='$(Esc $_.Desc)' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/></StackPanel>" +
         "<ToggleButton x:Name='S_$($_.Key)' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/></Grid></Border>"
     }) -join ''
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+  <Border Style='{DynamicResource Zd.Card}' Padding='20,16' Margin='0,0,0,10'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
       <StackPanel>
@@ -15730,7 +16217,7 @@ function New-SettingsPage {
       <ToggleButton x:Name='S_pause' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center' ToolTip='Off: every tweak ZeroDelay switched on is turned off and remembered. On: they all come back.'/>
     </Grid>
   </Border>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+  <Border Style='{DynamicResource Zd.Card}' Padding='20,16' Margin='0,0,0,10'>
     <StackPanel>
       <TextBlock Text='Appearance' FontSize='14' FontWeight='SemiBold'/>
       <Grid Margin='0,14,0,0'>
@@ -15738,7 +16225,7 @@ function New-SettingsPage {
         <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
         <TextBlock Text='Theme' Foreground='#A1A1A6' FontSize='12.5' VerticalAlignment='Center'/>
         <StackPanel Grid.Column='1' Orientation='Horizontal'>
-          <Button x:Name='T_dark' Content='Dark' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='72'/>
+          <Button x:Name='T_dark' Content='Dark' Style='{DynamicResource Btn}' Margin='0,0,6,0' MinWidth='72'/>
           <Button x:Name='T_light' Content='Light' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='72'/>
           <Button x:Name='T_system' Content='Match Windows' Style='{DynamicResource Btn}'/>
         </StackPanel>
@@ -15750,17 +16237,17 @@ function New-SettingsPage {
           <TextBlock Text='Frosted, see-through window and panels (Windows 11)' Foreground='#98989D' FontSize='12' VerticalAlignment='Center' Margin='10,0,0,0'/>
         </StackPanel>
       </Grid>
-      <Border x:Name='ThemeNote' Background='#1C1C1E' CornerRadius='8' Padding='14,10' Margin='0,16,0,0' Visibility='Collapsed'>
+      <Border x:Name='ThemeNote' Background='{DynamicResource Info.Soft}' CornerRadius='8' Padding='14,10' Margin='0,16,0,0' Visibility='Collapsed'>
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
           <TextBlock Text='ZeroDelay restarts to switch its look. It takes about 3 seconds.' Foreground='#D1D1D6' FontSize='12.5' VerticalAlignment='Center' TextWrapping='Wrap'/>
-          <Button x:Name='ThemeApply' Grid.Column='1' Content='Restart ZeroDelay' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='12,0,0,0'/>
+          <Button x:Name='ThemeApply' Grid.Column='1' Content='Restart ZeroDelay' Style='{DynamicResource Zd.Button.Primary}' Margin='12,0,0,0'/>
         </Grid>
       </Border>
     </StackPanel>
   </Border>
   $xr
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,6,0,10'>
+  <Border Style='{DynamicResource Zd.Card}' Padding='20,16' Margin='0,6,0,10'>
     <StackPanel>
       <Grid>
         <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
@@ -15769,15 +16256,15 @@ function New-SettingsPage {
           <TextBlock x:Name='UpdStatus' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/>
         </StackPanel>
         <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-          <Button x:Name='UpdCheck' Content='Check for updates' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='UpdGet' Content='Download' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Margin='0,0,8,0' Visibility='Collapsed'/>
-          <Button x:Name='UpdReport' Content='Report a problem' Style='{DynamicResource Btn}' Margin='0,0,8,0' ToolTip='Opens a new GitHub issue with your PC details filled in. Needs a free GitHub account.'/>
-          <Button x:Name='UpdRepo' Content='GitHub page' Style='{DynamicResource Btn}'/>
+          <Button x:Name='UpdCheck' Content='Check for updates' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0'/>
+          <Button x:Name='UpdGet' Content='Download' Style='{DynamicResource Zd.Button.Primary}' Margin='0,0,8,0' Visibility='Collapsed'/>
+          <Button x:Name='UpdReport' Content='Report a problem' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0' ToolTip='Opens a new GitHub issue with your PC details filled in. Needs a free GitHub account.'/>
+          <Button x:Name='UpdRepo' Content='GitHub page' Style='{DynamicResource Zd.Button.Secondary}'/>
         </StackPanel>
       </Grid>
     </StackPanel>
   </Border>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+  <Border Style='{DynamicResource Zd.Card}' Padding='20,16' Margin='0,0,0,10'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
       <StackPanel>
@@ -15785,17 +16272,17 @@ function New-SettingsPage {
         <TextBlock Text='Save your preferences, presets, calendars and the list of tweaks that are on to one file, or bring them back on this or another PC. No match data, logs or backups of game files are included.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,4,20,0' TextWrapping='Wrap'/>
       </StackPanel>
       <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-        <Button x:Name='SetExport' Content='Export settings' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-        <Button x:Name='SetImport' Content='Import settings' Style='{DynamicResource Btn}'/>
+        <Button x:Name='SetExport' Content='Export settings' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0'/>
+        <Button x:Name='SetImport' Content='Import settings' Style='{DynamicResource Zd.Button.Secondary}'/>
       </StackPanel>
     </Grid>
   </Border>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='22,16' Margin='0,0,0,10'>
+  <Border Style='{DynamicResource Zd.Card}' Padding='20,16' Margin='0,0,0,10'>
     <StackPanel>
       <TextBlock Text='More' FontSize='14' FontWeight='SemiBold'/>
       <StackPanel Orientation='Horizontal' Margin='0,12,0,0'>
-        <Button x:Name='Wizard' Content='Run the setup wizard again' Style='{DynamicResource Btn}' Margin='0,0,10,0'/>
-        <Button x:Name='Folder' Content='Open ZeroDelay data folder' Style='{DynamicResource Btn}'/>
+        <Button x:Name='Wizard' Content='Run the setup wizard again' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,10,0'/>
+        <Button x:Name='Folder' Content='Open ZeroDelay data folder' Style='{DynamicResource Zd.Button.Secondary}'/>
       </StackPanel>
       <TextBlock x:Name='About' FontSize='12' Foreground='#98989D' Margin='0,14,0,0' TextWrapping='Wrap'/>
     </StackPanel>
@@ -15817,7 +16304,7 @@ function New-SettingsPage {
     $st.Folder.Add_Click({ Start-Process explorer.exe -ArgumentList "`"$DataDir`"" })
     $st.SetExport.Add_Click({ Export-ZdSettings })
     $st.SetImport.Add_Click({ Import-ZdSettings })
-    $st.About.Text = "ZeroDelay $AppVersion  ·  app: $PSCommandPath  ·  data and backups: $DataDir"
+    $st.About.Text = "ZeroDelay $AppVersion  ·  app: $PSCommandPath  ·  data: $DataDir  ·  backup: $BackupFile"
     $st.S_matchreport.IsChecked = [bool](Get-Setting 'matchreport' $true)
     $st.S_matchreport.Add_Click({ param($s, $e) $script:Backup.Custom['matchreport'] = [bool]$s.IsChecked; Save-Backup })
     $st.S_startup.IsChecked = [bool](Get-StartupTask)
@@ -15856,7 +16343,7 @@ function New-SettingsPage {
         [void]$st.Swatches.Children.Add($ring)
     }
     $st.ThemeApply.Add_Click({ Restart-ZeroDelay })
-    $st.S_glass.IsChecked = [bool](Get-Setting 'glass' $true)
+    $st.S_glass.IsChecked = [bool](Get-Setting 'glass' $false)   # 2.0: glass is opt-in
     if ([Environment]::OSVersion.Version.Build -lt 22621) { $st.S_glass.IsEnabled = $false; $st.S_glass.ToolTip = 'Needs Windows 11 22H2 or newer' }
     $st.S_glass.Add_Click({ param($s, $e) $script:Backup.Custom['glass'] = [bool]$s.IsChecked; Save-Backup; Update-AppearanceUi })
     Update-AppearanceUi
@@ -15872,7 +16359,8 @@ function New-SettingsPage {
 function Update-AppearanceUi {
     $st = $script:SetUi; if (-not $st) { return }
     $mode = Get-Setting 'theme' 'dark'
-    $acc = Get-Setting 'accent' 'blue'
+    $acc = Get-Setting 'accent' 'cyan'
+    if ($AccentMigration.ContainsKey("$acc")) { $acc = $AccentMigration["$acc"] }   # an old choice counts as its 2.0 preset
     foreach ($m in 'dark', 'light', 'system') {
         $b = $st["T_$m"]
         if ($m -eq $mode) { $b.Background = [ZdTheme]::Brush('#0071E3'); $b.Foreground = [ZdTheme]::Brush('#FFFFFF') }
@@ -15882,7 +16370,7 @@ function Update-AppearanceUi {
     foreach ($ring in $st.Swatches.Children) {
         $ring.BorderBrush = if ($ring.Tag -eq $acc) { [ZdTheme]::Brush('#F5F5F7') } else { [Windows.Media.Brushes]::Transparent }
     }
-    $changed = ($mode -ne $script:ThemeMode) -or ($acc -ne $script:Accent) -or ([bool](Get-Setting 'glass' $true) -ne $script:GlassSetting)
+    $changed = ($mode -ne $script:ThemeMode) -or ($acc -ne $script:Accent) -or ([bool](Get-Setting 'glass' $false) -ne $script:GlassSetting)
     $st.ThemeNote.Visibility = if ($changed) { 'Visible' } else { 'Collapsed' }
 }
 # Closes this window and starts a fresh copy on the Settings page (used to switch theme).
@@ -15941,8 +16429,16 @@ function Set-UpdateResult($r, [string]$err) {
     $latest = Get-TagVersion $r.Tag
     $script:UpdateInfo = $null
     if ($latest -and $latest -gt [version]$AppVersion) {
-        $asset = @($r.Assets) | Where-Object { $_.name -like '*Setup*.exe' } | Select-Object -First 1
-        $sha = if ("$($r.Body)" -match '\b([A-Fa-f0-9]{64})\b') { $Matches[1].ToUpper() } else { $null }
+        $assets = @($r.Assets)
+        $asset = @($assets | Where-Object { $_.name -eq 'ZeroDelay-Setup.exe' }) + @($assets | Where-Object { $_.name -match '^ZeroDelay-Setup.*\.exe$' }) | Select-Object -First 1
+        $sha = $null
+        # 1. GitHub's own SHA-256 of the uploaded file ("sha256:<hex>")
+        if ("$($asset.digest)" -match '^sha256:([A-Fa-f0-9]{64})$') { $sha = $Matches[1].ToUpper() }
+        # 2. a line in the release notes that names this file and gives its hash
+        elseif ($asset.name -and "$($r.Body)" -match "(?im)^[^\r\n]*$([regex]::Escape($asset.name))[^\r\n]*?\b([A-Fa-f0-9]{64})\b") { $sha = $Matches[1].ToUpper() }
+        # 3. a line that says SHA-256 (the format used so far); never just the first hash anywhere in the notes
+        elseif ("$($r.Body)" -match '(?im)^[^\r\n]*SHA-?256[^\r\n]*?\b([A-Fa-f0-9]{64})\b') { $sha = $Matches[1].ToUpper() }
+        if (-not $asset) { $sha = $null }
         $script:UpdateInfo = @{ Version = "$latest"; Url = $r.Url; SetupUrl = "$($asset.browser_download_url)"; Size = [long]$asset.size; Sha = $sha }
     }
     if ($script:UpdateManual -and -not $script:UpdateInfo) { Show-Toast "You have the latest version ($AppVersion)." '#30D158' }
@@ -15981,7 +16477,10 @@ function Install-Update {
     if (-not $u.SetupUrl -or -not $u.Sha) { Open-UpdatePage; return }
     $r = (Show-ZdDialog ("Update ZeroDelay to $($u.Version) now?`n`nZeroDelay downloads the new setup from GitHub, checks it, closes, installs it and opens again. It takes about 10 seconds. Your settings, backups and history are kept.") ('ZeroDelay update') ('YesNo') ('Question'))
     if ($r -ne 'Yes') { return }
-    $dir = Join-Path $env:TEMP 'ZeroDelay-Update'
+    # The setup is started with ZeroDelay's admin rights after its hash check, so it must sit where no other program
+    # can swap it in between (%TEMP% is writable by everything the user runs).
+    if (-not $SecureDir) { Open-UpdatePage; return }
+    $dir = Join-Path $SecureDir 'Update'
     New-Item -ItemType Directory -Force $dir | Out-Null
     $file = Join-Path $dir "ZeroDelay-Setup-$($u.Version).exe"
     Remove-Item $file -Force -ErrorAction SilentlyContinue
@@ -16026,6 +16525,12 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.0.0' = @(
+        @{ T = 'A new look'; D = 'ZeroDelay has a new design: darker and calmer, with one accent colour you choose in Settings (six to pick from) and a light mode. Home, Boost now, the tweak cards, the game pages, Checks, Game Mode, Tools and Settings were all rebuilt. Every tweak, check and tool is still here.' }
+        @{ T = 'Undo from the message'; D = 'After you switch something on or off, the message at the bottom has an Undo button, so a wrong click is one click to take back.' }
+        @{ T = '10 new tweaks and checks'; D = 'NVIDIA Low Latency Mode for games without Reflex, laptop display mode (MUX) and WhisperMode guides, Intel Application Optimization, the colour filter on older Windows, more receive buffers for a network card that drops packets, a Wi-Fi drop check, and guides for the Apex, VALORANT and Siege data center and buffering settings. Find them under New.' }
+        @{ T = 'Safer by design'; D = 'ZeroDelay now installs to Program Files, and its backup of your original settings lives in a folder only administrators can change. Updates are checked against GitHub''s own checksum before they install. The Wi-Fi 5 GHz tweak is no longer offered when you are already on 6 GHz.' }
+    )
     '1.19.0' = @(
         @{ T = 'Game Mode for every game'; D = 'Game Mode now starts by itself with any game ZeroDelay knows, not only Fortnite, and turns off when that game closes. The sidebar and the message say which game. Switch it off for one game on its page, or for all games in Settings.' }
         @{ T = 'A game''s tweaks, applied when it starts'; D = 'On a game''s page, choose to have its recommended tweaks switched on when the game starts and put back when it closes. Tweaks that change the game''s own settings files wait until it has closed. Everything ZeroDelay changes is listed in History and undone the same way.' }
@@ -16255,9 +16760,22 @@ function Open-ProblemReport {
 
 # --- Start with Windows: a logon task (admin rights, so no permission prompt at every sign-in), started in the tray.
 $StartupTaskName = 'ZeroDelay'
+# true when this script runs from Program Files (only administrators can change it there)
+function Test-ProtectedAppFolder {
+    $here = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
+    foreach ($pf in $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
+        if ($pf -and $here.StartsWith([IO.Path]::GetFullPath($pf).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    $false
+}
 function Get-StartupTask { Get-ScheduledTask -TaskName $StartupTaskName -TaskPath '\' -ErrorAction SilentlyContinue }
 function Set-StartWithWindows([bool]$On) {
     if (-not $On) { Unregister-ScheduledTask -TaskName $StartupTaskName -TaskPath '\' -Confirm:$false -ErrorAction SilentlyContinue; return }
+    # The task runs this script as administrator at every sign-in without asking. Only allow that for a copy in
+    # Program Files: a copy any program can edit would hand that program administrator rights.
+    if (-not (Test-ProtectedAppFolder)) {
+        throw "Start with Windows needs ZeroDelay installed in Program Files. This copy is in $PSScriptRoot, which other programs can change. Install ZeroDelay with ZeroDelay-Setup.exe, then turn this on again."
+    }
     $user = "$env:USERDOMAIN\$env:USERNAME"
     $ps = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
     $action = New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Tray"
@@ -16271,7 +16789,14 @@ function Set-StartWithWindows([bool]$On) {
 # After an update or a move the task may point at an old copy; point it at this one.
 function Repair-StartupTask {
     if ($Snapshot -or $NoElevate) { return }
-    try { $t = Get-StartupTask; if ($t -and "$($t.Actions[0].Arguments)" -notlike "*$PSCommandPath*") { Set-StartWithWindows $true } } catch {}
+    try {
+        $t = Get-StartupTask
+        # plain substring test: '[' or ']' in the path are not wildcards here
+        if ($t -and "$($t.Actions[0].Arguments)".IndexOf($PSCommandPath, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            # a copy outside Program Files may not take over the admin task; remove it rather than leave it pointing elsewhere
+            if (Test-ProtectedAppFolder) { Set-StartWithWindows $true } else { Set-StartWithWindows $false }
+        }
+    } catch {}
 }
 
 # --- Mouse test (Tools > Mouse test)
@@ -17066,6 +17591,18 @@ $AppScanScript = {
     param($opt)
     $list = New-Object Collections.ArrayList
     $seen = @{}
+    # the disk an app is on: from its install folder, else its icon or uninstaller (not msiexec or the MSI cache,
+    # which sit on the Windows disk whatever disk the app went to). Shown as "C:" or "D: (Games)" with the disk's own name.
+    $driveNames = @{}
+    foreach ($d in [IO.DriveInfo]::GetDrives()) { try { if ($d.IsReady) { $driveNames[$d.Name.Substring(0, 2).ToUpper()] = "$($d.VolumeLabel)".Trim() } } catch {} }
+    function Get-AppDrive([string[]]$Paths) {
+        foreach ($x in $Paths) {
+            $t = "$x".Trim().Trim('"')
+            if (-not $t -or $t -match '(?i)msiexec|rundll32|\\Package Cache\\|\\Installer\\') { continue }
+            if ($t -match '^([A-Za-z]:)\\') { $l = $Matches[1].ToUpper(); return $(if ($driveNames[$l]) { "$l ($($driveNames[$l]))" } else { $l }) }
+        }
+        $null
+    }
     # Start-menu shortcuts by name -> the exe they open (used for icons when an app registers none)
     $lnkIndex = @{}
     $sh = New-Object -ComObject WScript.Shell
@@ -17113,7 +17650,7 @@ $AppScanScript = {
             }
             [void]$list.Add([pscustomobject]@{ Kind = 'desktop'; Name = "$($p.DisplayName)".Trim(); Publisher = "$($p.Publisher)".Trim(); Version = "$($p.DisplayVersion)"
                 SizeMb = $(if ($p.EstimatedSize) { [Math]::Round($p.EstimatedSize / 1024.0) } else { $null }); Date = $date; Uninstall = "$($p.UninstallString)"; Id = $k.PSChildName; Bloat = $false
-                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:'); IconPng = $png })
+                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; Drive = (Get-AppDrive @("$($p.InstallLocation)", "$($p.DisplayIcon)", "$($p.UninstallString)")); KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:'); IconPng = $png })
         }
     }
     foreach ($a in @(Get-AppxPackage -PackageTypeFilter Main -ErrorAction SilentlyContinue)) {
@@ -17135,7 +17672,7 @@ $AppScanScript = {
         if (-not $dn -or $dn -like 'ms-resource:*') { $dn = (($a.Name -replace '^[^.]+\.', '') -creplace '([a-z])([A-Z])', '$1 $2') }
         if (-not $pub -or $pub -like 'ms-resource:*') { $pub = ($a.Publisher -replace '^CN=([^,]+).*', '$1') }
         [void]$list.Add([pscustomobject]@{ Kind = 'store'; Name = $dn; Publisher = $pub; Version = "$($a.Version)"; SizeMb = $null; Date = $null
-            Full = $a.PackageFullName; Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name); IconPng = $png })
+            Full = $a.PackageFullName; Drive = (Get-AppDrive @("$($a.InstallLocation)")); Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name); IconPng = $png })
     }
     $list
 }
@@ -17150,7 +17687,7 @@ function New-AppsPage {
           <Button x:Name='TabDesk' Content='Programs' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
           <Button x:Name='TabStore' Content='Store apps' Style='{DynamicResource Btn}'/>
         </StackPanel>
-        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name or publisher'/>
+        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name, publisher or disk (for example D:)'/>
         <StackPanel Grid.Column='2' Orientation='Horizontal'>
           <Button x:Name='SortName' Content='A to Z' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
           <Button x:Name='SortSize' Content='Biggest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
@@ -17203,7 +17740,7 @@ function Update-AppsList {
     foreach ($b in 'SortName', 'SortSize', 'SortDate') { $au[$b].FontWeight = if ($b -eq "Sort$($script:AppsSort)") { 'Bold' } else { 'Normal' } }
     $q = $au.Find.Text.Trim()
     $items = if ($script:AppsKind -eq 'desktop') { $desk } else { $store }
-    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" }) }
+    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" -or ($_.Drive -and ($_.Drive -like "$q*" -or "$($_.Drive)".Substring(0, 1) -eq $q.TrimEnd(':'))) }) }
     $items = switch ($script:AppsSort) {
         'size' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { [double]$_.SizeMb } -Descending) } else { @($items | Sort-Object Name) } }
         'date' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { if ($_.Date) { $_.Date } else { [datetime]::MinValue } } -Descending) } else { @($items | Sort-Object Name) } }
@@ -17213,7 +17750,7 @@ function Update-AppsList {
                     else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them. Showing $($items.Count)." }
     $rows = for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
         $a = $items[$i]
-        $sub = @($a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
+        $sub = @($(if ($a.Drive) { "disk $($a.Drive)" }), $a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
         $tag = if ($a.Bloat) { "<Border Background='#4E3E28' CornerRadius='5' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='#FF9F0A'/></Border>" } else { '' }
         # icon slot: a letter tile in the app's own colour, covered by the real icon when there is one
         $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
@@ -18237,15 +18774,15 @@ $LiveTileDefs = @(
 )
 function New-LiveTile($d) {
     $b = [ZdTheme]::Parse(@"
-<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Card}' Padding='20,18' Margin='14,14,-2,-2'>
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Zd.Card}' Padding='16' Margin='14,14,-2,-2'>
   <StackPanel>
     <Grid>
-      <TextBlock Text='$($d.Label)' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
+      <TextBlock Text='$($d.Label)' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}'/>
       <TextBlock Text='$($d.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#98989D' HorizontalAlignment='Right'/>
     </Grid>
     <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
-      <TextBlock x:Name='Val' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/>
-      <TextBlock x:Name='Unit' Text='$($d.Unit)' FontSize='15' Foreground='#A1A1A6' VerticalAlignment='Bottom' Margin='3,0,0,6'/>
+      <TextBlock x:Name='Val' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/>
+      <TextBlock x:Name='Unit' Text='$($d.Unit)' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='6,0,0,7'/>
     </StackPanel>
     <TextBlock x:Name='Sub' FontSize='12' Foreground='#A1A1A6' Margin='0,-2,0,0' Visibility='Collapsed'/>
     <Grid Height='5' Margin='0,8,0,0'>
@@ -18275,7 +18812,7 @@ function New-LiveTile($d) {
 }
 function New-LiveAppsTile {
     $b = [ZdTheme]::Parse(@"
-<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Card}' Padding='20,18' Margin='14,14,-2,-2'>
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Style='{DynamicResource Zd.Card}' Padding='16' Margin='14,14,-2,-2'>
   <StackPanel>
     <Grid>
       <TextBlock Text='BUSIEST APPS' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
@@ -21044,7 +21581,7 @@ function Set-GameChips($Panel, $Games, [string]$Sel, [scriptblock]$Pick) {
         $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$(Esc "$(Get-GameTitle $r.Id)  ·  $($r.Count)")' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
         $c.Tag = @{ Id = $r.Id; Pick = $Pick }
         $c.Add_Click({ param($s, $e) & $s.Tag.Pick $s.Tag.Id })
-        $c.Background = ConvertTo-Brush $(if ($on) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($on) { '#FDFDFD' } else { '#F5F5F7' })
+        $c.Background = ConvertTo-Brush $(if ($on) { '#0071E3' } else { '#15181D' }); $c.Foreground = ConvertTo-Brush $(if ($on) { '#0A0B0C' } else { '#9AA3AF' })
         [void]$Panel.Children.Add($c)
     }
 }
@@ -21798,8 +22335,8 @@ function New-GameTile($g) {
   <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,1'><GradientStop Color='$($g.From)' Offset='0'/><GradientStop Color='$($g.To)' Offset='1'/></LinearGradientBrush></Border.Background>
   <Grid ClipToBounds='True'>
     <TextBlock x:Name='Glyph' Text='$('&#x{0:X};' -f [int]$g.Glyph)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='170' Foreground='#26FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-6,-44,0'/>
-    <TextBlock x:Name='Big' Text='$(Esc $g.Title.ToUpper())' FontSize='$([Math]::Min(29, [Math]::Floor(184 / (0.82 * [Math]::Max(1, ($g.Title -split '[\s-]' | Measure-Object Length -Maximum).Maximum)))))' FontWeight='Black' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
-    <Border x:Name='Logo' Width='124' Height='124' CornerRadius='28' HorizontalAlignment='Center' VerticalAlignment='Top' Margin='0,52,0,0' Visibility='Collapsed'>
+    <TextBlock x:Name='Big' Text='$(Esc $g.Title.ToUpper())' FontSize='$([Math]::Min(29, [Math]::Floor(184 / (0.82 * [Math]::Max(1, ($g.Title -split '[\s-]' | Measure-Object Length -Maximum).Maximum)))))' FontWeight='SemiBold' Foreground='#FFFDFDFD' TextWrapping='Wrap' Margin='18,22,18,0' VerticalAlignment='Top'/>
+    <Border x:Name='Logo' Width='124' Height='124' CornerRadius='16' HorizontalAlignment='Center' VerticalAlignment='Top' Margin='0,52,0,0' Visibility='Collapsed'>
       <Border.Effect><DropShadowEffect BlurRadius='28' ShadowDepth='6' Direction='270' Opacity='0.45' Color='Black'/></Border.Effect>
     </Border>
     <Border x:Name='Bar' VerticalAlignment='Bottom' Background='#8C0B0B10' CornerRadius='0,0,16,16' Padding='16,12'>
@@ -21852,25 +22389,35 @@ function New-GamesPage {
       <Button x:Name='Back' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='10,6' Margin='0,0,0,14'>
         <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72B;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' Margin='0,1,8,0'/><TextBlock Text='All games'/></StackPanel>
       </Button>
-      <Border x:Name='Hero' CornerRadius='18' Padding='26,22' Margin='0,0,0,16'>
+      <!-- 2.0 hero: game art faded into the page background, logo + title, Start Game in the accent with the Game Mode chip -->
+      <Border x:Name='Hero' CornerRadius='16' Margin='0,0,0,16' ClipToBounds='True' MinHeight='260'>
         <Grid>
-          <TextBlock x:Name='HeroGlyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Center' Margin='0,-30,-10,-30'/>
-          <StackPanel Orientation='Horizontal'>
-          <Border x:Name='HeroLogo' Width='96' Height='96' CornerRadius='22' Margin='0,0,20,0' VerticalAlignment='Center' Visibility='Collapsed'>
-            <Border.Effect><DropShadowEffect BlurRadius='22' ShadowDepth='4' Direction='270' Opacity='0.4' Color='Black'/></Border.Effect>
+          <Border x:Name='HeroFade' CornerRadius='16'>
+            <Border.Background>
+              <LinearGradientBrush StartPoint='0,0' EndPoint='0,1'>
+                <GradientStop Color='#2607080A' Offset='0'/><GradientStop Color='#9907080A' Offset='0.5'/><GradientStop Color='#F207080A' Offset='0.85'/><GradientStop Color='#FF07080A' Offset='1'/>
+              </LinearGradientBrush>
+            </Border.Background>
           </Border>
-          <StackPanel VerticalAlignment='Center'>
-            <TextBlock x:Name='HeroTitle' FontSize='38' FontWeight='Black' Foreground='#FFFDFDFD'/>
-            <WrapPanel Margin='0,12,0,0'>
-              <Border x:Name='GmChip' CornerRadius='12' Padding='12,5' Margin='0,0,8,0' Background='#33FDFDFD'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
-              <Border x:Name='AutoChip' CornerRadius='12' Padding='10,3,12,3' Margin='0,0,8,0' Background='#33FDFDFD'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
-              <Border CornerRadius='12' Padding='12,5' Background='#33FDFDFD'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='#FFFDFDFD'/></Border>
+          <TextBlock x:Name='HeroGlyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,10,20,0'/>
+          <StackPanel VerticalAlignment='Bottom' Margin='24,24,24,22'>
+            <StackPanel Orientation='Horizontal'>
+              <Border x:Name='HeroLogo' Width='64' Height='64' CornerRadius='14' Margin='0,0,16,0' VerticalAlignment='Center' Visibility='Collapsed' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'/>
+              <TextBlock x:Name='HeroTitle' FontFamily='{DynamicResource Font.Display}' FontSize='32' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>
+            </StackPanel>
+            <WrapPanel Margin='0,16,0,0'>
+              <Button x:Name='Play' Style='{DynamicResource Zd.Button.Primary}' MinHeight='44' Padding='22,0' Margin='0,0,12,8' AutomationProperties.Name='Start Game'>
+                <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' VerticalAlignment='Center' Margin='0,1,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='16' FontWeight='SemiBold'/></StackPanel>
+              </Button>
+              <Border x:Name='GmChip' Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,8,8' VerticalAlignment='Center'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/></Border>
+              <Border x:Name='AutoChip' Style='{DynamicResource Zd.Chip}' Padding='10,4,12,4' Margin='0,0,8,8' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
+              <Border Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,0,8' VerticalAlignment='Center'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}'/></Border>
             </WrapPanel>
-          </StackPanel>
+            <TextBlock x:Name='PlayNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' MaxWidth='560' HorizontalAlignment='Left' Margin='0,4,0,0'/>
           </StackPanel>
         </Grid>
       </Border>
-      <Border x:Name='AutoCard' Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
+      <Border x:Name='AutoCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
         <StackPanel>
           <TextBlock Text='WHEN THIS GAME STARTS' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
           <TextBlock x:Name='AutoSum' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,12'/>
@@ -21893,7 +22440,7 @@ function New-GamesPage {
           </StackPanel>
         </StackPanel>
       </Border>
-      <Border x:Name='ServerCard' Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,16'>
+      <Border x:Name='ServerCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
           <StackPanel>
@@ -21909,44 +22456,27 @@ function New-GamesPage {
             <TextBlock x:Name='ServerHint' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,10,0,0' MaxWidth='420' HorizontalAlignment='Left'/>
           </StackPanel>
           <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-            <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
-            <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
-            <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontSize='30' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+            <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+            <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+            <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
           </StackPanel>
         </Grid>
       </Border>
-      <Border Style='{DynamicResource Card}' Padding='22,18' Margin='0,0,0,18'>
+      <Border Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,18'>
         <StackPanel>
           <TextBlock Text='YOUR ROUTE, LIVE' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
           <Grid x:Name='Route' Margin='0,16,0,0'>
             <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-            <Border Grid.ColumnSpan='4' Height='2' Background='#3A3A3C' VerticalAlignment='Top' Margin='60,21,60,0'/>
           </Grid>
           <TextBlock x:Name='RouteNote' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,14,0,0'/>
         </StackPanel>
       </Border>
-      <Grid>
-        <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-        <Button x:Name='Play' Cursor='Hand' Width='260' Height='58'>
-          <Button.Template>
-            <ControlTemplate TargetType='Button'>
-              <Border x:Name='Bg' CornerRadius='29'>
-                <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,0'><GradientStop Color='#FF4BF0BA' Offset='0'/><GradientStop Color='#FF22CF93' Offset='1'/></LinearGradientBrush></Border.Background>
-                <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
-              </Border>
-              <ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Bg' Property='Opacity' Value='0.88'/></Trigger></ControlTemplate.Triggers>
-            </ControlTemplate>
-          </Button.Template>
-          <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='#FF06281C' Margin='0,2,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='18' FontWeight='SemiBold' Foreground='#FF06281C'/></StackPanel>
-        </Button>
-        <TextBlock x:Name='PlayNote' Grid.Column='1' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' VerticalAlignment='Center' Margin='18,0,0,0'/>
-      </Grid>
-      <StackPanel x:Name='Stats' Margin='0,30,0,0'/>
+      <StackPanel x:Name='Stats' Margin='0,14,0,0'/>
     </StackPanel>
-    <Border Grid.Column='1' Style='{DynamicResource Card}' Padding='18,16' VerticalAlignment='Top'>
+    <Border Grid.Column='1' Style='{DynamicResource Zd.Card}' Padding='18' VerticalAlignment='Top'>
       <StackPanel>
         <TextBlock Text='Preset' FontSize='15' FontWeight='SemiBold'/>
-        <WrapPanel x:Name='PresetChips' Margin='0,12,0,4'/>
+        <Border HorizontalAlignment='Left' Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3' Margin='0,12,0,8'><WrapPanel x:Name='PresetChips'/></Border>
         <TextBlock x:Name='PresetNote' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,0,0,16'/>
         <TextBlock Text='Game tools' FontSize='15' FontWeight='SemiBold'/>
         <WrapPanel x:Name='ToolChips' Margin='0,12,0,8'/>
@@ -21970,16 +22500,22 @@ function New-GamesPage {
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
         $n = [ZdTheme]::Parse(@"
-<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' HorizontalAlignment='Center'>
-  <Border Width='44' Height='44' CornerRadius='22' Background='#2C2C2E' BorderBrush='#48484A' BorderThickness='1' HorizontalAlignment='Center'>
-    <TextBlock FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' HorizontalAlignment='Center' VerticalAlignment='Center' Foreground='#0A84FF'/>
-  </Border>
-  <TextBlock FontSize='12.5' FontWeight='SemiBold' HorizontalAlignment='Center' Margin='0,8,0,0' TextTrimming='CharacterEllipsis' MaxWidth='150'/>
-  <TextBlock FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center' Margin='0,2,0,0' Typography.NumeralAlignment='Tabular'/>
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' HorizontalAlignment='Stretch'>
+  <Grid Height='44'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+    <Border Height='2' Background='{DynamicResource Border.Strong}' VerticalAlignment='Center'/>
+    <Border Grid.Column='1' Height='2' Background='{DynamicResource Border.Strong}' VerticalAlignment='Center'/>
+    <Border Grid.ColumnSpan='2' Width='44' Height='44' CornerRadius='22' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Strong}' BorderThickness='1' HorizontalAlignment='Center'>
+      <TextBlock FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' HorizontalAlignment='Center' VerticalAlignment='Center' Foreground='{DynamicResource Accent}'/>
+    </Border>
+  </Grid>
+  <TextBlock FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center' Margin='0,8,0,0' TextTrimming='CharacterEllipsis' MaxWidth='150'/>
+  <TextBlock FontFamily='{DynamicResource Font.Mono}' FontSize='13' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Center' Margin='0,2,0,0' Typography.NumeralAlignment='Tabular'/>
 </StackPanel>
 "@)
         [Windows.Controls.Grid]::SetColumn($n, $i); [void]$h.Route.Children.Add($n)
-        $n.Children[0].Child.Text = @([char]0xE7F8, [char]0xE839, [char]0xE774, [char]0xE968)[$i]
+        $n.Children[0].Children[2].Child.Text = @([char]0xE7F8, [char]0xE839, [char]0xE774, [char]0xE968)[$i]
+        if ($i -eq 0) { $n.Children[0].Children[0].Visibility = 'Hidden' }; if ($i -eq 3) { $n.Children[0].Children[1].Visibility = 'Hidden' }
         $n })
     $h.Back.Add_Click({ Hide-GameDetail })
     $h.ServerBtn.Add_Click({ $script:GamesUi.ServerPop.IsOpen = $true })
@@ -22015,16 +22551,14 @@ function Show-GameDetail($g) {
     $grad = New-Object Windows.Media.LinearGradientBrush; $grad.StartPoint = '0,0'; $grad.EndPoint = '1,1'
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.From)), 0))
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.To)), 1))
-    $h.Hero.Background = $grad
-    $h.HeroTitle.Text = $g.Title.ToUpper(); $h.HeroGlyph.Text = [string]$g.Glyph
+    $h.HeroTitle.Text = $g.Title; $h.HeroGlyph.Text = [string]$g.Glyph
+    $art = Get-GameArt $g 'header'
+    if ($art) {
+        $ib = New-Object Windows.Media.ImageBrush $art; $ib.Stretch = 'UniformToFill'; $ib.AlignmentY = 'Top'
+        $h.Hero.Background = $ib; $h.HeroGlyph.Visibility = 'Collapsed'
+    } else { $h.Hero.Background = $grad; $h.HeroGlyph.Visibility = 'Visible' }
     $logo = Get-GameLogo $g
-    $art = if ($logo) { $null } else { Get-GameArt $g 'header' }
-    if ($logo) { $h.HeroLogo.Width = 96; $h.HeroLogo.CornerRadius = 22; $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible'; $h.HeroGlyph.Visibility = 'Collapsed' }
-    elseif ($art) {
-        $ib = New-Object Windows.Media.ImageBrush $art; $ib.Stretch = 'UniformToFill'
-        $h.HeroLogo.Width = 205; $h.HeroLogo.CornerRadius = 14; $h.HeroLogo.Background = $ib; $h.HeroLogo.Visibility = 'Visible'; $h.HeroGlyph.Visibility = 'Collapsed'
-    }
-    else { $h.HeroLogo.Visibility = 'Collapsed'; $h.HeroGlyph.Visibility = 'Visible' }
+    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible' } else { $h.HeroLogo.Visibility = 'Collapsed' }
     $h.Nodes[0].Children[1].Text = 'This PC'; $h.Nodes[1].Children[1].Text = 'Your router'; $h.Nodes[2].Children[1].Text = 'Internet provider'
     # server list: automatic first, then every server by region
     $h.ServerList.Children.Clear()
@@ -22082,9 +22616,9 @@ function Update-GameDetail {
     $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h) { return }
     $gm = Test-ZDGameMode
     $h.GmChipText.Text = Get-GameModeChipText $g
-    $h.GmChip.Background = ConvertTo-Brush $(if ($gm) { '#5530D158' } else { '#33FDFDFD' })
+    $h.GmChip.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($gm) { 'Good.Soft' } else { 'Bg.Raised' }))
     $inst = try { [bool](& $g.Installed) } catch { $false }
-    $h.Play.IsEnabled = $inst; $h.Play.Opacity = $(if ($inst) { 1 } else { 0.45 })
+    $h.Play.IsEnabled = $inst   # the 2.0 button dims itself when disabled
     $p = if ($inst) { Get-Process $g.Proc -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
     if (-not $inst) {
         $h.RunText.Text = 'Not installed'; $h.PlayText.Text = 'Not installed'
@@ -22100,6 +22634,13 @@ function Update-GameDetail {
         $h.PlayText.Text = 'Start Game'
     }
     $h.PlayNote.Text = if ($g.Id -eq 'fortnite') { 'Turns Game Mode on (background apps closed, match power settings) and launches Fortnite through the Epic Games Launcher.' } else { "Launches $($g.Title). For background apps closed while you play, switch Game Mode on in the sidebar first." }
+}
+# colours the link into route stop $i (and that stop's ms reading) by its delay; $null = not measured yet
+function Set-RouteHop($h, [int]$i, $Key) {
+    $line = if ($Key) { $Key } else { 'Border.Strong' }
+    $h.Nodes[$i].Children[0].Children[0].SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $line)
+    $h.Nodes[$i - 1].Children[0].Children[1].SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $line)
+    $h.Nodes[$i].Children[2].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($Key) { $Key } else { 'Text.Secondary' }))
 }
 # once a second while a game page is on screen: keeps the route monitor running and shows its numbers
 function Update-GameDetailTick {
@@ -22118,6 +22659,12 @@ function Update-GameDetailTick {
     $h.Nodes[2].Children[2].Text = if ([int]$s.Rounds -ge 3 -and (-not $s.Isp -or [int]$s.IspMs -lt 0)) { 'hidden' } elseif ($s.Isp) { & $fmt $s.IspMs } else { 'finding...' }
     if (-not $script:GameServer) { $h.Nodes[3].Children[1].Text = if ($s.AutoName) { "$($s.AutoName) (auto)" } else { 'Game server' } }
     $h.Nodes[3].Children[2].Text = if ($s.Target) { & $fmt $s.SrvMs } elseif ($script:GameServers.Count) { 'measuring...' } else { 'not visible' }
+    # 2.0: each link and its ms reading take the colour of that hop's delay (router < 2 / 5 ms, provider < 15 / 30, server < 30 / 60)
+    $lat = { param($on, $v, $good, $warn) if (-not $on -or $null -eq $v -or [int]$v -lt 0) { $null } elseif ([int]$v -lt $good) { 'Good' } elseif ([int]$v -le $warn) { 'Warn' } else { 'Bad' } }
+    Set-RouteHop $h 1 (& $lat $s.Gw $s.GwMs 2 5)
+    Set-RouteHop $h 2 (& $lat $s.Isp $s.IspMs 15 30)
+    Set-RouteHop $h 3 (& $lat $s.Target $s.SrvMs 30 60)
+    $h.PingVal.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($k = & $lat $s.Target $s.SrvMs 30 60) { $k } else { 'Text.Primary' }))
     $h.PingVal.Text = if ([int]$s.SrvMs -ge 0 -and $s.Target) { "$($s.SrvMs)" } else { '-' }
     $h.LossVal.Text = if ([int]$s.Sent -ge 5) { '{0:0.#}' -f (100.0 * [int]$s.Lost / [int]$s.Sent) } else { '-' }
     $h.JitVal.Text = if ([double]$s.Jitter -ge 0) { '{0:0.#}' -f [double]$s.Jitter } else { '-' }
@@ -22144,7 +22691,7 @@ function Update-GameTools {
     foreach ($k in $kinds) {
         $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$k' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
         $c.Tag = $k; $c.Add_Click({ param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools })
-        $c.Background = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0A84FF' } else { '#2C2C2E' }); $c.Foreground = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#FDFDFD' } else { '#F5F5F7' })
+        $c.Background = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0071E3' } else { '#15181D' }); $c.Foreground = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0A0B0C' } else { '#9AA3AF' })
         [void]$h.ToolChips.Children.Add($c)
     }
     $h.ToolList.Children.Clear()
@@ -22311,112 +22858,185 @@ function Update-StatusStrip([bool]$Paused) {
     $ui.StripItems.Opacity = if ($Paused) { 0.5 } else { 1 }
 }
 function New-HomePage {
+    # 2.0 Home: "how did my last matches feel, and am I set up right?"
+    # 1. last matches strip  2. setup score hero  3. heads-up banners  4. live tiles
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
-  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='24,20' Margin='0,0,0,16'>
-    <Grid>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-      <StackPanel>
-        <TextBlock Text='Your last matches' FontSize='15' FontWeight='SemiBold'/>
-        <TextBlock x:Name='ResSub' FontSize='12.5' Foreground='#A1A1A6' Margin='0,2,0,0' TextWrapping='Wrap'/>
-      </StackPanel>
-      <Button x:Name='ResOpen' Grid.Column='1' Style='{DynamicResource Btn}' Content='Match reports' VerticalAlignment='Top' Padding='12,6'/>
-    </Grid>
-  </Border>
-  <UniformGrid x:Name='ResNums' Columns='4' Margin='-14,-30,-2,2'/>
-  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='10,6' Margin='0,14,0,16'>
+  <Grid Margin='0,0,12,12'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <StackPanel>
+      <TextBlock Text='Your last matches' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+      <TextBlock x:Name='ResSub' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0' TextWrapping='Wrap'/>
+    </StackPanel>
+    <Button x:Name='ResOpen' Grid.Column='1' Style='{DynamicResource Zd.Button.Ghost}' Content='All match reports' VerticalAlignment='Bottom'/>
+  </Grid>
+  <ScrollViewer x:Name='MatchScroll' HorizontalScrollBarVisibility='Auto' VerticalScrollBarVisibility='Disabled' Margin='0,0,0,24' Padding='0,0,0,4'>
+    <StackPanel x:Name='Matches' Orientation='Horizontal'/>
+  </ScrollViewer>
+  <Border x:Name='NoMatches' Style='{DynamicResource Zd.Card}' Margin='0,0,12,24' Visibility='Collapsed'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-      <Grid Width='132' Height='132' VerticalAlignment='Center' Margin='24'>
-        <Ellipse Stroke='#3A3A3C' StrokeThickness='11'/>
-        <Ellipse x:Name='Ring' Stroke='#30D158' StrokeThickness='11' StrokeDashCap='Round' RenderTransformOrigin='0.5,0.5'>
-          <Ellipse.RenderTransform><RotateTransform Angle='-90'/></Ellipse.RenderTransform>
-        </Ellipse>
-        <StackPanel VerticalAlignment='Center' HorizontalAlignment='Center'>
-          <TextBlock x:Name='Pct' Text='0' FontSize='38' FontWeight='Bold' HorizontalAlignment='Center' Typography.NumeralAlignment='Tabular'/>
-          <TextBlock Text='optimized' FontSize='12' Foreground='#A1A1A6' HorizontalAlignment='Center' Margin='0,-4,0,0'/>
-        </StackPanel>
-      </Grid>
-      <StackPanel Grid.Column='1' Margin='6,24,24,24' VerticalAlignment='Center'>
-        <TextBlock x:Name='Headline' FontSize='24' FontWeight='Bold' TextWrapping='Wrap'/>
-        <TextBlock x:Name='Sub' FontSize='13' Foreground='#A1A1A6' Margin='0,6,0,0' TextWrapping='Wrap' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
-        <WrapPanel Margin='0,16,0,0'>
-          <Button x:Name='Go' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='22,10' FontSize='14' Margin='0,0,10,8'>
-            <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,8,0'/><TextBlock x:Name='GoText' Text='Boost now'/></StackPanel>
-          </Button>
-          <Button x:Name='Undo' Style='{DynamicResource Btn}' Padding='18,10' FontSize='14' Margin='0,0,18,8'>
-            <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE7A7;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Margin='0,2,8,0'/><TextBlock Text='Restore'/></StackPanel>
-          </Button>
-          <StackPanel Orientation='Horizontal' VerticalAlignment='Center' Margin='0,0,0,8'>
-            <ToggleButton x:Name='Auto' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
-            <TextBlock Text='Game Mode by itself when Fortnite starts' FontSize='12.5' VerticalAlignment='Center' Margin='10,0,0,0'/>
-          </StackPanel>
-        </WrapPanel>
+      <Border Width='32' Height='32' CornerRadius='8' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Top'>
+        <TextBlock Text='&#xE7FC;' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+      </Border>
+      <StackPanel Grid.Column='1' Margin='12,0,0,0'>
+        <TextBlock Text='No matches yet' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+        <TextBlock Text='Play a match with ZeroDelay open and your ping, packet loss, FPS and stutters show up here. That is what your settings really do.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,0,0'/>
       </StackPanel>
     </Grid>
   </Border>
-  <Border x:Name='Warm' CornerRadius='16' Background='#1F0A84FF' BorderBrush='#550A84FF' BorderThickness='1' Padding='18,14' Margin='0,0,12,16' Visibility='Collapsed'>
-    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-      <TextBlock Text='&#xE895;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='18' Foreground='#0A84FF' VerticalAlignment='Center' Margin='0,0,14,0'/>
-      <StackPanel Grid.Column='1'><TextBlock x:Name='WarmTitle' FontSize='14' FontWeight='SemiBold'/><TextBlock x:Name='WarmText' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/></StackPanel>
-      <Button x:Name='WarmOk' Grid.Column='2' Content='Got it' Style='{DynamicResource Btn}' VerticalAlignment='Center' Margin='12,0,0,0'/>
+
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24' Margin='0,0,12,16'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+      <Grid Width='120' Height='120' VerticalAlignment='Top' Margin='0,0,24,0'>
+        <Ellipse Stroke='{DynamicResource Border.Subtle}' StrokeThickness='10'/>
+        <Ellipse x:Name='Ring' Stroke='{DynamicResource AccentFill}' StrokeThickness='10' StrokeDashCap='Round' RenderTransformOrigin='0.5,0.5'>
+          <Ellipse.RenderTransform><RotateTransform Angle='-90'/></Ellipse.RenderTransform>
+        </Ellipse>
+        <StackPanel Orientation='Horizontal' VerticalAlignment='Center' HorizontalAlignment='Center'>
+          <TextBlock x:Name='Pct' Text='0' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/>
+          <TextBlock Text='%' FontSize='14' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='2,0,0,7'/>
+        </StackPanel>
+      </Grid>
+      <StackPanel Grid.Column='1' VerticalAlignment='Center'>
+        <TextBlock x:Name='Headline' FontFamily='{DynamicResource Font.Display}' FontSize='22' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+        <TextBlock Text='This counts recommended tweaks, not FPS.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' Margin='0,4,0,0'/>
+        <TextBlock x:Name='Sub' FontSize='13' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0' TextWrapping='Wrap' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+        <WrapPanel Margin='0,16,0,0'>
+          <Button x:Name='Go' Style='{DynamicResource Zd.Button.Primary}' Margin='0,0,8,8' AutomationProperties.Name='Boost now'>
+            <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE945;' FontFamily='{DynamicResource Font.Icons}' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock x:Name='GoText' Text='Boost now'/></StackPanel>
+          </Button>
+          <Button x:Name='Undo' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,20,8' AutomationProperties.Name='Restore'>
+            <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE7A7;' FontFamily='{DynamicResource Font.Icons}' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Restore'/></StackPanel>
+          </Button>
+          <StackPanel Orientation='Horizontal' VerticalAlignment='Center' Margin='0,0,0,8'>
+            <ToggleButton x:Name='Auto' Style='{DynamicResource Switch}' Width='36' Height='21' VerticalAlignment='Center' AutomationProperties.Name='Game Mode by itself when Fortnite starts'/>
+            <TextBlock Text='Game Mode by itself when Fortnite starts' FontSize='13' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='10,0,0,0'/>
+          </StackPanel>
+        </WrapPanel>
+        <WrapPanel x:Name='AreaChips' Margin='0,10,0,-6'/>
+      </StackPanel>
     </Grid>
   </Border>
-  <Grid Margin='0,0,12,0'>
-    <TextBlock Text='Right now' FontSize='15' FontWeight='SemiBold'/>
-    <TextBlock Text='Live while this page is open' FontSize='12' Foreground='#98989D' HorizontalAlignment='Right' VerticalAlignment='Bottom'/>
+
+  <Border x:Name='Warm' CornerRadius='12' Background='{DynamicResource Info.Soft}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,12' Margin='0,0,12,16' Visibility='Collapsed'>
+    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <TextBlock Text='&#xE946;' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='{DynamicResource Info}' VerticalAlignment='Top' Margin='0,2,12,0'/>
+      <StackPanel Grid.Column='1'><TextBlock x:Name='WarmTitle' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/><TextBlock x:Name='WarmText' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,0,0'/></StackPanel>
+      <Button x:Name='WarmOk' Grid.Column='2' Content='Got it' Style='{DynamicResource Zd.Button.Ghost}' VerticalAlignment='Center' Margin='12,0,0,0'/>
+    </Grid>
+  </Border>
+
+  <Grid Margin='0,8,12,0'>
+    <TextBlock Text='Right now' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+    <TextBlock Text='Live while this page is open. Paused while you play.' FontSize='12' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Right' VerticalAlignment='Bottom'/>
   </Grid>
   <UniformGrid x:Name='Live' Columns='3' Margin='-14,-6,-2,22'/>
-  <TextBlock Text='Your PC' FontSize='15' FontWeight='SemiBold'/>
-  <UniformGrid x:Name='Areas' Columns='3' Margin='-14,-6,-2,-14'/>
 </StackPanel>
 "@)
     $h = @{}
-    foreach ($n in 'ResSub', 'ResOpen', 'ResNums', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk', 'Areas') { $h[$n] = $root.FindName($n) }
+    foreach ($n in 'ResSub', 'ResOpen', 'Matches', 'MatchScroll', 'NoMatches', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'AreaChips', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk') { $h[$n] = $root.FindName($n) }
     $h.WarmOk.Add_Click({ $script:Backup.Custom.Remove('shaderwarm'); Save-Backup; Hide-Animated $script:HomeUi.Warm 200 })
     $script:HomeUi = $h
     $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
     $h.Undo.Add_Click({ $ui.RestoreAll.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
     $h.Auto.Add_Click({ param($s, $e) $p = Get-GameModePrefs; $p['auto'] = [bool]$s.IsChecked; $script:Backup.Custom['gamemodeprefs'] = $p; Save-Backup; Update-GameModeUi; Show-Toast $(if ($s.IsChecked) { 'Game Mode turns on by itself when Fortnite starts.' } else { 'Game Mode only turns on when you start it.' }) '#30D158' })
     $h.ResOpen.Add_Click({ Select-NavPage 'Matches' })
-    # last matches: four numbers
-    $h.Res = @{}
-    foreach ($k in @(@('ping', 'ms ping'), @('loss', '% packet loss'), @('fps', 'average FPS'), @('stut', 'stutters per minute'))) {
-        $b = [ZdTheme]::Parse("<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='20,14' Margin='14,14,-2,-2'><StackPanel><TextBlock Text='-' FontSize='28' FontWeight='Bold' Typography.NumeralAlignment='Tabular'/><TextBlock Text='$($k[1])' FontSize='12' Foreground='#A1A1A6'/></StackPanel></Border>")
-        [void]$h.ResNums.Children.Add($b); $h.Res[$k[0]] = $b.Child.Children[0]
-    }
     # live tiles
     $live = $root.FindName('Live'); $script:LiveUi = @{}
     foreach ($d in $LiveTileDefs) { $script:LiveUi[$d.Key] = New-LiveTile $d; [void]$live.Children.Add($script:LiveUi[$d.Key].Root) }
     $script:LiveUi.apps = New-LiveAppsTile; [void]$live.Children.Add($script:LiveUi.apps.Root)
     Update-LiveTiles; Start-LiveTimer
-    # the parts of the PC the tweaks cover; a click opens Tweaks on that area
-    $h.AreaTiles = @{}
+    # the areas the tweaks cover, as chips under the score: done or how many are left; a click opens Tweaks on that area
+    $h.AreaChips2 = @{}
     foreach ($a in $BoostAreas + @(@{ Title = 'Graphics driver'; Icon = [char]0xE7F8; Cats = @(); Nav = 'Nvidia'; Driver = $true })) {
-        $tile = [ZdTheme]::Parse(@"
-<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='18,14' Margin='14,14,-2,-2' Cursor='Hand'>
-  <Grid>
-    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-    <Border Width='38' Height='38' CornerRadius='11' Background='#2C2C2E' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$a.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
-    <StackPanel Grid.Column='1' Margin='12,0,0,0' VerticalAlignment='Center'>
-      <TextBlock Text='$(Esc $a.Title)' FontSize='14' FontWeight='SemiBold'/>
-      <TextBlock FontSize='12' Foreground='#A1A1A6' Margin='0,2,0,0' TextWrapping='Wrap'/>
-    </StackPanel>
-  </Grid>
+        $chip = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Chip}' Cursor='Hand' AutomationProperties.Name='$(Esc $a.Title)'>
+  <StackPanel Orientation='Horizontal'>
+    <TextBlock Text='$('&#x{0:X};' -f [int][char]$a.Icon)' FontFamily='{DynamicResource Font.Icons}' FontSize='12' VerticalAlignment='Center' Margin='0,1,6,0'/>
+    <TextBlock Text='$(Esc $a.Title)' Foreground='{DynamicResource Text.Primary}'/>
+    <TextBlock Text='  ' />
+    <TextBlock Text='' FontFamily='{DynamicResource Font.Icons}' FontSize='11' VerticalAlignment='Center' Margin='0,1,4,0'/>
+    <TextBlock/>
+  </StackPanel>
 </Border>
 "@)
-        $tile.Tag = $a
-        $tile.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag.Nav })
-        $tile.RenderTransform = New-Object Windows.Media.TranslateTransform
-        $tile.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
-        $tile.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
-        [void]$h.Areas.Children.Add($tile)
-        $h.AreaTiles[$a.Title] = $tile
+        $chip.Tag = $a
+        $chip.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag.Nav })
+        [void]$h.AreaChips.Children.Add($chip)
+        $h.AreaChips2[$a.Title] = $chip
     }
     $script:PageRefresh['Home'] = { Update-HomePage }
     Update-HomePage
     New-PageScroll $root
 }
+
+# good / warn / bad for one match number (thresholds from the design brief; $null = not measured)
+function Get-MatchMetricState([string]$Kind, $v, $Avg) {
+    if ($null -eq $v) { return 'idle' }
+    switch ($Kind) {
+        'ping'   { if ($v -lt 30) { 'good' } elseif ($v -le 60) { 'warn' } else { 'bad' } }
+        'jitter' { if ($v -lt 5) { 'good' } elseif ($v -le 15) { 'warn' } else { 'bad' } }
+        'loss'   { if ($v -lt 0.5) { 'good' } elseif ($v -le 2) { 'warn' } else { 'bad' } }
+        'low1'   { if ($null -eq $Avg -or $Avg -le 0) { 'idle' } elseif ($v -ge 0.6 * $Avg) { 'good' } elseif ($v -ge 0.4 * $Avg) { 'warn' } else { 'bad' } }
+        'stut'   { if ($v -lt 0.5) { 'good' } elseif ($v -le 2) { 'warn' } else { 'bad' } }
+        default  { 'idle' }
+    }
+}
+# one card in the last-matches strip
+function New-MatchCard($r) {
+    $num = { param($x) if ($null -eq $x) { $null } else { [double]$x } }
+    $ping = & $num $r.PingAvg; $jit = & $num $r.Jitter; $loss = & $num $r.LossPct
+    $avg = if ($r.Fps) { & $num $r.Fps.Avg } else { $null }; $low = if ($r.Fps) { & $num $r.Fps.Low1 } else { $null }
+    $stut = if ($null -ne $r.StutterCount -and [double]$r.Minutes -gt 0) { [double]$r.StutterCount / [double]$r.Minutes } else { $null }
+    $m = @(
+        @{ L = 'Ping';      V = $ping; F = '{0:0}';   U = 'ms'; S = (Get-MatchMetricState 'ping' $ping) }
+        @{ L = 'Jitter';    V = $jit;  F = '{0:0.#}'; U = 'ms'; S = (Get-MatchMetricState 'jitter' $jit) }
+        @{ L = 'Loss';      V = $loss; F = '{0:0.#}'; U = '%';  S = (Get-MatchMetricState 'loss' $loss) }
+        @{ L = 'Avg FPS';   V = $avg;  F = '{0:0}';   U = '';   S = 'idle' }
+        @{ L = '1% low';    V = $low;  F = '{0:0}';   U = '';   S = (Get-MatchMetricState 'low1' $low $avg) }
+        @{ L = 'Stutters';  V = $stut; F = '{0:0.#}'; U = '/min'; S = (Get-MatchMetricState 'stut' $stut) }
+    )
+    $bad = @($m | Where-Object { $_.S -eq 'bad' }).Count; $warn = @($m | Where-Object { $_.S -eq 'warn' }).Count
+    # the verdict in words and an icon, so colour is never the only signal
+    $verdict = if (-not @($m | Where-Object { $_.S -ne 'idle' }).Count) { @('&#xE9CE;', 'Text.Muted', 'Not measured') } elseif ($bad) { @('&#xEA39;', 'Bad', "$bad problem$(if ($bad -ne 1) { 's' })") } elseif ($warn) { @('&#xE7BA;', 'Warn', "$warn to check") } else { @('&#xE73E;', 'Good', 'Smooth') }
+    $cells = for ($i = 0; $i -lt $m.Count; $i++) {
+        $x = $m[$i]; $row = [Math]::Floor($i / 3); $col = $i % 3
+        $txt = if ($null -ne $x.V) { $x.F -f $x.V } else { '-' }
+        $fg = @{ good = 'Good'; warn = 'Warn'; bad = 'Bad' }[$x.S]; if (-not $fg) { $fg = 'Text.Primary' }
+        "<StackPanel Grid.Row='$row' Grid.Column='$col' Margin='0,0,0,10'><TextBlock Text='$($x.L)' FontSize='11' Foreground='{DynamicResource Text.Muted}'/>" +
+        "<StackPanel Orientation='Horizontal'><TextBlock Text='$txt' FontFamily='{DynamicResource Font.Mono}' FontSize='16' Foreground='{DynamicResource $fg}' Typography.NumeralAlignment='Tabular'/>" +
+        "<TextBlock Text='$($x.U)' FontSize='11' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='3,0,0,2'/></StackPanel></StackPanel>"
+    }
+    $start = [datetime]$r.Start
+    $tip = "Ping $(if ($null -ne $ping) { '{0:0} ms' -f $ping } else { 'not measured' }). Thresholds: ping under 30 ms is good, over 60 ms high; packet loss under 0.5% is good. Click for the full report."
+    $card = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Card}' Width='236' Margin='0,0,12,0' Cursor='Hand' ToolTip='$(Esc $tip)'
+        AutomationProperties.Name='Match on $(Esc $start.ToString('ddd d MMM HH:mm'))'>
+  <StackPanel>
+    <Grid Margin='0,0,0,12'>
+      <StackPanel>
+        <TextBlock Text='$(Esc $start.ToString('ddd d MMM · HH:mm'))' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+        <TextBlock Text='$([int]$r.Minutes) min$(if ($r.Boosted) { ' · boosted' })' FontSize='11' Foreground='{DynamicResource Text.Muted}'/>
+      </StackPanel>
+      <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' VerticalAlignment='Top'>
+        <TextBlock Text='$($verdict[0])' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Foreground='{DynamicResource $($verdict[1])}' VerticalAlignment='Center' Margin='0,1,5,0'/>
+        <TextBlock Text='$($verdict[2])' FontSize='12' Foreground='{DynamicResource $($verdict[1])}'/>
+      </StackPanel>
+    </Grid>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+      $($cells -join '')
+    </Grid>
+  </StackPanel>
+</Border>
+"@)
+    $card.Add_MouseLeftButtonUp({ Select-NavPage 'Matches' })
+    $card
+}
+
 function Update-HomePage {
     $h = $script:HomeUi; if (-not $h) { return }
     $w = $script:Backup.Custom['shaderwarm']
@@ -22425,48 +23045,52 @@ function Update-HomePage {
         $h.WarmText.Text = "Fortnite rebuilds its shaders after a game or driver update, so your next $([int]$w.Left) match$(if ([int]$w.Left -ne 1) { 'es' }) may hitch. Play a warm-up match before a cup or a benchmark; it settles by itself."
         $h.Warm.Visibility = 'Visible'
     } else { $h.Warm.Visibility = 'Collapsed' }
-    # last matches (up to 5)
+    # last matches: one card each, newest first (up to 5)
     $reps = @(Get-GameReports 'fortnite' | Select-Object -First 5)
-    $num = { param($v) if ($null -eq $v) { $null } else { [double]$v } }
-    $avg = { param($vals) $v = @($vals | Where-Object { $null -ne $_ }); if ($v.Count) { ($v | Measure-Object -Average).Average } else { $null } }
-    $ping = & $avg @($reps | ForEach-Object { & $num $_.PingAvg })
-    $loss = & $avg @($reps | ForEach-Object { & $num $_.LossPct })
-    $fps = & $avg @($reps | ForEach-Object { if ($_.Fps) { & $num $_.Fps.Avg } })
-    $mins = (@($reps | Where-Object { $null -ne $_.StutterCount } | ForEach-Object { [double]$_.Minutes }) | Measure-Object -Sum).Sum
-    $stut = if ($mins -gt 0) { (@($reps | ForEach-Object { & $num $_.StutterCount }) | Measure-Object -Sum).Sum / $mins } else { $null }
-    $h.Res.ping.Text = if ($null -ne $ping) { '{0:0}' -f $ping } else { '-' }
-    $h.Res.loss.Text = if ($null -ne $loss) { '{0:0.#}' -f $loss } else { '-' }
-    $h.Res.fps.Text = if ($null -ne $fps) { '{0:0}' -f $fps } else { '-' }
-    $h.Res.stut.Text = if ($null -ne $stut) { '{0:0.#}' -f $stut } else { '-' }
-    $h.ResSub.Text = if ($reps.Count) { "Averages of your last $($reps.Count) match$(if ($reps.Count -ne 1) { 'es' }), the latest on $(([datetime]$reps[0].Start).ToString('ddd d MMM, HH:mm')). This is what your settings really do." }
-                     else { 'Play a match with ZeroDelay open and your ping, packet loss, FPS and stutters show up here. That is what your settings really do.' }
-    # score
+    $h.Matches.Children.Clear()
+    foreach ($r in $reps) { try { [void]$h.Matches.Children.Add((New-MatchCard $r)) } catch { Write-CrashLog $_.Exception 'home match card' } }
+    $h.MatchScroll.Visibility = if ($reps.Count) { 'Visible' } else { 'Collapsed' }
+    $h.NoMatches.Visibility = if ($reps.Count) { 'Collapsed' } else { 'Visible' }
+    $h.ResSub.Text = if ($reps.Count) { "Your last $($reps.Count) Fortnite match$(if ($reps.Count -ne 1) { 'es' }), newest first. Measured in the game, not estimated." } else { '' }
+    # score: the share of recommended tweaks that are on (not an FPS promise)
     $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State -and -not $_.Hidden })
     $on = @($rec | Where-Object { $_.State }).Count
     $left = $rec.Count - $on
     $pct = if ($rec.Count) { [int][Math]::Round(100 * $on / $rec.Count) } else { 100 }
     Start-CountUp $h.Pct $pct '' 900
-    $circ = [Math]::PI * (132 - 11) / 11
+    $circ = [Math]::PI * (120 - 10) / 10
     $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(($circ * $pct / 100), 1000))
-    $h.Ring.Stroke = ConvertTo-Brush $(if ($pct -ge 90) { '#30D158' } elseif ($pct -ge 60) { '#FFD60A' } else { '#FF9F0A' })
-    $h.Ring.Effect = New-Glow $h.Ring.Stroke.Color 22 0.55
     if ($left -gt 0) {
-        $h.Headline.Text = "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off"
-        $h.Sub.Text = 'Boost now shows the list and you pick what to switch on. A restore point comes first; Restore undoes everything ZeroDelay changed.'
+        $h.Headline.Text = "$pct% of recommended setup on"
+        $h.Sub.Text = "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off. Boost now lists them and you choose; a restore point comes first, and Restore undoes everything."
         $h.Go.IsEnabled = $true; $h.GoText.Text = 'Boost now'
     } else {
-        $h.Headline.Text = 'Your PC is fully optimized'
-        $h.Sub.Text = 'Everything recommended for this PC is on. ZeroDelay keeps watching and tells you if another program changes something back.'
+        $h.Headline.Text = 'All recommended tweaks are on'
+        $h.Sub.Text = 'ZeroDelay keeps watching and tells you if another program changes something back.'
         $h.Go.IsEnabled = $false; $h.GoText.Text = 'All set'
     }
     $h.Auto.IsChecked = [bool](Get-GameModePrefs)['auto']
+    # area chips: a check when done, otherwise how many are left
     foreach ($a in $BoostAreas) {
         $r = @($rec | Where-Object { $a.Cats -contains $_.Cat }); $o = @($r | Where-Object { $_.State }).Count
-        $h.AreaTiles[$a.Title].Child.Children[1].Children[1].Text = if ($r.Count) { "$o of $($r.Count) recommended on" } else { 'Nothing recommended for this PC' }
+        $sp = $h.AreaChips2[$a.Title].Child
+        if (-not $r.Count) { $sp.Children[3].Text = ''; $sp.Children[4].Text = 'nothing to do'; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted') }
+        elseif ($o -ge $r.Count) {
+            $sp.Children[3].Text = [string][char]0xE73E; $sp.Children[3].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+            $sp.Children[4].Text = 'done'; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+        } else {
+            $sp.Children[3].Text = ''
+            $sp.Children[4].Text = "$($r.Count - $o) of $($r.Count) left"; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+        }
     }
     $d = try { Get-NvDriverInfo } catch { $null }
-    $h.AreaTiles['Graphics driver'].Child.Children[1].Children[1].Text = if ($d -and $d.Latest -and $d.Installed -ne $d.Latest) { "$($d.Installed) installed, $($d.Latest) available" }
-        elseif ($d) { "NVIDIA $($d.Installed)$(if ($d.Latest) { ', the latest' })" } else { 'See This PC for your driver' }
+    $sp = $h.AreaChips2['Graphics driver'].Child
+    if ($d -and $d.Latest -and $d.Installed -ne $d.Latest) {
+        $sp.Children[3].Text = ''; $sp.Children[4].Text = "$($d.Latest) available"; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Warn')
+    } elseif ($d) {
+        $sp.Children[3].Text = [string][char]0xE73E; $sp.Children[3].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+        $sp.Children[4].Text = "$($d.Installed)$(if ($d.Latest) { ', latest' })"; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+    } else { $sp.Children[3].Text = ''; $sp.Children[4].Text = 'see This PC'; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted') }
 }
 
 # =============================================================== Navigation (1.17): six places in the menu
@@ -22526,8 +23150,18 @@ function Test-CheckCardVisible($t) {
 }
 function New-Chip([string]$Label, [bool]$On, [scriptblock]$Click, $Tag) {
     $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Padding='12,5' Margin='0,0,6,6' FontSize='12.5'><TextBlock Text='$(Esc $Label)'/></Button>")
-    $c.Background = ConvertTo-Brush $(if ($On) { '#0A84FF' } else { '#2C2C2E' })
-    $c.Content.Foreground = ConvertTo-Brush $(if ($On) { '#FDFDFD' } else { '#F5F5F7' })
+    # 2.0: selected = accent fill with on-accent text ('#0A0B0C' resolves to it); otherwise the raised tone
+    $c.Background = ConvertTo-Brush $(if ($On) { '#0071E3' } else { '#15181D' })
+    $c.Content.Foreground = ConvertTo-Brush $(if ($On) { '#0A0B0C' } else { '#9AA3AF' })
+    $c.Tag = $Tag; $c.Add_Click($Click)
+    $c
+}
+# 2.0 segmented control item (Tweaks views): the selected one sits on the raised tone with primary text
+function New-Segment([string]$Label, [bool]$On, [scriptblock]$Click, $Tag) {
+    $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Padding='14,5' Margin='0' FontSize='13' MinHeight='28' AutomationProperties.Name='$(Esc $Label)'><TextBlock Text='$(Esc $Label)'/></Button>")
+    $c.Background = ConvertTo-Brush $(if ($On) { '#2B323B' } else { '#00000000' })
+    $c.Content.Foreground = ConvertTo-Brush $(if ($On) { '#F2F4F7' } else { '#9AA3AF' })
+    if ($On) { $c.FontWeight = 'SemiBold' }
     $c.Tag = $Tag; $c.Add_Click($Click)
     $c
 }
@@ -22535,20 +23169,20 @@ function New-Chip([string]$Label, [bool]$On, [scriptblock]$Click, $Tag) {
 function Update-ChipBar {
     $ui.ChipViews.Children.Clear(); $ui.ChipAreas.Children.Clear()
     if ($script:CurrentCat.Name -eq 'Tweaks') {
-        foreach ($v in @(@('Recommended', 'Recommended'), @('Latency', 'Input delay and ping'), @('On', 'Switched on'), @('New', 'New in this version'), @('All', 'Everything'))) {
-            [void]$ui.ChipViews.Children.Add((New-Chip $v[1] ($script:TweakView -eq $v[0]) { param($s, $e) $script:TweakView = $s.Tag; Update-Filter; Reset-Scroll } $v[0]))
+        $ui.ChipViewsBox.Visibility = 'Visible'
+        foreach ($v in @(@('Recommended', 'Recommended'), @('Latency', 'Input delay'), @('On', 'On'), @('New', 'New'), @('All', 'All'))) {
+            [void]$ui.ChipViews.Children.Add((New-Segment $v[1] ($script:TweakView -eq $v[0]) { param($s, $e) $script:TweakView = $s.Tag; Update-Filter; Reset-Scroll } $v[0]))
         }
         [void]$ui.ChipAreas.Children.Add((New-Chip 'All areas' ($script:TweakArea -eq 'All') { param($s, $e) $script:TweakArea = 'All'; Update-Filter; Reset-Scroll } 'All'))
         foreach ($c in Get-TweakAreas) {
             [void]$ui.ChipAreas.Children.Add((New-Chip $c.Title ($script:TweakArea -eq $c.Name) { param($s, $e) $script:TweakArea = $s.Tag; if ($script:TweakView -eq 'Recommended') { $script:TweakView = 'All' }; Update-Filter; Reset-Scroll } $c.Name))
         }
     } elseif ($script:CurrentCat.Name -eq 'Checks') {
+        $ui.ChipViewsBox.Visibility = 'Collapsed'
         foreach ($k in $CheckAreas.Keys) {
             [void]$ui.ChipAreas.Children.Add((New-Chip $(if ($k -eq 'All') { 'All checks' } else { $k }) ($script:CheckArea -eq $k) { param($s, $e) $script:CheckArea = $s.Tag; Update-Filter; Reset-Scroll } $k))
         }
-        $hc = New-Chip 'Run the full health check' $false { Select-NavPage 'Health' } 'Health'
-        $hc.Background = ConvertTo-Brush '#1F30D158'; $hc.Content.Foreground = ConvertTo-Brush '#30D158'
-        [void]$ui.ChipViews.Children.Add($hc)
+        # 2.0: "Run all checks" is the header button on the right (Update-Filter), not a chip
     }
 }
 # the line under the title on Tweaks and Checks: what is shown and how to see more
@@ -22617,28 +23251,67 @@ $ToolInfo = [ordered]@{
     'Clean'    = 'Temp files, update leftovers and caches. You see the size first.'
     'Memory'   = 'Free memory before a match and see what uses it.'
 }
+# 2.0 Tools: tiles grouped by what you use them for; pinned tools sit at the top ('toolpins' setting)
+$ToolGroups = [ordered]@{
+    'Play'    = @('GameMode', 'Matches', 'Ping', 'Booster', 'Profiles')
+    'Measure' = @('Prove', 'Benchmark', 'Trends', 'Mouse', 'Sens')
+    'Clean'   = @('Clean', 'Memory', 'Debloat', 'Apps')
+    'System'  = @('ThisPC', 'Active', 'History', 'Nvidia', 'Sync')
+}
+function Get-ToolPins { @($script:Backup.Custom['toolpins'] | Where-Object { $_ -and $ToolInfo.Contains("$_") }) }
 function New-ToolsPage {
-    $root = [ZdTheme]::Parse("<UniformGrid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Columns='3' MaxWidth='1080' HorizontalAlignment='Left' Margin='-14,-14,-2,-14'/>")
-    foreach ($name in $ToolInfo.Keys) {
-        $c = $Categories | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-        if (-not $c -or ($c.Requires -and -not (& $c.Requires))) { continue }
-        $tile = [ZdTheme]::Parse(@"
-<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='20,18' Margin='14,14,-2,-2' Cursor='Hand'>
-  <StackPanel>
-    <Border Width='40' Height='40' CornerRadius='11' Background='#2C2C2E' HorizontalAlignment='Left'><TextBlock Text='$('&#x{0:X};' -f [int][char]$c.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
-    <TextBlock Text='$(Esc $c.Title)' FontSize='15' FontWeight='SemiBold' Margin='0,12,0,0'/>
-    <TextBlock Text='$(Esc $ToolInfo[$name])' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,4,0,0' MinHeight='34'/>
-  </StackPanel>
+    $root = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' MaxWidth='1080' HorizontalAlignment='Left'/>")
+    $script:ToolsRoot = $root
+    Update-ToolsPage
+    $script:PageRefresh['Tools'] = { Update-ToolsPage }
+    New-PageScroll $root
+}
+function Update-ToolsPage {
+    $root = $script:ToolsRoot; if (-not $root) { return }
+    $root.Children.Clear()
+    $avail = @($ToolInfo.Keys | Where-Object { $n = $_; $c = $Categories | Where-Object { $_.Name -eq $n } | Select-Object -First 1; $c -and -not ($c.Requires -and -not (& $c.Requires)) })
+    $pins = @(Get-ToolPins | Where-Object { $avail -contains $_ })
+    $grouped = @($ToolGroups.Values | ForEach-Object { $_ })
+    $sections = [ordered]@{}
+    if ($pins.Count) { $sections['Pinned'] = $pins }
+    foreach ($g in $ToolGroups.Keys) { $sections[$g] = @($ToolGroups[$g] | Where-Object { $avail -contains $_ -and $pins -notcontains $_ }) }
+    $rest = @($avail | Where-Object { $grouped -notcontains $_ -and $pins -notcontains $_ }); if ($rest.Count) { $sections['More'] = $rest }
+    foreach ($sec in $sections.Keys) {
+        $names = @($sections[$sec]); if (-not $names.Count) { continue }
+        [void]$root.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='$($sec.ToUpper())' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' Margin='2,$(if ($root.Children.Count) { 18 } else { 0 }),0,10'/>"))
+        $grid = [ZdTheme]::Parse("<UniformGrid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Columns='3' Margin='0,0,-12,0'/>")
+        foreach ($name in $names) { [void]$grid.Children.Add((New-ToolTile $name ($pins -contains $name))) }
+        [void]$root.Children.Add($grid)
+    }
+}
+function New-ToolTile([string]$Name, [bool]$Pinned) {
+    $c = $Categories | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    $tile = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        Style='{DynamicResource Zd.Card}' Padding='16' Margin='0,0,12,12' Cursor='Hand' AutomationProperties.Name='$(Esc $c.Title)'>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
+    <Border Width='36' Height='36' CornerRadius='9' Background='{DynamicResource Bg.Raised}' HorizontalAlignment='Left'>
+      <TextBlock Text='$('&#x{0:X};' -f [int][char]$c.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='16' Foreground='{DynamicResource Accent}' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+    </Border>
+    <Button x:Name='Pin' Style='{DynamicResource Zd.Button.Ghost}' MinWidth='32' Padding='0' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-6,-8,0'
+            ToolTip='$(if ($Pinned) { 'Unpin' } else { 'Pin to the top' })' AutomationProperties.Name='$(if ($Pinned) { "Unpin $(Esc $c.Title)" } else { "Pin $(Esc $c.Title)" })'>
+      <TextBlock Text='$(if ($Pinned) { '&#xE77A;' } else { '&#xE718;' })' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='13' Foreground='{DynamicResource $(if ($Pinned) { 'Accent' } else { 'Text.Muted' })}'/>
+    </Button>
+    <TextBlock Grid.Row='1' Text='$(Esc $c.Title)' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,12,0,0'/>
+    <TextBlock Grid.Row='2' Text='$(Esc $ToolInfo[$Name])' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,0' MinHeight='36'/>
+  </Grid>
 </Border>
 "@)
-        $tile.Tag = $name
-        $tile.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag })
-        $tile.RenderTransform = New-Object Windows.Media.TranslateTransform
-        $tile.Add_MouseEnter({ param($s, $e) Set-HoverGlow $s $true; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null -3 180 } })
-        $tile.Add_MouseLeave({ param($s, $e) Set-HoverGlow $s $false; if ($script:Anim) { Start-Anim $s.RenderTransform ([Windows.Media.TranslateTransform]::YProperty) $null 0 220 } })
-        [void]$root.Children.Add($tile)
-    }
-    New-PageScroll $root
+    $tile.Tag = $Name
+    $tile.Add_MouseLeftButtonUp({ param($s, $e) Select-NavPage $s.Tag })
+    $pin = $tile.FindName('Pin'); $pin.Tag = $Name
+    $pin.Add_Click({ param($s, $e)
+        $p = @(Get-ToolPins)
+        $script:Backup.Custom['toolpins'] = if ($p -contains $s.Tag) { @($p | Where-Object { $_ -ne $s.Tag }) } else { @($p) + $s.Tag }
+        Save-Backup; Update-ToolsPage
+    })
+    $tile
 }
 
 # =============================================================== Game Mode page (booster dashboard)
@@ -22710,66 +23383,56 @@ $GmStatScript = {
 function New-GameModePage {
     $root = [ZdTheme]::Parse(@"
 <Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' HorizontalAlignment='Stretch' Margin='0,0,0,8'>
-  <Border CornerRadius='26' ClipToBounds='True' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Height='640'>
+  <Border CornerRadius='16' ClipToBounds='True' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Height='640'>
     <Grid>
-      <!-- soft colour glows instead of game art -->
-      <Ellipse Width='620' Height='620' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-180,-260,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#552EE6A6' Offset='0'/><GradientStop Color='#002EE6A6' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='760' Height='760' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-260,-320' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#555E5CE6' Offset='0'/><GradientStop Color='#005E5CE6' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='420' Height='420' HorizontalAlignment='Center' VerticalAlignment='Center' Margin='0,0,260,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#3324A0FF' Offset='0'/><GradientStop Color='#0024A0FF' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
       <Grid Margin='44,40,22,22'>
         <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='370'/></Grid.ColumnDefinitions>
         <Grid.RowDefinitions><RowDefinition Height='*'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
         <!-- left: title, status, numbers, start -->
         <DockPanel Margin='0,0,28,0'>
           <StackPanel DockPanel.Dock='Top'>
-            <TextBlock Text='FORTNITE' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='74' Foreground='#FFFFFF' Margin='-3,0,0,0'/>
+            <TextBlock Text='GAME MODE' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+            <TextBlock Text='Fortnite' FontFamily='{DynamicResource Font.Display}' FontWeight='SemiBold' FontSize='32' Foreground='{DynamicResource Text.Primary}' Margin='0,2,0,0'/>
             <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
-              <Border x:Name='StatePill' CornerRadius='14' Padding='12,5,14,6' Background='#1AFFFFFF' BorderBrush='#26FFFFFF' BorderThickness='1'>
+              <Border x:Name='StatePill' CornerRadius='14' Padding='12,5,14,6' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'>
                 <StackPanel Orientation='Horizontal'>
                   <Ellipse x:Name='StateDot' Width='8' Height='8' Fill='#8E8E93' VerticalAlignment='Center' Margin='0,0,8,0'/>
-                  <TextBlock x:Name='StateText' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+                  <TextBlock x:Name='StateText' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
                 </StackPanel>
               </Border>
-              <TextBlock x:Name='StateSub' FontSize='12.5' Foreground='#9A9AA5' VerticalAlignment='Center' Margin='14,0,0,0'/>
+              <TextBlock x:Name='StateSub' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='14,0,0,0'/>
             </StackPanel>
             <WrapPanel Margin='0,30,0,0'>
               <StackPanel Margin='0,0,44,16'>
-                <StackPanel Orientation='Horizontal'><TextBlock x:Name='PingVal' Text='-' FontSize='38' FontWeight='Bold' Foreground='#2EE6A6' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms' FontSize='13' Foreground='#2EE6A6' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
-                <TextBlock x:Name='PingLbl' Text='Ping' FontSize='12' Foreground='#9A9AA5' Cursor='Hand' ToolTip='Click to pick your Fortnite region'/>
+                <StackPanel Orientation='Horizontal'><TextBlock x:Name='PingVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
+                <TextBlock x:Name='PingLbl' Text='Ping' FontSize='12' Foreground='{DynamicResource Text.Muted}' Cursor='Hand' ToolTip='Click to pick your Fortnite region'/>
               </StackPanel>
               <StackPanel Margin='0,0,44,16'>
-                <TextBlock x:Name='AppsVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/>
-                <TextBlock x:Name='AppsLbl' Text='Apps closed' FontSize='12' Foreground='#9A9AA5'/>
+                <TextBlock x:Name='AppsVal' Text='0' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/>
+                <TextBlock x:Name='AppsLbl' Text='Apps closed' FontSize='12' Foreground='{DynamicResource Text.Muted}'/>
               </StackPanel>
               <StackPanel Margin='0,0,44,16'>
-                <StackPanel Orientation='Horizontal'><TextBlock x:Name='MemVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/><TextBlock Text='GB' FontSize='13' Foreground='#9A9AA5' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
-                <TextBlock Text='Memory freed' FontSize='12' Foreground='#9A9AA5'/>
+                <StackPanel Orientation='Horizontal'><TextBlock x:Name='MemVal' Text='0' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='GB' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='4,0,0,8'/></StackPanel>
+                <TextBlock Text='Memory freed' FontSize='12' Foreground='{DynamicResource Text.Muted}'/>
               </StackPanel>
               <StackPanel Margin='0,0,0,16'>
-                <TextBlock x:Name='StepsVal' Text='0' FontSize='38' FontWeight='Bold' Foreground='#FFFFFF'/>
-                <TextBlock Text='Boost steps on' FontSize='12' Foreground='#9A9AA5'/>
+                <TextBlock x:Name='StepsVal' Text='0' FontFamily='{DynamicResource Font.Mono}' FontSize='32' Foreground='{DynamicResource Text.Primary}'/>
+                <TextBlock Text='Boost steps on' FontSize='12' Foreground='{DynamicResource Text.Muted}'/>
               </StackPanel>
             </WrapPanel>
-            <TextBlock x:Name='DoneText' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' MaxWidth='560' HorizontalAlignment='Left' Margin='0,6,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+            <TextBlock x:Name='DoneText' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' MaxWidth='560' HorizontalAlignment='Left' Margin='0,6,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
           </StackPanel>
           <StackPanel DockPanel.Dock='Bottom' Orientation='Horizontal' VerticalAlignment='Bottom' Margin='0,30,0,0'>
-            <Border CornerRadius='30' Background='#14FFFFFF' BorderBrush='#22FFFFFF' BorderThickness='1' Padding='22,0' Height='60' Margin='0,0,14,0'>
+            <Border CornerRadius='30' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='22,0' Height='52' Margin='0,0,14,0'>
               <StackPanel Orientation='Horizontal' VerticalAlignment='Center'>
                 <Ellipse x:Name='TimerDot' Width='10' Height='10' Fill='#8E8E93' Margin='0,0,12,0'/>
-                <TextBlock x:Name='Timer' Text='00:00:00' FontSize='22' FontWeight='SemiBold' Foreground='#FFFFFF' Typography.NumeralAlignment='Tabular'/>
+                <TextBlock x:Name='Timer' Text='00:00:00' FontFamily='{DynamicResource Font.Mono}' FontSize='22' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/>
               </StackPanel>
             </Border>
-            <Button x:Name='Start' Height='60' Width='270' Cursor='Hand' Margin='0,0,10,0'>
+            <Button x:Name='Start' Height='52' MinWidth='240' Padding='24,0' Cursor='Hand' Margin='0,0,10,0'>
               <Button.Template>
                 <ControlTemplate TargetType='Button'>
-                  <Border x:Name='B' CornerRadius='30' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='{TemplateBinding BorderThickness}'>
-                    <Border.Effect><DropShadowEffect x:Name='Glow' Color='#2EE6A6' BlurRadius='34' ShadowDepth='0' Opacity='0.55'/></Border.Effect>
+                  <Border x:Name='B' CornerRadius='10' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='{TemplateBinding BorderThickness}'>
                     <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/>
                   </Border>
                   <ControlTemplate.Triggers>
@@ -22778,26 +23441,29 @@ function New-GameModePage {
                   </ControlTemplate.Triggers>
                 </ControlTemplate>
               </Button.Template>
-              <TextBlock x:Name='StartText' Text='Start Game' FontSize='20' FontWeight='SemiBold'/>
+              <TextBlock x:Name='StartText' Text='Start Game' FontSize='17' FontWeight='SemiBold'/>
             </Button>
-            <Button x:Name='Power' Width='60' Height='60' Cursor='Hand' ToolTip='Game Mode on or off, without launching Fortnite'>
+            <Button x:Name='Power' Width='52' Height='52' Cursor='Hand' ToolTip='Game Mode on or off, without launching Fortnite'>
               <Button.Template>
                 <ControlTemplate TargetType='Button'>
-                  <Border x:Name='B' CornerRadius='30' Background='{TemplateBinding Background}' BorderBrush='#33FFFFFF' BorderThickness='1'><ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+                  <Border x:Name='B' CornerRadius='10' Background='{TemplateBinding Background}' BorderBrush='{DynamicResource Border.Strong}' BorderThickness='1'><ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
                   <ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='B' Property='Opacity' Value='0.85'/></Trigger></ControlTemplate.Triggers>
                 </ControlTemplate>
               </Button.Template>
               <TextBlock x:Name='PowerIcon' Text='&#xE7E8;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='20'/>
             </Button>
+            <Button x:Name='ToTray' Style='{DynamicResource Zd.Button.Ghost}' Margin='8,0,0,0' VerticalAlignment='Center' ToolTip='Hides ZeroDelay to the tray. Game Mode keeps running and is put back when the game closes.'>
+              <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE921;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Minimize to tray'/></StackPanel>
+            </Button>
           </StackPanel>
         </DockPanel>
         <!-- right: the tools panel -->
-        <Border Grid.Column='1' Grid.RowSpan='2' CornerRadius='20' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,18,10,14'>
+        <Border Grid.Column='1' Grid.RowSpan='2' CornerRadius='20' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='18,18,10,14'>
           <DockPanel>
             <StackPanel DockPanel.Dock='Top' Margin='0,0,8,0'>
               <StackPanel Orientation='Horizontal'>
-                <TextBlock Text='&#xE71D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#2EE6A6' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/>
-                <TextBlock Text='Game Mode tools' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+                <TextBlock Text='&#xE71D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='{DynamicResource Accent}' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/>
+                <TextBlock Text='Game Mode tools' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
               </StackPanel>
               <StackPanel x:Name='Chips' Orientation='Horizontal' Margin='0,14,0,12'/>
             </StackPanel>
@@ -22807,15 +23473,15 @@ function New-GameModePage {
           </DockPanel>
         </Border>
         <!-- live numbers -->
-        <Border Grid.Row='1' HorizontalAlignment='Left' CornerRadius='16' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='6,8' Margin='0,18,28,0'>
+        <Border Grid.Row='1' HorizontalAlignment='Left' CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='6,8' Margin='0,18,28,0'>
           <StackPanel Orientation='Horizontal'>
-            <StackPanel Width='86'><TextBlock x:Name='CpuVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='CPU' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
-            <Border Width='1' Background='#22FFFFFF' Margin='0,4'/>
-            <StackPanel Width='86'><TextBlock x:Name='GpuTVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='GPU temp' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
-            <Border Width='1' Background='#22FFFFFF' Margin='0,4'/>
-            <StackPanel Width='86'><TextBlock x:Name='GpuUVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='GPU load' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
-            <Border Width='1' Background='#22FFFFFF' Margin='0,4'/>
-            <StackPanel Width='86'><TextBlock x:Name='MemPctVal' Text='-' FontSize='17' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center'/><TextBlock Text='Memory' FontSize='11' Foreground='#9A9AA5' HorizontalAlignment='Center'/></StackPanel>
+            <StackPanel Width='86'><TextBlock x:Name='CpuVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='17' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center'/><TextBlock Text='CPU' FontSize='11' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/></StackPanel>
+            <Border Width='1' Background='{DynamicResource Border.Subtle}' Margin='0,4'/>
+            <StackPanel Width='86'><TextBlock x:Name='GpuTVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='17' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center'/><TextBlock Text='GPU temp' FontSize='11' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/></StackPanel>
+            <Border Width='1' Background='{DynamicResource Border.Subtle}' Margin='0,4'/>
+            <StackPanel Width='86'><TextBlock x:Name='GpuUVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='17' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center'/><TextBlock Text='GPU load' FontSize='11' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/></StackPanel>
+            <Border Width='1' Background='{DynamicResource Border.Subtle}' Margin='0,4'/>
+            <StackPanel Width='86'><TextBlock x:Name='MemPctVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='17' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center'/><TextBlock Text='Memory' FontSize='11' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/></StackPanel>
           </StackPanel>
         </Border>
       </Grid>
@@ -22825,8 +23491,9 @@ function New-GameModePage {
 "@)
     $g = @{}; foreach ($n in 'StatePill', 'StateDot', 'StateText', 'StateSub', 'PingVal', 'PingLbl', 'AppsVal', 'AppsLbl', 'MemVal', 'StepsVal', 'DoneText', 'TimerDot', 'Timer', 'Start', 'StartText', 'Power', 'PowerIcon', 'Chips', 'Tools', 'CpuVal', 'GpuTVal', 'GpuUVal', 'MemPctVal') { $g[$n] = $root.FindName($n) }
     $script:GmUi = $g
+    $root.FindName('ToTray').Add_Click({ if ($script:TrayIcon) { $window.Hide() } else { $window.WindowState = 'Minimized' } })
     $g.PingLbl.Add_MouseLeftButtonUp({ param($s, $e) Show-RegionMenu $s { $script:GmTick = 0; $script:GmUi.PingVal.Text = '-'; $script:GmUi.PingLbl.Text = "Ping to $(Get-PlayRegionName)  ▾" } })
-    Set-RoundClip $root.Children[0] 26   # glows stay inside the rounded corners
+    Set-RoundClip $root.Children[0] 16
     $script:GmFilter = 'all'
     foreach ($c in @(@('all', 'All'), @('steps', 'Boost'), @('apps', 'Apps'), @('auto', 'Auto'))) {
         $b = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Content='$($c[1])' Cursor='Hand' Margin='0,0,6,0' Padding='14,5' FontSize='12.5'><Button.Template><ControlTemplate TargetType='Button'><Border CornerRadius='13' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='1' Padding='{TemplateBinding Padding}'><ContentPresenter/></Border></ControlTemplate></Button.Template></Button>")
@@ -22872,8 +23539,9 @@ function New-GameModePage {
                     $g.GpuUVal.Text = if ($null -ne $r.GpuUtil) { "$($r.GpuUtil)%" } else { '-' }
                     $g.MemPctVal.Text = if ($null -ne $r.MemPct) { "$($r.MemPct)%" } else { '-' }
                     $g.PingVal.Text = if ($null -ne $r.Ping) { "$($r.Ping)" } else { '-' }
+                    $g.PingVal.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($null -eq $r.Ping) { 'Text.Primary' } elseif ([int]$r.Ping -lt 30) { 'Good' } elseif ([int]$r.Ping -le 60) { 'Warn' } else { 'Bad' }))
                     $g.PingLbl.Text = "Ping to $($script:GmPingName)  ▾"
-                    $g.GpuTVal.Foreground = ConvertTo-Brush $(if ($r.GpuTemp -ge 83) { '#FF453A' } elseif ($r.GpuTemp -ge 75) { '#FF9F0A' } else { '#FFFFFF' })
+                    $g.GpuTVal.Foreground = ConvertTo-Brush $(if ($r.GpuTemp -ge 83) { '#FF453A' } elseif ($r.GpuTemp -ge 75) { '#FF9F0A' } else { '#F2F4F7' })
                     $changed = (@($r.Running.Keys) -join ',') -ne (@($script:GmRunningPaths.Keys) -join ',')
                     $script:GmRunningPaths = $r.Running
                     if ($changed) { Update-GameModeTools; Update-GameModePage }
@@ -22900,28 +23568,21 @@ function Update-GameModePage {
     $fn = Test-FortniteRunning
     $prefs = Get-GameModePrefs
     $st = $null; if ($on) { try { $st = Get-Content $GameModeFile -Raw | ConvertFrom-Json } catch {} }
-    $mint = '#2EE6A6'
-    $g.StateDot.Fill = ConvertTo-Brush $(if ($on) { $mint } elseif ($fn) { '#FF9F0A' } else { '#8E8E93' })
+    $g.StateDot.SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ($on) { 'Good' } elseif ($fn) { 'Warn' } else { 'Text.Muted' }))
     $g.StateText.Text = if ($on) { 'Game Mode on' } else { 'Game Mode off' }
     $g.StateSub.Text = if ($on -and $fn) { 'Fortnite is running' } elseif ($on) { "On since $(([datetime]$st.Started).ToString('HH:mm'))" } elseif ($fn) { 'Fortnite is running without Game Mode' } elseif ($prefs.auto) { 'Turns on by itself when Fortnite starts' } else { 'Press Start Game when you are ready' }
-    $g.TimerDot.Fill = ConvertTo-Brush $(if ($on) { '#FF453A' } else { '#8E8E93' })
-    if ($on -and $script:Anim) {
-        $a = New-Object Windows.Media.Animation.DoubleAnimation 1, 0.25, ([Windows.Duration][TimeSpan]::FromMilliseconds(900)); $a.AutoReverse = $true; $a.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
-        $g.TimerDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
-    } else { $g.TimerDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null) }
-    # Start button: mint gradient to start, dark with a mint edge to stop
+    # 2.0: a still dot (no pulsing while you play) and the Start / Stop button from the tokens
+    $g.TimerDot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
+    $g.TimerDot.SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ($on) { 'Good' } else { 'Text.Muted' }))
     if ($on) {
-        $g.Start.Background = ConvertTo-Brush '#141416'; $g.Start.BorderBrush = ConvertTo-Brush $mint; $g.Start.BorderThickness = 1.5
-        $g.StartText.Text = 'Stop Game Mode'; $g.StartText.Foreground = ConvertTo-Brush $mint
+        $g.Start.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'Bad.Soft'); $g.Start.SetResourceReference([Windows.Controls.Control]::BorderBrushProperty, 'Bad'); $g.Start.BorderThickness = 1
+        $g.StartText.Text = 'Stop Game Mode'; $g.StartText.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Bad')
     } else {
-        $grad = New-Object Windows.Media.LinearGradientBrush; $grad.StartPoint = '0,0'; $grad.EndPoint = '1,1'
-        $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString('#4BF0BA')), 0))
-        $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString('#1FC48C')), 1))
-        $g.Start.Background = [Windows.Media.Brush]$grad; $g.Start.BorderThickness = 0
-        $g.StartText.Text = if ($fn) { 'Start Game Mode' } else { 'Start Game' }; $g.StartText.Foreground = ConvertTo-Brush '#04241A'
+        $g.Start.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'AccentFill'); $g.Start.BorderThickness = 0
+        $g.StartText.Text = if ($fn) { 'Start Game Mode' } else { 'Start Game' }; $g.StartText.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Accent.OnAccent')
     }
-    $g.Power.Background = ConvertTo-Brush $(if ($on) { '#262E2EE6' } else { '#14FFFFFF' })
-    $g.PowerIcon.Foreground = ConvertTo-Brush $(if ($on) { $mint } else { '#FFFFFF' })
+    $g.Power.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, $(if ($on) { 'Good.Soft' } else { 'Bg.Raised' }))
+    $g.PowerIcon.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($on) { 'Good' } else { 'Text.Secondary' }))
     # numbers
     if ($on) {
         $g.AppsVal.Text = "$([int]$st.ClosedCount)"; $g.AppsLbl.Text = 'Apps closed'
@@ -22940,20 +23601,20 @@ function Update-GameModeTools {
     $g = $script:GmUi; if (-not $g) { return }
     foreach ($b in $g.Chips.Children) {
         $sel = $b.Tag -eq $script:GmFilter
-        $b.Background = ConvertTo-Brush $(if ($sel) { '#332EE6A6' } else { '#12FFFFFF' })
-        $b.BorderBrush = ConvertTo-Brush $(if ($sel) { '#2EE6A6' } else { '#1FFFFFFF' })
-        $b.Foreground = [ZdTheme]::Brush($(if ($sel) { '#2EE6A6' } else { '#D3D3D9' }))
+        $b.Background = ConvertTo-Brush $(if ($sel) { '#273A4F' } else { '#15181D' })
+        $b.BorderBrush = ConvertTo-Brush $(if ($sel) { '#0071E3' } else { '#1F242B' })
+        $b.Foreground = [ZdTheme]::Brush($(if ($sel) { '#0A84FF' } else { '#9AA3AF' }))
     }
     $prefs = Get-GameModePrefs; $sp = Get-SessionPrefs
     $rows = New-Object Collections.ArrayList
-    function Head([string]$t) { "<TextBlock Text='$t' FontSize='11' FontWeight='SemiBold' Foreground='#7C7C86' Margin='4,10,0,6'/>" }
+    function Head([string]$t) { "<TextBlock Text='$t' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' Margin='4,10,0,6'/>" }
     function Row([string]$name, [string]$id, [string]$desc, [string]$iconXaml, [bool]$running) {
-        "<Border Background='#0DFFFFFF' CornerRadius='12' Padding='10,9' Margin='0,0,0,6'><Grid>" +
+        "<Border Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='10,9' Margin='0,0,0,6'><Grid>" +
         "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
         "$iconXaml<StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='12,0,8,0'>" +
-        "<StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $name)' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF' TextTrimming='CharacterEllipsis'/>" +
-        $(if ($running) { "<Border Background='#262EE6A6' CornerRadius='6' Padding='6,0,6,1' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='running' FontSize='10.5' Foreground='#2EE6A6'/></Border>" } else { '' }) +
-        "</StackPanel>" + $(if ($desc) { "<TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,2,0,0'/>" } else { '' }) +
+        "<StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $name)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'/>" +
+        $(if ($running) { "<Border Background='{DynamicResource Good.Soft}' CornerRadius='6' Padding='6,0,6,1' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='running' FontSize='10.5' Foreground='{DynamicResource Good}'/></Border>" } else { '' }) +
+        "</StackPanel>" + $(if ($desc) { "<TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,2,0,0'/>" } else { '' }) +
         "</StackPanel><ToggleButton x:Name='$id' Grid.Column='2' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/></Grid></Border>"
     }
     function Glyph([int]$code, [string]$tint) { "<Border Width='34' Height='34' CornerRadius='9' Background='$($tint -replace '^#', '#33')'><TextBlock Text='&#x$('{0:X}' -f $code);' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' Foreground='$tint' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
@@ -22970,7 +23631,7 @@ function Update-GameModeTools {
         foreach ($a in $shown) {
             $nm = "$($a.Name)" -replace '^[^A-Za-z0-9]+', ''; $letter = if ($nm) { $nm.Substring(0, 1).ToUpper() } else { '?' }
             $tint = $AppTileColors[[Math]::Abs($a.Name.GetHashCode()) % $AppTileColors.Count]
-            $icon = "<Grid Width='34' Height='34'><Border x:Name='GT_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><Image x:Name='GI_$i' Width='30' Height='30' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>"
+            $icon = "<Grid Width='34' Height='34'><Border x:Name='GT_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><Image x:Name='GI_$i' Width='30' Height='30' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>"
             [void]$rows.Add((Row $a.Name "S_$($a.Key)" $(if ($a.Pause) { 'Paused, not closed' } else { '' }) $icon ([bool]($script:GmRunningPaths -and $script:GmRunningPaths.ContainsKey($a.Key)))))
             $i++
         }
@@ -23643,8 +24304,8 @@ function Update-TourPicker {
     foreach ($g in Get-TourGames) {
         $on = $g.Id -eq $script:TourGame
         $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Padding='14,6' Margin='0,0,6,6' FontSize='13'><TextBlock Text='$(Esc $g.Title)'/></Button>")
-        $c.Background = ConvertTo-Brush $(if ($on) { '#0A84FF' } else { '#2C2C2E' })
-        $c.Content.Foreground = ConvertTo-Brush $(if ($on) { '#FDFDFD' } else { '#F5F5F7' })
+        $c.Background = ConvertTo-Brush $(if ($on) { '#0071E3' } else { '#15181D' })
+        $c.Content.Foreground = ConvertTo-Brush $(if ($on) { '#0A0B0C' } else { '#9AA3AF' })
         $c.Tag = $g.Id; $c.Add_Click({ param($s, $e) Show-TourGame $s.Tag })
         [void]$u.Picker.Children.Add($c)
     }
@@ -23666,12 +24327,12 @@ function New-EsportsView([string]$Id) {
     $title = "$((Get-TourGames | Where-Object { $_.Id -eq $Id } | Select-Object -First 1).Title)"
     $sp = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
-  <Border Style='{DynamicResource Card}' CornerRadius='22' Padding='26,22' Margin='0,0,0,16'>
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='26,22' Margin='0,0,0,16'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
       <StackPanel>
-        <TextBlock Text='$(Esc $title.ToUpper()) TOURNAMENTS' FontSize='28' FontWeight='Black'/>
-        <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,0'/>
+        <TextBlock Text='$(Esc $title) tournaments' FontFamily='{DynamicResource Font.Display}' FontSize='22' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+        <TextBlock x:Name='Sub' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,6,0,0'/>
       </StackPanel>
       <StackPanel Grid.Column='1' VerticalAlignment='Center' Orientation='Horizontal'>
         <Button x:Name='Refresh' Style='{DynamicResource Btn}' Padding='12,7' Margin='0,0,8,0'><TextBlock Text='Refresh'/></Button>
@@ -23680,14 +24341,14 @@ function New-EsportsView([string]$Id) {
       </StackPanel>
     </Grid>
   </Border>
-  <TextBlock Text='Your own calendar (optional): paste a public calendar link (https:// or webcal://) and its events are listed here.' FontSize='12' Foreground='#98989D' TextWrapping='Wrap' Margin='4,0,0,6'/>
+  <TextBlock Text='Your own calendar (optional): paste a public calendar link (https:// or webcal://) and its events are listed here.' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='4,0,0,6'/>
   <Grid Margin='0,0,0,12'>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
     <TextBox x:Name='Ics' FontSize='12.5' Padding='10,7' VerticalContentAlignment='Center' Background='#2C2C2E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' ToolTip='Your own calendar for this game: paste a public https:// or webcal:// (ICS) address. Empty + Save removes it.'/>
     <Button x:Name='IcsSave' Grid.Column='1' Style='{DynamicResource Btn}' Padding='12,7' Margin='8,0,0,0'><TextBlock Text='Add calendar'/></Button>
   </Grid>
   <StackPanel x:Name='List'/>
-  <TextBlock x:Name='Credit' FontSize='11.5' Foreground='#98989D' TextWrapping='Wrap' Margin='4,10,0,0'/>
+  <TextBlock x:Name='Credit' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='4,10,0,0'/>
 </StackPanel>
 "@)
     $v = @{ Root = (New-PageScroll $sp); Sub = $sp.FindName('Sub'); List = $sp.FindName('List'); Credit = $sp.FindName('Credit'); Open = $sp.FindName('Open'); Refresh = $sp.FindName('Refresh')
@@ -23747,15 +24408,15 @@ function Show-EsportsRows([string]$Id) {
             $meta = (@($dates, "$($r.Prize)", "$($r.Location)") | Where-Object { $_ -and $_ -ne '' }) -join '   ·   '
             $b = switch ("$($r.Status)") { 'Ongoing' { 'Live now', '#3330D158', '#30D158' } 'Upcoming' { 'Upcoming', '#330A84FF', '#0A84FF' } default { "$($r.Status)", '#2C2C2E', '#A1A1A6' } }
             $row = [ZdTheme]::Parse(@"
-<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Card}' Padding='20,14' Margin='0,0,0,10' Cursor='Hand'>
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Card}' Padding='20,14' Margin='0,0,0,10' Cursor='Hand'>
   <Grid>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
     <StackPanel>
       <TextBlock Text='$(& $ea $r.Name)' FontSize='15' FontWeight='SemiBold' TextWrapping='Wrap'/>
-      <TextBlock Text='$(& $ea $meta)' FontSize='12.5' Foreground='#A1A1A6' Margin='0,3,0,0' TextWrapping='Wrap'/>
+      <TextBlock Text='$(& $ea $meta)' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' Margin='0,3,0,0' TextWrapping='Wrap'/>
     </StackPanel>
     <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-      $(if ($r.Tier) { "<Border CornerRadius='9' Padding='9,3' Margin='0,0,8,0' Background='#2C2C2E'><TextBlock Text='$(& $ea $r.Tier)' FontSize='11.5' Foreground='#D1D1D6'/></Border>" })
+      $(if ($r.Tier) { "<Border CornerRadius='9' Padding='9,3' Margin='0,0,8,0' Background='#2C2C2E'><TextBlock Text='$(& $ea $r.Tier)' FontSize='11.5' Foreground='{DynamicResource Text.Secondary}'/></Border>" })
       <Border CornerRadius='9' Padding='9,3' Background='$($b[1])'><TextBlock Text='$(& $ea $b[0])' FontSize='11.5' FontWeight='SemiBold' Foreground='$($b[2])'/></Border>
     </StackPanel>
   </Grid>
@@ -23774,33 +24435,27 @@ function New-EventsPage {
         $t = $CompTips[$i]
         "<Grid Margin='0,0,0,12'><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
         "<Border Width='30' Height='30' CornerRadius='8' Background='$($t[1] -replace '^#', '#33')' VerticalAlignment='Top'><TextBlock Text='&#x$('{0:X}' -f $t[0]);' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='13' Foreground='$($t[1])' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
-        "<StackPanel Grid.Column='1' Margin='11,0,0,0'><TextBlock Text='$(Esc $t[2])' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF' TextWrapping='Wrap'/><TextBlock Text='$(Esc $t[3])' FontSize='12' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,2,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel></Grid>"
+        "<StackPanel Grid.Column='1' Margin='11,0,0,0'><TextBlock Text='$(Esc $t[2])' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/><TextBlock Text='$(Esc $t[3])' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,2,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel></Grid>"
     }
     $tz = [TimeZoneInfo]::Local
     $off = $tz.GetUtcOffset((Get-Date)); $offTxt = 'UTC{0}{1:00}:{2:00}' -f $(if ($off -lt [TimeSpan]::Zero) { '-' } else { '+' }), [Math]::Abs($off.Hours), [Math]::Abs($off.Minutes)
     $root = [ZdTheme]::Parse(@"
 <Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Margin='32,0,32,28'>
   <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
-  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1'>
+  <Border x:Name='Hero' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'>
     <Grid>
-      <Ellipse Width='560' Height='560' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-330,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#55BF5AF2' Offset='0'/><GradientStop Color='#00BF5AF2' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='520' Height='520' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,-300,-140,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#44FFD60A' Offset='0'/><GradientStop Color='#00FFD60A' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
       <Grid Margin='28,22,24,20'>
         <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment='Center'>
           <StackPanel Orientation='Horizontal'>
             <TextBlock Text='&#xE7C1;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#FFD60A' FontSize='12' VerticalAlignment='Center' Margin='0,1,8,0'/>
-            <TextBlock Text='COMPETITIVE' FontSize='12' FontWeight='Bold' Foreground='#C9C9D1'/>
+            <TextBlock Text='COMPETITIVE' FontSize='12' FontWeight='Bold' Foreground='{DynamicResource Text.Secondary}'/>
           </StackPanel>
-          <TextBlock Text='FORTNITE EVENTS' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='40' Foreground='#FFFFFF' Margin='-2,2,0,0'/>
-          <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,4,0,0'/>
+          <TextBlock Text='Fortnite events' FontFamily='{DynamicResource Font.Display}' FontWeight='SemiBold' FontSize='22' Foreground='{DynamicResource Text.Primary}' Margin='0,2,0,0'/>
+          <TextBlock x:Name='Sub' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,0'/>
         </StackPanel>
         <StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='20,0,0,0'>
-          <TextBlock Text='REGION' FontSize='11' FontWeight='Bold' Foreground='#8A8A94' Margin='2,0,0,6'/>
+          <TextBlock Text='REGION' FontSize='11' FontWeight='Bold' Foreground='{DynamicResource Text.Muted}' Margin='2,0,0,6'/>
           <WrapPanel x:Name='Regions' MaxWidth='380'>$chips</WrapPanel>
           <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
             <Button x:Name='Today' Content='Jump to today' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
@@ -23812,34 +24467,34 @@ function New-EventsPage {
   </Border>
   <Grid Grid.Row='1' Margin='0,16,0,0'>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='350'/></Grid.ColumnDefinitions>
-    <Border CornerRadius='18' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Padding='1'>
+    <Border CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='1'>
       <ContentControl x:Name='Web'/>
     </Border>
     <ScrollViewer Grid.Column='1' Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' Margin='16,0,0,0' Padding='0,0,6,0'>
       <StackPanel>
-        <Border CornerRadius='18' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='16,14,16,8' Margin='0,0,0,12'>
+        <Border CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,14,16,8' Margin='0,0,0,12'>
           <StackPanel>
             <StackPanel Orientation='Horizontal' Margin='0,0,0,10'>
               <TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#30D158' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/>
-              <TextBlock Text='Tournament ready check' FontSize='14.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+              <TextBlock Text='Tournament ready check' FontSize='14.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
             </StackPanel>
             <StackPanel x:Name='Ready'/>
           </StackPanel>
         </Border>
-        <Border x:Name='RecentBox' CornerRadius='18' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='16,14,16,10' Margin='0,0,0,12'>
+        <Border x:Name='RecentBox' CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,14,16,10' Margin='0,0,0,12'>
           <StackPanel>
             <StackPanel Orientation='Horizontal' Margin='0,0,0,8'>
               <TextBlock Text='&#xE81C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#0A84FF' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/>
-              <TextBlock Text='Your recent cups' FontSize='14.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+              <TextBlock Text='Your recent cups' FontSize='14.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
             </StackPanel>
             <StackPanel x:Name='Recent'/>
           </StackPanel>
         </Border>
-        <Border CornerRadius='18' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='16,14,16,4'>
+        <Border CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,14,16,4'>
           <StackPanel>
             <StackPanel Orientation='Horizontal' Margin='0,0,0,12'>
               <TextBlock Text='&#xE82F;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#FFD60A' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/>
-              <TextBlock Text='Competitive tips' FontSize='14.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+              <TextBlock Text='Competitive tips' FontSize='14.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
             </StackPanel>
             $($tips -join '')
           </StackPanel>
@@ -23853,7 +24508,7 @@ function New-EventsPage {
     $tzName = $tz.DisplayName -replace '^\(UTC[^)]*\)\s*', ''
     $g.TzText = "$offTxt, $tzName"
     $script:EventsUi = $g
-    Set-RoundClip $g.Hero 22
+    Set-RoundClip $g.Hero 16
     foreach ($k in $EventRegions.Keys) {
         $b = $root.FindName("R_$k"); $b.Tag = $k
         $b.Add_Click({ param($s, $e)
@@ -23892,7 +24547,7 @@ function Update-EventsRecent {
     $g.Recent.Children.Clear()
     foreach ($it in $items) {
         $ago = if ($it.Time) { $d = (Get-Date) - $it.Time; if ($d.TotalHours -lt 1) { 'just now' } elseif ($d.TotalHours -lt 24) { "$([int]$d.TotalHours) h ago" } else { "$([int]$d.TotalDays) d ago" } } else { '' }
-        $row = [ZdTheme]::Parse("<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions><TextBlock Text='$(Esc (Format-TournamentName $it.Link))' FontSize='12.5' Foreground='#E6E6EC' TextTrimming='CharacterEllipsis'/><TextBlock Grid.Column='1' Text='$(Esc "$($it.Region)  ·  $ago")' FontSize='11.5' Foreground='#8A8A94' Margin='10,0,0,0'/></Grid>")
+        $row = [ZdTheme]::Parse("<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,0,6'><Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions><TextBlock Text='$(Esc (Format-TournamentName $it.Link))' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextTrimming='CharacterEllipsis'/><TextBlock Grid.Column='1' Text='$(Esc "$($it.Region)  ·  $ago")' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' Margin='10,0,0,0'/></Grid>")
         [void]$g.Recent.Children.Add($row)
     }
 }
@@ -23929,7 +24584,7 @@ function Update-EventsReady {
         $btn = if ($r.Button) { "<Button x:Name='A_$i' Grid.Column='2' Content='$(Esc $r.Button)' Style='{DynamicResource Btn}' Padding='11,4' FontSize='12' VerticalAlignment='Center' Margin='8,0,0,0'/>" } else { '' }
         "<Grid Margin='0,0,0,10'><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
         "<Ellipse x:Name='D_$i' Width='9' Height='9' Fill='$col' VerticalAlignment='Top' Margin='0,5,10,0'/>" +
-        "<StackPanel Grid.Column='1'><TextBlock x:Name='T_$i' Text='$(Esc $r.Title)' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF' TextWrapping='Wrap'/><TextBlock x:Name='S_$i' Text='$(Esc $r.Desc)' FontSize='12' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,1,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel>$btn</Grid>"
+        "<StackPanel Grid.Column='1'><TextBlock x:Name='T_$i' Text='$(Esc $r.Title)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/><TextBlock x:Name='S_$i' Text='$(Esc $r.Desc)' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,1,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel>$btn</Grid>"
     }
     $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($x -join '')</StackPanel>")
     for ($i = 0; $i -lt $rows.Count; $i++) {
@@ -23969,30 +24624,24 @@ function Update-EventsReady {
 function New-ActivePage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
-  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,0,16'>
+  <Border x:Name='Hero' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Margin='0,0,0,16'>
     <Grid>
-      <Ellipse Width='520' Height='520' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-180,-300,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#5530D158' Offset='0'/><GradientStop Color='#0030D158' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='480' Height='480' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-160,-300' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#440A84FF' Offset='0'/><GradientStop Color='#000A84FF' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
       <Grid Margin='30,24,26,24'>
         <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment='Center'>
-          <TextBlock x:Name='Count' FontSize='64' FontWeight='Black' FontFamily='Segoe UI Black, Segoe UI' Foreground='#30D158' Typography.NumeralAlignment='Tabular'>
+          <TextBlock x:Name='Count' FontSize='48' FontFamily='{DynamicResource Font.Mono}' Foreground='#30D158' Typography.NumeralAlignment='Tabular'>
             <TextBlock.Effect><DropShadowEffect Color='#30D158' BlurRadius='28' ShadowDepth='0' Opacity='0.5'/></TextBlock.Effect>
           </TextBlock>
-          <TextBlock Text='tweaks active' FontSize='13' Foreground='#B8B8C2' Margin='2,-6,0,0'/>
+          <TextBlock Text='tweaks active' FontSize='13' Foreground='{DynamicResource Text.Secondary}' Margin='2,-6,0,0'/>
         </StackPanel>
         <WrapPanel Grid.Column='1' VerticalAlignment='Center' Margin='40,0,20,0'>
-          <StackPanel Margin='0,0,36,8'><TextBlock x:Name='ByZd' FontSize='26' FontWeight='Bold' Foreground='#FFFFFF'/><TextBlock Text='switched on by ZeroDelay' FontSize='12' Foreground='#9A9AA5'/></StackPanel>
-          <StackPanel Margin='0,0,36,8'><TextBlock x:Name='Already' FontSize='26' FontWeight='Bold' Foreground='#FFFFFF'/><TextBlock Text='were already set that way' FontSize='12' Foreground='#9A9AA5'/></StackPanel>
-          <StackPanel Margin='0,0,0,8'><TextBlock x:Name='Restart' FontSize='26' FontWeight='Bold' Foreground='#FFFFFF'/><TextBlock Text='need a restart to apply' FontSize='12' Foreground='#9A9AA5'/></StackPanel>
+          <StackPanel Margin='0,0,36,8'><TextBlock x:Name='ByZd' FontSize='26' FontWeight='Bold' Foreground='{DynamicResource Text.Primary}'/><TextBlock Text='switched on by ZeroDelay' FontSize='12' Foreground='{DynamicResource Text.Muted}'/></StackPanel>
+          <StackPanel Margin='0,0,36,8'><TextBlock x:Name='Already' FontSize='26' FontWeight='Bold' Foreground='{DynamicResource Text.Primary}'/><TextBlock Text='were already set that way' FontSize='12' Foreground='{DynamicResource Text.Muted}'/></StackPanel>
+          <StackPanel Margin='0,0,0,8'><TextBlock x:Name='Restart' FontSize='26' FontWeight='Bold' Foreground='{DynamicResource Text.Primary}'/><TextBlock Text='need a restart to apply' FontSize='12' Foreground='{DynamicResource Text.Muted}'/></StackPanel>
         </WrapPanel>
         <StackPanel Grid.Column='2' VerticalAlignment='Center'>
           <Button x:Name='Undo' Content='Undo everything' Style='{DynamicResource Btn}' Padding='16,8' Margin='0,0,0,8'/>
-          <TextBlock Text='Switch any row off to put it back.' FontSize='11.5' Foreground='#8A8A94' HorizontalAlignment='Center'/>
+          <TextBlock Text='Switch any row off to put it back.' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Center'/>
         </StackPanel>
       </Grid>
     </Grid>
@@ -24002,7 +24651,7 @@ function New-ActivePage {
 "@)
     $g = @{}; foreach ($n in 'Hero', 'Count', 'ByZd', 'Already', 'Restart', 'Undo', 'List') { $g[$n] = $root.FindName($n) }
     $script:ActiveUi = $g
-    Set-RoundClip $g.Hero 22
+    Set-RoundClip $g.Hero 16
     $g.Undo.Add_Click({ $ui.RestoreAll.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))); Update-ActivePage })
     $script:PageRefresh['Active'] = { Update-ActivePage }
     Update-ActivePage
@@ -24068,43 +24717,37 @@ function Update-ActivePage {
 function New-BoosterPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
-  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,0,16'>
+  <Border x:Name='Hero' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Margin='0,0,0,16'>
     <Grid>
-      <Ellipse Width='560' Height='560' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-320,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#550A84FF' Offset='0'/><GradientStop Color='#000A84FF' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='480' Height='480' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-150,-300' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#4430D158' Offset='0'/><GradientStop Color='#0030D158' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
       <StackPanel Margin='30,24,26,22'>
         <StackPanel Orientation='Horizontal'>
           <TextBlock Text='&#xE9F5;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#0A84FF' FontSize='12' VerticalAlignment='Center' Margin='0,1,8,0'/>
-          <TextBlock Text='PING BOOSTER' FontSize='12' FontWeight='Bold' Foreground='#C9C9D1'/>
+          <TextBlock Text='PING BOOSTER' FontSize='12' FontWeight='Bold' Foreground='{DynamicResource Text.Secondary}'/>
         </StackPanel>
         <StackPanel x:Name='Boosters' Margin='0,10,0,0'/>
-        <TextBlock FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,10,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'
+        <TextBlock FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,10,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'
                    Text='With the switch on, the booster may change any setting: ZeroDelay keeps its values, never switches them back (not in alerts, auto-fix, Optimize or Game Mode), and lists every change it saw below. ZeroDelay checks every 90 seconds while ZeroDelay is open.'/>
       </StackPanel>
     </Grid>
   </Border>
-  <Border CornerRadius='18' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,16,18,10' Margin='0,0,0,14'>
+  <Border CornerRadius='18' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='18,16,18,10' Margin='0,0,0,14'>
     <StackPanel>
       <Grid Margin='0,0,0,10'>
         <StackPanel Orientation='Horizontal'>
           <TextBlock Text='&#xE81C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#0A84FF' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/>
-          <TextBlock Text='What it changed' FontSize='14.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>
-          <TextBlock x:Name='LogCount' FontSize='12' Foreground='#8A8A94' VerticalAlignment='Center' Margin='10,1,0,0'/>
+          <TextBlock Text='What it changed' FontSize='14.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+          <TextBlock x:Name='LogCount' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='10,1,0,0'/>
         </StackPanel>
         <Button x:Name='Check' Content='Check now' Style='{DynamicResource Btn}' HorizontalAlignment='Right' Padding='12,5' FontSize='12'/>
       </Grid>
       <StackPanel x:Name='Log'/>
     </StackPanel>
   </Border>
-  <Border CornerRadius='18' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,16,18,12'>
+  <Border CornerRadius='18' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='18,16,18,12'>
     <StackPanel>
       <StackPanel Orientation='Horizontal' Margin='0,0,0,10'>
         <TextBlock Text='&#xE839;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#30D158' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/>
-        <TextBlock Text='Network settings right now' FontSize='14.5' FontWeight='SemiBold' Foreground='#FFFFFF'/>
+        <TextBlock Text='Network settings right now' FontSize='14.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
       </StackPanel>
       <StackPanel x:Name='Now'/>
     </StackPanel>
@@ -24113,7 +24756,7 @@ function New-BoosterPage {
 "@)
     $g = @{}; foreach ($n in 'Hero', 'Boosters', 'LogCount', 'Check', 'Log', 'Now') { $g[$n] = $root.FindName($n) }
     $script:BoosterUi = $g
-    Set-RoundClip $g.Hero 22
+    Set-RoundClip $g.Hero 16
     $g.Check.Add_Click({ Invoke-DriftCheck; Invoke-BoosterWatch; Show-Toast 'Checking network settings...' '#A1A1A6' })
     $script:PageRefresh['Booster'] = { Update-BoosterPage; Invoke-BoosterWatch }
     Update-BoosterPage
@@ -24130,14 +24773,14 @@ function Update-BoosterPage {
 <Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Margin='0,0,0,8'>
   <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
   <StackPanel Orientation='Horizontal' VerticalAlignment='Center'>
-    <TextBlock Text='$(Esc $Boosters[$k].Name.ToUpper())' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='34' Foreground='#FFFFFF'/>
+    <TextBlock Text='$(Esc $Boosters[$k].Name.ToUpper())' FontFamily='{DynamicResource Font.Display}' FontWeight='SemiBold' FontSize='22' Foreground='{DynamicResource Text.Primary}'/>
     <Border Background='$(if ($run) { '#2630D158' } else { '#1AFFFFFF' })' CornerRadius='12' Padding='10,3,12,4' Margin='16,4,0,0' VerticalAlignment='Center'>
       <StackPanel Orientation='Horizontal'><Ellipse Width='7' Height='7' Fill='$(if ($run) { '#30D158' } else { '#8E8E93' })' VerticalAlignment='Center' Margin='0,0,7,0'/>
       <TextBlock Text='$(if ($run) { 'Running' } else { 'Not running' })' FontSize='12' FontWeight='SemiBold' Foreground='$(if ($run) { '#30D158' } else { '#C9C9D1' })'/></StackPanel>
     </Border>
   </StackPanel>
   <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-    <TextBlock Text='Let it change settings' FontSize='13' Foreground='#E6E6EC' VerticalAlignment='Center' Margin='0,0,10,0'/>
+    <TextBlock Text='Let it change settings' FontSize='13' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='0,0,10,0'/>
     <ToggleButton x:Name='Trust' Style='{DynamicResource Switch}' IsChecked='$(if ($tr) { 'True' } else { 'False' })' VerticalAlignment='Center'/>
   </StackPanel>
 </Grid>
@@ -24161,9 +24804,9 @@ function Update-BoosterPage {
         $x = ($log | Select-Object -First 60 | ForEach-Object {
             $when = try { ([datetime]$_.Time).ToString('d MMM, HH:mm') } catch { '' }
             "<Border Background='#0DFFFFFF' CornerRadius='12' Padding='12,9' Margin='0,0,0,6'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='96'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
-            "<TextBlock Text='$(Esc $when)' FontSize='12' Foreground='#9A9AA5' VerticalAlignment='Center'/>" +
+            "<TextBlock Text='$(Esc $when)' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>" +
             "<StackPanel Grid.Column='1' Margin='0,0,12,0'><TextBlock Text='$(Esc $_.Setting)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>" +
-            "<TextBlock FontSize='12' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,2,0,0'><Run Text='$(Esc $_.Before)'/><Run Text='  →  ' Foreground='#0A84FF'/><Run Text='$(Esc $_.After)' Foreground='#E6E6EC'/><Run Text='$(Esc "   ·   by $($_.Booster)")'/></TextBlock></StackPanel>" +
+            "<TextBlock FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,2,0,0'><Run Text='$(Esc $_.Before)'/><Run Text='  →  ' Foreground='#0A84FF'/><Run Text='$(Esc $_.After)' Foreground='{DynamicResource Text.Secondary}'/><Run Text='$(Esc "   ·   by $($_.Booster)")'/></TextBlock></StackPanel>" +
             "<Border Grid.Column='2' Background='#2630D158' CornerRadius='8' Padding='8,2,9,3' VerticalAlignment='Center'><TextBlock Text='kept' FontSize='11.5' FontWeight='SemiBold' Foreground='#30D158'/></Border></Grid></Border>"
         }) -join ''
         [void]$g.Log.Children.Add([ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>$x</StackPanel>"))
@@ -24176,7 +24819,7 @@ function Update-BoosterPage {
     $x = ($snap.Keys | ForEach-Object {
         $hi = $recent.ContainsKey($_)
         "<Grid Margin='0,0,0,5'><Grid.ColumnDefinitions><ColumnDefinition Width='300'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
-        "<TextBlock Text='$(Esc $_)' FontSize='12.5' Foreground='#9A9AA5' TextTrimming='CharacterEllipsis'/>" +
+        "<TextBlock Text='$(Esc $_)' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' TextTrimming='CharacterEllipsis'/>" +
         "<TextBlock Grid.Column='1' Text='$(Esc "$($snap[$_])$(if ($hi) { '   (changed by the booster)' })")' FontSize='12.5' Foreground='$(if ($hi) { '#0A84FF' } else { '#E6E6EC' })' TextWrapping='Wrap'/></Grid>"
     }) -join ''
     [void]$g.Now.Children.Add([ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>$x</StackPanel>"))
@@ -24228,33 +24871,27 @@ function Test-MainVrrOn { $m = @(Get-VrrMonitors) | Where-Object { $_.Main } | S
 function New-SyncPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
-  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,0,16'>
+  <Border x:Name='Hero' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Margin='0,0,0,16'>
     <Grid>
-      <Ellipse Width='560' Height='560' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-320,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#55FF3B30' Offset='0'/><GradientStop Color='#00FF3B30' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='500' Height='500' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-160,-300' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#4476B900' Offset='0'/><GradientStop Color='#0076B900' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
       <StackPanel Margin='30,24,26,24'>
         <StackPanel Orientation='Horizontal'>
           <TextBlock Text='&#xE7F4;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' Foreground='#FF6482' FontSize='12' VerticalAlignment='Center' Margin='0,1,8,0'/>
-          <TextBlock Text='VARIABLE REFRESH RATE' FontSize='12' FontWeight='Bold' Foreground='#C9C9D1'/>
+          <TextBlock Text='VARIABLE REFRESH RATE' FontSize='12' FontWeight='Bold' Foreground='{DynamicResource Text.Secondary}'/>
         </StackPanel>
         <StackPanel Orientation='Horizontal' Margin='0,4,0,0'>
-          <TextBlock Text='FREESYNC' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='44' Foreground='#FFFFFF'/>
+          <TextBlock Text='FREESYNC' FontFamily='{DynamicResource Font.Display}' FontWeight='SemiBold' FontSize='22' Foreground='{DynamicResource Text.Primary}'/>
           <Border x:Name='StatePill' CornerRadius='13' Padding='11,4,13,5' Margin='18,6,0,0' VerticalAlignment='Center'>
             <StackPanel Orientation='Horizontal'><Ellipse x:Name='StateDot' Width='8' Height='8' VerticalAlignment='Center' Margin='0,0,8,0'/><TextBlock x:Name='StateText' FontSize='13' FontWeight='SemiBold'/></StackPanel>
           </Border>
         </StackPanel>
-        <TextBlock x:Name='StateSub' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,6,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+        <TextBlock x:Name='StateSub' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,6,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
       </StackPanel>
     </Grid>
   </Border>
   <StackPanel x:Name='Monitors'/>
-  <Border CornerRadius='18' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,16,18,8' Margin='0,4,0,0'>
+  <Border CornerRadius='18' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='18,16,18,8' Margin='0,4,0,0'>
     <StackPanel>
-      <TextBlock Text='Settings' FontSize='14.5' FontWeight='SemiBold' Foreground='#FFFFFF' Margin='0,0,0,12'/>
+      <TextBlock Text='Settings' FontSize='14.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='0,0,0,12'/>
       <StackPanel x:Name='Steps'/>
     </StackPanel>
   </Border>
@@ -24262,7 +24899,7 @@ function New-SyncPage {
 "@)
     $g = @{}; foreach ($n in 'Hero', 'StatePill', 'StateDot', 'StateText', 'StateSub', 'Monitors', 'Steps') { $g[$n] = $root.FindName($n) }
     $script:SyncUi = $g
-    Set-RoundClip $g.Hero 22
+    Set-RoundClip $g.Hero 16
     $script:PageRefresh['Sync'] = { $script:VrrMonitors = $null; Update-SyncPage }
     Update-SyncPage
     New-PageScroll $root
@@ -24294,12 +24931,12 @@ function Update-SyncPage {
             default   { if ($m.Cable -eq 'DisplayPort') { @($good, $(if ($nv) { 'Supported over DisplayPort.' } else { 'Supported. Turn it on in AMD Software.' }), 'Can use FreeSync') } else { @($warn, "Connected by $($m.Cable): VRR may need DisplayPort on this graphics card.", 'Check the cable') } }
         }
         $row = [ZdTheme]::Parse(@"
-<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' CornerRadius='16' Background='#B8101012' BorderBrush='#24FFFFFF' BorderThickness='1' Padding='18,14' Margin='0,0,0,10'>
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='18,14' Margin='0,0,0,10'>
   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-    <Border Width='40' Height='40' CornerRadius='11' Background='#22FFFFFF' VerticalAlignment='Top'><TextBlock Text='&#xE7F4;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' Foreground='#E6E6EC' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <Border Width='40' Height='40' CornerRadius='11' Background='#22FFFFFF' VerticalAlignment='Top'><TextBlock Text='&#xE7F4;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='17' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
     <StackPanel Grid.Column='1' Margin='14,0,14,0'>
-      <StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $m.Name)' FontSize='15' FontWeight='SemiBold' Foreground='#FFFFFF'/>$(if ($m.Main) { "<Border Background='#260A84FF' CornerRadius='6' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='main screen' FontSize='11' Foreground='#0A84FF'/></Border>" })</StackPanel>
-      <TextBlock Text='$(Esc "Variable refresh $($m.Min) to $($m.Max) Hz  ·  connected by $($m.Cable)")' FontSize='12.5' Foreground='#9A9AA5' Margin='0,2,0,0'/>
+      <StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $m.Name)' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>$(if ($m.Main) { "<Border Background='#260A84FF' CornerRadius='6' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='main screen' FontSize='11' Foreground='#0A84FF'/></Border>" })</StackPanel>
+      <TextBlock Text='$(Esc "Variable refresh $($m.Min) to $($m.Max) Hz  ·  connected by $($m.Cable)")' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0'/>
       <TextBlock Text='$(Esc $state[1])' FontSize='12.5' Foreground='$($state[0])' TextWrapping='Wrap' Margin='0,6,0,0'/>
     </StackPanel>
     <Border Grid.Column='2' Background='$($state[0] -replace '^#', '#26')' CornerRadius='10' Padding='10,3,12,4' VerticalAlignment='Top'>
@@ -24323,11 +24960,11 @@ function Update-SyncPage {
     $x = for ($i = 0; $i -lt $steps.Count; $i++) {
         $st = $steps[$i]
         $dot = if ($st.Done) { "<Border Width='22' Height='22' CornerRadius='11' Background='#2630D158'><TextBlock Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#30D158' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
-               else { "<Border Width='22' Height='22' CornerRadius='11' Background='#1AFFFFFF'><TextBlock Text='$($i + 1)' FontSize='11.5' FontWeight='SemiBold' Foreground='#E6E6EC' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
+               else { "<Border Width='22' Height='22' CornerRadius='11' Background='#1AFFFFFF'><TextBlock Text='$($i + 1)' FontSize='11.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
         $right = if ($st.Switch) { "<ToggleButton x:Name='V_$i' Grid.Column='2' Style='{DynamicResource Switch}' IsChecked='$(if ($st.Done) { 'True' } else { 'False' })' VerticalAlignment='Center'/>" }
                  elseif ($st.Btn -or $st.Btn2) { "<StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center'>" + $(if ($st.Btn2) { "<Button x:Name='C_$i' Content='$(Esc $st.Btn2)' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,6,0' ToolTip='The driver does not use it yet: ZeroDelay adds it to the restart banner and checks it after the restart.'/>" } else { '' }) + $(if ($st.Btn) { "<Button x:Name='B_$i' Content='$(Esc $st.Btn)' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12'/>" } else { '' }) + "</StackPanel>" } else { '' }
         "<Grid Margin='0,0,0,12'><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>$dot" +
-        "<StackPanel Grid.Column='1' Margin='12,0,12,0'><TextBlock Text='$(Esc $st.Title)' FontSize='13' FontWeight='SemiBold' Foreground='#FFFFFF' TextWrapping='Wrap'/><TextBlock Text='$(Esc $st.Desc)' FontSize='12' Foreground='#9A9AA5' TextWrapping='Wrap' Margin='0,2,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel>$right</Grid>"
+        "<StackPanel Grid.Column='1' Margin='12,0,12,0'><TextBlock Text='$(Esc $st.Title)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/><TextBlock Text='$(Esc $st.Desc)' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,2,0,0' LineHeight='17' LineStackingStrategy='BlockLineHeight'/></StackPanel>$right</Grid>"
     }
     $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($x -join '')</StackPanel>")
     for ($i = 0; $i -lt $steps.Count; $i++) {
@@ -24391,22 +25028,16 @@ function Get-BloatList {
 function New-DebloatPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
-  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,0,16'>
+  <Border x:Name='Hero' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Margin='0,0,0,16'>
     <Grid>
-      <Ellipse Width='560' Height='560' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-320,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#55FF9F0A' Offset='0'/><GradientStop Color='#00FF9F0A' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <Ellipse Width='500' Height='500' HorizontalAlignment='Right' VerticalAlignment='Bottom' Margin='0,0,-160,-300' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#44FF453A' Offset='0'/><GradientStop Color='#00FF453A' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
       <Grid Margin='30,24,26,24'>
         <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
         <StackPanel>
-          <TextBlock Text='DEBLOAT' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='44' Foreground='#FFFFFF'/>
-          <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,4,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
+          <TextBlock Text='DEBLOAT' FontFamily='{DynamicResource Font.Display}' FontWeight='SemiBold' FontSize='22' Foreground='{DynamicResource Text.Primary}'/>
+          <TextBlock x:Name='Sub' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,0' LineHeight='19' LineStackingStrategy='BlockLineHeight'/>
         </StackPanel>
         <StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='20,0,0,0'>
-          <Button x:Name='Go' Content='Remove selected' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' Padding='18,9' FontSize='14' IsEnabled='False'/>
+          <Button x:Name='Go' Content='Remove selected' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='{DynamicResource Text.Primary}' Padding='18,9' FontSize='14' IsEnabled='False'/>
           <Button x:Name='Rescan' Content='Scan again' Style='{DynamicResource Btn}' Margin='0,8,0,0'/>
         </StackPanel>
       </Grid>
@@ -24417,7 +25048,7 @@ function New-DebloatPage {
 "@)
     $g = @{}; foreach ($n in 'Hero', 'Sub', 'Go', 'Rescan', 'List') { $g[$n] = $root.FindName($n) }
     $script:DebloatUi = $g
-    Set-RoundClip $g.Hero 22
+    Set-RoundClip $g.Hero 16
     $g.Rescan.Add_Click({ Start-DebloatScan })
     $g.Go.Add_Click({ Invoke-Debloat })
     $script:PageRefresh['Debloat'] = { if ($null -eq $script:AppsData) { Start-DebloatScan } else { Update-DebloatPage } }
@@ -24540,7 +25171,7 @@ function Get-TrendEvents($reports) {
 # chart colours: validated categorical slots 1 (blue) and 2 (orange), separate steps for light and dark
 function Get-TrendColors {
     if ($script:Theme -eq 'light') { @{ S1 = '#2a78d6'; S2 = '#eb6834'; Grid = '#14000000'; Axis = '#6E6E73'; Ink = '#1C1C1E'; Ring = '#FFFFFF'; Mark = '#55000000' } }
-    else { @{ S1 = '#3987e5'; S2 = '#d95926'; Grid = '#1AFFFFFF'; Axis = '#8E8E93'; Ink = '#F5F5F7'; Ring = '#141416'; Mark = '#66FFFFFF' } }
+    else { @{ S1 = '#3987e5'; S2 = '#d95926'; Grid = '#1AFFFFFF'; Axis = '#8E8E93'; Ink = '#F5F5F7'; Ring = '#0E1013'; Mark = '#66FFFFFF' } }
 }
 function New-Brush([string]$hex) { $b = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)); $b.Freeze(); $b }
 # A small line chart drawn on a Canvas: one y-axis, 2 px lines, 8 px points with a surface ring, a tooltip on every
@@ -24623,27 +25254,24 @@ function Show-TrendChart($cv) {
 function New-TrendsPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1100' HorizontalAlignment='Left'>
-  <Border x:Name='Hero' CornerRadius='22' Background='#050507' BorderBrush='#22FFFFFF' BorderThickness='1' Margin='0,0,0,16'>
+  <Border x:Name='Hero' CornerRadius='16' Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Margin='0,0,0,16'>
     <Grid>
-      <Ellipse Width='540' Height='540' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-200,-320,0,0' IsHitTestVisible='False'>
-        <Ellipse.Fill><RadialGradientBrush><GradientStop Color='#550A84FF' Offset='0'/><GradientStop Color='#000A84FF' Offset='1'/></RadialGradientBrush></Ellipse.Fill>
-      </Ellipse>
-      <StackPanel Margin='30,22,26,22'>
-        <TextBlock Text='TRENDS' FontFamily='Segoe UI Black, Segoe UI' FontWeight='Black' FontSize='40' Foreground='#FFFFFF'/>
-        <TextBlock x:Name='Sub' FontSize='12.5' Foreground='#B8B8C2' TextWrapping='Wrap' Margin='0,4,0,14'/>
+      <StackPanel Margin='24,20,24,20'>
+        <TextBlock Text='Trends' FontFamily='{DynamicResource Font.Display}' FontWeight='SemiBold' FontSize='22' Foreground='{DynamicResource Text.Primary}'/>
+        <TextBlock x:Name='Sub' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,14'/>
         <WrapPanel x:Name='Games' Margin='0,0,0,10'/>
         <WrapPanel x:Name='Tiles'/>
       </StackPanel>
     </Grid>
   </Border>
   <StackPanel x:Name='Charts'/>
-  <Button x:Name='TableBtn' Content='Show as a table' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Margin='0,4,0,10'/>
-  <Border x:Name='TableBox' Style='{DynamicResource Card}' Padding='18,14' Visibility='Collapsed'><StackPanel x:Name='Table'/></Border>
+  <Button x:Name='TableBtn' Content='Show as a table' Style='{DynamicResource Zd.Button.Secondary}' HorizontalAlignment='Left' Margin='0,4,0,10'/>
+  <Border x:Name='TableBox' Style='{DynamicResource Zd.Card}' Padding='18,14' Visibility='Collapsed'><StackPanel x:Name='Table'/></Border>
 </StackPanel>
 "@)
     $g = @{}; foreach ($n in 'Hero', 'Sub', 'Games', 'Tiles', 'Charts', 'TableBtn', 'TableBox', 'Table') { $g[$n] = $root.FindName($n) }
     $script:TrendsUi = $g
-    Set-RoundClip $g.Hero 22
+    Set-RoundClip $g.Hero 16
     $g.TableBtn.Add_Click({ $tb = $script:TrendsUi.TableBox; $tb.Visibility = if ($tb.Visibility -eq 'Visible') { 'Collapsed' } else { 'Visible' }; $script:TrendsUi.TableBtn.Content = if ($tb.Visibility -eq 'Visible') { 'Hide the table' } else { 'Show as a table' } })
     $script:PageRefresh['Trends'] = { Update-TrendsPage }
     Update-TrendsPage
@@ -24680,7 +25308,7 @@ function Update-TrendsPage {
         $better = if ($lowerBetter) { $pct -lt 0 } else { $pct -gt 0 }
         $flat = [Math]::Abs($pct) -lt 3
         $state = if ($flat) { @('#8E8E93', '&#xE738;', 'about the same') } elseif ($better) { @('#30D158', $(if ($pct -gt 0) { '&#xE70E;' } else { '&#xE70D;' }), "$('{0:0}' -f [Math]::Abs($pct))% better") } else { @('#FF453A', $(if ($pct -gt 0) { '&#xE70E;' } else { '&#xE70D;' }), "$('{0:0}' -f [Math]::Abs($pct))% worse") }
-        $x = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,34,6'><TextBlock Text='$(Esc ("{0} {1}" -f $(if ($a -ge 20) { '{0:0}' -f $a } else { '{0:0.#}' -f $a }), $unit))' FontSize='24' FontWeight='Bold' Foreground='#FFFFFF'/><TextBlock Text='$(Esc $name)' FontSize='12' Foreground='#9A9AA5'/>" +
+        $x = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,34,6'><TextBlock Text='$(Esc ("{0} {1}" -f $(if ($a -ge 20) { '{0:0}' -f $a } else { '{0:0.#}' -f $a }), $unit))' FontFamily='{DynamicResource Font.Mono}' FontSize='24' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='$(Esc $name)' FontSize='12' Foreground='{DynamicResource Text.Muted}'/>" +
             "<StackPanel Orientation='Horizontal' Margin='0,3,0,0'><TextBlock Text='$($state[1])' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Foreground='$($state[0])' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='$($state[2])' FontSize='12' FontWeight='SemiBold' Foreground='$($state[0])'/></StackPanel></StackPanel>")
         [void]$script:TrendsUi.Tiles.Children.Add($x)
     }
@@ -24689,7 +25317,7 @@ function Update-TrendsPage {
     & $tile "stutters per $(Get-SessionWord $tg)" $stu '' $true
     & $tile 'input latency' $lat 'ms' $true
     & $tile 'ping' $png 'ms' $true
-    if ($g.Tiles.Children.Count) { [void]$g.Tiles.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='Last $k $(Get-SessionWord $tg 2) compared with the $k before.' FontSize='11.5' Foreground='#8A8A94' VerticalAlignment='Bottom' Margin='0,0,0,8'/>")) }
+    if ($g.Tiles.Children.Count) { [void]$g.Tiles.Children.Add([ZdTheme]::Parse("<TextBlock xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Text='Last $k $(Get-SessionWord $tg 2) compared with the $k before.' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='0,0,0,8'/>")) }
     # small multiples, one measure each
     if (@($avg | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart 'FPS' @(@{ Name = 'Average'; Values = $avg; Color = $col.S1 }, @{ Name = '1% low'; Values = $low; Color = $col.S2 }) 'FPS' $reps $marks $false)) }
     if (@($stu | Where-Object { $null -ne $_ }).Count) { [void]$g.Charts.Children.Add((New-TrendChart "Stutters per $(Get-SessionWord $tg)" @(@{ Name = 'Stutters'; Values = $stu; Color = $col.S1 }) '' $reps $marks $true)) }
@@ -25053,7 +25681,7 @@ function Update-Filter {
     $ui.ChipBar.Visibility = if ($chips) { 'Visible' } else { 'Collapsed' }
     if ($chips) { Update-ChipBar }
     if (-not $q -and $script:CurrentCat.Page) {
-        $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'
+        $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'; $ui.EmptyState.Visibility = 'Collapsed'
         $ui.PageHost.Content = Get-PageContent $script:CurrentCat.Page
         return
     }
@@ -25070,8 +25698,35 @@ function Update-Filter {
         $t.Card.Visibility = if ($show -and -not $t.Hidden) { 'Visible' } else { 'Collapsed' }
     }
     if ($chips) { $ui.LatencyNote.Text = Get-ViewNote; $ui.LatencyNote.Visibility = 'Visible' }
+    # 2.0: result count, "Turn on all shown" (Tweaks only) and the empty state
+    $shown = @($Tweaks | Where-Object { $_.Card -and $_.Card.Visibility -eq 'Visible' -and -not $_.Header })
+    $noun = if ($cn -eq 'Checks' -and -not $q) { 'check' } else { 'card' }; if ($cn -eq 'Tweaks' -and -not $q) { $noun = 'tweak' }
+    $ui.ResultCount.Text = "$($shown.Count) $noun$(if ($shown.Count -ne 1) { 's' })"
+    $owned = @(Get-BoosterOwned)
+    $script:ShownOff = @($shown | Where-Object { $_.Toggle -and $_.State -eq $false -and $owned -notcontains $_.Id })
+    if ($cn -eq 'Checks' -and -not $q) {
+        # Checks: the same slot runs every check at once (the health check) and shows the findings
+        $ui.ShowAllOn.Style = $window.FindResource('Zd.Button.Primary'); $ui.ShowAllOn.Content = 'Run all checks'; $ui.ShowAllOn.Visibility = 'Visible'
+        $ui.ShowAllOn.ToolTip = 'Runs every check that matters most at once and lists what it finds. Checks only look; nothing changes until you press Fix.'
+    } else {
+        $ui.ShowAllOn.Style = $window.FindResource('Zd.Button.Secondary')
+        $ui.ShowAllOn.Visibility = if ($cn -eq 'Tweaks' -and -not $q -and $script:ShownOff.Count) { 'Visible' } else { 'Collapsed' }
+        $ui.ShowAllOn.Content = "Turn on all $($script:ShownOff.Count) shown"
+        $ui.ShowAllOn.ToolTip = 'Opens Boost now with every card shown here that is off. You still see the list and choose before anything changes.'
+    }
+    if (-not $shown.Count) {
+        $ui.EmptyTitle.Text = if ($q) { "Nothing matches `"$q`"" } else { "No $($noun)s match these filters" }
+        $ui.EmptyText.Text = if ($q) { 'Search looks at card titles and descriptions. Try a shorter word, or clear the search.' } elseif ($script:TweakView -eq 'On' -and $cn -eq 'Tweaks') { 'None of these are switched on yet.' } else { 'Try another area, or show everything.' }
+        $ui.EmptyState.Visibility = 'Visible'
+    } else { $ui.EmptyState.Visibility = 'Collapsed' }
 }
 $ui.Search.Add_TextChanged({ Update-Filter })
+$ui.EmptyReset.Add_Click({ if ($ui.Search.Text) { $ui.Search.Text = '' }; $script:TweakView = 'All'; $script:TweakArea = 'All'; $script:CheckArea = 'All'; Update-Filter; Reset-Scroll })
+# opens Boost now with exactly the shown cards that are off: the sheet is the confirmation, nothing changes before step 3
+$ui.ShowAllOn.Add_Click({
+    if ($script:CurrentCat.Name -eq 'Checks') { Select-NavPage 'Health'; if ($script:Health) { Invoke-HealthScan } }
+    elseif ($script:ShownOff.Count) { Show-OptimizeChooser $script:ShownOff }
+})
 $script:NavButtons = @{}
 $NavTop = @('Home', 'Games', 'Events', 'Tweaks', 'Checks', 'Tools')
 $NavTools = @('ThisPC', 'Sync', 'Nvidia', 'Benchmark', 'Matches', 'Trends', 'Booster', 'Ping', 'Sens', 'Mouse', 'Profiles', 'History', 'Debloat', 'Apps', 'Clean', 'Memory')
@@ -25168,9 +25823,11 @@ $ui.RestorePoint.Add_PreviewMouseLeftButtonUp({ $ui.MorePop.IsOpen = $false })
 $ui.RestoreAll.Add_PreviewMouseLeftButtonUp({ $ui.MorePop.IsOpen = $false })
 $ui.ApplyRec.Add_Click({ Show-OptimizeChooser })
 # Shows every recommended tweak that is still off; nothing changes until you tick what you want and confirm.
-function Show-OptimizeChooser {
+function Show-OptimizeChooser($List) {
+    # 2.0 Boost now: one sheet, three steps. $List: the cards to offer (Tweaks > "Turn on all shown"); default: recommended. 1 Safety first (restore point, on by default), 2 Choose (recommended tweaks
+    # that are still off, all ticked, grouped by area), 3 Apply (real per-item progress, then the result).
     $owned = Get-BoosterOwned
-    $list = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and -not $_.Hidden -and $_.State -eq $false -and $owned -notcontains $_.Id })
+    $list = if ($List) { @($List) } else { @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and -not $_.Hidden -and $_.State -eq $false -and $owned -notcontains $_.Id }) }
     if (-not $list.Count) { Show-Toast 'Everything recommended for this PC is already on.' '#30D158'; return }
     $catTitle = @{}; foreach ($c in $Categories) { $catTitle[$c.Name] = $c.Title }
     $order = @{}; for ($i = 0; $i -lt $Categories.Count; $i++) { $order[$Categories[$i].Name] = $i }
@@ -25178,47 +25835,283 @@ function Show-OptimizeChooser {
     $groups = foreach ($grp in ($list | Group-Object { $_.Cat } | Sort-Object { $order[$_.Name] })) {
         $rows = foreach ($t in $grp.Group) {
             $t.ChooseIdx = $i; $i++
-            $badge = if ($t.Badge -eq 'restart') { "<Border Background='#260A84FF' CornerRadius='6' Padding='6,0,6,1' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='needs restart' FontSize='10.5' Foreground='#0A84FF'/></Border>" } else { '' }
-            "<Border Background='#14FFFFFF' CornerRadius='10' Padding='12,9' Margin='0,0,0,6'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
-            "<CheckBox x:Name='C_$($t.ChooseIdx)' VerticalAlignment='Top' Margin='0,2,10,0'/>" +
-            "<StackPanel Grid.Column='1'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>$badge</StackPanel>" +
-            "<TextBlock Text='$(Esc $t.Desc)' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/>" +
-            $(if (($chg = @(Get-TweakChanges $t)).Count) { "<TextBlock Text='$((Esc ($chg -join "`n")) -replace "`n", '&#x0a;')' FontSize='11.5' Foreground='#8A8A94' FontFamily='Cascadia Mono, Consolas, Segoe UI' TextWrapping='Wrap' Margin='0,3,0,0'/>" } else { '' }) +
-            $(if ($t.Warn) { "<TextBlock Text='$(Esc "Skip it if: $($t.Warn)")' FontSize='11.5' Foreground='#FF9F0A' TextWrapping='Wrap' Margin='0,3,0,0'/>" } else { '' }) +
-            "</StackPanel></Grid></Border>"
+            $restart = if ($t.Badge -eq 'restart') { "<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource Warn.Soft}' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='Needs restart' Foreground='{DynamicResource Warn}'/></Border>" } else { '' }
+            $chg = @(Get-TweakChanges $t)
+            $more = if ($t.Warn -or $chg.Count) {
+                "<ToggleButton x:Name='W_$($t.ChooseIdx)' Style='{DynamicResource Zd.LinkToggle}' Content='When not to use it' Margin='0,6,0,0' HorizontalAlignment='Left'/>" +
+                "<StackPanel x:Name='WT_$($t.ChooseIdx)' Visibility='Collapsed' Margin='0,6,0,0'>" +
+                $(if ($t.Warn) { "<TextBlock TextWrapping='Wrap' FontSize='12' Foreground='{DynamicResource Text.Secondary}'><Run Text=""Don't use if:"" FontWeight='SemiBold'/> <Run Text='$(Esc $t.Warn)'/></TextBlock>" } else { '' }) +
+                $(if ($chg.Count) { "<TextBlock Text='$((Esc ($chg -join "`n")) -replace "`n", '&#x0a;')' FontFamily='{DynamicResource Font.Mono}' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,6,0,0'/>" } else { '' }) +
+                "</StackPanel>"
+            } else { '' }
+            "<Border Background='{DynamicResource Bg.Raised}' CornerRadius='10' Padding='12,10' Margin='0,0,0,6'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>" +
+            "<CheckBox x:Name='C_$($t.ChooseIdx)' IsChecked='True' VerticalAlignment='Top' Margin='0,2,12,0' AutomationProperties.Name='$(Esc $t.Title)'/>" +
+            "<StackPanel Grid.Column='1'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $t.Title)' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>$restart</StackPanel>" +
+            "<TextBlock Text='$(Esc $t.Desc)' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='38' Margin='0,2,0,0'/>" +
+            "$more</StackPanel></Grid></Border>"
         }
-        "<TextBlock Text='$(Esc $(if ($catTitle[$grp.Name]) { $catTitle[$grp.Name] } else { $grp.Name }))' FontSize='12' FontWeight='SemiBold' Foreground='#98989D' Margin='2,10,0,6'/>$($rows -join '')"
+        "<TextBlock Text='$(Esc $(if ($catTitle[$grp.Name]) { $catTitle[$grp.Name] } else { $grp.Name }))' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' Margin='2,12,0,6'/>$($rows -join '')"
     }
-    $body = [ZdTheme]::Parse(@"
-<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-  <TextBlock Text='Choose what to switch on' FontSize='22' FontWeight='Bold'/>
-  <TextBlock Text='$($list.Count) recommended tweaks are off on this PC. Tick only the ones you want: nothing changes until you press Switch on. Every change can be undone later.' Foreground='#A1A1A6' FontSize='13' Margin='0,6,0,12' TextWrapping='Wrap'/>
-  <StackPanel Orientation='Horizontal' Margin='0,0,0,4'>
-    <Button x:Name='All' Content='Select all' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,8,0'/>
-    <Button x:Name='None' Content='Clear' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12'/>
+    $rpWhen = "$($script:Backup.Custom['restorepoint'])"
+    $rpNote = if ($rpWhen -and $rpWhen -ne 'declined') { try { "Your last one is from $(([datetime]$rpWhen).ToString('ddd d MMM, HH:mm')). Windows makes at most one every 24 hours." } catch { '' } } else { '' }
+    $steps = foreach ($s in @(@(1, 'Safety first'), @(2, 'Choose'), @(3, 'Apply'))) {
+        "<StackPanel Orientation='Horizontal' Margin='0,0,16,0'><Border x:Name='S$($s[0])' Width='22' Height='22' CornerRadius='11' Background='{DynamicResource Bg.Raised}'>" +
+        "<TextBlock x:Name='SN$($s[0])' Text='$($s[0])' FontSize='12' FontWeight='SemiBold' HorizontalAlignment='Center' VerticalAlignment='Center' Foreground='{DynamicResource Text.Muted}'/></Border>" +
+        "<TextBlock x:Name='SL$($s[0])' Text='$($s[1])' FontSize='13' VerticalAlignment='Center' Margin='8,0,0,0' Foreground='{DynamicResource Text.Muted}'/></StackPanel>"
+    }
+    $sheet = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Grid.Resources>
+    <!-- text-link toggle: "When not to use it" -->
+    <Style x:Key='Zd.LinkToggle' TargetType='ToggleButton'>
+      <Setter Property='Cursor' Value='Hand'/>
+      <Setter Property='Foreground' Value='{DynamicResource Accent}'/>
+      <Setter Property='FontSize' Value='12'/>
+      <Setter Property='FocusVisualStyle' Value='{DynamicResource Zd.FocusRing}'/>
+      <Setter Property='Template'><Setter.Value><ControlTemplate TargetType='ToggleButton'>
+        <StackPanel Orientation='Horizontal' Background='Transparent'>
+          <ContentPresenter VerticalAlignment='Center'/>
+          <TextBlock x:Name='Chev' Text='&#xE70D;' FontFamily='{DynamicResource Font.Icons}' FontSize='9' VerticalAlignment='Center' Margin='6,1,0,0' RenderTransformOrigin='0.5,0.5'>
+            <TextBlock.RenderTransform><RotateTransform/></TextBlock.RenderTransform>
+          </TextBlock>
+        </StackPanel>
+        <ControlTemplate.Triggers>
+          <Trigger Property='IsChecked' Value='True'><Setter TargetName='Chev' Property='RenderTransform'><Setter.Value><RotateTransform Angle='180'/></Setter.Value></Setter></Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+  </Grid.Resources>
+  <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
+
+  <!-- header: title + step bar -->
+  <StackPanel>
+    <TextBlock Text='Boost now' FontFamily='{DynamicResource Font.Display}' FontSize='22' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+    <WrapPanel Margin='0,12,0,0'>$($steps -join '')</WrapPanel>
+    <Border Height='1' Background='{DynamicResource Border.Subtle}' Margin='0,16,0,0'/>
   </StackPanel>
-  $($groups -join '')
-  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,14,0,0'>
-    <Button x:Name='Cancel' Content='Cancel' Style='{DynamicResource Btn}' Margin='0,0,8,0' MinWidth='90'/>
-    <Button x:Name='Go' Content='Switch on 0' Style='{DynamicResource Btn}' Background='#0071E3' Foreground='#FFFFFF' MinWidth='130' IsEnabled='False'/>
-  </StackPanel>
-</StackPanel>
+
+  <Grid Grid.Row='1' Margin='0,16,0,0'>
+    <!-- step 1: safety first -->
+    <StackPanel x:Name='P1'>
+      <TextBlock Text='Safety first' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+      <TextBlock Text='Nothing changes until step 3, and every tweak can be switched off again later.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,16'/>
+      <Border Style='{DynamicResource Zd.Card}' Background='{DynamicResource Bg.Raised}'>
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+          <TextBlock Text='&#xE777;' FontFamily='{DynamicResource Font.Icons}' FontSize='18' Foreground='{DynamicResource Accent}' VerticalAlignment='Top' Margin='0,2,12,0'/>
+          <StackPanel Grid.Column='1'>
+            <TextBlock Text='Create a Windows restore point' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+            <TextBlock Text='Windows saves a snapshot of its system settings first, so you can roll back from Control Panel &gt; Recovery even without ZeroDelay. Takes a few seconds.' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,0,0'/>
+            <TextBlock Text='$(Esc $rpNote)' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,6,0,0' Visibility='$(if ($rpNote) { 'Visible' } else { 'Collapsed' })'/>
+          </StackPanel>
+          <ToggleButton x:Name='RpSwitch' Grid.Column='2' Style='{DynamicResource Switch}' IsChecked='True' VerticalAlignment='Top' Margin='16,2,0,0' AutomationProperties.Name='Create a Windows restore point'/>
+        </Grid>
+      </Border>
+      <StackPanel Orientation='Horizontal' Margin='0,16,0,0'>
+        <TextBlock Text='&#xE7A7;' FontFamily='{DynamicResource Font.Icons}' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Top' Margin='0,2,8,0'/>
+        <TextBlock Text='Separately, ZeroDelay saves the original value of every setting before it changes it. Home &gt; Restore puts them all back.' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' MaxWidth='500'/>
+      </StackPanel>
+    </StackPanel>
+
+    <!-- step 2: choose -->
+    <Grid x:Name='P2' Visibility='Collapsed'>
+      <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/></Grid.RowDefinitions>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+        <StackPanel>
+          <TextBlock Text='Choose what to switch on' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+          <TextBlock x:Name='Count' FontSize='13' Foreground='{DynamicResource Text.Secondary}' Margin='0,4,0,0'/>
+        </StackPanel>
+        <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Bottom'>
+          <Button x:Name='All' Content='Select all' Style='{DynamicResource Zd.Button.Ghost}'/>
+          <Button x:Name='None' Content='None' Style='{DynamicResource Zd.Button.Ghost}'/>
+        </StackPanel>
+      </Grid>
+      <ScrollViewer x:Name='ChooseScroll' Grid.Row='1' Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' Margin='0,8,-12,0' Padding='0,0,12,0'>
+        <StackPanel>$($groups -join '')</StackPanel>
+      </ScrollViewer>
+    </Grid>
+
+    <!-- step 3: apply, then the result -->
+    <Grid x:Name='P3' Visibility='Collapsed'>
+      <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
+      <StackPanel>
+        <TextBlock x:Name='ApplyTitle' Text='Switching on' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+        <TextBlock x:Name='ApplySub' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,0'/>
+      </StackPanel>
+      <ScrollViewer x:Name='ApplyScroll' Grid.Row='1' Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' Margin='0,12,-12,0' Padding='0,0,12,0'>
+        <StackPanel x:Name='ApplyList'/>
+      </ScrollViewer>
+      <Border x:Name='Result' Grid.Row='2' Visibility='Collapsed' Background='{DynamicResource Good.Soft}' CornerRadius='12' Padding='16' Margin='0,16,0,0'>
+        <StackPanel>
+          <TextBlock x:Name='ResultTitle' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+          <TextBlock x:Name='ResultText' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,4,0,12'/>
+          <WrapPanel>
+            <Button x:Name='Prove' Style='{DynamicResource Zd.Button.Primary}' Margin='0,0,8,0'>
+              <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE9D9;' FontFamily='{DynamicResource Font.Icons}' FontSize='14' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Run a Before &amp; after test'/></StackPanel>
+            </Button>
+            <Button x:Name='Done' Content='Close' Style='{DynamicResource Zd.Button.Secondary}'/>
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
+  </Grid>
+
+  <!-- footer -->
+  <Grid x:Name='Footer' Grid.Row='2' Margin='0,20,0,0'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Button x:Name='Back' Content='Back' Style='{DynamicResource Zd.Button.Ghost}' Visibility='Hidden'/>
+    <Button x:Name='Cancel' Grid.Column='2' Content='Cancel' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0' MinWidth='90'/>
+    <Button x:Name='Next' Grid.Column='3' Content='Next' Style='{DynamicResource Zd.Button.Primary}' MinWidth='130'/>
+  </Grid>
+</Grid>
 "@)
-    $script:ChooseList = $list; $script:ChooseBody = $body
-    $upd = { $n = @($script:ChooseList | Where-Object { $script:ChooseBody.FindName("C_$($_.ChooseIdx)").IsChecked }).Count; $g = $script:ChooseBody.FindName('Go'); $g.Content = "Switch on $n"; $g.IsEnabled = $n -gt 0 }
-    $script:ChooseUpd = $upd
-    foreach ($t in $list) { $cb = $body.FindName("C_$($t.ChooseIdx)"); $cb.Add_Click({ & $script:ChooseUpd }) }
-    $body.FindName('All').Add_Click({ foreach ($t in $script:ChooseList) { $script:ChooseBody.FindName("C_$($t.ChooseIdx)").IsChecked = $true }; & $script:ChooseUpd })
-    $body.FindName('None').Add_Click({ foreach ($t in $script:ChooseList) { $script:ChooseBody.FindName("C_$($t.ChooseIdx)").IsChecked = $false }; & $script:ChooseUpd })
-    $body.FindName('Cancel').Add_Click({ Hide-Animated $ui.Wizard 200 })
-    $body.FindName('Go').Add_Click({
-        $pick = @($script:ChooseList | Where-Object { $script:ChooseBody.FindName("C_$($_.ChooseIdx)").IsChecked })
-        Hide-Animated $ui.Wizard 200
-        Invoke-ApplyTweaks $pick
+    # keep the sheet inside the window: the step-2 list scrolls on its own, header and footer stay put
+    $sheet.MaxHeight = [Math]::Max(420, $window.ActualHeight - 200)
+    $sheet.Height = $sheet.MaxHeight
+    $B = @{ Sheet = $sheet; List = $list; Step = 1; Running = $false }
+    foreach ($n in 'P1', 'P2', 'P3', 'RpSwitch', 'Count', 'ApplyTitle', 'ApplySub', 'ApplyList', 'ApplyScroll', 'Result', 'ResultTitle', 'ResultText', 'Prove', 'Done', 'Footer', 'Back', 'Cancel', 'Next') { $B[$n] = $sheet.FindName($n) }
+    $script:Bst = $B
+    foreach ($t in $list) {
+        $cb = $sheet.FindName("C_$($t.ChooseIdx)"); $cb.Add_Click({ Update-BoostSheet })
+        $w = $sheet.FindName("W_$($t.ChooseIdx)")
+        if ($w) { $w.Tag = $sheet.FindName("WT_$($t.ChooseIdx)"); $w.Add_Click({ param($s, $e) $s.Tag.Visibility = $(if ($s.IsChecked) { 'Visible' } else { 'Collapsed' }) }) }
+    }
+    $sheet.FindName('All').Add_Click({ foreach ($t in $script:Bst.List) { $script:Bst.Sheet.FindName("C_$($t.ChooseIdx)").IsChecked = $true }; Update-BoostSheet })
+    $sheet.FindName('None').Add_Click({ foreach ($t in $script:Bst.List) { $script:Bst.Sheet.FindName("C_$($t.ChooseIdx)").IsChecked = $false }; Update-BoostSheet })
+    $B.Cancel.Add_Click({ Close-BoostSheet })
+    $B.Done.Add_Click({ Close-BoostSheet })
+    $B.Prove.Add_Click({ Close-BoostSheet; Select-NavPage 'Prove' })
+    $B.Back.Add_Click({ if ($script:Bst.Step -eq 2) { $script:Bst.Step = 1; Update-BoostSheet } })
+    $B.Next.Add_Click({
+        $b = $script:Bst
+        if ($b.Step -eq 1) { $b.Step = 2; Update-BoostSheet }
+        elseif ($b.Step -eq 2) {
+            $pick = @($b.List | Where-Object { $b.Sheet.FindName("C_$($_.ChooseIdx)").IsChecked })
+            if ($pick.Count) { $b.Step = 3; Update-BoostSheet; Start-BoostApply $pick ([bool]$b.RpSwitch.IsChecked) }
+        }
     })
-    $ui.WizardBody.Content = $body
+    Update-BoostSheet
+    $ui.WizardBody.Content = $sheet
     $ui.Wizard.Visibility = 'Visible'
     if ($script:Anim) { Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220; Show-Animated $ui.WizardBody 24 380 60 }
+}
+function Close-BoostSheet {
+    if ($script:Bst -and $script:Bst.Running) { return }   # never close half-way through applying
+    Hide-Animated $ui.Wizard 200
+    if ($script:HomeUi) { Update-HomePage }
+}
+# step bar, visible panel, footer buttons and the selection count
+function Update-BoostSheet {
+    $b = $script:Bst; if (-not $b) { return }
+    foreach ($n in 1..3) {
+        $dot = $b.Sheet.FindName("S$n"); $num = $b.Sheet.FindName("SN$n"); $lab = $b.Sheet.FindName("SL$n")
+        if ($n -lt $b.Step) {
+            $dot.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'Good.Soft')
+            $num.Text = [string][char]0xE73E; $num.FontFamily = $window.FindResource('Font.Icons'); $num.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+            $lab.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+        } elseif ($n -eq $b.Step) {
+            $dot.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'AccentFill')
+            $num.Text = "$n"; $num.ClearValue([Windows.Controls.TextBlock]::FontFamilyProperty); $num.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Accent.OnAccent')
+            $lab.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Primary')
+        } else {
+            $dot.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'Bg.Raised')
+            $num.Text = "$n"; $num.ClearValue([Windows.Controls.TextBlock]::FontFamilyProperty); $num.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
+            $lab.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
+        }
+    }
+    $b.P1.Visibility = if ($b.Step -eq 1) { 'Visible' } else { 'Collapsed' }
+    $b.P2.Visibility = if ($b.Step -eq 2) { 'Visible' } else { 'Collapsed' }
+    $b.P3.Visibility = if ($b.Step -eq 3) { 'Visible' } else { 'Collapsed' }
+    $b.Back.Visibility = if ($b.Step -eq 2) { 'Visible' } else { 'Hidden' }
+    $b.Footer.Visibility = if ($b.Step -eq 3) { 'Collapsed' } else { 'Visible' }
+    if ($b.Step -eq 1) { $b.Next.Content = 'Next'; $b.Next.IsEnabled = $true }
+    elseif ($b.Step -eq 2) {
+        $n = @($b.List | Where-Object { $b.Sheet.FindName("C_$($_.ChooseIdx)").IsChecked }).Count
+        $b.Count.Text = "$n of $($b.List.Count) selected. Everything recommended is ticked; untick what you want to skip."
+        $b.Next.Content = if ($n) { "Switch on $n" } else { 'Switch on' }
+        $b.Next.IsEnabled = $n -gt 0
+    }
+}
+# Step 3. One item per timer tick, so each row shows "working" before the work starts and its result right after:
+# real progress with the real operation names, not an animation.
+function Start-BoostApply($pick, [bool]$WithRestorePoint) {
+    $b = $script:Bst
+    $items = New-Object Collections.ArrayList
+    if ($WithRestorePoint) { [void]$items.Add(@{ Kind = 'rp'; Title = 'Create a Windows restore point' }) }
+    elseif (-not $script:Backup.Custom.ContainsKey('restorepoint')) { $script:Backup.Custom['restorepoint'] = 'declined'; Save-Backup }
+    foreach ($t in $pick) { [void]$items.Add(@{ Kind = 'tweak'; Title = $t.Title; T = $t }) }
+    $b.ApplyList.Children.Clear()
+    foreach ($it in $items) {
+        $row = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,0,10'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='24'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+  <TextBlock Text='&#xEA3A;' FontFamily='{DynamicResource Font.Icons}' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Top' Margin='0,2,0,0'/>
+  <StackPanel Grid.Column='1'>
+    <TextBlock Text='$(Esc $it.Title)' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap'/>
+    <TextBlock FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Visibility='Collapsed'/>
+  </StackPanel>
+</Grid>
+"@)
+        $it.Row = $row
+        [void]$b.ApplyList.Children.Add($row)
+    }
+    $b.Items = $items; $b.Pos = 0; $b.Phase = 'mark'; $b.Ok = 0; $b.Failed = 0; $b.Restart = 0; $b.Running = $true
+    $b.ApplyTitle.Text = 'Switching on'
+    $b.ApplySub.Text = "0 of $($items.Count) done"
+    $window.Cursor = [Windows.Input.Cursors]::AppStarting
+    $script:BoostTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:BoostTimer.Interval = [TimeSpan]::FromMilliseconds(40)
+    $script:BoostTimer.Add_Tick({ try { Step-BoostApply } catch { $script:BoostTimer.Stop(); $script:Bst.Running = $false; $window.Cursor = $null; Write-CrashLog $_.Exception 'boost apply'; Show-BoostResult } })
+    $script:BoostTimer.Start()
+}
+function Set-BoostRow($it, [string]$Glyph, [string]$Brush, [string]$Note) {
+    $g = $it.Row.Children[0]; $sp = $it.Row.Children[1]
+    $g.Text = [string][char][int]$Glyph; $g.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $Brush)
+    $sp.Children[0].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($Brush -eq 'Text.Muted') { 'Text.Secondary' } else { 'Text.Primary' }))
+    if ($Note) { $sp.Children[1].Text = $Note; $sp.Children[1].Visibility = 'Visible' }
+}
+function Step-BoostApply {
+    $b = $script:Bst
+    if ($b.Pos -ge $b.Items.Count) { $script:BoostTimer.Stop(); $b.Running = $false; $window.Cursor = $null; Update-AllAsync; Show-BoostResult; return }
+    $it = $b.Items[$b.Pos]
+    if ($b.Phase -eq 'mark') {
+        Set-BoostRow $it 0xE895 'AccentFill' $(if ($it.Kind -eq 'rp') { 'Working... Windows can take up to a minute.' } else { 'Working...' })
+        $it.Row.BringIntoView()
+        $b.Phase = 'run'; return   # let WPF draw "working" before the blocking call
+    }
+    if ($it.Kind -eq 'rp') {
+        $m = New-ZeroDelayRestorePoint
+        if ($m -like 'Restore point created*') { Set-BoostRow $it 0xE73E 'Good' 'Created.' }
+        else { Set-BoostRow $it 0xE7BA 'Warn' $m }   # a skipped restore point does not stop the tweaks: the per-setting backup still runs
+    } else {
+        try {
+            Invoke-TweakOn $it.T
+            $b.Ok++
+            if ($it.T.Badge -eq 'restart') { $b.Restart++; Set-BoostRow $it 0xE73E 'Good' 'On. Takes effect after a restart.' } else { Set-BoostRow $it 0xE73E 'Good' $null }
+            $it.Row.Children[1].Children[1].Visibility = $(if ($it.T.Badge -eq 'restart') { 'Visible' } else { 'Collapsed' })
+        } catch {
+            $b.Failed++
+            Set-BoostRow $it 0xE7BA 'Warn' "Not switched on: $($_.Exception.Message)"
+        }
+    }
+    $b.Pos++; $b.Phase = 'mark'
+    $b.ApplySub.Text = "$($b.Pos) of $($b.Items.Count) done"
+}
+function Show-BoostResult {
+    $b = $script:Bst
+    $b.ApplyTitle.Text = 'Done'
+    $b.ResultTitle.Text = "$($b.Ok) tweak$(if ($b.Ok -ne 1) { 's' }) on."
+    $txt = 'Everything can be undone from Home > Restore.'
+    if ($b.Failed) { $txt = "$($b.Failed) could not be switched on; the reason is next to each one above. " + $txt }
+    if ($b.Restart) { $txt += " Restart your PC to finish $(if ($b.Restart -eq 1) { 'one of them' } else { "$($b.Restart) of them" })." }
+    $txt += ' A Before & after test measures what changed on your PC.'
+    $b.ResultText.Text = $txt
+    $b.Result.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($b.Failed) { 'Warn.Soft' } else { 'Good.Soft' }))
+    $b.Result.Visibility = 'Visible'
+    $b.Result.BringIntoView()
+    Show-Toast "Switched on $($b.Ok) tweak$(if ($b.Ok -ne 1) { 's' })$(if ($b.Failed) { ", $($b.Failed) skipped" })." $(if ($b.Failed) { '#FF9F0A' } else { '#30D158' })
+    if ($script:HomeUi) { Update-HomePage }
 }
 function Invoke-ApplyTweaks($pick) {
     if (-not @($pick).Count) { return }
@@ -25520,6 +26413,27 @@ if ($Snapshot) {
     }    if ($env:ZD_SCAN -and $script:Health) { Invoke-HealthScan }
     if ($env:ZD_DRIFT) { Invoke-DriftCheck; if (-not $script:DriftItems) { $ui.DriftTitle.Text = '2 settings were changed back — ExitLag is running'; $ui.DriftText.Text = 'Stop USB 3 ports dozing between clicks  ·  USB hubs never suspend'; $ui.DriftBar.Visibility = 'Visible' } }
     if ($env:ZD_FAKE_UPDATE) { Start-UpdateCheck }
+    # CI only (a throwaway Windows VM): switch every registry and power-plan tweak that applies on, check it reads as on,
+    # switch it off and check every value and key is exactly as before. Writes one line per tweak to <snapshot>.roundtrip.txt.
+    if ($env:ZD_ROUNDTRIP -and $env:GITHUB_ACTIONS -eq 'true' -and $IsAdmin) {
+        $readReg = { param($t) @(foreach ($e in $t.Reg) { $k = Get-Item -LiteralPath $e.P -ErrorAction SilentlyContinue
+            if ($k -and ($k.GetValueNames() -contains $e.N)) { "$($e.P)|$($e.N)|$($k.GetValueKind($e.N))|$(@($k.GetValue($e.N, $null, 'DoNotExpandEnvironmentNames')) -join ',')" }
+            else { "$($e.P)|$($e.N)|key:$([bool]$k)" } }) -join "`n" }
+        $rt = foreach ($t in $Tweaks | Where-Object { ($_.Reg -or $_.Power) -and -not ($_.On -or $_.Off -or $_.Test -or $_.After -or $_.Action) }) {
+            $before = Invoke-TweakTest $t
+            if ($before -ne $false) { "SKIP  $($t.Id)  (state $(if ($null -eq $before) { 'n/a' } else { 'already on' }))"; continue }
+            $snap = if ($t.Reg) { & $readReg $t } else { "$(Get-PowerIndex $t.Power.Sub $t.Power.Set)" }
+            try {
+                Invoke-TweakOn $t; $on = Invoke-TweakTest $t
+                Invoke-TweakOff $t; $off = Invoke-TweakTest $t
+                $now = if ($t.Reg) { & $readReg $t } else { "$(Get-PowerIndex $t.Power.Sub $t.Power.Set)" }
+                $why = @(); if ($on -ne $true) { $why += "on reads $on" }; if ($off -ne $false) { $why += "off reads $off" }
+                if ($now -ne $snap) { $why += "not restored: before [$($snap -replace "`n", '; ')] after [$($now -replace "`n", '; ')]" }
+                if ($why) { "FAIL  $($t.Id)  $($why -join '; ')" } else { "OK    $($t.Id)" }
+            } catch { "FAIL  $($t.Id)  error: $($_.Exception.Message)" }
+        }
+        Set-Content -LiteralPath "$Snapshot.roundtrip.txt" -Value $rt -Encoding UTF8
+    }
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Let the graphics card schedule its own work', 'Consistent timer resolution') }; Update-RestartBar }
     if ($script:Glass) {
         $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
@@ -25527,20 +26441,34 @@ if ($Snapshot) {
         if ($script:Theme -eq 'light') { $bg.GradientStops.Clear(); foreach ($st in @(@('#FFDDE4F2', 0), @('#FFEADFF0', 0.55), @('#FFDCEDEB', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) } }
         $window.Background = [Windows.Media.Brush]$bg
     }
+    $script:SnapWait = if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }
     $window.Add_ContentRendered({
+        [Console]::WriteLine('SNAP rendered')
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
-        $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($(if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }))
+        $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($script:SnapWait)
         $script:SnapTimer.Add_Tick({ $script:SnapTimer.Stop(); Save-Snapshot })
         $script:SnapTimer.Start()
     })
+    # if the window never reports it rendered (seen on busy CI machines), take the picture anyway
+    $script:SnapFallback = New-Object Windows.Threading.DispatcherTimer
+    $script:SnapFallback.Interval = [TimeSpan]::FromSeconds($script:SnapWait + 60)
+    $script:SnapFallback.Add_Tick({ $script:SnapFallback.Stop(); [Console]::WriteLine('SNAP fallback: no ContentRendered'); Save-Snapshot })
+    $script:SnapFallback.Start()
     function Save-Snapshot {
-        foreach ($t in $Tweaks) { if ($t.Toggle) { [Console]::WriteLine(("{0,-10} {1,-34} {2}" -f $t.Cat, $t.Id, $(if ($null -eq $t.State) { "n/a" } else { $t.State }))) } }
-        $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]$window.ActualWidth, [int]$window.ActualHeight, 96, 96, 'Pbgra32')
-        $bmp.Render($window)
-        $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
-        $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bmp))
-        $fs = [IO.File]::Create($Snapshot); $enc.Save($fs); $fs.Close()
-        $window.Close()
+        if ($script:SnapDone) { return }
+        $script:SnapDone = $true
+        try {
+            foreach ($t in $Tweaks) { if ($t.Toggle) { [Console]::WriteLine(("{0,-10} {1,-34} {2}" -f $t.Cat, $t.Id, $(if ($null -eq $t.State) { "n/a" } else { $t.State }))) } }
+            $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]$window.ActualWidth, [int]$window.ActualHeight, 96, 96, 'Pbgra32')
+            $bmp.Render($window)
+            $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
+            $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+            $fs = [IO.File]::Create($Snapshot); $enc.Save($fs); $fs.Close()
+            [Console]::WriteLine('SNAP saved')
+        } catch { [Console]::Error.WriteLine("SNAP error: $($_.Exception.Message)") }
+        # a dev render has nothing to clean up, and a listener that is slow to stop must not keep it open
+        [Console]::Out.Flush(); [Console]::Error.Flush()
+        [Environment]::Exit(0)
     }
 }
 if (-not $Snapshot) {
@@ -25563,7 +26491,8 @@ if (-not $Snapshot) {
     $script:ShowTimer.Add_Tick({
         if (-not $script:ShowSignal.WaitOne(0)) { return }
         # ZeroDelay was updated while this copy kept running (for example in the tray): start the new version
-        $disk = try { if ((Get-Content -LiteralPath $PSCommandPath -TotalCount 60 | Out-String) -match "\`$AppVersion = '([\d.]+)'") { [version]$Matches[1] } } catch { $null }
+        # -List stops at the first match, wherever $AppVersion sits in the file
+        $disk = try { $vm = Select-String -LiteralPath $PSCommandPath -Pattern "^\`$AppVersion = '([\d.]+)'" -List; if ($vm) { [version]$vm.Matches[0].Groups[1].Value } } catch { $null }
         if ($disk -and $disk -gt [version]$AppVersion) { Save-Backup; $script:Relaunch = $true; $script:RelaunchPage = $null; $script:ReallyExit = $true; $window.Close(); return }
         Show-MainWindow
     })
@@ -25590,6 +26519,11 @@ function Show-AfterStartup {
     if ($script:StartupGuard) { $script:StartupGuard.Stop() }
     Complete-Startup
     if (-not $Tray -or $Snapshot) { $window.Show() } else { Close-Splash }
+    if ($script:BackupWarning -and -not $Snapshot) {
+        if ($Tray) { Show-MainWindow }   # started hidden: bring the window up so the warning is seen
+        [void](Show-ZdDialog $script:BackupWarning 'ZeroDelay backup' 'OK' 'Warning')
+    }
+    elseif ($script:SecureDirError -and -not $Snapshot) { Show-Toast "Could not prepare the protected backup folder ($($script:SecureDirError)). The backup stays in the old folder." '#FF9F0A' }
     # build the heavier pages while nothing is happening, so their first visit is instant
     $script:WarmTimer = New-Object Windows.Threading.DispatcherTimer
     $script:WarmTimer.Interval = [TimeSpan]::FromSeconds(2)

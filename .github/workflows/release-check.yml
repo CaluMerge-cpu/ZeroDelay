@@ -1,0 +1,64 @@
+# After a release is published: on a fresh Windows VM, download ZeroDelay-Setup.exe the way users get it, check it
+# against GitHub's checksum (the same one the in-app updater uses), install it, and open the installed app.
+name: Release check
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download the latest release like a user
+        shell: powershell
+        run: |
+          $rel = Invoke-RestMethod "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" -Headers @{ 'User-Agent' = 'ZeroDelay-release-check' }
+          $asset = $rel.assets | Where-Object { $_.name -eq 'ZeroDelay-Setup.exe' }
+          if (-not $asset) { throw "Release $($rel.tag_name) has no ZeroDelay-Setup.exe." }
+          Invoke-WebRequest $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\ZeroDelay-Setup.exe"
+          $hash = (Get-FileHash "$env:RUNNER_TEMP\ZeroDelay-Setup.exe" -Algorithm SHA256).Hash
+          "Release:  $($rel.tag_name)"
+          "Digest:   $($asset.digest)"
+          "Download: sha256:$($hash.ToLower())"
+          if ("$($asset.digest)" -ne "sha256:$($hash.ToLower())") { throw 'The download does not match the checksum GitHub publishes, so the in-app updater would refuse it.' }
+          "TAG=$($rel.tag_name)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install it
+        shell: powershell
+        run: |
+          $p = Start-Process "$env:RUNNER_TEMP\ZeroDelay-Setup.exe" -ArgumentList '/update' -PassThru
+          if (-not $p.WaitForExit(300000)) { throw 'Setup did not finish in 5 minutes.' }
+          if ($p.ExitCode -ne 0) { throw "Setup exited with $($p.ExitCode)." }
+          Start-Sleep 5
+          Get-Process ZeroDelay -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'ZeroDelay\.ps1' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          $dir = Join-Path $env:ProgramFiles 'ZeroDelay'
+          Get-ChildItem $dir | Select-Object Name, Length | Format-Table -AutoSize | Out-String
+          $v = Select-String -LiteralPath (Join-Path $dir 'ZeroDelay.ps1') -Pattern "^\`$AppVersion = '([^']+)'" | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          "Installed version: $v"
+          if ("v$v" -ne $env:TAG) { throw "Installed $v, but the release is $env:TAG." }
+
+      - name: Open the installed app
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force snapshots | Out-Null
+          $png = "$PWD\snapshots\installed-home.png"
+          $p = Start-Process powershell.exe -PassThru -NoNewWindow -ArgumentList @(
+            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $env:ProgramFiles 'ZeroDelay\ZeroDelay.ps1'), '-NoElevate', '-Snapshot', $png)
+          if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; throw 'The installed app did not finish rendering in 3 minutes.' }
+          if (-not (Test-Path $png) -or (Get-Item $png).Length -lt 10000) { throw 'The installed app did not render its window.' }
+          'The installed app opened and rendered Home.'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installed-snapshot
+          path: snapshots/
+          if-no-files-found: ignore

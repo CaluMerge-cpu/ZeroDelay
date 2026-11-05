@@ -138,8 +138,9 @@ an on/off switch, explained in plain words, backed up before it is applied, and 
 Not comfortable running an unsigned file? Every line of code is in this repository: compare the SHA-256 on the
 release page, or build the setup yourself (see below).
 
-ZeroDelay installs for your Windows account only (`%LOCALAPPDATA%\Programs\ZeroDelay`) and adds Desktop and Start menu
-shortcuts. **Updating:** ZeroDelay tells you when a new version is out; press **Update now**. (From 1.0 or 1.1, update once
+ZeroDelay installs to `%ProgramFiles%\ZeroDelay` (the setup asks for administrator rights) and adds Desktop and Start
+menu shortcuts. ZeroDelay runs as administrator, so its files live where only administrators can change them; versions
+before 1.20 installed to `%LOCALAPPDATA%\Programs\ZeroDelay`, and the setup moves an old copy over by itself. **Updating:** ZeroDelay tells you when a new version is out; press **Update now**. (From 1.0 or 1.1, update once
 by hand: exit ZeroDelay from the tray and run the new setup.) Your settings and backups are kept. **Uninstalling:** press **Restore all** in ZeroDelay first if you want your
 original settings back, then remove it from Settings > Apps > ZeroDelay.
 
@@ -161,12 +162,15 @@ This compiles `dist\ZeroDelay-Setup.exe` with the C# compiler that ships with Wi
 
 ## How it stays safe
 
-- The original value of every setting is saved to `%LOCALAPPDATA%\FortniteLatencyOptimizer\backup-v2.json` before it
-  is changed; switching a card off or pressing **Restore all** puts it back.
+- The original value of every setting is saved to `%ProgramData%\ZeroDelay\backup-<account SID>.json` before it
+  is changed; switching a card off or pressing **Restore all** puts it back. Only administrators can change that folder,
+  so no other program can edit what Restore writes back. Each save goes to a temporary file first and the previous
+  save is kept as `.bak`, so a crash or power cut while saving cannot wipe the backup.
+- Downloaded updates and PresentMon are kept in the same protected folder until they are checked and run.
 - No placebo tweaks: TCP/Nagle tweaks (Fortnite uses UDP), RAM cleaners, disabling Windows Update or security
   protections are deliberately not included.
 - **Start with Windows** is off unless you switch it on. It creates a scheduled task named ZeroDelay, which switching it
-  off (or uninstalling) removes.
+  off (or uninstalling) removes. It can only be switched on for a copy installed in Program Files.
 - Game files are only edited when Fortnite is closed. ZeroDelay never touches Fortnite's program files or anti-cheat.
 - ZeroDelay only connects to the internet for the update check (it reads the latest release from GitHub; the new
   setup is downloaded only when you press **Update now**; switch the check off in Settings), the optional PresentMon download (from
