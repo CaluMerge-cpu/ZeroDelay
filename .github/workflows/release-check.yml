@@ -51,7 +51,7 @@ jobs:
           New-Item -ItemType Directory -Force snapshots | Out-Null
           $png = "$PWD\snapshots\installed-home.png"
           $p = Start-Process powershell.exe -PassThru -NoNewWindow -ArgumentList @(
-            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $env:ProgramFiles 'ZeroDelay\ZeroDelay.ps1'), '-NoElevate', '-Snapshot', $png)
+            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $env:ProgramFiles 'ZeroDelay\ZeroDelay.ps1')`"", '-NoElevate', '-Snapshot', "`"$png`"")
           if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; throw 'The installed app did not finish rendering in 3 minutes.' }
           if (-not (Test-Path $png) -or (Get-Item $png).Length -lt 10000) { throw 'The installed app did not render its window.' }
           'The installed app opened and rendered Home.'
