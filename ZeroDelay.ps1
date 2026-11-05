@@ -11697,10 +11697,16 @@ function Set-Applied([string]$Id, [bool]$On) {
     $script:Backup.Custom['applied'] = $list
 }
 
+# Sticky/Filter/Toggle Keys: Windows keeps a live copy of the registry flags. The live copy is set from the registry
+# AFTER the registry change, so the backup holds the user's real original (writing it first also writes the registry).
+function Sync-AccessKeysLive {
+    $f = foreach ($k in 'StickyKeys', 'Keyboard Response', 'ToggleKeys') { $v = 0; [void][uint32]::TryParse("$(Get-RegValue "HKCU:\Control Panel\Accessibility\$k" 'Flags')", [ref]$v); $v }
+    if ($f -notcontains 0) { try { [void][AccessKeys]::Write($f[0], $f[1], $f[2]) } catch {} }
+}
 function Invoke-TweakOn($t) {
-    if ($t.Id -eq 'sticky') { try { [void][AccessKeys]::Write(506, 122, 58) } catch {} }
     if ($t.On) { & $t.On } elseif ($t.Reg) { Enable-RegTweak $t } elseif ($t.Ini) { Enable-IniTweak $t }
     elseif ($t.Power) { Enable-PowerTweak $t } elseif ($t.Dx) { Enable-DxTweak $t } elseif ($t.Tasks) { Enable-TaskTweak $t } elseif ($t['Remove']) { Enable-RemoveTweak $t } elseif ($t.Nv) { Enable-NvTweak $t } elseif ($t.Cs) { Enable-CsTweak $t }
+    if ($t.Id -eq 'sticky') { Sync-AccessKeysLive }
     if ($t.After) { & $t.After }
     Set-Applied $t.Id $true
     Save-Backup
@@ -11709,9 +11715,9 @@ function Invoke-TweakOn($t) {
     Clear-ReadCache
 }
 function Invoke-TweakOff($t) {
-    if ($t.Id -eq 'sticky') { try { [void][AccessKeys]::Write(510, 126, 62) } catch {} }
     if ($t.Off) { & $t.Off } elseif ($t.Reg) { Disable-RegTweak $t } elseif ($t.Ini) { Disable-IniTweak $t }
     elseif ($t.Power) { Disable-PowerTweak $t } elseif ($t.Dx) { Disable-DxTweak $t } elseif ($t.Tasks) { Disable-TaskTweak $t } elseif ($t['Remove']) { Disable-RemoveTweak $t } elseif ($t.Nv) { Disable-NvTweak $t } elseif ($t.Cs) { Disable-CsTweak $t }
+    if ($t.Id -eq 'sticky') { Sync-AccessKeysLive }
     if ($t.After) { & $t.After }
     Set-Applied $t.Id $false
     Save-Backup
@@ -26435,20 +26441,34 @@ if ($Snapshot) {
         if ($script:Theme -eq 'light') { $bg.GradientStops.Clear(); foreach ($st in @(@('#FFDDE4F2', 0), @('#FFEADFF0', 0.55), @('#FFDCEDEB', 1))) { $bg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($st[0])), $st[1])) } }
         $window.Background = [Windows.Media.Brush]$bg
     }
+    $script:SnapWait = if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }
     $window.Add_ContentRendered({
+        [Console]::WriteLine('SNAP rendered')
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
-        $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($(if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }))
+        $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($script:SnapWait)
         $script:SnapTimer.Add_Tick({ $script:SnapTimer.Stop(); Save-Snapshot })
         $script:SnapTimer.Start()
     })
+    # if the window never reports it rendered (seen on busy CI machines), take the picture anyway
+    $script:SnapFallback = New-Object Windows.Threading.DispatcherTimer
+    $script:SnapFallback.Interval = [TimeSpan]::FromSeconds($script:SnapWait + 60)
+    $script:SnapFallback.Add_Tick({ $script:SnapFallback.Stop(); [Console]::WriteLine('SNAP fallback: no ContentRendered'); Save-Snapshot })
+    $script:SnapFallback.Start()
     function Save-Snapshot {
-        foreach ($t in $Tweaks) { if ($t.Toggle) { [Console]::WriteLine(("{0,-10} {1,-34} {2}" -f $t.Cat, $t.Id, $(if ($null -eq $t.State) { "n/a" } else { $t.State }))) } }
-        $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]$window.ActualWidth, [int]$window.ActualHeight, 96, 96, 'Pbgra32')
-        $bmp.Render($window)
-        $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
-        $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bmp))
-        $fs = [IO.File]::Create($Snapshot); $enc.Save($fs); $fs.Close()
-        $window.Close()
+        if ($script:SnapDone) { return }
+        $script:SnapDone = $true
+        try {
+            foreach ($t in $Tweaks) { if ($t.Toggle) { [Console]::WriteLine(("{0,-10} {1,-34} {2}" -f $t.Cat, $t.Id, $(if ($null -eq $t.State) { "n/a" } else { $t.State }))) } }
+            $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]$window.ActualWidth, [int]$window.ActualHeight, 96, 96, 'Pbgra32')
+            $bmp.Render($window)
+            $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
+            $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+            $fs = [IO.File]::Create($Snapshot); $enc.Save($fs); $fs.Close()
+            [Console]::WriteLine('SNAP saved')
+        } catch { [Console]::Error.WriteLine("SNAP error: $($_.Exception.Message)") }
+        # a dev render has nothing to clean up, and a listener that is slow to stop must not keep it open
+        [Console]::Out.Flush(); [Console]::Error.Flush()
+        [Environment]::Exit(0)
     }
 }
 if (-not $Snapshot) {
