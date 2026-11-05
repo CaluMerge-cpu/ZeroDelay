@@ -38,10 +38,12 @@ jobs:
           ZD_FAKE_MATCH: '1'
         run: |
           $out = New-Item -ItemType Directory -Force snapshots
-          $pages = 'New', 'Home', 'Games', 'Boost', 'Tweaks', 'Checks', 'Tools', 'GameMode', 'Events', 'Fortnite', 'CS2', 'Valorant'
+          $pages = 'New', 'Home', 'Games', 'Boost', 'Tweaks', 'Checks', 'Tools', 'GameMode', 'Events', 'Fortnite', 'CS2', 'Valorant', 'Apps'
           $failed = @()
           foreach ($p in $pages) {
             $png = Join-Path $out "$p.png"
+            # the Apps list is read in the background: give it time before the picture is taken
+            $env:ZD_SNAPWAIT = if ($p -eq 'Apps') { '20' } else { $null }
             $proc = Start-Process powershell.exe -PassThru -NoNewWindow -RedirectStandardError "$out\$p.err.txt" -ArgumentList @(
               '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "$PWD\ZeroDelay.ps1", '-NoElevate', '-Snapshot', $png, '-Page', $p)
             if (-not $proc.WaitForExit(180000)) {

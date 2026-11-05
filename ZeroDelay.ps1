@@ -17585,6 +17585,18 @@ $AppScanScript = {
     param($opt)
     $list = New-Object Collections.ArrayList
     $seen = @{}
+    # the disk an app is on: from its install folder, else its icon or uninstaller (not msiexec or the MSI cache,
+    # which sit on the Windows disk whatever disk the app went to). Shown as "C:" or "D: (Games)" with the disk's own name.
+    $driveNames = @{}
+    foreach ($d in [IO.DriveInfo]::GetDrives()) { try { if ($d.IsReady) { $driveNames[$d.Name.Substring(0, 2).ToUpper()] = "$($d.VolumeLabel)".Trim() } } catch {} }
+    function Get-AppDrive([string[]]$Paths) {
+        foreach ($x in $Paths) {
+            $t = "$x".Trim().Trim('"')
+            if (-not $t -or $t -match '(?i)msiexec|rundll32|\\Package Cache\\|\\Installer\\') { continue }
+            if ($t -match '^([A-Za-z]:)\\') { $l = $Matches[1].ToUpper(); return $(if ($driveNames[$l]) { "$l ($($driveNames[$l]))" } else { $l }) }
+        }
+        $null
+    }
     # Start-menu shortcuts by name -> the exe they open (used for icons when an app registers none)
     $lnkIndex = @{}
     $sh = New-Object -ComObject WScript.Shell
@@ -17632,7 +17644,7 @@ $AppScanScript = {
             }
             [void]$list.Add([pscustomobject]@{ Kind = 'desktop'; Name = "$($p.DisplayName)".Trim(); Publisher = "$($p.Publisher)".Trim(); Version = "$($p.DisplayVersion)"
                 SizeMb = $(if ($p.EstimatedSize) { [Math]::Round($p.EstimatedSize / 1024.0) } else { $null }); Date = $date; Uninstall = "$($p.UninstallString)"; Id = $k.PSChildName; Bloat = $false
-                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:'); IconPng = $png })
+                InstallLocation = "$($p.InstallLocation)"; Icon = "$($p.DisplayIcon)"; Drive = (Get-AppDrive @("$($p.InstallLocation)", "$($p.DisplayIcon)", "$($p.UninstallString)")); KeyPath = ($k.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:'); IconPng = $png })
         }
     }
     foreach ($a in @(Get-AppxPackage -PackageTypeFilter Main -ErrorAction SilentlyContinue)) {
@@ -17654,7 +17666,7 @@ $AppScanScript = {
         if (-not $dn -or $dn -like 'ms-resource:*') { $dn = (($a.Name -replace '^[^.]+\.', '') -creplace '([a-z])([A-Z])', '$1 $2') }
         if (-not $pub -or $pub -like 'ms-resource:*') { $pub = ($a.Publisher -replace '^CN=([^,]+).*', '$1') }
         [void]$list.Add([pscustomobject]@{ Kind = 'store'; Name = $dn; Publisher = $pub; Version = "$($a.Version)"; SizeMb = $null; Date = $null
-            Full = $a.PackageFullName; Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name); IconPng = $png })
+            Full = $a.PackageFullName; Drive = (Get-AppDrive @("$($a.InstallLocation)")); Id = $a.Name; Family = $a.PackageFamilyName; Bloat = ($opt.Bloat -contains $a.Name); IconPng = $png })
     }
     $list
 }
@@ -17669,7 +17681,7 @@ function New-AppsPage {
           <Button x:Name='TabDesk' Content='Programs' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
           <Button x:Name='TabStore' Content='Store apps' Style='{DynamicResource Btn}'/>
         </StackPanel>
-        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name or publisher'/>
+        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name, publisher or disk (for example D:)'/>
         <StackPanel Grid.Column='2' Orientation='Horizontal'>
           <Button x:Name='SortName' Content='A to Z' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
           <Button x:Name='SortSize' Content='Biggest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
@@ -17722,7 +17734,7 @@ function Update-AppsList {
     foreach ($b in 'SortName', 'SortSize', 'SortDate') { $au[$b].FontWeight = if ($b -eq "Sort$($script:AppsSort)") { 'Bold' } else { 'Normal' } }
     $q = $au.Find.Text.Trim()
     $items = if ($script:AppsKind -eq 'desktop') { $desk } else { $store }
-    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" }) }
+    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" -or ($_.Drive -and ($_.Drive -like "$q*" -or "$($_.Drive)".Substring(0, 1) -eq $q.TrimEnd(':'))) }) }
     $items = switch ($script:AppsSort) {
         'size' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { [double]$_.SizeMb } -Descending) } else { @($items | Sort-Object Name) } }
         'date' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { if ($_.Date) { $_.Date } else { [datetime]::MinValue } } -Descending) } else { @($items | Sort-Object Name) } }
@@ -17732,7 +17744,7 @@ function Update-AppsList {
                     else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them. Showing $($items.Count)." }
     $rows = for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
         $a = $items[$i]
-        $sub = @($a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
+        $sub = @($(if ($a.Drive) { "disk $($a.Drive)" }), $a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
         $tag = if ($a.Bloat) { "<Border Background='#4E3E28' CornerRadius='5' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='#FF9F0A'/></Border>" } else { '' }
         # icon slot: a letter tile in the app's own colour, covered by the real icon when there is one
         $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
