@@ -35,7 +35,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '1.19.0'
+$AppVersion = '2.0.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -16519,6 +16519,12 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.0.0' = @(
+        @{ T = 'A new look'; D = 'ZeroDelay has a new design: darker and calmer, with one accent colour you choose in Settings (six to pick from) and a light mode. Home, Boost now, the tweak cards, the game pages, Checks, Game Mode, Tools and Settings were all rebuilt. Every tweak, check and tool is still here.' }
+        @{ T = 'Undo from the message'; D = 'After you switch something on or off, the message at the bottom has an Undo button, so a wrong click is one click to take back.' }
+        @{ T = '10 new tweaks and checks'; D = 'NVIDIA Low Latency Mode for games without Reflex, laptop display mode (MUX) and WhisperMode guides, Intel Application Optimization, the colour filter on older Windows, more receive buffers for a network card that drops packets, a Wi-Fi drop check, and guides for the Apex, VALORANT and Siege data center and buffering settings. Find them under New.' }
+        @{ T = 'Safer by design'; D = 'ZeroDelay now installs to Program Files, and its backup of your original settings lives in a folder only administrators can change. Updates are checked against GitHub''s own checksum before they install. The Wi-Fi 5 GHz tweak is no longer offered when you are already on 6 GHz.' }
+    )
     '1.19.0' = @(
         @{ T = 'Game Mode for every game'; D = 'Game Mode now starts by itself with any game ZeroDelay knows, not only Fortnite, and turns off when that game closes. The sidebar and the message say which game. Switch it off for one game on its page, or for all games in Settings.' }
         @{ T = 'A game''s tweaks, applied when it starts'; D = 'On a game''s page, choose to have its recommended tweaks switched on when the game starts and put back when it closes. Tweaks that change the game''s own settings files wait until it has closed. Everything ZeroDelay changes is listed in History and undone the same way.' }
