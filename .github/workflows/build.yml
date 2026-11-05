@@ -50,6 +50,21 @@ jobs:
           Get-ChildItem $out *.png | ForEach-Object { "{0,-14} {1,9:N0} bytes" -f $_.Name, $_.Length }
           if ($failed) { "Failed: $($failed -join ', ')"; exit 1 }
 
+      - name: Switch every registry and power tweak on and off, and check nothing is left behind
+        shell: powershell
+        env:
+          ZD_ROUNDTRIP: '1'
+        run: |
+          $png = "$PWD\snapshots\roundtrip.png"
+          $p = Start-Process powershell.exe -PassThru -NoNewWindow -ArgumentList @(
+            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "$PWD\ZeroDelay.ps1", '-NoElevate', '-Snapshot', $png)
+          if (-not $p.WaitForExit(600000)) { Stop-Process -Id $p.Id -Force; throw 'Timed out.' }
+          $r = @(Get-Content "$png.roundtrip.txt" -ErrorAction Stop)
+          $r
+          $ok = @($r | Where-Object { $_ -like 'OK*' }).Count; $fail = @($r | Where-Object { $_ -like 'FAIL*' })
+          "`n$ok switched on and back off cleanly, $($fail.Count) failed, $(@($r | Where-Object { $_ -like 'SKIP*' }).Count) skipped (not applicable here or already on)."
+          if ($fail.Count) { exit 1 }
+
       - name: Render the What's new window
         shell: powershell
         env:

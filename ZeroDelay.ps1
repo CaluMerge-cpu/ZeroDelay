@@ -26395,6 +26395,27 @@ if ($Snapshot) {
     }    if ($env:ZD_SCAN -and $script:Health) { Invoke-HealthScan }
     if ($env:ZD_DRIFT) { Invoke-DriftCheck; if (-not $script:DriftItems) { $ui.DriftTitle.Text = '2 settings were changed back — ExitLag is running'; $ui.DriftText.Text = 'Stop USB 3 ports dozing between clicks  ·  USB hubs never suspend'; $ui.DriftBar.Visibility = 'Visible' } }
     if ($env:ZD_FAKE_UPDATE) { Start-UpdateCheck }
+    # CI only (a throwaway Windows VM): switch every registry and power-plan tweak that applies on, check it reads as on,
+    # switch it off and check every value and key is exactly as before. Writes one line per tweak to <snapshot>.roundtrip.txt.
+    if ($env:ZD_ROUNDTRIP -and $env:GITHUB_ACTIONS -eq 'true' -and $IsAdmin) {
+        $readReg = { param($t) @(foreach ($e in $t.Reg) { $k = Get-Item -LiteralPath $e.P -ErrorAction SilentlyContinue
+            if ($k -and ($k.GetValueNames() -contains $e.N)) { "$($e.P)|$($e.N)|$($k.GetValueKind($e.N))|$(@($k.GetValue($e.N, $null, 'DoNotExpandEnvironmentNames')) -join ',')" }
+            else { "$($e.P)|$($e.N)|key:$([bool]$k)" } }) -join "`n" }
+        $rt = foreach ($t in $Tweaks | Where-Object { ($_.Reg -or $_.Power) -and -not ($_.On -or $_.Off -or $_.Test -or $_.After -or $_.Action) }) {
+            $before = Invoke-TweakTest $t
+            if ($before -ne $false) { "SKIP  $($t.Id)  (state $(if ($null -eq $before) { 'n/a' } else { 'already on' }))"; continue }
+            $snap = if ($t.Reg) { & $readReg $t } else { "$(Get-PowerIndex $t.Power.Sub $t.Power.Set)" }
+            try {
+                Invoke-TweakOn $t; $on = Invoke-TweakTest $t
+                Invoke-TweakOff $t; $off = Invoke-TweakTest $t
+                $now = if ($t.Reg) { & $readReg $t } else { "$(Get-PowerIndex $t.Power.Sub $t.Power.Set)" }
+                $why = @(); if ($on -ne $true) { $why += "on reads $on" }; if ($off -ne $false) { $why += "off reads $off" }
+                if ($now -ne $snap) { $why += "not restored: before [$($snap -replace "`n", '; ')] after [$($now -replace "`n", '; ')]" }
+                if ($why) { "FAIL  $($t.Id)  $($why -join '; ')" } else { "OK    $($t.Id)" }
+            } catch { "FAIL  $($t.Id)  error: $($_.Exception.Message)" }
+        }
+        Set-Content -LiteralPath "$Snapshot.roundtrip.txt" -Value $rt -Encoding UTF8
+    }
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Let the graphics card schedule its own work', 'Consistent timer resolution') }; Update-RestartBar }
     if ($script:Glass) {
         $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
