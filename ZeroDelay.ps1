@@ -24208,6 +24208,7 @@ function Start-GameArtFetch {
         if ($script:GameArtTried[$id] -and ((Get-Date) - $script:GameArtTried[$id]).TotalHours -lt 24) { continue }
         $script:GameArtTried[$id] = Get-Date; $id
     }) | Select-Object -Unique)
+    Write-StartupMark "games page: art to download: $($ids.Count)"
     if (-not $ids.Count) { return }
     $script:GameArtBusy = $true
     Invoke-Worker $GameArtWorkerCode @([string[]]$ids, (Join-Path $DataDir 'art')) {
@@ -24262,9 +24263,11 @@ function Start-GameImageFetch([object[]]$Games) {
         if ($aid) { $artKey = "$aid-capsule"; if (-not $script:GameArt[$artKey]) { $f = Get-GameArtFile $aid 'capsule'; if (Test-Path -LiteralPath $f) { $artFile = $f } } }
         if ($logoFile -or ($artFile -and -not $script:GameLogos[$g.Id])) { @{ Id = "$($g.Id)"; Logo = $logoFile; Art = $artFile; ArtKey = $artKey } }
     })
+    Write-StartupMark "games page: icon and art files found ($(@($items).Count) to read)"
     if (-not $items.Count) { Update-GameImages; return }
     foreach ($it in $items) { $script:GameImgBusy[$it.Id] = $true }
     if ($Snapshot -and -not $env:ZD_PCMATRIX) { Complete-GameImageFetch (& ([scriptblock]::Create($GameImageWorkerCode)) $items); return }
+    Write-StartupMark 'games page: image worker queued (before)'
     Invoke-Worker $GameImageWorkerCode @(, $items) {
         param($out, $errs)
         $r = Get-WorkerResult $out
@@ -24545,7 +24548,9 @@ function New-GamesPage {
     }
     if ($Snapshot) { [Console]::WriteLine(('STARTUP games page: {0} tiles in {1:N0} ms' -f @($GameDefs).Count, $gParse)) }
     if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
+    Write-StartupMark 'games page: tiles added'
     Start-GameImageFetch $GameDefs
+    Write-StartupMark 'games page: image fetch returned'
     Start-GameArtFetch
     Write-StartupMark 'games page: image fetch started'
     # the four route stops: this PC, the router, the provider, the game server
