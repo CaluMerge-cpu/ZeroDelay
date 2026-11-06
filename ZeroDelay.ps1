@@ -39,7 +39,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '2.0.0'
+$AppVersion = '2.1.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -17756,6 +17756,15 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.1.0' = @(
+        @{ T = 'Tweaks, easier to read'; D = 'One list grouped by area, each with how many are on. Every tweak says Safe, Moderate or Advanced and what is true now (Optimized or Windows default). Click one to see exactly what it changes and when not to use it. Switches are collected and applied together from the bar at the bottom, with one Undo.' }
+        @{ T = 'Proof on Home'; D = 'Your last match comes first, with how its FPS, 1% lows, ping and stutters compare to your usual, and when it stuttered. Presets Safe, Competitive and Max, and your recent changes with Undo.' }
+        @{ T = 'Search everything with Ctrl+K'; D = 'Every tweak, check, tool, game and Windows setting from one box. Enter opens it, Space switches a tweak on or off.' }
+        @{ T = 'New: PC health and repairs'; D = 'Crash timeline, the file that keeps crashing your games, graphics driver resets, disk errors, devices with problems, Intel 13th/14th gen microcode, Secure Boot 2023 certificates, BitLocker key, Windows support status, one-click Windows repair, update repair, memory test, battery health and why the PC will not sleep.' }
+        @{ T = 'New: Windows cleanup'; D = 'Remove Recall, AI in Paint and Notepad, the Copilot app, Start menu and Settings ads, Edge and Brave clutter, the classic right-click menu, file extensions, End task on the taskbar, and a Game Mode hotkey (Ctrl+Alt+G).' }
+        @{ T = 'Game pages and uninstall by disk'; D = 'Each game page shows your last match under its art, with Route, Tweaks, Checks and Trends tabs. Uninstall apps shows each disk with its free space; click one to see only its apps.' }
+        @{ T = 'Faster and works on more PCs'; D = 'Pages open faster, typing in search no longer lags, and non-English Windows, redirected Documents folders and small or high-DPI screens are handled. The Memory tool now closes apps you pick instead of clearing Windows memory, which could cause stutter.' }
+    )
     '2.0.0' = @(
         @{ T = 'A new look'; D = 'ZeroDelay has a new design: darker and calmer, with one accent colour you choose in Settings (six to pick from) and a light mode. Home, Boost now, the tweak cards, the game pages, Checks, Game Mode, Tools and Settings were all rebuilt. Every tweak, check and tool is still here.' }
         @{ T = 'Undo from the message'; D = 'After you switch something on or off, the message at the bottom has an Undo button, so a wrong click is one click to take back.' }
@@ -29454,6 +29463,19 @@ if ($Snapshot) {
     $script:SnapFallback.Interval = [TimeSpan]::FromSeconds($script:SnapWait + 60)
     $script:SnapFallback.Add_Tick({ $script:SnapFallback.Stop(); [Console]::WriteLine('SNAP fallback: no ContentRendered'); Save-Snapshot })
     $script:SnapFallback.Start()
+    # Windows Server 2025 CI: the window sometimes stops getting timer messages (the freeze report shows the UI thread
+    # idle in GetMessage, a tooltip never closing). A thread-pool timer posts to the dispatcher instead, which wakes it.
+    try {
+        Add-Type -ReferencedAssemblies WindowsBase -TypeDefinition @'
+public static class ZdKick {
+    static System.Threading.Timer t;
+    public static void Every(System.Windows.Threading.Dispatcher d, int ms, System.Action a) {
+        t = new System.Threading.Timer(delegate(object s) { try { d.BeginInvoke(a); } catch { } }, null, ms, ms);
+    }
+}
+'@
+        [ZdKick]::Every($window.Dispatcher, [int](($script:SnapWait + 8) * 1000), [Action]{ if (-not $script:SnapDone) { [Console]::WriteLine('SNAP kick: the dispatcher timer did not fire, saved from a thread-pool timer'); Save-Snapshot } })
+    } catch { [Console]::Error.WriteLine("SNAP kick unavailable: $($_.Exception.Message)") }
     function Save-Snapshot {
         if ($script:SnapDone) { return }
         $script:SnapDone = $true
