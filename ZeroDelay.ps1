@@ -23060,14 +23060,32 @@ function Update-StatusStrip([bool]$Paused) {
     $ui.StripItems.Opacity = if ($Paused) { 0.5 } else { 1 }
 }
 function New-HomePage {
-    # 2.0 Home: "how did my last matches feel, and am I set up right?"
-    # 1. last matches strip  2. setup score hero  3. heads-up banners  4. live tiles
+    # 2.1 Home: proof first (Razer Cortex's after-session report): the last match with how it compares to your usual,
+    # and when it stuttered. Then the setup score with presets, recent changes with Undo, earlier matches, live tiles.
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
+  <Border x:Name='Last' Style='{DynamicResource Zd.Card}' CornerRadius='14' Padding='22,18' Margin='0,0,12,16' Cursor='Hand' Visibility='Collapsed' AutomationProperties.Name='Last match'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <StackPanel Orientation='Horizontal'>
+          <TextBlock Text='LAST MATCH' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
+          <TextBlock x:Name='LastSub' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='12,0,0,0'/>
+        </StackPanel>
+        <UniformGrid x:Name='LastStats' Columns='4' Margin='0,14,0,0'/>
+        <TextBlock x:Name='LastVerdict' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,12,0,0'/>
+      </StackPanel>
+      <StackPanel Grid.Column='1' Width='330' Margin='24,0,0,0'>
+        <TextBlock Text='STUTTERS DURING THE MATCH' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+        <Canvas x:Name='StutCanvas' Width='330' Height='78' Margin='0,10,0,0' ClipToBounds='True'/>
+        <TextBlock x:Name='StutNote' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,6,0,0'/>
+      </StackPanel>
+    </Grid>
+  </Border>
   <Grid Margin='0,0,12,12'>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
     <StackPanel>
-      <TextBlock Text='Your last matches' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+      <TextBlock x:Name='ResHead' Text='Earlier matches' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
       <TextBlock x:Name='ResSub' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0' TextWrapping='Wrap'/>
     </StackPanel>
     <Button x:Name='ResOpen' Grid.Column='1' Style='{DynamicResource Zd.Button.Ghost}' Content='All match reports' VerticalAlignment='Bottom'/>
@@ -23088,7 +23106,9 @@ function New-HomePage {
     </Grid>
   </Border>
 
-  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24' Margin='0,0,12,16'>
+  <Grid Margin='0,0,12,16'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='1.35*'/><ColumnDefinition Width='16'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
       <Grid Width='120' Height='120' VerticalAlignment='Top' Margin='0,0,24,0'>
@@ -23117,10 +23137,24 @@ function New-HomePage {
             <TextBlock Text='Game Mode by itself when Fortnite starts' FontSize='13' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='10,0,0,0'/>
           </StackPanel>
         </WrapPanel>
-        <WrapPanel x:Name='AreaChips' Margin='0,10,0,-6'/>
+        <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
+          <TextBlock Text='Preset' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,0,10,0'/>
+          <Border Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3'><StackPanel x:Name='Presets' Orientation='Horizontal'/></Border>
+        </StackPanel>
+        <WrapPanel x:Name='AreaChips' Margin='0,14,0,-6'/>
       </StackPanel>
     </Grid>
   </Border>
+  <Border Grid.Column='2' Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='20,18'>
+    <StackPanel>
+      <Grid Margin='0,0,0,8'>
+        <TextBlock Text='RECENT CHANGES' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
+        <Button x:Name='HistOpen' Content='History' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Right' MinHeight='28'/>
+      </Grid>
+      <StackPanel x:Name='Recent'/>
+    </StackPanel>
+  </Border>
+  </Grid>
 
   <Border x:Name='Warm' CornerRadius='12' Background='{DynamicResource Info.Soft}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,12' Margin='0,0,12,16' Visibility='Collapsed'>
     <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
@@ -23138,7 +23172,16 @@ function New-HomePage {
 </StackPanel>
 "@)
     $h = @{}
-    foreach ($n in 'ResSub', 'ResOpen', 'Matches', 'MatchScroll', 'NoMatches', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'AreaChips', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk') { $h[$n] = $root.FindName($n) }
+    foreach ($n in 'ResSub', 'ResOpen', 'Matches', 'MatchScroll', 'NoMatches', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'AreaChips', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk',
+                 'Last', 'LastSub', 'LastStats', 'LastVerdict', 'StutCanvas', 'StutNote', 'ResHead', 'Presets', 'Recent', 'HistOpen') { $h[$n] = $root.FindName($n) }
+    $h.Last.Add_MouseLeftButtonUp({ Select-NavPage 'Matches' })
+    $h.HistOpen.Add_Click({ Select-NavPage 'History' })
+    # presets (NVIDIA / AMD style): each opens Boost now with exactly that set of tweaks that are still off
+    foreach ($pz in @(@('Safe', 'Only tweaks marked Safe: recommended for most PCs.'), @('Competitive', 'Safe plus Moderate tweaks that lower input delay.'), @('Max', 'Every input-delay tweak, Advanced ones too. Read each one.'))) {
+        $b = New-Segment $pz[0] $false { param($s, $e) $list = @(Get-PresetTweaks $s.Tag); if ($list.Count) { Show-OptimizeChooser $list } else { Show-Toast "Everything in $($s.Tag) is already on." '#30D158' } } $pz[0]
+        $b.ToolTip = $pz[1]
+        [void]$h.Presets.Children.Add($b)
+    }
     $h.WarmOk.Add_Click({ $script:Backup.Custom.Remove('shaderwarm'); Save-Backup; Hide-Animated $script:HomeUi.Warm 200 })
     $script:HomeUi = $h
     $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
@@ -23247,13 +23290,22 @@ function Update-HomePage {
         $h.WarmText.Text = "Fortnite rebuilds its shaders after a game or driver update, so your next $([int]$w.Left) match$(if ([int]$w.Left -ne 1) { 'es' }) may hitch. Play a warm-up match before a cup or a benchmark; it settles by itself."
         $h.Warm.Visibility = 'Visible'
     } else { $h.Warm.Visibility = 'Collapsed' }
-    # last matches: one card each, newest first (up to 5)
-    $reps = @(Get-GameReports 'fortnite' | Select-Object -First 5)
+    # 2.1: the newest report of any game, compared with the ones before it of the same game
+    $game = 'fortnite'
+    $newest = if ($Snapshot -and $env:ZD_FAKE_MATCH) { $null } elseif (Test-Path $MatchDir) { Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -First 1 } else { $null }
+    if ($newest) { $game = Get-ReportFileGame $newest.Name }
+    $all = @(Get-GameReports $game | Select-Object -First 6)
+    Update-LastMatchCard $all $game
+    Update-RecentChanges
+    # earlier matches: one card each, newest first (up to 5)
+    $reps = @($all | Select-Object -Skip 1 -First 5)
     $h.Matches.Children.Clear()
     foreach ($r in $reps) { try { [void]$h.Matches.Children.Add((New-MatchCard $r)) } catch { Write-CrashLog $_.Exception 'home match card' } }
     $h.MatchScroll.Visibility = if ($reps.Count) { 'Visible' } else { 'Collapsed' }
     $h.NoMatches.Visibility = if ($reps.Count) { 'Collapsed' } else { 'Visible' }
-    $h.ResSub.Text = if ($reps.Count) { "Your last $($reps.Count) Fortnite match$(if ($reps.Count -ne 1) { 'es' }), newest first. Measured in the game, not estimated." } else { '' }
+    $h.ResSub.Text = if ($reps.Count) { "Your $($reps.Count) $(Get-SessionWord $game $reps.Count) of $(if ($game -eq 'fortnite') { 'Fortnite' } else { Get-GameTitle $game }) before that, newest first. Measured in the game, not estimated." } else { '' }
+    $h.ResHead.Text = 'Earlier matches'
+    if ($all.Count -and -not $reps.Count) { $h.NoMatches.Visibility = 'Collapsed'; $h.ResHead.Visibility = 'Collapsed'; $h.ResOpen.Visibility = 'Collapsed' } else { $h.ResHead.Visibility = 'Visible'; $h.ResOpen.Visibility = 'Visible' }
     # score: the share of recommended tweaks that are on (not an FPS promise)
     $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State -and -not $_.Hidden })
     $on = @($rec | Where-Object { $_.State }).Count
@@ -23293,6 +23345,115 @@ function Update-HomePage {
         $sp.Children[3].Text = [string][char]0xE73E; $sp.Children[3].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
         $sp.Children[4].Text = "$($d.Installed)$(if ($d.Latest) { ', latest' })"; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
     } else { $sp.Children[3].Text = ''; $sp.Children[4].Text = 'see This PC'; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted') }
+}
+
+# 2.1 Home helpers ---------------------------------------------------------------------------------------------
+# the off tweaks a preset would switch on: Safe = risk Safe and recommended; Competitive = recommended, plus Moderate
+# input-delay tweaks; Max = every recommended or input-delay tweak, Advanced included
+function Get-PresetTweaks([string]$Name) {
+    @($Tweaks | Where-Object { $_.Toggle -and $_.State -eq $false -and -not $_.Hidden -and -not (Test-CheckCard $_) } | Where-Object {
+        $r = Get-TweakRisk $_
+        switch ($Name) {
+            'Safe' { $r -eq 'Safe' }
+            'Competitive' { $_.Rec -or ($_.Lat -and $r -ne 'Advanced') }
+            default { $_.Rec -or $_.Lat }
+        }
+    })
+}
+# one number on the last-match card, with how it compares to your usual (the average of the sessions before it)
+function New-LastStat([string]$Label, $Value, [string]$Fmt, [string]$Unit, $Usual, [bool]$LowerBetter) {
+    $txt = if ($null -ne $Value) { $Fmt -f [double]$Value } else { '-' }
+    $chip = ''; $tone = $null
+    if ($null -ne $Value -and $null -ne $Usual -and [double]$Usual -gt 0) {
+        $d = ([double]$Value - [double]$Usual) / [double]$Usual * 100
+        if ([Math]::Abs($d) -lt 3) { $chip = 'same as usual' }
+        else {
+            $better = if ($LowerBetter) { $d -lt 0 } else { $d -gt 0 }
+            $chip = ('{0}{1:0}% vs usual' -f $(if ($d -gt 0) { '+' } else { [char]0x2212 }), [Math]::Abs($d)); $tone = if ($better) { 'Good' } else { 'Warn' }
+        }
+    }
+    $chipX = if ($chip) { "<Border Style='{DynamicResource Zd.Chip}' HorizontalAlignment='Left' Margin='0,6,0,0'$(if ($tone) { " Background='{DynamicResource $tone.Soft}'" })><TextBlock Text='$chip'$(if ($tone) { " Foreground='{DynamicResource $tone}'" })/></Border>" } else { '' }
+    [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,16,0'>
+  <TextBlock Text='$Label' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/>
+  <StackPanel Orientation='Horizontal' Margin='0,2,0,0'>
+    <TextBlock Text='$txt' FontFamily='{DynamicResource Font.Mono}' FontSize='28' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/>
+    <TextBlock Text='$Unit' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='4,0,0,5'/>
+  </StackPanel>
+  $chipX
+</StackPanel>
+"@)
+}
+function Update-LastMatchCard($All, [string]$Game) {
+    $h = $script:HomeUi
+    if (-not @($All).Count) { $h.Last.Visibility = 'Collapsed'; return }
+    $r = $All[0]; $prev = @($All | Select-Object -Skip 1)
+    $num = { param($x) if ($null -eq $x) { $null } else { [double]$x } }
+    $avgOf = { param($sel) $v = @($prev | ForEach-Object { & $sel $_ } | Where-Object { $null -ne $_ }); if ($v.Count) { ($v | Measure-Object -Average).Average } else { $null } }
+    $stut = { param($x) if ($null -ne $x.StutterCount -and [double]$x.Minutes -gt 0) { [double]$x.StutterCount / [double]$x.Minutes } else { $null } }
+    $fpsA = { param($x) if ($x.Fps) { & $num $x.Fps.Avg } else { $null } }
+    $fpsL = { param($x) if ($x.Fps) { & $num $x.Fps.Low1 } else { $null } }
+    $ping = { param($x) & $num $x.PingAvg }
+    $h.LastStats.Children.Clear()
+    [void]$h.LastStats.Children.Add((New-LastStat 'Avg FPS' (& $fpsA $r) '{0:0}' '' (& $avgOf $fpsA) $false))
+    [void]$h.LastStats.Children.Add((New-LastStat '1% low' (& $fpsL $r) '{0:0}' '' (& $avgOf $fpsL) $false))
+    [void]$h.LastStats.Children.Add((New-LastStat 'Ping' (& $ping $r) '{0:0}' 'ms' (& $avgOf $ping) $true))
+    [void]$h.LastStats.Children.Add((New-LastStat 'Stutters' (& $stut $r) '{0:0.#}' '/min' (& $avgOf $stut) $true))
+    $start = [datetime]$r.Start
+    $ago = (Get-Date) - $start
+    $when = if ($ago.TotalMinutes -lt 60) { "$([int]$ago.TotalMinutes) min ago" } elseif ($start.Date -eq (Get-Date).Date) { "today $($start.ToString('HH:mm'))" } else { $start.ToString('ddd d MMM HH:mm') }
+    $h.LastSub.Text = "$(if ($Game -eq 'fortnite') { 'Fortnite' } else { Get-GameTitle $Game })  ·  $when  ·  $([int]$r.Minutes) min$(if ($r.Boosted) { '  ·  boosted' })"
+    $h.LastVerdict.Text = if ($prev.Count) { "Compared with your $($prev.Count) $(Get-SessionWord $Game $prev.Count) before it. Differences under 3% are noise. Click for the full report." } else { 'Your first report for this game: the next ones are compared with it. Click for the full report.' }
+    # stutters as bars over the length of the match: where they were and how long each froze (no invented curve)
+    $c = $h.StutCanvas; $c.Children.Clear()
+    $W = 330; $H = 78; $base = $H - 14
+    $ln = New-Object Windows.Shapes.Line; $ln.X1 = 0; $ln.X2 = $W; $ln.Y1 = $base; $ln.Y2 = $base; $ln.StrokeThickness = 1; $ln.SetResourceReference([Windows.Shapes.Shape]::StrokeProperty, 'Border.Subtle'); [void]$c.Children.Add($ln)
+    $end = [datetime]$r.End; $len = [Math]::Max(1, ($end - $start).TotalSeconds)
+    $st = @($r.Stutters)
+    foreach ($x in $st) {
+        try { $at = ([datetime]$x.At - $start).TotalSeconds } catch { continue }
+        $px = [Math]::Max(1, [Math]::Min($W - 3, $W * $at / $len))
+        $hh = [Math]::Min($base - 4, 8 + [double]$x.Ms / 4)
+        $b = New-Object Windows.Shapes.Rectangle; $b.Width = 3; $b.Height = $hh; $b.RadiusX = 1.5; $b.RadiusY = 1.5
+        $b.SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ([double]$x.Ms -ge 100) { 'Warn' } else { 'AccentFill' }))
+        $b.ToolTip = "$([int]$x.Ms) ms freeze$(if ($x.Busy) { " while $($x.Busy) was busy" })"
+        [Windows.Controls.Canvas]::SetLeft($b, $px - 1.5); [Windows.Controls.Canvas]::SetTop($b, $base - $hh); [void]$c.Children.Add($b)
+    }
+    foreach ($e in @(@(0, 'start'), @($W, "$([int]$r.Minutes) min"))) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $e[1]; $tb.FontSize = 10.5; $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
+        [Windows.Controls.Canvas]::SetTop($tb, $base + 2); if ($e[0] -gt 0) { [Windows.Controls.Canvas]::SetRight($tb, 0) } else { [Windows.Controls.Canvas]::SetLeft($tb, 0) }
+        [void]$c.Children.Add($tb)
+    }
+    $h.StutNote.Text = if (-not $r.Fps) { 'Frame times were not recorded for this match.' } elseif (-not $st.Count) { 'No stutters: frame times stayed steady the whole match.' } else { "$($st.Count) freeze$(if ($st.Count -ne 1) { 's' }). Taller = longer; orange = 100 ms or more. Hover one to see what was busy." }
+    $h.Last.Visibility = 'Visible'
+}
+# the last few things ZeroDelay changed, with Undo where one click can take it back
+function Update-RecentChanges {
+    $h = $script:HomeUi; $h.Recent.Children.Clear()
+    $items = @(Get-History | Select-Object -First 4)
+    if (-not $items.Count) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Nothing changed yet. Everything ZeroDelay changes shows up here, and in History.'; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 13
+        $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted'); [void]$h.Recent.Children.Add($tb); return
+    }
+    foreach ($it in $items) {
+        $t = if ($it.Id) { $Tweaks | Where-Object { $_.Id -eq $it.Id } | Select-Object -First 1 } else { $null }
+        $canUndo = $t -and $t.Toggle -and $it.Action -in 'on', 'off' -and $null -ne $t.State -and [bool]$t.State -eq ($it.Action -eq 'on') -and $it -eq ($items | Where-Object { $_.Id -eq $it.Id } | Select-Object -First 1)
+        $when = try { $d = [datetime]$it.Time; if ($d.Date -eq (Get-Date).Date) { $d.ToString('HH:mm') } else { $d.ToString('ddd') } } catch { '' }
+        $verb = switch ($it.Action) { 'on' { 'On: ' } 'off' { 'Off: ' } default { '' } }
+        $dot = switch ($it.Action) { 'on' { 'AccentFill' } 'off' { 'Text.Muted' } default { 'Info' } }
+        $row = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Margin='0,4,0,4' MinHeight='30'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+  <Ellipse Width='6' Height='6' Fill='{DynamicResource $dot}' VerticalAlignment='Center' Margin='0,0,10,0'/>
+  <TextBlock Grid.Column='1' Text='$(Esc ($verb + $it.Title))' FontSize='13' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis' VerticalAlignment='Center'/>
+  <TextBlock Grid.Column='2' Text='$when' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='10,0,8,0'/>
+  <Button x:Name='U' Grid.Column='3' Content='Undo' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='28' Padding='10,0' FontSize='12' Visibility='$(if ($canUndo) { 'Visible' } else { 'Collapsed' })'/>
+</Grid>
+"@)
+        $u = $row.FindName('U'); $u.Tag = $t
+        $u.Add_Click({ param($s, $e) $tw = $s.Tag; Switch-Tweak $tw (-not [bool]$tw.State); Update-RecentChanges })
+        [void]$h.Recent.Children.Add($row)
+    }
 }
 
 # =============================================================== Navigation (1.17): six places in the menu
