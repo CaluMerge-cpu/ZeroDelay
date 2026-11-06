@@ -27483,6 +27483,357 @@ if ($Snapshot) {
         }
         Set-Content -LiteralPath "$Snapshot.roundtrip.txt" -Value $rt -Encoding UTF8
     }
+    # CI only (a throwaway Windows VM): simulated PCs. For each profile below, the hardware and software detection is
+    # swapped for answers from that PC (graphics, CPU, chassis, network, games, other apps, NVIDIA driver, WMI). Then
+    # every card's Requires and state test runs directly (errors are not swallowed), every card is refreshed and every
+    # main page is built. Only reads: nothing is switched on. Writes one section per profile to <snapshot>.pcmatrix.txt.
+    if ($env:ZD_PCMATRIX -and $env:GITHUB_ACTIONS -eq 'true') {
+        function Get-ZdPcProfiles {
+            $eth = @{ Name = 'Ethernet'; Desc = 'Intel(R) Ethernet Controller I226-V'; Wifi = $false; Up = $true; Speed = '2.5 Gbps' }
+            $wifi = @{ Name = 'Wi-Fi'; Desc = 'Intel(R) Wi-Fi 6E AX211 160MHz'; Wifi = $true; Up = $true; Speed = '1.2 Gbps' }
+            $rtx = @{ Name = 'NVIDIA GeForce RTX 4070 SUPER'; Pnp = 'PCI\VEN_10DE&DEV_2783&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.8101'; Ram = 4293918720 }
+            @(
+                @{ Id = 'rtx-desktop'; Name = 'NVIDIA RTX desktop'; Cpu = 'Intel(R) Core(TM) i7-14700K'; Laptop = $false; Nv = 'ok'
+                   Gpus = @($rtx); Displays = @(@{ Monitor = 'ASUS VG27AQ'; Gpu = $rtx.Name; Hz = 165; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite', 'cs2'); Creator = $false; Owned = 0
+                   Software = @('Steam', 'Epic Games Launcher', 'Discord', 'NVIDIA App') }
+                @{ Id = 'nv-hybrid-laptop'; Name = 'NVIDIA laptop with Intel graphics (hybrid)'; Cpu = '13th Gen Intel(R) Core(TM) i7-13700H'; Laptop = $true; Nv = 'ok'
+                   Gpus = @(@{ Name = 'Intel(R) Iris(R) Xe Graphics'; Pnp = 'PCI\VEN_8086&DEV_A7A0&SUBSYS_00000000&REV_04\3&1'; Driver = '31.0.101.5186'; Ram = 134217728 },
+                            @{ Name = 'NVIDIA GeForce RTX 4060 Laptop GPU'; Pnp = 'PCI\VEN_10DE&DEV_28A0&SUBSYS_00000000&REV_A1\4&2'; Driver = '32.0.15.6094'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'Built-in display'; Gpu = 'Intel(R) Iris(R) Xe Graphics'; Hz = 144; Primary = $true })
+                   Adapters = @($wifi, @{ Name = 'Ethernet'; Desc = 'Realtek PCIe GbE Family Controller'; Wifi = $false; Up = $false; Speed = '0 bps' })
+                   Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'Armoury Crate', 'MyASUS') }
+                @{ Id = 'amd-x3d'; Name = 'AMD Radeon desktop with Ryzen X3D'; Cpu = 'AMD Ryzen 7 9800X3D 8-Core Processor'; Laptop = $false; Nv = 'none'
+                   Gpus = @(@{ Name = 'AMD Radeon RX 7900 XTX'; Pnp = 'PCI\VEN_1002&DEV_744C&SUBSYS_00000000&REV_C8\6&1'; Driver = '32.0.21013.1000'; Ram = 4293918720 },
+                            @{ Name = 'AMD Radeon(TM) Graphics'; Pnp = 'PCI\VEN_1002&DEV_13C0&SUBSYS_00000000&REV_C9\6&2'; Driver = '32.0.21013.1000'; Ram = 536870912 })
+                   Displays = @(@{ Monitor = 'Samsung Odyssey G7'; Gpu = 'AMD Radeon RX 7900 XTX'; Hz = 240; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('valorant', 'cs2'); Creator = $false; Owned = 0; Software = @('AMD Software', 'Riot Client', 'Steam') }
+                @{ Id = 'intel-laptop'; Name = 'Intel-only laptop (no graphics card)'; Cpu = 'Intel(R) Core(TM) Ultra 7 155H'; Laptop = $true; Nv = 'none'
+                   Gpus = @(@{ Name = 'Intel(R) Arc(TM) Graphics'; Pnp = 'PCI\VEN_8086&DEV_7D55&SUBSYS_00000000&REV_08\3&1'; Driver = '32.0.101.6078'; Ram = 134217728 })
+                   Displays = @(@{ Monitor = 'Built-in display'; Gpu = 'Intel(R) Arc(TM) Graphics'; Hz = 60; Primary = $true })
+                   Adapters = @($wifi); Wifi6 = $false; Games = @(); Creator = $false; Owned = 0; Software = @('Lenovo Vantage') }
+                @{ Id = 'gtx1080ti'; Name = 'GTX 1080 Ti desktop'; Cpu = 'Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz'; Laptop = $false; Nv = 'ok'
+                   Gpus = @(@{ Name = 'NVIDIA GeForce GTX 1080 Ti'; Pnp = 'PCI\VEN_10DE&DEV_1B06&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.8097'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'BenQ XL2546'; Gpu = 'NVIDIA GeForce GTX 1080 Ti'; Hz = 240; Primary = $true }, @{ Monitor = 'Dell U2415'; Gpu = 'NVIDIA GeForce GTX 1080 Ti'; Hz = 60; Primary = $false })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'GeForce Experience') }
+                @{ Id = 'no-driver'; Name = 'No graphics driver (Microsoft Basic Display Adapter, NVIDIA DLL missing)'; Cpu = 'Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz'; Laptop = $false; Nv = 'throw'
+                   Gpus = @(@{ Name = 'Microsoft Basic Display Adapter'; Pnp = 'PCI\VEN_10DE&DEV_2504&SUBSYS_00000000&REV_A1\4&1'; Driver = '10.0.20348.1'; Ram = 0 })
+                   Displays = @(@{ Monitor = 'Generic PnP Monitor'; Gpu = 'Microsoft Basic Display Adapter'; Hz = 60; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher') }
+                @{ Id = 'wifi-6ghz'; Name = 'Wi-Fi only, on 6 GHz'; Cpu = 'AMD Ryzen 5 7600 6-Core Processor'; Laptop = $false; Nv = 'ok'
+                   Gpus = @(@{ Name = 'NVIDIA GeForce RTX 3060'; Pnp = 'PCI\VEN_10DE&DEV_2504&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.7680'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'LG 27GP850'; Gpu = 'NVIDIA GeForce RTX 3060'; Hz = 180; Primary = $true })
+                   Adapters = @(@{ Name = 'Wi-Fi'; Desc = 'Intel(R) Wi-Fi 7 BE200 320MHz'; Wifi = $true; Up = $true; Speed = '2.4 Gbps' })
+                   Wifi6 = $true; Games = @('fortnite', 'rocketleague'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'Discord') }
+                @{ Id = 'loaded'; Name = 'Many games, ping boosters, Razer Cortex, MSI Afterburner and Adobe apps'; Cpu = 'AMD Ryzen 9 7950X3D 16-Core Processor'; Laptop = $false; Nv = 'ok'
+                   Gpus = @(@{ Name = 'NVIDIA GeForce RTX 4080'; Pnp = 'PCI\VEN_10DE&DEV_2704&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.8101'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'Alienware AW2725DF'; Gpu = 'NVIDIA GeForce RTX 4080'; Hz = 360; Primary = $true }, @{ Monitor = 'LG 27UL500'; Gpu = 'NVIDIA GeForce RTX 4080'; Hz = 60; Primary = $false })
+                   Adapters = @($eth, $wifi); Wifi6 = $false; Games = @('*'); Creator = $true; Owned = 2
+                   Software = @('ExitLag', 'GearUP Booster', 'Razer Cortex', 'MSI Afterburner', 'RivaTuner Statistics Server', 'Adobe Premiere Pro 2025', 'Adobe After Effects 2025',
+                                'Adobe Photoshop 2025', 'Adobe Creative Cloud', 'OBS Studio', 'Discord', 'Steam', 'Epic Games Launcher', 'Battle.net', 'Riot Client', 'Ubisoft Connect', 'EA app', 'Process Lasso', 'Overwolf', 'Medal') }
+                @{ Id = 'offline-empty'; Name = 'Nothing installed, offline (network adapters down)'; Cpu = 'Intel(R) Pentium(R) Gold G6400 CPU @ 4.00GHz'; Laptop = $false; Nv = 'none'
+                   Gpus = @(@{ Name = 'Intel(R) UHD Graphics 610'; Pnp = 'PCI\VEN_8086&DEV_9BA8&SUBSYS_00000000&REV_03\3&1'; Driver = '31.0.101.2111'; Ram = 1073741824 })
+                   Displays = @(@{ Monitor = 'Generic PnP Monitor'; Gpu = 'Intel(R) UHD Graphics 610'; Hz = 60; Primary = $true })
+                   Adapters = @(@{ Name = 'Ethernet'; Desc = 'Realtek PCIe GbE Family Controller'; Wifi = $false; Up = $false; Speed = '0 bps' }, @{ Name = 'Wi-Fi'; Desc = 'Realtek RTL8821CE 802.11ac PCIe Adapter'; Wifi = $true; Up = $false; Speed = '0 bps' })
+                   Wifi6 = $false; Games = @(); Creator = $false; Owned = 0; Software = @() }
+                @{ Id = 'broken-wmi'; Name = 'Broken WMI (every CIM query fails)'; Cpu = 'AMD Ryzen 7 5800X 8-Core Processor'; Laptop = $false; Nv = 'ok'; BrokenWmi = $true
+                   Gpus = @(@{ Name = 'NVIDIA GeForce RTX 3070'; Pnp = 'PCI\VEN_10DE&DEV_2484&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.7680'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'AOC 24G2'; Gpu = 'NVIDIA GeForce RTX 3070'; Hz = 144; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'Steam') }
+            )
+        }
+        # a folder that stands in for a game or app install: the exe is a copy of a small Windows exe, so icons load
+        function New-ZdPcFakeExe([string]$Path) {
+            $dir = Split-Path $Path
+            if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Force -Path $dir) }
+            $src = Join-Path "$env:WINDIR" 'System32\where.exe'
+            if ($env:WINDIR -and (Test-Path -LiteralPath $src)) { Copy-Item -LiteralPath $src -Destination $Path -Force } else { [IO.File]::WriteAllBytes($Path, [byte[]]@()) }
+            $Path
+        }
+        # what the profile scan would have saved for this PC (same shape as $ProfileScan's output)
+        function New-ZdPcSysProfile($P) {
+            $cpuVendor = if ($P.Cpu -match 'AMD|Ryzen') { 'AMD' } else { 'Intel' }
+            $gpus = @(foreach ($g in $P.Gpus) {
+                $vendor = if ($g.Pnp -match 'VEN_10DE') { 'NVIDIA' } elseif ($g.Pnp -match 'VEN_1002') { 'AMD' } elseif ($g.Pnp -match 'VEN_8086') { 'Intel' } else { 'Other' }
+                $int = ($vendor -eq 'Intel' -and $g.Name -notmatch 'Arc\(TM\) (A|B)\d') -or ($vendor -eq 'AMD' -and $g.Name -match 'Radeon\(TM\) Graphics')
+                [ordered]@{ Name = $g.Name; Vendor = $vendor; Arch = ''; Integrated = [bool]$int; VramMb = $(if ($g.Ram) { [int]($g.Ram / 1MB) } else { $null }); Driver = $g.Driver; DriverDate = '2026-09-01' }
+            })
+            $groups = [ordered]@{
+                'Game launchers' = 'Epic Games Launcher|^Steam$|Battle\.net|^EA app|Ubisoft Connect|Riot Client'
+                'Overlays and recording' = 'Discord|^Medal|Overwolf|OBS Studio|NVIDIA App|GeForce Experience|AMD Software'
+                'Monitoring and tuning' = 'MSI Afterburner|RivaTuner'
+                'Other optimizers' = 'ExitLag|GearUP|Razer Cortex|WTFast|NoPing|Process Lasso'
+                'PC maker software' = 'MyASUS|Lenovo Vantage|Armoury Crate'
+                'Streaming and voice' = 'OBS Studio'
+            }
+            $sw = [ordered]@{}
+            foreach ($k in $groups.Keys) { $hit = @($P.Software | Where-Object { $_ -match $groups[$k] }); if ($hit.Count) { $sw[$k] = $hit } }
+            $os = [Environment]::OSVersion.Version
+            $o = [ordered]@{ Version = 1; AppVersion = $AppVersion; ScannedAt = (Get-Date).ToString('o')
+                Windows = [ordered]@{ Name = 'Microsoft Windows'; Version = ''; Build = "$($os.Build).0"; Installed = '2026-01-01' }
+                Computer = [ordered]@{ Maker = 'ZeroDelay CI'; Model = $P.Name; Board = ''; Bios = ''; BiosDate = $null; Laptop = [bool]$P.Laptop }
+                Cpu = [ordered]@{ Name = $P.Cpu; Vendor = $cpuVendor; Cores = 8; Threads = 16; MaxMHz = 4200
+                                  Hybrid = [bool]($P.Cpu -match 'i[3579]-1[2-4]\d{3}|Core\(TM\) Ultra|Core Ultra'); X3D = [bool]($P.Cpu -match 'X3D'); DualDieX3D = [bool]($P.Cpu -match '79[05]0X3D|99[05]0X3D') }
+                Gpus = $gpus
+                Memory = [ordered]@{ TotalGb = 32; Sticks = 2; SpeedMts = 6000; RatedMts = 6000; Type = 'DDR5' }
+                Drives = @(); Fortnite = [ordered]@{ Path = $null; Drive = $null }; SystemDrive = $null
+                Displays = @(foreach ($d in $P.Displays) { [ordered]@{ Name = $d.Monitor; Gpu = $d.Gpu; Hz = $d.Hz; Primary = $d.Primary; Cable = 'DisplayPort' } })
+                Monitors = @(foreach ($d in $P.Displays) { [ordered]@{ Name = $d.Monitor; Cable = 'DisplayPort' } })
+                Network = @(foreach ($a in $P.Adapters | Where-Object { $_.Up }) { [ordered]@{ Name = $a.Desc; Kind = $(if ($a.Wifi) { 'Wi-Fi' } else { 'Ethernet' }); Speed = $a.Speed } })
+                Audio = @(); Input = @()
+                Security = [ordered]@{ Vbs = $false; MemoryIntegrity = $false; Hypervisor = $false; Antivirus = @('Windows Defender') }
+                Power = [ordered]@{ Plan = 'Balanced'; OnBattery = $false }
+                Apps = [ordered]@{ Programs = @($P.Software); StoreCount = 0; Store = @() }
+                Software = $sw }
+            $o | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+        }
+        # the stand-ins, all reading the current profile from $script:ZdPc. Get-CimInstance and Get-NetAdapter are
+        # shadowed so the app's own detection code (Get-CpuName, Get-GpuIds, Test-LaptopChassis, Get-UpAdapters...) runs
+        # on the profile's answers; everything that reads the driver, the display list, files or the registry is swapped.
+        $script:ZdPcMocks = [ordered]@{
+            'Get-CimInstance' = {
+                [CmdletBinding()]
+                param([Parameter(Position = 0)][string]$ClassName, [string]$Namespace, [string]$Filter, [string[]]$Property, [string]$Query, [string]$QueryDialect,
+                      [switch]$KeyOnly, [switch]$Shallow, [uint32]$OperationTimeoutSec, $CimSession, [string[]]$ComputerName, $ResourceUri, $InputObject)
+                if ($script:ZdPc.BrokenWmi) {
+                    # what a damaged WMI repository does: an error for every query (-ErrorAction Stop turns it into a throw)
+                    $PSCmdlet.WriteError((New-Object Management.Automation.ErrorRecord (New-Object InvalidOperationException "Invalid class (simulated broken WMI: $ClassName$Query)"), 'ZdPcBrokenWmi', 'InvalidOperation', $ClassName))
+                    return
+                }
+                $mine = (-not $Namespace -or $Namespace -match '^root[\\/]cimv2$') -and -not $Query
+                if ($mine -and $ClassName -eq 'Win32_VideoController') {
+                    foreach ($g in $script:ZdPc.Gpus) {
+                        $hz = ($script:ZdPc.Displays | Where-Object { $_.Gpu -eq $g.Name } | Measure-Object Hz -Maximum).Maximum
+                        [pscustomobject]@{ Name = $g.Name; Caption = $g.Name; Description = $g.Name; PNPDeviceID = $g.Pnp; DriverVersion = $g.Driver; DriverDate = (Get-Date '2026-09-01')
+                                           AdapterRAM = $g.Ram; CurrentRefreshRate = $(if ($hz) { [uint32]$hz } else { [uint32]0 }); VideoProcessor = $g.Name; Status = 'OK'; AdapterCompatibility = '' }
+                    }
+                    return
+                }
+                if ($mine -and $ClassName -eq 'Win32_Processor') {
+                    $amd = $script:ZdPc.Cpu -match 'AMD|Ryzen'
+                    [pscustomobject]@{ Name = $script:ZdPc.Cpu; Manufacturer = $(if ($amd) { 'AuthenticAMD' } else { 'GenuineIntel' }); NumberOfCores = [uint32]8; NumberOfLogicalProcessors = [uint32]16
+                                       MaxClockSpeed = [uint32]4200; CurrentClockSpeed = [uint32]4200; L2CacheSize = [uint32]8192; L3CacheSize = [uint32]32768; SocketDesignation = 'CPU 1'; ProcessorId = 'ZDCI' }
+                    return
+                }
+                if ($mine -and $ClassName -eq 'Win32_SystemEnclosure') { [pscustomobject]@{ ChassisTypes = [uint16[]]@($(if ($script:ZdPc.Laptop) { 10 } else { 3 })); Manufacturer = 'ZeroDelay CI' }; return }
+                if ($mine -and $ClassName -eq 'Win32_Battery') {
+                    if ($script:ZdPc.Laptop) { [pscustomobject]@{ Name = 'Battery'; BatteryStatus = [uint16]2; EstimatedChargeRemaining = [uint16]80; EstimatedRunTime = [uint32]71582788; DesignCapacity = $null; FullChargeCapacity = $null } }
+                    return
+                }
+                CimCmdlets\Get-CimInstance @PSBoundParameters
+            }
+            'Get-NetAdapter' = {
+                [CmdletBinding()]
+                param([Parameter(Position = 0)][string[]]$Name, [string[]]$InterfaceDescription, [uint32[]]$InterfaceIndex, [switch]$Physical, [switch]$IncludeHidden, $CimSession, [int]$ThrottleLimit, [switch]$AsJob)
+                if ($script:ZdPc.BrokenWmi) {
+                    $PSCmdlet.WriteError((New-Object Management.Automation.ErrorRecord (New-Object InvalidOperationException 'Invalid class (simulated broken WMI: MSFT_NetAdapter)'), 'ZdPcBrokenWmi', 'InvalidOperation', 'MSFT_NetAdapter'))
+                    return
+                }
+                $i = 0
+                $all = @(foreach ($a in $script:ZdPc.Adapters) {
+                    $i++
+                    $up = [bool]$a.Up
+                    [pscustomobject]@{ Name = $a.Name; InterfaceAlias = $a.Name; InterfaceDescription = $a.Desc; DriverDescription = $a.Desc; Status = $(if ($up) { 'Up' } else { 'Disconnected' })
+                        MediaConnectionState = $(if ($up) { 'Connected' } else { 'Disconnected' }); NdisPhysicalMedium = [uint32]$(if ($a.Wifi) { 9 } else { 14 })
+                        PhysicalMediaType = $(if ($a.Wifi) { 'Native 802.11' } else { '802.3' }); MediaType = '802.3'; LinkSpeed = $a.Speed
+                        ReceiveLinkSpeed = [uint64]$(if ($up) { 1000000000 } else { 0 }); TransmitLinkSpeed = [uint64]$(if ($up) { 1000000000 } else { 0 }); Speed = [uint64]$(if ($up) { 1000000000 } else { 0 })
+                        ifIndex = [uint32](9000 + $i); InterfaceIndex = [uint32](9000 + $i); InterfaceGuid = "{00000000-5A44-4349-0000-00000000000$i}"; DeviceID = "{00000000-5A44-4349-0000-00000000000$i}"
+                        PnPDeviceID = "PCI\VEN_8086&DEV_000$i\ZDCI"; MacAddress = "00-5A-44-43-49-0$i"; ComponentID = "PCI\VEN_8086&DEV_000$i"; DriverProvider = 'ZeroDelay CI'; DriverVersion = '1.0.0.0'
+                        DriverInformation = 'ZeroDelay CI'; Virtual = $false; HardwareInterface = $true; ConnectorPresent = $true; Hidden = $false }
+                })
+                if ($Name) { $all = @($all | Where-Object { $n = $_.Name; @($Name | Where-Object { $n -like $_ }).Count -gt 0 }) }
+                if ($InterfaceDescription) { $all = @($all | Where-Object { $n = $_.InterfaceDescription; @($InterfaceDescription | Where-Object { $n -like $_ }).Count -gt 0 }) }
+                if ($InterfaceIndex) { $all = @($all | Where-Object { $InterfaceIndex -contains $_.ifIndex }) }
+                $all
+            }
+            # the NVIDIA driver library: present and answering 'not set' (ok), absent (none), or throwing as if nvapi64.dll were missing (throw)
+            'Test-NvAvailable' = { $script:ZdPc.Nv -eq 'ok' }
+            'Get-NvEff' = {
+                param([string]$Profile, [uint32]$Id)
+                if ($script:ZdPc.Nv -eq 'throw') { throw (New-Object DllNotFoundException 'Unable to load DLL ''nvapi64.dll'' (simulated: no NVIDIA driver)') }
+                $rc = if ($script:ZdPc.Nv -eq 'ok') { -160 } else { -2 }
+                [pscustomobject]@{ Found = $false; Value = 0; Own = $false; Predefined = $false; Rc = $rc }
+            }
+            'Get-NvLod' = {
+                if ($script:ZdPc.Nv -eq 'throw') { throw (New-Object DllNotFoundException 'Unable to load DLL ''nvapi64.dll'' (simulated: no NVIDIA driver)') }
+                if ($script:ZdPc.Nv -eq 'ok') { 0 } else { $null }
+            }
+            'Test-NvTweak' = {
+                param($t)
+                if (-not (Test-NvAvailable)) { return $null }
+                if ($script:ZdPc.Nv -eq 'throw') { throw (New-Object DllNotFoundException 'Unable to load DLL ''nvapi64.dll'' (simulated: no NVIDIA driver)') }
+                $false
+            }
+            'Get-Displays' = {
+                @(foreach ($d in $script:ZdPc.Displays) { [pscustomobject]@{ Monitor = $d.Monitor; Gpu = $d.Gpu; Hz = [int]$d.Hz; Primary = [bool]$d.Primary; Discrete = ($d.Gpu -match $DiscreteGpuRx) } })
+            }
+            'Test-WifiOn6Ghz' = { [bool]$script:ZdPc.Wifi6 }
+            'Get-InstalledNames' = { @($script:ZdPc.Software) }
+            'Test-EpicLauncherInstalled' = { [bool](@($script:ZdPc.Software) -contains 'Epic Games Launcher') }
+            'Test-CreatorPc' = { [bool]$script:ZdPc.Creator }
+            'Get-CreatorExes' = {
+                if (-not $script:ZdPc.Creator) { return @() }
+                @('Adobe\Adobe Premiere Pro 2025\Adobe Premiere Pro.exe', 'Adobe\Adobe After Effects 2025\Support Files\AfterFX.exe', 'Adobe\Adobe Photoshop 2025\Photoshop.exe' |
+                    ForEach-Object { $f = Join-Path $script:ZdPcRoot "apps\$_"; if (-not (Test-Path -LiteralPath $f)) { [void](New-ZdPcFakeExe $f) }; $f })
+            }
+            'Get-BoosterOwned' = { @($script:ZdPc.OwnedIds) }
+            'Find-FortniteExe' = {
+                if (@($script:ZdPc.Games) -notcontains 'fortnite' -and @($script:ZdPc.Games) -notcontains '*') { return $null }
+                $f = Join-Path $script:ZdPcRoot "games\fortnite\FortniteGame\Binaries\Win64\$FortniteExeName"
+                if (-not (Test-Path -LiteralPath $f)) { [void](New-ZdPcFakeExe $f) }
+                $f
+            }
+            'Get-Cs2Dir' = {
+                if (@($script:ZdPc.Games) -notcontains 'cs2' -and @($script:ZdPc.Games) -notcontains '*') { return '' }
+                $d = Join-Path $script:ZdPcRoot 'games\cs2\Counter-Strike Global Offensive'
+                $f = Join-Path $d 'game\bin\win64\cs2.exe'
+                if (-not (Test-Path -LiteralPath $f)) { [void](New-ZdPcFakeExe $f) }
+                $d
+            }
+            'Get-GameInstallDir' = {
+                param([string]$Game)
+                if (@($script:ZdPc.Games) -notcontains $Game -and @($script:ZdPc.Games) -notcontains '*') { return $null }
+                $f = $GameFind[$Game]; if (-not $f) { return $null }
+                $d = Join-Path $script:ZdPcRoot "games\$Game"
+                $exe = if ($f.Exe) { Join-Path $d $f.Exe } else { Join-Path $d "$Game.exe" }
+                if (-not (Test-Path -LiteralPath $exe)) { [void](New-ZdPcFakeExe $exe) }
+                $d
+            }
+        }
+        function Clear-ZdPcCaches {
+            Clear-ReadCache
+            foreach ($v in 'NvOk', 'Is1080Ti', 'CpuName', 'GpuIdsCache', 'Cs2DirCache', 'GameDirCache', 'EpicInstalled', 'SteamLibs', 'TpmInfo', 'BiosInfo', 'NvBgCap',
+                           'UninstallRows', 'VrrMonitors', 'GameCatCache', 'NicMsiKeyCache', 'GameLogos', 'GameArt', 'GameArtTried', 'ExeIcons', 'AppIconCache') {
+                Set-Variable -Scope Script -Name $v -Value $null
+            }
+        }
+        # one timed call: an exception or a call over 3 s is written to the report. Locals start with zd so a card's
+        # script block that reads a variable it never set cannot pick up the matrix's own.
+        function Invoke-ZdPcStep([string]$ZdWhat, [scriptblock]$ZdDo) {
+            $script:ZdPcFailed = $false
+            $zdSw = [Diagnostics.Stopwatch]::StartNew(); $zdRet = $null
+            try { $zdRet = & $ZdDo }
+            catch {
+                $script:ZdPcFailed = $true; $script:ZdPcStat.Errors++
+                $zdMsg = "$($_.Exception.Message)" -replace '\s+', ' '
+                [void]$script:ZdPcLines.Add(('ERROR  {0}  {1}  (line {2})' -f $ZdWhat, $zdMsg, $_.InvocationInfo.ScriptLineNumber))
+            }
+            $zdSw.Stop(); $script:ZdPcStat.Calls++
+            $zdSec = $zdSw.Elapsed.TotalSeconds
+            if ($zdSec -gt 3) { $script:ZdPcStat.Slow++; [void]$script:ZdPcLines.Add(('SLOW   {0}  {1:N1} s' -f $ZdWhat, $zdSec)) }
+            if ($zdSec -gt $script:ZdPcStat.MaxS) { $script:ZdPcStat.MaxS = $zdSec; $script:ZdPcStat.MaxWhat = $ZdWhat }
+            $zdRet
+        }
+        function Invoke-ZdPcRequires($t) { & $t.Requires }
+        # the same order as Invoke-TweakTest, without its try/catch
+        function Invoke-ZdPcState($t) {
+            if ($t.Test) { & $t.Test } elseif ($t.Reg) { Test-RegTweak $t } elseif ($t.Ini) { Test-IniTweak $t }
+            elseif ($t.Power) { Test-PowerTweak $t } elseif ($t.Dx) { Test-DxTweak $t } elseif ($t.Tasks) { Test-TaskTweak $t }
+            elseif ($t['Remove']) { Test-RemoveTweak $t } elseif ($t.Nv) { Test-NvTweak $t } elseif ($t.Cs) { Test-CsTweak $t }
+        }
+        function Invoke-ZdPcMatrix {
+            $script:ZdPcRoot = Join-Path ([IO.Path]::GetTempPath()) 'zd-pcmatrix'
+            $zdOut = New-Object Collections.ArrayList
+            $zdProfiles = @(Get-ZdPcProfiles)
+            [void]$zdOut.Add("ZeroDelay $AppVersion simulated PC matrix on Windows build $([Environment]::OSVersion.Version.Build), PowerShell $($PSVersionTable.PSVersion)")
+            [void]$zdOut.Add("Stand-ins: $(@($script:ZdPcMocks.Keys) -join ', ')")
+            [void]$zdOut.Add('Per profile: Requires and state test of every card (called directly), Update-Card, then the pages Home, Games (+ game pages), Tweaks, Checks, Tools, Settings, Matches, Apps, ThisPC, Nvidia.')
+            # keep what the real PC had, to put it all back afterwards
+            $zdOrig = @{}
+            foreach ($zdN in $script:ZdPcMocks.Keys) {
+                $zdC = Get-Command $zdN -CommandType Function -ErrorAction SilentlyContinue
+                if ($zdC -and -not $zdC.ModuleName -and $zdN -notin 'Get-CimInstance', 'Get-NetAdapter') { $zdOrig[$zdN] = $zdC.ScriptBlock }
+            }
+            $zdSaved = @(foreach ($t in $Tweaks) { @{ Rec = $t.Rec; RecBase = $t.RecBase; TailorWhy = $t.TailorWhy; ForceHidden = $t.ForceHidden; Hidden = $t.Hidden; State = $t.State } })
+            $zdKeep = @{ SysProfile = $script:SysProfile; FortniteExe = $script:FortniteExe; GameSel = $script:GameSel; TweakView = $script:TweakView; TweakArea = $script:TweakArea; CheckArea = $script:CheckArea }
+            $zdTotal = @{ Errors = 0; Slow = 0; Calls = 0 }
+            try {
+                foreach ($zdN in $script:ZdPcMocks.Keys) { Set-Item -Path "function:script:$zdN" -Value $script:ZdPcMocks[$zdN] }
+                foreach ($zdP in $zdProfiles) {
+                    $zdP.OwnedIds = @($Tweaks | Where-Object { $_.Cat -eq 'Network' -and $_.Toggle } | Select-Object -First ([int]$zdP.Owned) | ForEach-Object { $_.Id })
+                    $script:ZdPc = $zdP
+                    $script:ZdPcLines = New-Object Collections.ArrayList
+                    $script:ZdPcStat = @{ Errors = 0; Slow = 0; Calls = 0; MaxS = 0.0; MaxWhat = '' }
+                    for ($zdI = 0; $zdI -lt $Tweaks.Count; $zdI++) { foreach ($zdK in @($zdSaved[$zdI].Keys)) { $Tweaks[$zdI][$zdK] = $zdSaved[$zdI][$zdK] } }
+                    Clear-ZdPcCaches
+                    $script:FortniteExe = Invoke-ZdPcStep 'detect Find-FortniteExe' { Find-FortniteExe }
+                    $script:SysProfile = Invoke-ZdPcStep 'profile scan stand-in' { New-ZdPcSysProfile $zdP }
+                    [void](Invoke-ZdPcStep 'Set-ProfileTailoring' { Set-ProfileTailoring })
+                    [void](Invoke-ZdPcStep 'Set-GpuTailoring' { Set-GpuTailoring })
+                    $zdDet = @(
+                        "CPU $(Invoke-ZdPcStep 'detect Get-CpuName' { Get-CpuName })"
+                        "laptop $(Invoke-ZdPcStep 'detect Test-LaptopChassis' { Test-LaptopChassis })"
+                        "AMD CPU $(Invoke-ZdPcStep 'detect Test-AmdCpu' { Test-AmdCpu })"
+                        "GPUs $(@(Invoke-ZdPcStep 'detect Get-GpuIds' { Get-GpuIds }).Count)"
+                        "1080 Ti $(Invoke-ZdPcStep 'detect Test-Gtx1080Ti' { Test-Gtx1080Ti })"
+                        "displays $(@(Invoke-ZdPcStep 'detect Get-Displays' { Get-Displays }).Count)"
+                        "refresh $(Invoke-ZdPcStep 'detect Get-RefreshRate' { Get-RefreshRate }) Hz"
+                        "adapters up $(@(Invoke-ZdPcStep 'detect Get-UpAdapters' { Get-UpAdapters }).Count)"
+                        "Wi-Fi adapters $(@(Invoke-ZdPcStep 'detect Get-WifiAdapters' { Get-WifiAdapters }).Count)"
+                        "6 GHz $(Invoke-ZdPcStep 'detect Test-WifiOn6Ghz' { Test-WifiOn6Ghz })"
+                        "NVIDIA driver $(Invoke-ZdPcStep 'detect Test-NvAvailable' { Test-NvAvailable })"
+                        "Fortnite $([bool]$script:FortniteExe)"
+                        "CS2 $(Invoke-ZdPcStep 'detect Test-Cs2Installed' { Test-Cs2Installed })"
+                        "other games $(@(foreach ($zdGk in @($GameFind.Keys)) { if (Invoke-ZdPcStep "detect Test-GameInstalled $zdGk" { Test-GameInstalled $zdGk }) { $zdGk } }).Count)"
+                        "creator $(Invoke-ZdPcStep 'detect Test-CreatorPc' { Test-CreatorPc })"
+                        "boosters $(@(Invoke-ZdPcStep 'detect Get-InstalledBoosters' { Get-InstalledBoosters }) -join '+')"
+                        "optimizers $(@(Invoke-ZdPcStep 'detect Get-InstalledOptimizers' { Get-InstalledOptimizers }) -join '+')"
+                    )
+                    [void](Invoke-ZdPcStep 'detect Get-NvDriverInfo' { Get-NvDriverInfo })
+                    [void](Invoke-ZdPcStep 'detect Get-NvDriverReport' { Get-NvDriverReport })
+                    # every card: Requires, then the state test only when Requires says the card applies (as the app does)
+                    $zdAvail = 0; $zdToggles = 0
+                    foreach ($t in $Tweaks) {
+                        if ($t.Svc -and -not (Invoke-ZdPcStep "service-key $($t.Id)" { Test-SvcKey $t.Svc })) { continue }
+                        $zdReq = $true
+                        if ($t.Requires) { $zdReq = Invoke-ZdPcStep "requires $($t.Id)" { Invoke-ZdPcRequires $t }; if ($script:ZdPcFailed) { continue } }
+                        if ($zdReq) { $zdState = Invoke-ZdPcStep "test $($t.Id)" { Invoke-ZdPcState $t }; if ($t.Toggle -and $null -ne $zdState -and -not $script:ZdPcFailed) { $zdAvail++ } }
+                    }
+                    foreach ($t in $Tweaks) { if ($t.Card) { if ($t.Toggle) { $zdToggles++ }; [void](Invoke-ZdPcStep "Update-Card $($t.Id)" { Update-Card $t }) } }
+                    $zdHidden = @($Tweaks | Where-Object { $_.Card -and $_.Toggle -and $_.Hidden }).Count
+                    # every main page, built fresh for this PC
+                    $script:Pages.Clear(); $script:GameSel = $null
+                    $zdCards = @{}
+                    foreach ($zdPage in 'Home', 'Games', 'All', 'Checks', 'Tools', 'Settings', 'Matches', 'Apps', 'ThisPC', 'Nvidia') {
+                        [void](Invoke-ZdPcStep "page $zdPage" { Select-NavPage $zdPage })
+                        if ($zdPage -in 'All', 'Checks') { $zdCards[$zdPage] = @($Tweaks | Where-Object { $_.Card -and -not $_.Header -and "$($_.Card.Visibility)" -eq 'Visible' }).Count }
+                        if ($zdPage -eq 'Games') {
+                            $zdGames = @($GameDefs | Where-Object { $_.Id -in 'fortnite', 'cs2' }) + @($GameDefs | Where-Object { $_.Id -notin 'fortnite', 'cs2' } | Select-Object -First 1)
+                            foreach ($zdG in $zdGames) { [void](Invoke-ZdPcStep "game page $($zdG.Id)" { Show-GameDetail $zdG }) }
+                            $script:GameSel = $null
+                        }
+                    }
+                    $zdSt = $script:ZdPcStat
+                    [void]$zdOut.Add('')
+                    [void]$zdOut.Add("=== $($zdP.Id): $($zdP.Name) ===")
+                    [void]$zdOut.Add("detected: $($zdDet -join ', ')")
+                    [void]$zdOut.Add("cards: $($zdCards['All']) tweak cards and $($zdCards['Checks']) check cards visible; $zdAvail of $zdToggles switches available, $zdHidden hidden as not for this PC")
+                    foreach ($zdL in $script:ZdPcLines) { [void]$zdOut.Add($zdL) }
+                    [void]$zdOut.Add(('result: {0} calls, {1} errors, {2} over 3 s; slowest: {3} ({4:N2} s)' -f $zdSt.Calls, $zdSt.Errors, $zdSt.Slow, $zdSt.MaxWhat, $zdSt.MaxS))
+                    $zdTotal.Errors += $zdSt.Errors; $zdTotal.Slow += $zdSt.Slow; $zdTotal.Calls += $zdSt.Calls
+                }
+            } catch {
+                [void]$zdOut.Add("ERROR  matrix stopped: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"); $zdTotal.Errors++
+            } finally {
+                # put the real PC back: detection, caches, the scanned profile and every card's flags
+                foreach ($zdN in $script:ZdPcMocks.Keys) {
+                    if ($zdOrig.ContainsKey($zdN)) { Set-Item -Path "function:script:$zdN" -Value $zdOrig[$zdN] } else { Remove-Item -Path "function:script:$zdN" -ErrorAction SilentlyContinue }
+                }
+                for ($zdI = 0; $zdI -lt $Tweaks.Count; $zdI++) { foreach ($zdK in @($zdSaved[$zdI].Keys)) { $Tweaks[$zdI][$zdK] = $zdSaved[$zdI][$zdK] } }
+                $script:ZdPc = $null
+                Clear-ZdPcCaches
+                foreach ($zdK in $zdKeep.Keys) { Set-Variable -Scope Script -Name $zdK -Value $zdKeep[$zdK] }
+                if ($script:Pages) { $script:Pages.Clear() }
+                Remove-Item -LiteralPath $script:ZdPcRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            [void]$zdOut.Add('')
+            [void]$zdOut.Add(('SUMMARY  {0} profiles, {1} calls, {2} errors, {3} calls over 3 s' -f $zdProfiles.Count, $zdTotal.Calls, $zdTotal.Errors, $zdTotal.Slow))
+            Set-Content -LiteralPath "$Snapshot.pcmatrix.txt" -Value $zdOut -Encoding UTF8
+        }
+        Invoke-ZdPcMatrix
+        # back to the page the snapshot was asked for, built from the real PC again
+        try { Select-NavPage $startName } catch {}
+    }
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Let the graphics card schedule its own work', 'Consistent timer resolution') }; Update-RestartBar }
     if ($script:Glass) {
         $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
