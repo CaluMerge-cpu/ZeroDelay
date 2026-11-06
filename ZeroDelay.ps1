@@ -7223,6 +7223,36 @@ $Ifeo  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Executio
 $GpuPrefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
 $LayersKey  = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
 
+# ================================================================ 2.1 Windows cleanup helpers
+# The AllowRecallEnablement policy applies from Windows 11 24H2 build 26100.3915 (KB5055627) on (WindowsAI Policy CSP).
+function Test-RecallPolicySupported {
+    $b = [Environment]::OSVersion.Version.Build
+    if ($b -ne 26100) { return ($b -gt 26100) }
+    $ubr = 0; [void][int]::TryParse("$(Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'UBR')", [ref]$ubr)
+    $ubr -ge 3915
+}
+# The Copilot app from the Store (Microsoft.Copilot). The Windows Copilot provider package has another name and is not matched.
+function Get-CopilotAppx { @(Get-AppxPackage -Name 'Microsoft.Copilot*' -ErrorAction SilentlyContinue | Where-Object { -not $_.IsFramework }) }
+# Windows 11 shows the old full right-click menu when this COM class has an empty InprocServer32 (Default) value.
+$ClassicMenuSubKey = 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+function Test-ClassicMenu {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$ClassicMenuSubKey\InprocServer32")
+    if (-not $k) { return $false }
+    try { ($k.GetValueNames() -contains '') -and "$($k.GetValue(''))" -eq '' } finally { $k.Close() }
+}
+# Explorer reads the menu choice when it starts. Stops Explorer in this session only; Windows starts it again by
+# itself as the signed-in user (AutoRestartShell). Only if it has not come back after 5 s is it started from here.
+function Restart-ExplorerShell {
+    if ($Snapshot) { return }
+    $sess = (Get-Process -Id $PID).SessionId
+    Get-Process explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sess } | Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 250
+        if (Get-Process explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sess }) { return }
+    }
+    Start-Process explorer.exe
+}
+
 # ================================================================ research round 2.0 helpers
 # Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11. The label is
 # translated ("Bande", "Frequenzband"), so match the value: no other line of the interface list ends in "6 GHz"
@@ -11581,6 +11611,154 @@ $Tweaks = @(
            }
        } }
 
+    # ======================================================= 2.1 Windows cleanup
+    # Lock-screen ads (RotatingLockScreenOverlayEnabled, SubscribedContent-338387Enabled) are already in 'tips', and
+    # Edge Startup Boost is already in 'edgebg', so they are not repeated here (two cards on one value break undo).
+    @{ Id = 'recall-remove'; Cat = 'Background'; Icon = [char]0xE72E; Rec = $false; Badge = 'restart'
+       Requires = { (Test-RecallPolicySupported) -or (Test-TweakHasBackup 'recall-remove') }
+       Title = 'Remove Recall completely'
+       Desc  = 'Windows policy that makes Recall unavailable and removes it from the PC, instead of only pausing snapshots like "Turn off Recall snapshots". Takes effect after a restart.'
+       Warn  = 'You use Recall. Snapshots it already saved are deleted with it.'
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowsai'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; N = 'AllowRecallEnablement'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'ai-paintnotepad'; Cat = 'Background'; Icon = [char]0xE70F; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22621 -or (Test-TweakHasBackup 'ai-paintnotepad') }
+       Title = 'Turn off AI in Paint and Notepad'
+       Desc  = 'Hides Cocreator, Generative fill and Image Creator in Paint, and the AI writing features in Notepad. Takes effect the next time the app opens.'
+       Warn  = 'You use the AI image or text features in these apps.'
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowsai'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'; N = 'DisableCocreator'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'; N = 'DisableGenerativeFill'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'; N = 'DisableImageCreator'; V = 1; D = $null; M = 0 }
+           # less certain: from the Notepad policy template, not listed in the WindowsAI CSP page; harmless if Notepad ignores it
+           @{ P = 'HKLM:\SOFTWARE\Policies\WindowsNotepad'; N = 'DisableAIFeatures'; V = 1; D = $null; M = 0 }
+       ) }
+
+    @{ Id = 'copilot-app'; Cat = 'Background'; Icon = [char]0xE74D; Rec = $false
+       Requires = { (@(Get-CopilotAppx).Count -gt 0) -or (Test-TweakHasBackup 'copilot-app') }
+       Title = 'Uninstall the Copilot app'
+       Desc  = 'Removes the Copilot app for your account. Since Windows 11 24H2 Copilot is a normal Store app and the old "Turn off Copilot" policy no longer applies to it, so uninstalling is the only way on Home and Pro.'
+       Warn  = 'You use Copilot or the Copilot key. Undo reinstalls it from the Microsoft Store.'
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/manage-windows-copilot'
+       Test  = {
+           if (@(Get-CopilotAppx).Count) { return $false }
+           if (Test-TweakHasBackup 'copilot-app') { return $true }
+           $null
+       }
+       On    = {
+           $pk = @(Get-CopilotAppx)
+           if (-not $script:Backup.Custom.ContainsKey('copilot-app')) { $script:Backup.Custom['copilot-app'] = @($pk | ForEach-Object { $_.Name }) }
+           foreach ($p in $pk) { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop }
+       }
+       Off   = {
+           if (@(Get-CopilotAppx).Count) { [void]$script:Backup.Custom.Remove('copilot-app'); return }
+           $ok = $false
+           if (Get-Command winget -ErrorAction SilentlyContinue) {
+               try {
+                   $p = Start-Process winget -ArgumentList 'install --id 9NHT9RB2F4HD -e --source msstore --accept-package-agreements --accept-source-agreements' -WindowStyle Hidden -PassThru
+                   if ($p.WaitForExit(180000)) { $ok = @(Get-CopilotAppx).Count -gt 0 }
+               } catch {}
+           }
+           if ($ok) { [void]$script:Backup.Custom.Remove('copilot-app'); return }
+           # explorer.exe opens the Store as you, not as administrator
+           Start-Process explorer.exe -ArgumentList '"ms-windows-store://pdp/?productid=9NHT9RB2F4HD"'
+           throw 'Opened Copilot in the Microsoft Store: click Get to reinstall it.'
+       } }
+
+    @{ Id = 'start-recs'; Cat = 'Background'; Icon = [char]0xE946; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22000 -or (Test-TweakHasBackup 'start-recs') }
+       Title = 'Start menu: no recommended apps or account nags'
+       Desc  = 'Removes promoted apps from Start''s Recommended section and the Microsoft account reminders on your profile picture. Your recent files stay.'
+       Warn  = 'You like app suggestions in Start.'
+       Source = 'https://learn.microsoft.com/en-us/windows/configuration/start/'
+       Reg   = @(
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'Start_IrisRecommendations'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'Start_AccountNotifications'; V = 0; D = 1; M = 1 }
+       ) }
+
+    @{ Id = 'settings-ads'; Cat = 'Background'; Icon = [char]0xE713; Rec = $false
+       Title = 'No suggestions in Settings and File Explorer'
+       Desc  = 'Stops suggested content in the Settings app and OneDrive and other sync-provider ads in File Explorer. "Turn off tips and suggestions" covers Start, tips and the lock screen; this covers these two places.'
+       Warn  = 'You want Windows to suggest features in Settings.'
+       Source = 'https://learn.microsoft.com/en-us/windows/privacy/manage-connections-from-windows-operating-system-components-to-microsoft-services'
+       Reg   = @(
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-338393Enabled'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-353694Enabled'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-353696Enabled'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'ShowSyncProviderNotifications'; V = 0; D = 1; M = 1 }
+       ) }
+
+    @{ Id = 'edge-clutter'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Requires = { (Test-AppInstalled 'msedge.exe' @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe")) -or (Test-TweakHasBackup 'edge-clutter') }
+       Title = 'Edge: no shopping, Rewards or recommendations'
+       Desc  = 'Turns off Edge''s shopping assistant, Microsoft Rewards, pop-up recommendations, the first-run tour and new desktop shortcuts after updates. Startup Boost is in "Stop Edge running in the background".'
+       Warn  = 'You use Edge''s coupons or Rewards. Edge will show "Managed by your organization".'
+       Source = 'https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'EdgeShoppingAssistantEnabled'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'ShowMicrosoftRewards'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'ShowRecommendationsEnabled'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'HideFirstRunExperience'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate'; N = 'CreateDesktopShortcutDefault'; V = 0; D = $null; M = 1 }
+       ) }
+
+    @{ Id = 'brave-clutter'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Requires = { (Test-AppInstalled 'brave.exe' @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe")) -or (Test-TweakHasBackup 'brave-clutter') }
+       Title = 'Brave: no AI chat, Wallet, Rewards, VPN, News or Tor'
+       Desc  = 'Switches off Brave''s extra features (Leo AI chat, crypto Wallet, Rewards, VPN, News and Tor windows) by policy, so they stop showing and running. The ad and tracker blocking stays.'
+       Warn  = 'You use any of these Brave features. Brave will show "Managed by your organization".'
+       Source = 'https://support.brave.com/hc/en-us/articles/360039248271-Group-Policy'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveAIChatEnabled'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveRewardsDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveWalletDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveVPNDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveNewsDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'TorDisabled'; V = 1; D = $null; M = 0 }
+       ) }
+
+    @{ Id = 'classicmenu'; Cat = 'Visuals'; Icon = [char]0xE700; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22000 -or (Test-TweakHasBackup 'classicmenu') }
+       Title = 'Classic right-click menu'
+       Desc  = 'Brings back the full Windows 10 style right-click menu, so you do not have to click "Show more options". The taskbar and open File Explorer windows restart once to apply it.'
+       Warn  = 'You prefer the compact Windows 11 menu.'
+       Source = 'https://learn.microsoft.com/en-us/windows/win32/shell/context-menu-handlers'
+       Test  = { Test-ClassicMenu }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey('classicmenu')) {
+               $old = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($ClassicMenuSubKey)
+               $script:Backup.Custom['classicmenu'] = @{ Existed = [bool]$old }
+               if ($old) { $old.Close() }
+           }
+           $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$ClassicMenuSubKey\InprocServer32")
+           try { $k.SetValue('', '', [Microsoft.Win32.RegistryValueKind]::String) } finally { $k.Close() }
+           Restart-ExplorerShell
+       }
+       Off   = {
+           $b = $script:Backup.Custom['classicmenu']
+           # a key that was there before ZeroDelay is left alone; one ZeroDelay made (or no backup) is deleted
+           if (-not ($b -and $b.Existed)) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($ClassicMenuSubKey, $false) }
+           [void]$script:Backup.Custom.Remove('classicmenu')
+           Restart-ExplorerShell
+       } }
+
+    @{ Id = 'fileext'; Cat = 'System'; Icon = [char]0xE8A5; Rec = $true
+       Title = 'Show file extensions'
+       Desc  = 'File Explorer shows the ending of every file name (.exe, .pdf, .zip), so a fake "setup.pdf.exe" sent as a game mod or cheat cannot pass as a document.'
+       Warn  = 'Never. You just see the full file names.'
+       Source = 'https://support.microsoft.com/en-us/windows/common-file-name-extensions-in-windows-da4a4430-8e76-89c5-59f7-1cdbbc75cb01'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'HideFileExt'; V = 0; D = 1; M = 1 } ) }
+
+    @{ Id = 'taskbar-endtask'; Cat = 'System'; Icon = [char]0xE711; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22631 -or (Test-TweakHasBackup 'taskbar-endtask') }
+       Title = '"End task" when you right-click the taskbar'
+       Desc  = 'Adds End task to the right-click menu of apps on the taskbar, so a frozen game closes without opening Task Manager. This is the switch in Settings > System > For developers.'
+       Warn  = 'You worry about closing an app by accident: End task does not ask to save.'
+       Source = 'https://learn.microsoft.com/en-us/windows/apps/get-started/developer-mode-features-and-debugging'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings'; N = 'TaskbarEndTask'; V = 1; D = $null; M = 0 } ) }
+
     # ======================================================= research round 2.0 (sources in each card's Source / text)
     # ---------------------------------------------------------------- Windows and graphics
     @{ Id = 'colorfilter'; Cat = 'Visuals'; Icon = [char]0xE790; Rec = $false; Lat = $true; Badge = 'signout'
@@ -11860,6 +12038,7 @@ $NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn
             'pack-scan', 'repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services',
             'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready',
             'colorfilter', 'nvllm-global', 'laptop-mux', 'intel-apo', 'laptop-nvcaps', 'apex-datacenter', 'val-netbuffer', 'r6-datacenter', 'wifi-drops', 'rxbuffers')
+$NewIds += @('recall-remove', 'ai-paintnotepad', 'copilot-app', 'start-recs', 'settings-ads', 'edge-clutter', 'brave-clutter', 'classicmenu', 'fileext', 'taskbar-endtask')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
