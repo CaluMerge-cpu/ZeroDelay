@@ -1191,6 +1191,16 @@ function Get-ActivePowerScheme {
     if ($line -match "($GuidRx)\s+\((.*)\)\s*$") { return @{ Guid = $Matches[1]; Name = $Matches[2] } }
     @{ Guid = $null; Name = 'unknown' }
 }
+# The plan the Ultimate Performance card switches to. Windows names it in the display language ("Ultimative Leistung",
+# "Performances optimales"), so besides the English names it is recognised by GUID: High performance, the Ultimate
+# template and the copy this card made (remembered under 'power:plan').
+function Test-UltimatePlan($Scheme) {
+    if (-not $Scheme) { return $false }
+    if ("$($Scheme.Name)" -match 'Ultimate Performance|High performance') { return $true }
+    $g = "$($Scheme.Guid)"
+    if (-not $g) { return $false }
+    [bool]($g -eq $HighPerfGuid -or $g -eq $UltimateTemplate -or ($script:Backup -and $script:Backup.Custom -and $g -eq "$($script:Backup.Custom['power:plan'])"))
+}
 
 function Get-RefreshRate {
     $d = @(Get-Displays)
@@ -1604,7 +1614,11 @@ function Get-CreatorExes {
     }
 }
 $ObsIni = "$env:APPDATA\obs-studio\global.ini"
-function Get-PrPrefsFile { Get-ChildItem "$env:USERPROFILE\Documents\Adobe\Premiere Pro\*\Profile-*\Adobe Premiere Pro Prefs" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+# Documents is often not %USERPROFILE%\Documents (OneDrive backup: ...\OneDrive\Dokumente, or moved to another drive): ask Windows
+function Get-PrPrefsFile {
+    $docs = @([Environment]::GetFolderPath('MyDocuments'), "$env:USERPROFILE\Documents") | Where-Object { $_ } | Select-Object -Unique
+    @($docs | ForEach-Object { Get-ChildItem "$_\Adobe\Premiere Pro\*\Profile-*\Adobe Premiere Pro Prefs" -ErrorAction SilentlyContinue }) | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
 function Get-AePrefsFile { Get-ChildItem "$env:APPDATA\Adobe\After Effects\*\Adobe After Effects * Prefs.txt" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'indep' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
 function Get-MemBalancerFile { Get-ChildItem "$env:APPDATA\Adobe\dynamiclinkmanager\*\memorybalancer*.xml" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
 function Test-CreatorPc { @(Get-CreatorExes).Count -gt 0 -or (Test-Path $ObsIni) -or [bool](Get-PrPrefsFile) -or [bool](Get-AePrefsFile) }
@@ -3293,8 +3307,9 @@ $raw = (& pathping.exe -n -q 25 -p 150 -w 800 $ip 2>&1 | Out-String)
 }
 function Get-RouteVerdict([string]$Raw, [string]$Target) {
     # hop lines of the statistics block: "  3   12ms     0/ 25 =  0%     0/ 25 =  0%  10.0.0.1" ("---" = that router ignores probes)
-    $hops = foreach ($m in [regex]::Matches($Raw, '(?m)^\s*(\d+)\s+(\d+ms|---)\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\S+)')) {
-        [pscustomobject]@{ Hop = [int]$m.Groups[1].Value; Rtt = $(if ($m.Groups[2].Value -eq '---') { $null } else { [int]($m.Groups[2].Value -replace 'ms') }); Loss = [int]$m.Groups[5].Value; Ip = $m.Groups[9].Value }
+    # the unit is translated in some languages ("12мс"), so any letters after the number are accepted
+    $hops = foreach ($m in [regex]::Matches($Raw, '(?m)^\s*(\d+)\s+(\d+[^\d\s/=%]*|---)\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\S+)')) {
+        [pscustomobject]@{ Hop = [int]$m.Groups[1].Value; Rtt = $(if ($m.Groups[2].Value -eq '---') { $null } else { [int]($m.Groups[2].Value -replace '\D') }); Loss = [int]$m.Groups[5].Value; Ip = $m.Groups[9].Value }
     }
     try { Set-Clipboard -Value $Raw } catch {}
     if (-not $hops) { return "The route could not be measured (some networks block it). The full output was copied to your clipboard.`n`n$($Raw.Trim().Substring(0, [Math]::Min(700, $Raw.Trim().Length)))" }
@@ -5184,8 +5199,9 @@ function Get-BcdCurrent {
         $h
     } 30
 }
-# A bcdedit Yes in the languages Windows ships most
-function Test-BcdYes($v) { "$v" -match '^(Yes|Ja|Oui|Sí|Si|Sì|Sim|Tak|Evet|Ano|Igen|Kyllä)$' }
+# A bcdedit Yes / No in the languages Windows ships (bcdedit translates them: "Да" on Russian, "是" on Chinese Windows)
+function Test-BcdYes($v) { "$v".Trim() -match '^(Yes|Ja|Oui|Sí|Si|Sì|Sim|Tak|Evet|Ano|Áno|Igen|Kyllä|Da|Да|Так|Jah|Jā|Taip|Ναι|是|はい|예|כן|نعم|ใช่|Có)$' }
+function Test-BcdNo($v) { "$v".Trim() -match '^(No|Nein|Non|Não|Nie|Hayır|Nee|Ne|Nem|Ei|Nej|Nei|Nu|Nē|Нет|Ні|Не|Όχι|否|いいえ|아니요|לא|لا|ไม่ใช่|Không)$' }
 # Boot values that stop Easy Anti-Cheat
 $script:BcdAntiCheat = @(
     @{ N = 'testsigning'; Rule = 'yes'; What = 'test signing on: unsigned test drivers may load, and Easy Anti-Cheat refuses to start' }
@@ -5224,7 +5240,7 @@ function Get-BcdFindings($Rules, $Bcd = $null) {
     if ($null -eq $Bcd) { return }
     foreach ($r in $Rules) {
         $v = $Bcd[$r.N]; if ($null -eq $v) { continue }
-        $bad = switch ($r.Rule) { 'yes' { Test-BcdYes $v } 'any' { $true } 'notzero' { "$v" -notmatch '^(0|0x0|No|Nein|Non)$' } default { "$v" -eq $r.Rule } }
+        $bad = switch ($r.Rule) { 'yes' { Test-BcdYes $v } 'any' { $true } 'notzero' { "$v" -notmatch '^(0|0x0)$' -and -not (Test-BcdNo $v) } default { "$v" -eq $r.Rule } }
         if ($bad) { [pscustomobject]@{ N = $r.N; Value = $v; What = $r.What } }
     }
 }
@@ -5249,7 +5265,7 @@ function Invoke-BcdRepairOff([string]$Id) {
     $bcd = if ($b -is [System.Collections.IDictionary]) { $b['Bcd'] } elseif ($b) { $b.Bcd } else { $null }
     $fail = @()
     foreach ($e in @(Get-ZdPairs $bcd)) {
-        $val = if (Test-BcdYes $e.Value) { 'yes' } elseif ("$($e.Value)" -match '^(No|Nein|Non|Não|Nie|Hayır|Nee|Ne|Nem|Ei)$') { 'no' } else { "$($e.Value)" }
+        $val = if (Test-BcdYes $e.Value) { 'yes' } elseif (Test-BcdNo $e.Value) { 'no' } else { "$($e.Value)" }
         bcdedit /set '{current}' $e.Name $val | Out-Null; if ($LASTEXITCODE -ne 0) { $fail += $e.Name }
     }
     Clear-ReadCache
@@ -5927,7 +5943,9 @@ $dv = Get-ItemProperty $dk -ErrorAction SilentlyContinue
 $r.Prov = [bool]($dv -and $null -ne $dv.ProvAcSettingIndex)
 if ($r.BalancedExists) {
     $o = @(powercfg /qh $balanced $sub $set 2>$null)
-    foreach ($l in $o) { if ($l -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $r.MinCores = [Convert]::ToInt32($Matches[1], 16); break } }
+    # the AC index is the second-last hex value: the labels are translated ("Aktueller Wechselstrom-Energieeinstellungsindex")
+    $hex = @($o | Where-Object { $_ -match ':\s*0x[0-9a-fA-F]+\s*$' } | ForEach-Object { [Convert]::ToInt32(($_ -replace '.*0x', '').Trim(), 16) })
+    if ($hex.Count -ge 2) { $r.MinCores = $hex[-2] }
 }
 if ($r.MinCores -lt 0) {
     $uv = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$balanced\$sub\$set" -ErrorAction SilentlyContinue
@@ -5938,12 +5956,15 @@ if ($r.MinCores -lt 0) {
 $r.Running = [bool](Get-Process ($exeName -replace '\.exe$') -ErrorAction SilentlyContinue)
 if ($r.Running) {
     try {
-        $c = Get-Counter '\Processor Information(*)\Parking Status' -ErrorAction Stop
-        $smp = @($c.CounterSamples | Where-Object { $_.InstanceName -notmatch '_Total' })
+        # Get-Counter only knows the counter names of the Windows language ("\Prozessorinformationen(*)\Parkstatus"):
+        # elsewhere the same counter is read through its language-neutral WMI class
+        $smp = $null
+        try { $smp = @((Get-Counter '\Processor Information(*)\Parking Status' -ErrorAction Stop).CounterSamples | Where-Object { $_.InstanceName -notmatch '_Total' } | ForEach-Object { [pscustomobject]@{ Name = $_.InstanceName; V = $_.CookedValue } }) }
+        catch { $smp = @(Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop | Where-Object { $_.Name -notmatch '_Total' } | ForEach-Object { [pscustomobject]@{ Name = "$($_.Name)"; V = $_.ParkingStatus } }) }
         $r.Cores = $smp.Count
-        $parked = @($smp | Where-Object { $_.CookedValue -eq 1 })
+        $parked = @($smp | Where-Object { $_.V -eq 1 })
         $r.Parked = $parked.Count
-        $r.ParkedNames = (($parked | ForEach-Object { $_.InstanceName -replace '^0,', '' } | Sort-Object { [int]$_ }) -join ', ')
+        $r.ParkedNames = (($parked | ForEach-Object { $_.Name -replace '^0,', '' } | Sort-Object { [int]$_ }) -join ', ')
     } catch {}
 }
 $r.Tools = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(ProcessLasso|ProcessGovernor|CoreDirector|RazerCortex|Hone)' } | ForEach-Object { $_.ProcessName } | Sort-Object -Unique)
@@ -6773,7 +6794,18 @@ try {
     $d = @(); $i = @()
     foreach ($s in $c) { foreach ($x in $s.CounterSamples) { if ($x.Path -match 'dpc') { $d += [double]$x.CookedValue } else { $i += [double]$x.CookedValue } } }
     if ($d.Count) { $dpc = ($d | Measure-Object -Average).Average }; if ($i.Count) { $int = ($i | Measure-Object -Average).Average }
-} catch {}
+} catch {
+    # non-English Windows: Get-Counter wants translated counter names, the WMI class is the same everywhere
+    try {
+        $d = @(); $i = @()
+        for ($k = 0; $k -lt 5; $k++) {
+            Start-Sleep -Seconds 1
+            $x = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop | Select-Object -First 1
+            if ($x) { $d += [double]$x.PercentDPCTime; $i += [double]$x.PercentInterruptTime }
+        }
+        if ($d.Count) { $dpc = ($d | Measure-Object -Average).Average; $int = ($i | Measure-Object -Average).Average }
+    } catch {}
+}
 # a hashtable: Get-WorkerResult unwraps the top-level object, which strips a pscustomobject's properties
 @{ MaxUs = $g[0]; Over2 = $g[1]; Over5 = $g[2]; Samples = $g[3]; P99Us = $g[4]; MedUs = $g[5]; Dpc = $dpc; Int = $int }
 '@ @(5) {
@@ -7077,6 +7109,8 @@ function Get-WifiReport {
     if ("$o" -match 'denied|location') { return 'Windows did not allow reading the Wi-Fi details. On Windows 11 24H2 and newer this needs Location: Settings > Privacy & security > Location > on, and "Let desktop apps access your location" on. Then run this check again.' }
     $get = { param($label) foreach ($l in $o) { if ($l -match "^\s*$label\s*:\s*(.+)$") { return $Matches[1].Trim() } }; $null }
     $state = & $get 'State'; $sig = & $get 'Signal'; $band = & $get 'Band'; $radio = & $get 'Radio type'; $ch = & $get 'Channel'; $ssid = & $get 'SSID'; $rx = & $get 'Receive rate \(Mbps\)'
+    # other languages name the band line differently ("Bande", "Frequenzband") and write 2,4 with a comma: find it by its value
+    if (-not $band) { foreach ($l in $o) { if ($l -match ':\s*(\d+(?:[.,]\d+)?\s*GHz)\s*$') { $band = $Matches[1]; break } } }
     if (-not $sig) {
         if ($state -and $state -notmatch '^connected') { return 'Wi-Fi is not connected right now.' }
         return "ZeroDelay could not read the details in your Windows language. This is what Windows reports:`n`n" + (($o | Where-Object { $_.Trim() } | Select-Object -First 18) -join "`n")
@@ -7085,7 +7119,7 @@ function Get-WifiReport {
     $warn = @()
     $pct = if ($sig -match '(\d+)') { [int]$Matches[1] } else { 100 }
     if ($pct -lt 60) { $warn += "Weak signal ($pct%). Move closer to the router, keep walls and metal out of the way, or use a cable. A weak signal causes retries, which show up as ping spikes." }
-    if ("$band$ch" -match '2\.4' -or ($ch -match '^\d+$' -and [int]$ch -le 14)) { $warn += 'You are on 2.4 GHz, which is crowded and shares the air with Bluetooth headphones and controllers. Use your router''s 5 GHz network, or turn on Wi-Fi: prefer the 5 GHz band.' }
+    if ("$band" -match '^\s*2[.,]4' -or "$band$ch" -match '2\.4' -or ($ch -match '^\d+$' -and [int]$ch -le 14)) { $warn += 'You are on 2.4 GHz, which is crowded and shares the air with Bluetooth headphones and controllers. Use your router''s 5 GHz network, or turn on Wi-Fi: prefer the 5 GHz band.' }
     if ($radio -match '802\.11[abgn]$') { $warn += "Your connection uses an older Wi-Fi standard ($radio). If your router supports Wi-Fi 5 or 6 (802.11ac/ax), check that it is on and that this PC's driver is current." }
     if (Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -like '*Wi-Fi Direct Virtual Adapter*' -and $_.Status -eq 'Up' }) { $warn += 'Mobile hotspot or Wi-Fi Direct is on. The Wi-Fi card then shares its airtime between two networks; turn the hotspot off while you play.' }
     if ($warn.Count) { $s + "`n" + ($warn -join "`n`n") } else { $s + "`nThis looks good. If your ping still spikes, run Test the link to your router." }
@@ -7190,10 +7224,11 @@ $GpuPrefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
 $LayersKey  = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
 
 # ================================================================ research round 2.0 helpers
-# Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11
+# Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11. The label is
+# translated ("Bande", "Frequenzband"), so match the value: no other line of the interface list ends in "6 GHz"
 function Test-WifiOn6Ghz {
     $o = try { netsh wlan show interfaces 2>$null | Out-String } catch { '' }
-    [bool]($o -match '(?m)^\s*Band\s*:\s*6(\.\d+)?\s*GHz')
+    [bool]($o -match '(?m):\s*6([.,]\d+)?\s*GHz\s*$')
 }
 # wired adapters that dropped incoming packets for lack of receive buffers: at least 100 discards and at least 0.01% of
 # what they received since start-up (a few discards are normal, for example packets for protocols Windows does not run)
@@ -7302,18 +7337,22 @@ $Tweaks = @(
        Title = 'Ultimate Performance power plan'
        Desc  = 'Keeps CPU cores awake and at full clock so frames are never waiting on power saving.'
        Warn  = 'You are on a laptop running on battery. Battery life and fan noise will get noticeably worse.'
-       Test  = { (Get-ActivePowerScheme).Name -match 'Ultimate Performance|High performance' }
+       Test  = { Test-UltimatePlan (Get-ActivePowerScheme) }
        On    = {
            if (-not $script:Backup.Custom.ContainsKey('power')) { $script:Backup.Custom['power'] = (Get-ActivePowerScheme).Guid }
            $target = $null
-           $existing = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' } | Select-Object -First 1
+           $list = @(powercfg /list)
+           $existing = $list | Where-Object { $_ -match 'Ultimate Performance' } | Select-Object -First 1
+           $mine = "$($script:Backup.Custom['power:plan'])"
            if ($existing -and $existing -match $GuidRx) { $target = $Matches[0] }
+           elseif ($mine -and ($list | Where-Object { $_ -match [regex]::Escape($mine) })) { $target = $mine }   # non-English name, made earlier
            else {
                $out = powercfg -duplicatescheme $UltimateTemplate 2>$null
                if ($LASTEXITCODE -eq 0 -and "$out" -match $GuidRx) { $target = $Matches[0] } else { $target = $HighPerfGuid }
            }
            powercfg /setactive $target 2>$null
            if ($LASTEXITCODE -ne 0) { throw 'Windows refused the plan (common on Modern Standby laptops).' }
+           $script:Backup.Custom['power:plan'] = $target
        }
        Off   = {
            $prev = $script:Backup.Custom['power']
@@ -7321,6 +7360,7 @@ $Tweaks = @(
            if (-not $prev) { throw 'No other power plan to switch back to.' }
            powercfg /setactive $prev 2>$null
            $script:Backup.Custom.Remove('power')
+           $script:Backup.Custom.Remove('power:plan')
        } }
 
     @{ Id = 'gamemode'; Cat = 'System'; Icon = [char]0xE7FC; Rec = $true
@@ -9625,7 +9665,7 @@ $Tweaks = @(
        }
        Off   = {
            $b = $script:Backup.Custom[$t.Id]
-           if ($b) { foreach ($p in $(if ($b -is [System.Collections.IDictionary]) { $b.GetEnumerator() } else { $b.PSObject.Properties })) { $val = if ("$($p.Value)" -match '^(Yes|Ja|Oui|Sí|Si|Sim|Tak|Evet)$') { 'yes' } elseif ("$($p.Value)" -match '^(No|Nein|Non|Nie|Hayır|Não|Nee)$') { 'no' } else { "$($p.Value)" }; bcdedit /set '{current}' $p.Name $val | Out-Null } }
+           if ($b) { foreach ($p in $(if ($b -is [System.Collections.IDictionary]) { $b.GetEnumerator() } else { $b.PSObject.Properties })) { $val = if (Test-BcdYes $p.Value) { 'yes' } elseif (Test-BcdNo $p.Value) { 'no' } else { "$($p.Value)" }; bcdedit /set '{current}' $p.Name $val | Out-Null } }
            $script:Backup.Custom.Remove($t.Id)
        } }
 
@@ -12834,6 +12874,19 @@ if ($script:Glass) {
 '@)
 
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+# Small screens and high scaling (1366x768, 1920x1080 at 150%): a 1380x880 window centred on a smaller work area puts its
+# title bar above the screen edge, where it cannot be dragged. Fit the window (and its minimum) into the work area.
+if (-not $Snapshot) {
+    try {
+        $wa = [Windows.SystemParameters]::WorkArea
+        if ($wa.Width -gt 0 -and $wa.Height -gt 0) {
+            if ($window.MinWidth -gt $wa.Width) { $window.MinWidth = $wa.Width }
+            if ($window.MinHeight -gt $wa.Height) { $window.MinHeight = $wa.Height }
+            if ($window.Width -gt $wa.Width) { $window.Width = $wa.Width }
+            if ($window.Height -gt $wa.Height) { $window.Height = $wa.Height }
+        }
+    } catch {}
+}
 
 # --- App logo: mint rounded square with a dark lightning bolt (same as the sidebar badge).
 function New-LogoBitmap([int]$Size) {
@@ -13390,7 +13443,7 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
             </Border>
             <TextBlock Text='$(Esc $Title)' FontSize='18' FontWeight='SemiBold' Foreground='{DynamicResource Label}' VerticalAlignment='Center' Margin='14,0,0,0' TextWrapping='Wrap' MaxWidth='330'/>
           </StackPanel>
-          <ScrollViewer Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' MaxHeight='440' Margin='0,16,0,0'>
+          <ScrollViewer x:Name='MsgScroll' Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' MaxHeight='440' Margin='0,16,0,0'>
             <TextBlock x:Name='Msg' FontSize='13.5' Foreground='{DynamicResource Label2}' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'/>
           </ScrollViewer>
           <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,22,0,0'>$bx</StackPanel>
@@ -13403,6 +13456,8 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
     $dlg.Resources.MergedDictionaries.Add($window.Resources)
     Set-RoundClip $dlg.FindName('Card') 16
     $dlg.FindName('Msg').Text = $Message
+    # small screens / high scaling (1366x768 at 125% leaves about 580 px): keep the buttons on screen, the text scrolls
+    try { $wa = [Windows.SystemParameters]::WorkArea.Height; if ($wa -gt 0) { $dlg.FindName('MsgScroll').MaxHeight = [Math]::Max(120, [Math]::Min(440, $wa - 230)) } } catch {}
     $script:DlgResult = $escape
     foreach ($b in $btns) {
         $btn = $dlg.FindName("B_$b"); $btn.Tag = $b
@@ -14122,7 +14177,8 @@ function Get-HealthIssues {
         Add-Issue 1 "$($igpu.Count) monitor(s) run on the CPU graphics" "$(($igpu | ForEach-Object { "$($_.Monitor) ($($_.Hz) Hz)" }) -join ', ') is plugged into the motherboard. Only play on monitors plugged into the graphics card." $null $null
     }
     # --- power
-    if ((Get-ActivePowerScheme).Name -notmatch 'ZeroDelay|Ultimate|High performance') { Add-Issue 2 'Power plan is not a performance plan' 'Power saving lets the CPU drop clocks between frames.' 'zdplan' }
+    $actPlan = Get-ActivePowerScheme
+    if ($actPlan.Name -notmatch 'ZeroDelay|Ultimate|High performance' -and -not (Test-UltimatePlan $actPlan)) { Add-Issue 2 'Power plan is not a performance plan' 'Power saving lets the CPU drop clocks between frames.' 'zdplan' }
     $powerNames = @{ minstate = 'CPU can drop to low clocks between frames'; usbsuspend = 'USB ports can go to sleep'; usb3lpm = 'USB 3 power-saving is on'; usbhub = 'USB hubs can go to sleep' }
     foreach ($id in 'minstate', 'usbsuspend', 'usb3lpm', 'usbhub') {
         if ((St $id) -eq $false) { Add-Issue 2 $powerNames[$id] 'Your power plan still saves power here. Another tool (often ExitLag) may have changed it.' $id }
@@ -18879,7 +18935,7 @@ $ProfileScan = {
     $dg = Try-Get { Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard }
     $P.Security = [ordered]@{ Vbs = ([int]$dg.VirtualizationBasedSecurityStatus -eq 2); MemoryIntegrity = (@($dg.SecurityServicesRunning) -contains 2); Hypervisor = [bool]$cs.HypervisorPresent
                               Antivirus = @(Try-Get { Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop } | ForEach-Object { $_.displayName } | Select-Object -Unique) }
-    $plan = (Try-Get { powercfg /getactivescheme }) -replace '^.*\((.*)\)\s*$', '$1'
+    $plan = (Try-Get { powercfg /getactivescheme }) -replace '^[^(]*\((.*)\)\s*$', '$1'   # first "(": "ZeroDelay (Ultimate Performance)" stays whole
     $P.Power = [ordered]@{ Plan = "$plan".Trim(); OnBattery = (@($bat | Where-Object { $_.BatteryStatus -eq 1 }).Count -gt 0) }
     # --- installed apps
     $seen = @{}
@@ -19360,7 +19416,12 @@ function Assert-GameClosed([string]$Game) { if (Test-GameRunning $Game) { throw 
 # the game's settings file, or $null when the game has not written one yet
 function Get-GameCfgPath([string]$Game) {
     $best = $null
-    foreach ($pat in @($GameCfgPaths[$Game])) {
+    $pats = @($GameCfgPaths[$Game])
+    # games write to the real Documents folder, which OneDrive or a move can put elsewhere under a translated name
+    # (C:\Users\Jörg\OneDrive\Dokumente, D:\Documents): also look there
+    $docs = try { [Environment]::GetFolderPath('MyDocuments') } catch { '' }
+    if ($docs) { $pats += @($pats | Where-Object { "$_" -like '%USERPROFILE%\Documents\*' } | ForEach-Object { $docs + "$_".Substring('%USERPROFILE%\Documents'.Length) }) }
+    foreach ($pat in $pats) {
         if (-not $pat) { continue }
         $p = [Environment]::ExpandEnvironmentVariables($pat)
         if ($p.Contains('{Install}')) { $d = Get-GameInstallDir $Game; if (-not $d) { continue }; $p = $p.Replace('{Install}', $d) }
