@@ -8122,15 +8122,19 @@ $Tweaks = @(
 
     @{ Id = 'cleanlogs'; Cat = 'Storage'; Icon = [char]0xE74D; Action = 'Clean now'
        Title = 'Clear logs and crash dumps'
-       Desc  = 'Deletes old Windows crash dumps and error reports, plus old Fortnite logs and crash folders.'
+       Desc  = 'Deletes old Windows crash dumps and error reports, plus old Fortnite logs and crash folders. Blue-screen minidumps, LiveKernelReports (graphics driver resets) and archived error reports from the last 30 days are kept: ZeroDelay''s crash checks and Reliability Monitor read them.'
        Warn  = ''
        Run   = {
            $bytes = 0; $cut = (Get-Date).AddHours(-1)
+           # crash evidence the crash checks and Reliability Monitor read: only files older than 30 days go
+           $evidence = @("$env:WINDIR\Minidump", "$env:WINDIR\LiveKernelReports", "$env:ProgramData\Microsoft\Windows\WER\ReportArchive")
+           $keepCut = (Get-Date).AddDays(-30)
            $targets = @("$env:WINDIR\Minidump", "$env:WINDIR\LiveKernelReports", "$env:LOCALAPPDATA\CrashDumps",
                         "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
                         "$env:LOCALAPPDATA\FortniteGame\Saved\Logs", "$env:LOCALAPPDATA\FortniteGame\Saved\Crashes")
            foreach ($dir in $targets | Where-Object { Test-Path $_ }) {
-               Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut } | ForEach-Object {
+               $c = if ($evidence -contains $dir) { $keepCut } else { $cut }
+               Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $c } | ForEach-Object {
                    $len = $_.Length; try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $bytes += $len } catch {}
                }
            }
@@ -8624,8 +8628,9 @@ $Tweaks = @(
        Tasks = @( '\Microsoft\Windows\Maps\MapsUpdateTask', '\Microsoft\Windows\Maps\MapsToastTask' ) }
 
     @{ Id = 'task-wer'; Cat = 'Services'; Icon = [char]0xE823; Rec = $false
+       Requires = { Test-TweakHasBackup 'task-wer' }   # 2.1: retired; shown only so people who switched it on can switch it off
        Title = 'Turn off error report queue task'
-       Desc  = 'Stops the task that uploads queued crash reports in the background.'
+       Desc  = 'Stops the task that uploads queued crash reports in the background. Retired in 2.1: this Windows Error Reporting task feeds Reliability Monitor and the crash reports ZeroDelay''s crash checks read, so it is no longer offered. Switch it off to restore the task.'
        Warn  = 'You want your crash reports sent so bugs get fixed.'
        Tasks = @( '\Microsoft\Windows\Windows Error Reporting\QueueReporting' ) }
 
@@ -11836,6 +11841,52 @@ $Tweaks = @(
        Source = 'https://devtrackers.gg/r6-siege/p/bb8a00f7-connectivity-multiplayer-server-issues'
        Run   = { [void](Show-ZdDialog (Get-R6DataCenterReport) 'Siege data center' 'OK' 'Information'); 'Shown.' } }
 
+    # ======================================================= 2.1 tools (helpers: "2.1 tools" block before New-AppsPage)
+    @{ Id = 'winrepair'; Cat = 'Repair'; Icon = [char]0xE90F; Action = 'Repair Windows'; Lat = $false
+       Title = 'Repair Windows files (DISM + SFC)'
+       Desc  = 'Microsoft''s own repair in one click: DISM checks the Windows component store and repairs it from Windows Update only if it is damaged, then System File Checker (sfc /scannow) repairs Windows files. Takes 15 to 45 minutes in the background; nothing of yours is deleted.'
+       Warn  = 'You are about to play: the disk and processor stay busy until it finishes. ZeroDelay refuses to start while a game is running.'
+       Source = 'https://support.microsoft.com/help/929833'
+       Run   = { Start-WindowsRepair } }
+
+    @{ Id = 'wu-repair'; Cat = 'Repair'; Icon = [char]0xE895; Action = 'Fix updates'; Lat = $false
+       Title = 'Windows Update stuck or failing'
+       Desc  = 'Shows your last successful update and the updates that failed recently, with the error codes in plain words. Offers Microsoft''s reset: stops the update services, renames the download cache (SoftwareDistribution) and catalog (catroot2) to .old, and starts the services again. Takes 1 to 2 minutes.'
+       Warn  = 'An update is installing right now (let it finish first), or Game Mode is on (it pauses updates).'
+       Source = 'https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/additional-resources-for-windows-update'
+       Run   = { Show-WuRepair } }
+
+    @{ Id = 'memtest'; Cat = 'System'; Icon = [char]0xE950; Action = 'Test RAM'; Lat = $false
+       Title = 'Test your RAM (Windows Memory Diagnostic)'
+       Desc  = 'Random crashes, blue screens or corrupted game files can be faulty RAM or an unstable XMP/EXPO profile. Shows the result of the last memory test, and schedules Windows'' own test: it runs at the next restart for 15 to 30 minutes.'
+       Warn  = 'You need the PC in the next half hour: the test runs before Windows starts and cannot be paused.'
+       Source = 'https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/stop-code-error-troubleshooting'
+       Run   = { Show-MemTest } }
+
+    @{ Id = 'gm-hotkey'; Cat = 'System'; Icon = [char]0xE765; Rec = $false; Lat = $false
+       Title = 'Game Mode hotkey (Ctrl+Alt+G)'
+       Desc  = 'Off by default. Press Ctrl+Alt+G anywhere, also in a game or with ZeroDelay in the tray, to switch ZeroDelay Game Mode on or off. Works while ZeroDelay is running. If another app already uses Ctrl+Alt+G, ZeroDelay tells you and the switch stays off.'
+       Warn  = 'A game or app you use has its own Ctrl+Alt+G shortcut: the first one to register it wins.'
+       Source = 'https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey'
+       Test  = { [bool](Get-Setting 'gmhotkey' $false) }
+       On    = { Enable-ZdGmHotkey }
+       Off   = { Disable-ZdGmHotkey } }
+
+    @{ Id = 'sleep-check'; Cat = 'Power'; Icon = [char]0xE708; Action = 'Check'; Lat = $false
+       Title = 'Why won''t my PC sleep (or why does it wake up)?'
+       Desc  = 'Shows what keeps your PC awake right now, what woke it last, the timers that will wake it, and every device allowed to wake it (a mouse or network card is the usual cause). Uses Windows'' powercfg; nothing is changed.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options'
+       Run   = { Start-SleepCheck } }
+
+    @{ Id = 'battery-health'; Cat = 'Power'; Icon = [char]0xE83F; Action = 'Check'; Lat = $false
+       Requires = { [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) }
+       Title = 'Laptop battery health'
+       Desc  = 'Reads Windows'' battery report: how much of its original capacity your battery still holds and how many charge cycles it has done, with what to do about it. Nothing is changed.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options'
+       Run   = { Start-BatteryCheck } }
+
     # ---------------------------------------------------------------- network
     @{ Id = 'wifi-drops'; Cat = 'Network'; Icon = [char]0xE701; Action = 'Check'; Lat = $true
        Requires = { [bool](Get-WifiAdapters).Count }
@@ -12049,6 +12100,7 @@ $NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn
             'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready',
             'colorfilter', 'nvllm-global', 'laptop-mux', 'intel-apo', 'laptop-nvcaps', 'apex-datacenter', 'val-netbuffer', 'r6-datacenter', 'wifi-drops', 'rxbuffers')
 $NewIds += @('recall-remove', 'ai-paintnotepad', 'copilot-app', 'start-recs', 'settings-ads', 'edge-clutter', 'brave-clutter', 'classicmenu', 'fileext', 'taskbar-endtask')
+$NewIds += @('winrepair', 'wu-repair', 'memtest', 'gm-hotkey', 'sleep-check', 'battery-health')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
@@ -18194,6 +18246,473 @@ $AppScanScript = {
 $AppCols = "<Grid.ColumnDefinitions><ColumnDefinition Width='46'/><ColumnDefinition Width='*'/><ColumnDefinition Width='118'/><ColumnDefinition Width='84'/><ColumnDefinition Width='108'/><ColumnDefinition Width='190'/></Grid.ColumnDefinitions>"
 # letter tiles: token pairs (background, letter) picked from the app's name, so a name always gets the same tile
 $AppTileTones = @(@('Info.Soft', 'Info'), @('Good.Soft', 'Good'), @('Warn.Soft', 'Warn'), @('Accent.Soft', 'AccentFill'), @('Bg.Raised', 'Text.Secondary'))
+# ======================================================= 2.1 tools
+# Helpers for the 2.1 tool cards (winrepair, wu-repair, memtest, gm-hotkey, sleep-check, battery-health) and the
+# Windows Settings pages in Ctrl+K. Long work runs in Start-Background (a separate PowerShell); the window never waits.
+
+# --- a read-only report window: an English note per section above the command's own output, shown as it is
+#     (powercfg's text is translated, so ZeroDelay never parses it). $Sections = @( @{ H; Note; Mono } )
+function Show-ZdReport([string]$Title, [string]$Intro, $Sections) {
+    $dlg = [ZdTheme]::Parse(@"
+<Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        Title='$(Esc $Title)' Width='680' SizeToContent='Height' WindowStyle='None' AllowsTransparency='True' Background='Transparent'
+        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='{DynamicResource Font.UI}'>
+  <Grid Margin='24'>
+    <Border x:Name='Card' CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'>
+      <StackPanel Margin='26,22,24,20'>
+        <TextBlock x:Name='Head' FontSize='18' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+        <TextBlock x:Name='Intro' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,8,0,0'/>
+        <ScrollViewer x:Name='Scroll' VerticalScrollBarVisibility='Auto' MaxHeight='520' Margin='0,10,0,0'>
+          <StackPanel x:Name='Body'/>
+        </ScrollViewer>
+        <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,18,0,0'>
+          <Button x:Name='Copy' Content='Copy text' Style='{DynamicResource Zd.Button.Secondary}' MinWidth='96'/>
+          <Button x:Name='Done' Content='Close' Style='{DynamicResource Zd.Button.Primary}' MinWidth='96' Margin='8,0,0,0'/>
+        </StackPanel>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>
+"@)
+    $dlg.Resources.MergedDictionaries.Add($window.Resources)
+    $dlg.FindName('Head').Text = $Title
+    $dlg.FindName('Intro').Text = $Intro
+    if (-not $Intro) { $dlg.FindName('Intro').Visibility = 'Collapsed' }
+    $body = $dlg.FindName('Body')
+    $copy = New-Object Text.StringBuilder
+    [void]$copy.AppendLine($Title); if ($Intro) { [void]$copy.AppendLine($Intro) }
+    foreach ($s in @($Sections)) {
+        $h = New-Object Windows.Controls.TextBlock
+        $h.Text = "$($s.H)"; $h.FontSize = 14; $h.FontWeight = 'SemiBold'; $h.Margin = '0,14,0,0'; $h.TextWrapping = 'Wrap'
+        $h.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Primary')
+        [void]$body.Children.Add($h)
+        if ($s.Note) {
+            $n = New-Object Windows.Controls.TextBlock
+            $n.Text = "$($s.Note)"; $n.FontSize = 12.5; $n.Margin = '0,4,0,6'; $n.TextWrapping = 'Wrap'
+            $n.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+            [void]$body.Children.Add($n)
+        }
+        $mono = "$($s.Mono)".TrimEnd()
+        if (-not $mono) { $mono = '(no output)' }
+        $tb = New-Object Windows.Controls.TextBox
+        $tb.Text = $mono; $tb.IsReadOnly = $true; $tb.FontSize = 12; $tb.Padding = '10,8'; $tb.BorderThickness = 1
+        $tb.TextWrapping = 'NoWrap'; $tb.MaxHeight = 200
+        $tb.HorizontalScrollBarVisibility = 'Auto'; $tb.VerticalScrollBarVisibility = 'Auto'
+        $tb.SetResourceReference([Windows.Controls.Control]::FontFamilyProperty, 'Font.Mono')
+        $tb.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'Bg.Surface')
+        $tb.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'Text.Primary')
+        $tb.SetResourceReference([Windows.Controls.Control]::BorderBrushProperty, 'Border.Subtle')
+        [void]$body.Children.Add($tb)
+        [void]$copy.AppendLine(''); [void]$copy.AppendLine("== $($s.H)"); [void]$copy.AppendLine($mono)
+    }
+    $script:ReportCopy = $copy.ToString()
+    try { $wa = [Windows.SystemParameters]::WorkArea.Height; if ($wa -gt 0) { $dlg.FindName('Scroll').MaxHeight = [Math]::Max(160, [Math]::Min(520, $wa - 260)) } } catch {}
+    $dlg.FindName('Copy').Add_Click({ param($s, $e) try { [Windows.Clipboard]::SetText($script:ReportCopy); $s.Content = 'Copied' } catch {} })
+    $dlg.FindName('Done').Add_Click({ param($s, $e) [Windows.Window]::GetWindow($s).Close() })
+    $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
+    $dlg.Add_MouseLeftButtonDown({ param($s, $e) try { $s.DragMove() } catch {} })
+    if ($window -and $window.IsVisible) { $dlg.Owner = $window; $dlg.WindowStartupLocation = 'CenterOwner' } else { $dlg.WindowStartupLocation = 'CenterScreen'; $dlg.Topmost = $true }
+    [void]$dlg.ShowDialog()
+}
+function Format-ZdDate([datetime]$When, [datetime]$Now) {
+    $f = if ($When.Year -eq $Now.Year) { 'd MMM' } else { 'd MMM yyyy' }
+    $When.ToString($f, [Globalization.CultureInfo]::InvariantCulture)
+}
+
+# ---------------------------------------------------------------- 1. Repair Windows (DISM + SFC), Microsoft KB 929833
+$WinRepairScanCode = @'
+try { $r = Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop; @{ Ok = $true; State = "$($r.ImageHealthState)" } }
+catch { @{ Ok = $false; Err = "$($_.Exception.Message)" } }
+'@
+$WinRepairRestoreCode = @'
+try { $r = Repair-WindowsImage -Online -RestoreHealth -NoRestart -ErrorAction Stop; @{ Ok = $true; State = "$($r.ImageHealthState)" } }
+catch { @{ Ok = $false; Err = "$($_.Exception.Message)" } }
+'@
+# sfc's own text is translated, so only its exit code is used, plus the [SR] lines it writes to CBS.log (always English)
+# from this run: just the "Cannot repair" ones are counted
+$WinRepairSfcCode = @'
+$start = Get-Date
+$code = -1
+try {
+    $p = Start-Process -FilePath "$env:WINDIR\System32\sfc.exe" -ArgumentList '/scannow' -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+    $code = $p.ExitCode
+} catch { return @{ Ok = $false; Err = "$($_.Exception.Message)"; Code = -1; Cannot = 0 } }
+$cannot = 0
+$log = "$env:WINDIR\Logs\CBS\CBS.log"
+try {
+    $fs = New-Object IO.FileStream $log, 'Open', 'Read', 'ReadWrite'
+    $sr = New-Object IO.StreamReader $fs
+    $from = $start.AddMinutes(-1)
+    while ($null -ne ($l = $sr.ReadLine())) {
+        if ($l.IndexOf('[SR]', [StringComparison]::Ordinal) -lt 0) { continue }
+        if ($l -notmatch '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') { continue }
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$t) -or $t -lt $from) { continue }
+        if ($l -match 'Cannot repair') { $cannot++ }
+    }
+    $sr.Close()
+} catch {}
+@{ Ok = $true; Code = $code; Cannot = $cannot }
+'@
+function Set-WinRepairStep([string]$Text) {
+    $b = $script:WinRepair.Btn
+    if ($b) { try { $b.Content = $Text } catch {} }
+    Show-Toast $Text '#0A84FF'
+}
+function Start-WindowsRepair {
+    if ($script:WinRepair -and $script:WinRepair.Busy) { throw 'Windows repair is already running. ZeroDelay tells you when it is done.' }
+    $run = Find-RunningGame
+    if ($run) { throw "Close $($run.Def.Title) first: the repair keeps the disk and processor busy for a long time." }
+    $r = Show-ZdDialog ("Windows checks its own files and repairs broken ones, in three steps:`n`n1. DISM checks the Windows component store.`n2. DISM repairs it from Windows Update, only if step 1 found damage.`n3. System File Checker (sfc /scannow) repairs Windows files from that store.`n`nThis takes 15 to 45 minutes. Your PC stays usable, but do not play meanwhile: the disk and processor are busy. Nothing of yours is deleted, and you can keep ZeroDelay in the tray.") 'Repair Windows' 'OKCancel' 'Question'
+    if ($r -ne 'OK') { return 'Nothing changed.' }
+    $t = $Tweaks | Where-Object { $_.Id -eq 'winrepair' } | Select-Object -First 1
+    $btn = if ($t) { $t.ActionBtn } else { $null }
+    $script:WinRepair = @{ Busy = $true; Btn = $btn; Orig = $(if ($btn) { $btn.Content } else { $null }); Scan = $null; Restore = $null; Started = Get-Date }
+    Set-WinRepairStep 'Step 1 of 3: checking Windows...'
+    Start-Background $WinRepairScanCode @() { param($out, $errs) Complete-WinRepairScan (Get-WorkerResult $out) }
+    'Windows repair started. It takes 15 to 45 minutes; ZeroDelay tells you when it is done.'
+}
+function Complete-WinRepairScan($r) {
+    $script:WinRepair.Scan = $r
+    if ($r -and $r.Ok -and $r.State -ne 'Healthy') {
+        Set-WinRepairStep 'Step 2 of 3: repairing Windows from Windows Update...'
+        Start-Background $WinRepairRestoreCode @() { param($out, $errs) $script:WinRepair.Restore = Get-WorkerResult $out; Start-WinRepairSfc }
+    } else { Start-WinRepairSfc }
+}
+function Start-WinRepairSfc {
+    Set-WinRepairStep 'Step 3 of 3: checking system files (sfc)...'
+    Start-Background $WinRepairSfcCode @() { param($out, $errs) Complete-WindowsRepair (Get-WorkerResult $out) }
+}
+# plain-words summary of the three steps (pure: used by the test)
+function Format-WinRepairResult($Scan, $Restore, $Sfc) {
+    $l = @()
+    if (-not $Scan -or -not $Scan.Ok) { $l += "1. The Windows check could not run: $(if ($Scan) { $Scan.Err } else { 'no result' })" }
+    elseif ($Scan.State -eq 'Healthy') { $l += '1. Windows component store: no damage found.' }
+    else {
+        $l += '1. Windows component store: damage found.'
+        if ($Restore -and $Restore.Ok -and $Restore.State -eq 'Healthy') { $l += '2. Repaired from Windows Update.' }
+        elseif ($Restore -and $Restore.Ok) { $l += "2. The repair ran but Windows still reports: $($Restore.State). Settings > System > Recovery > 'Fix problems using Windows Update' reinstalls Windows and keeps your files and apps." }
+        else { $l += "2. The repair could not finish: $(if ($Restore) { $Restore.Err } else { 'no result' }). Check your internet connection and run it again." }
+    }
+    if (-not $Sfc -or -not $Sfc.Ok) { $l += "3. System File Checker could not run: $(if ($Sfc) { $Sfc.Err } else { 'no result' })" }
+    elseif ([int]$Sfc.Cannot -gt 0) { $l += "3. System File Checker found $($Sfc.Cannot) damaged file(s) it could not repair. Restart and run this again (it often fixes the rest); if it repeats, use Settings > System > Recovery > 'Fix problems using Windows Update'." }
+    elseif ([int]$Sfc.Code -eq 0) { $l += '3. System files: all fine, or repaired.' }
+    else { $l += "3. System File Checker ended with code $($Sfc.Code) and listed no file it could not repair. If problems continue, restart and run this again." }
+    $bad = (-not $Scan -or -not $Scan.Ok -or ($Scan.State -ne 'Healthy' -and -not ($Restore -and $Restore.State -eq 'Healthy')) -or -not $Sfc -or -not $Sfc.Ok -or [int]$Sfc.Cannot -gt 0)
+    @{ Text = ($l -join "`n`n"); Bad = $bad }
+}
+function Complete-WindowsRepair($sfc) {
+    $w = $script:WinRepair
+    $w.Busy = $false
+    if ($w.Btn) { try { $w.Btn.Content = $w.Orig } catch {} }
+    $res = Format-WinRepairResult $w.Scan $w.Restore $sfc
+    $mins = [int]((Get-Date) - $w.Started).TotalMinutes
+    Add-History 'Repaired Windows files (DISM + SFC)' 'tool' 'winrepair'
+    Show-Toast 'Windows repair finished.' $(if ($res.Bad) { '#FF9F0A' } else { '#30D158' })
+    [void](Show-ZdDialog ("$($res.Text)`n`nTook $mins minutes. Restart your PC when it suits you so every repaired file is in use.") 'Windows repair finished' 'OK' $(if ($res.Bad) { 'Warning' } else { 'Information' }))
+}
+
+# ---------------------------------------------------------------- 2. Windows Update history and reset
+# error codes as numbers or text ("0x80070643", "2147944003", -2147023293) -> "0x80070643"
+function ConvertTo-WuHex($Code) {
+    $s = "$Code".Trim()
+    if ($s -match '^0[xX]([0-9a-fA-F]{1,8})$') { return '0x' + $Matches[1].ToUpperInvariant().PadLeft(8, '0') }
+    $n = [long]0
+    if ([long]::TryParse($s, [ref]$n)) { if ($n -lt 0) { $n += 4294967296 }; return ('0x{0:X8}' -f $n) }
+    $s
+}
+function Get-WuErrorText($Code) {
+    $hex = ConvertTo-WuHex $Code
+    switch ($hex) {
+        '0x800F081F' { 'Windows could not find the files it needs to repair itself. Run "Repair Windows (DISM + SFC)", then try the update again.' }
+        '0x80070002' { 'A file the update expected is missing, usually from a broken or half-finished download. Resetting Windows Update fixes this most of the time.' }
+        '0x80073712' { 'A file Windows needs for updates is damaged or missing. Run "Repair Windows (DISM + SFC)", then try again.' }
+        '0x8024A105' { 'Windows Update could not reach its update service, often after a stuck download. Resetting Windows Update usually fixes it.' }
+        '0x80070643' { 'The update''s installer failed (common for Defender, .NET and recovery-partition updates). Restart and try again; if it repeats, reset Windows Update.' }
+        default { "Error $hex. Resetting Windows Update fixes many update errors; if it repeats, search Microsoft Support for this code." }
+    }
+}
+# $Items: @{ Id = 19 (installed) or 20 (failed); Time; Props = event data values (20: error code, title; 19: title) }
+function Format-WuHistory($Items, [datetime]$Now) {
+    $all = @($Items | Sort-Object { $_.Time } -Descending)
+    $ok = $all | Where-Object { $_.Id -eq 19 } | Select-Object -First 1
+    $out = @()
+    $out += if ($ok) { "Last successful update: $(Format-ZdDate $ok.Time $Now) ($(@($ok.Props)[0]))." } else { 'Last successful update: none in Windows'' update log.' }
+    $fails = @($all | Where-Object { $_.Id -eq 20 -and $_.Time -ge $Now.AddDays(-30) })
+    if (-not $fails.Count) { $out += 'Failed installs in the last 30 days: none.' }
+    else {
+        $out += "Failed installs in the last 30 days: $($fails.Count)."
+        foreach ($f in $fails | Select-Object -First 5) {
+            $p = @($f.Props)
+            $out += "- $(Format-ZdDate $f.Time $Now): $($p[1])`n  $(ConvertTo-WuHex $p[0]): $(Get-WuErrorText $p[0])"
+        }
+    }
+    $out -join "`n"
+}
+$WuResetCode = @'
+$errs = @()
+$svcs = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
+foreach ($s in $svcs) { try { Stop-Service -Name $s -Force -ErrorAction Stop } catch { $errs += "Could not stop $s : $($_.Exception.Message)" } }
+foreach ($s in $svcs) { $o = Get-Service -Name $s -ErrorAction SilentlyContinue; if ($o) { try { $o.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) } catch {} } }
+$renamed = @()
+foreach ($d in "$env:WINDIR\SoftwareDistribution", "$env:WINDIR\System32\catroot2") {
+    if (-not (Test-Path -LiteralPath $d)) { continue }
+    $old = "$d.old"
+    try {
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop }
+        Rename-Item -LiteralPath $d -NewName ([IO.Path]::GetFileName($old)) -ErrorAction Stop
+        $renamed += [IO.Path]::GetFileName($old)
+    } catch { $errs += "Could not rename $d : $($_.Exception.Message)" }
+}
+foreach ($s in 'cryptsvc', 'bits', 'wuauserv', 'msiserver') { try { Start-Service -Name $s -ErrorAction Stop } catch { $errs += "Could not start $s : $($_.Exception.Message)" } }
+@{ Renamed = $renamed; Errors = $errs }
+'@
+function Show-WuRepair {
+    if ($script:WuResetBusy) { throw 'The Windows Update reset is already running.' }
+    $ev = @(try { Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'; Id = 19, 20 } -MaxEvents 300 -ErrorAction Stop } catch { @() })
+    $items = @(foreach ($e in $ev) { @{ Id = $e.Id; Time = $e.TimeCreated; Props = @($e.Properties | ForEach-Object { $_.Value }) } })
+    $rep = Format-WuHistory $items (Get-Date)
+    $r = Show-ZdDialog ("$rep`n`nReset Windows Update? ZeroDelay stops the update services, renames the download cache and catalog to SoftwareDistribution.old and catroot2.old, and starts the services again. Takes 1 to 2 minutes. Updates already installed stay installed; the next check for updates takes a little longer.") 'Windows Update' 'YesNo' 'Question'
+    if ($r -ne 'Yes') { return 'Nothing changed.' }
+    if (Test-ZDGameMode) { throw 'Turn Game Mode off first: it pauses Windows Update while you play.' }
+    $script:WuResetBusy = $true
+    Start-Background $WuResetCode @() {
+        param($out, $errs)
+        $script:WuResetBusy = $false
+        $r = Get-WorkerResult $out
+        $bad = @($r.Errors | Where-Object { $_ }) + @($errs | ForEach-Object { "$_" })
+        Add-History 'Reset Windows Update' 'tool' 'wu-repair'
+        $msg = if (-not $bad.Count) { "Windows Update was reset.`n`nThe old files are kept as $(@($r.Renamed) -join ' and ') in your Windows folder; you can delete them once updates work again. Now open Settings > Windows Update and click Check for updates." }
+               else { "Windows Update was reset only partly:`n`n- $($bad -join "`n- ")`n`nRestart your PC and run this again. If a service is disabled, the card 'Turn Windows Update services back on' fixes that." }
+        Show-Toast $(if ($bad.Count) { 'Windows Update reset: partly done.' } else { 'Windows Update was reset.' }) $(if ($bad.Count) { '#FF9F0A' } else { '#30D158' })
+        [void](Show-ZdDialog $msg 'Windows Update reset' 'OK' $(if ($bad.Count) { 'Warning' } else { 'Information' }))
+    }
+    'Resetting Windows Update (1 to 2 minutes)...'
+}
+
+# ---------------------------------------------------------------- 3. Memory test (Windows Memory Diagnostic)
+# event 1201 / 1101 = no errors, 1202 / 1102 = errors found (provider Microsoft-Windows-MemoryDiagnostics-Results)
+function Format-MemTestResult($Id, $When, [datetime]$Now) {
+    if (-not $Id) { return 'Last memory test: none found on this PC (or Windows has cleared its log since).' }
+    $d = Format-ZdDate ([datetime]$When) $Now
+    switch ([int]$Id) {
+        { $_ -in 1201, 1101 } { "Last memory test: $d, no errors." }
+        { $_ -in 1202, 1102 } { "Last memory test: $d, ERRORS FOUND. Faulty RAM or an unstable XMP/EXPO profile: turn XMP/EXPO off in the BIOS and test again; if errors stay, test one stick at a time." }
+        default { "Last memory test: $d." }
+    }
+}
+function Get-MemTestLast {
+    $e = try { Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'; Id = 1101, 1102, 1201, 1202 } -MaxEvents 1 -ErrorAction Stop | Select-Object -First 1 } catch { $null }
+    if ($e) { Format-MemTestResult $e.Id $e.TimeCreated (Get-Date) } else { Format-MemTestResult $null $null (Get-Date) }
+}
+function Show-MemTest {
+    $last = Get-MemTestLast
+    $r = Show-ZdDialog ("$last`n`nWindows Memory Diagnostic tests your RAM at the next restart. It takes 15 to 30 minutes (longer with a lot of RAM) and the PC cannot be used meanwhile. Windows shows the result after you sign in, and this card shows it next time.`n`nOK opens it: Windows asks whether to restart now or test at the next restart. Save your work first.") 'Memory test' 'OKCancel' 'Question'
+    if ($r -ne 'OK') { return $last }
+    Start-Process -FilePath "$env:WINDIR\System32\MdSched.exe"
+    'Windows Memory Diagnostic is open: choose when to restart.'
+}
+
+# ---------------------------------------------------------------- 4. Game Mode hotkey (Ctrl+Alt+G)
+$ZdHotkeySrc = @'
+using System;
+using System.Runtime.InteropServices;
+public static class ZdHotkey {
+    [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    public const int Id = 0x5A47;
+    static IntPtr owner = IntPtr.Zero;
+    public static int LastError;
+    public static event EventHandler Pressed;
+    public static bool Registered { get { return owner != IntPtr.Zero; } }
+    // mods: 1 Alt, 2 Ctrl, 4 Shift; MOD_NOREPEAT is added so holding the keys fires once
+    public static bool Register(IntPtr hwnd, uint mods, uint vk) {
+        Unregister();
+        if (!RegisterHotKey(hwnd, Id, mods | 0x4000u, vk)) { LastError = Marshal.GetLastWin32Error(); return false; }
+        owner = hwnd; LastError = 0; return true;
+    }
+    public static void Unregister() { if (owner != IntPtr.Zero) { UnregisterHotKey(owner, Id); owner = IntPtr.Zero; } }
+    // an HwndSourceHook for the main window (WM_HOTKEY = 0x0312)
+    public static IntPtr Hook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled) {
+        if (msg == 0x0312 && wParam.ToInt64() == Id) { handled = true; EventHandler p = Pressed; if (p != null) p(null, EventArgs.Empty); }
+        return IntPtr.Zero;
+    }
+}
+'@
+function Register-ZdGmHotkey {
+    try {
+        if (-not ('ZdHotkey' -as [type])) { Add-Type -TypeDefinition $ZdHotkeySrc -ErrorAction Stop }
+        $h = (New-Object Windows.Interop.WindowInteropHelper $window).EnsureHandle()
+        if (-not $script:HotkeyHooked) {
+            $hs = [Windows.Interop.HwndSource]::FromHwnd($h)
+            $script:HotkeyHook = [Delegate]::CreateDelegate([Windows.Interop.HwndSourceHook], [ZdHotkey].GetMethod('Hook'))
+            $hs.AddHook($script:HotkeyHook)
+            # run Game Mode after the key message is handled, never inside the window procedure
+            [ZdHotkey]::add_Pressed([EventHandler] { param($s, $e) [void]$window.Dispatcher.BeginInvoke([action] { Invoke-ZdGmHotkey }) })
+            $script:HotkeyHooked = $true
+        }
+        [ZdHotkey]::Register($h, 3, 0x47)    # Ctrl + Alt + G
+    } catch { $script:HotkeyErr = "$($_.Exception.Message)"; $false }
+}
+function Get-ZdHotkeyFailText {
+    if (('ZdHotkey' -as [type]) -and [ZdHotkey]::LastError -eq 1409) { 'Ctrl+Alt+G is already used by another app, so the Game Mode hotkey stays off. Change or close that app''s shortcut and try again.' }
+    elseif ($script:HotkeyErr) { "The Game Mode hotkey could not be set up: $($script:HotkeyErr)" }
+    else { 'Windows did not allow Ctrl+Alt+G (another app may use it), so the Game Mode hotkey stays off.' }
+}
+function Enable-ZdGmHotkey {
+    if (-not (Register-ZdGmHotkey)) { throw (Get-ZdHotkeyFailText) }
+    $script:Backup.Custom['gmhotkey'] = $true
+}
+function Disable-ZdGmHotkey {
+    if ('ZdHotkey' -as [type]) { [ZdHotkey]::Unregister() }
+    $script:Backup.Custom.Remove('gmhotkey')
+}
+function Invoke-ZdGmHotkey {
+    if ($script:GmHotkeyBusy) { return }
+    $script:GmHotkeyBusy = $true
+    try {
+        if (Test-ZDGameMode) { [void](Disable-ZDGameMode); Suspend-GameModeAuto; $txt = 'Game Mode off (Ctrl+Alt+G)' }
+        else { [void](Enable-ZDGameMode); $txt = 'Game Mode on (Ctrl+Alt+G)' }
+        Show-Toast $txt '#30D158'
+        if (-not $window.IsVisible -and $script:TrayIcon) { try { $script:TrayIcon.ShowBalloonTip(2500, 'ZeroDelay', $txt, 'None') } catch {} }
+    } catch { Show-Toast "Game Mode hotkey: $($_.Exception.Message)" '#FF9F0A' }
+    finally { $script:GmHotkeyBusy = $false }
+}
+# at startup (once the message loop runs, so the window has its handle in normal and tray starts alike)
+function Start-ZdGmHotkeyAtStartup {
+    if (-not (Get-Setting 'gmhotkey' $false)) { return }
+    if (Register-ZdGmHotkey) { return }
+    $script:Backup.Custom.Remove('gmhotkey'); Set-Applied 'gm-hotkey' $false; Save-Backup
+    Show-Toast (Get-ZdHotkeyFailText) '#FF9F0A'
+    $t = $Tweaks | Where-Object { $_.Id -eq 'gm-hotkey' } | Select-Object -First 1
+    if ($t -and $t.Toggle) { Update-Card $t }
+}
+if (-not $Snapshot) { [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ApplicationIdle, [action] { Start-ZdGmHotkeyAtStartup }) }
+
+# ---------------------------------------------------------------- 5. Windows Settings pages in Ctrl+K
+# T = name, P = where it is in Windows, U = ms-settings page (or Exe + Arg for the classic tools), K = extra search words
+$ZdWinSettings = @(
+    @{ T = 'Display'; P = 'System > Display'; U = 'ms-settings:display'; K = 'screen monitor resolution scale scaling hdr refresh rate hz brightness' }
+    @{ T = 'Night light'; P = 'System > Display > Night light'; U = 'ms-settings:nightlight'; K = 'nightlight blue light warm colour color' }
+    @{ T = 'Sound'; P = 'System > Sound'; U = 'ms-settings:sound'; K = 'audio volume speakers headphones headset output input mic' }
+    @{ T = 'Sound devices'; P = 'System > Sound > All sound devices'; U = 'ms-settings:sound-devices'; K = 'audio devices headset mic enable disable output input' }
+    @{ T = 'Volume mixer'; P = 'System > Sound > Volume mixer'; U = 'ms-settings:apps-volume'; K = 'app volume per app audio output device game discord' }
+    @{ T = 'Mouse'; P = 'Bluetooth & devices > Mouse'; U = 'ms-settings:mousetouchpad'; K = 'pointer speed sensitivity enhance pointer precision acceleration scroll touchpad' }
+    @{ T = 'Typing'; P = 'Time & language > Typing'; U = 'ms-settings:typing'; K = 'keyboard autocorrect text suggestions' }
+    @{ T = 'Bluetooth & devices'; P = 'Bluetooth & devices'; U = 'ms-settings:bluetooth'; K = 'bluetooth controller headset pair devices' }
+    @{ T = 'Network status'; P = 'Network & internet'; U = 'ms-settings:network-status'; K = 'internet ethernet connection network reset' }
+    @{ T = 'Wi-Fi'; P = 'Network & internet > Wi-Fi'; U = 'ms-settings:network-wifi'; K = 'wifi wireless wlan' }
+    @{ T = 'Windows Update'; P = 'Windows Update'; U = 'ms-settings:windowsupdate'; K = 'updates check for updates patch' }
+    @{ T = 'Update history'; P = 'Windows Update > Update history'; U = 'ms-settings:windowsupdate-history'; K = 'installed updates uninstall updates kb' }
+    @{ T = 'Storage Sense'; P = 'System > Storage'; U = 'ms-settings:storagesense'; K = 'disk space storage cleanup free up space' }
+    @{ T = 'Power & sleep'; P = 'System > Power'; U = 'ms-settings:powersleep'; K = 'power mode sleep screen timeout' }
+    @{ T = 'Battery saver'; P = 'System > Power & battery'; U = 'ms-settings:batterysaver'; K = 'energy saver battery laptop' }
+    @{ T = 'Xbox Game Bar'; P = 'Gaming > Game Bar'; U = 'ms-settings:gaming-gamebar'; K = 'game bar overlay win g xbox' }
+    @{ T = 'Windows Game Mode'; P = 'Gaming > Game Mode'; U = 'ms-settings:gaming-gamemode'; K = 'game mode gaming' }
+    @{ T = 'Captures'; P = 'Gaming > Captures'; U = 'ms-settings:gaming-gamedvr'; K = 'record recording clips background recording game dvr screenshots' }
+    @{ T = 'Graphics'; P = 'System > Display > Graphics'; U = 'ms-settings:display-advancedgraphics'; K = 'gpu preference hardware accelerated gpu scheduling hags variable refresh rate vrr optimizations for windowed games auto hdr' }
+    @{ T = 'Microphone access'; P = 'Privacy & security > Microphone'; U = 'ms-settings:privacy-microphone'; K = 'mic microphone permission privacy' }
+    @{ T = 'Camera access'; P = 'Privacy & security > Camera'; U = 'ms-settings:privacy-webcam'; K = 'camera webcam permission privacy' }
+    @{ T = 'Location'; P = 'Privacy & security > Location'; U = 'ms-settings:privacy-location'; K = 'location gps privacy' }
+    @{ T = 'Notifications'; P = 'System > Notifications'; U = 'ms-settings:notifications'; K = 'alerts banners do not disturb' }
+    @{ T = 'Focus'; P = 'System > Focus'; U = 'ms-settings:quietmomentshome'; K = 'focus assist do not disturb quiet hours' }
+    @{ T = 'Taskbar'; P = 'Personalization > Taskbar'; U = 'ms-settings:taskbar'; K = 'taskbar tray icons' }
+    @{ T = 'Colours'; P = 'Personalization > Colours'; U = 'ms-settings:personalization-colors'; K = 'colors dark mode light mode accent transparency effects' }
+    @{ T = 'Default apps'; P = 'Apps > Default apps'; U = 'ms-settings:defaultapps'; K = 'default browser file types' }
+    @{ T = 'Installed apps'; P = 'Apps > Installed apps'; U = 'ms-settings:appsfeatures'; K = 'uninstall programs apps features' }
+    @{ T = 'Startup apps'; P = 'Apps > Startup'; U = 'ms-settings:startupapps'; K = 'startup autostart apps at sign in boot' }
+    @{ T = 'About this PC'; P = 'System > About'; U = 'ms-settings:about'; K = 'pc name specs system info windows version edition ram processor' }
+    @{ T = 'Recovery'; P = 'System > Recovery'; U = 'ms-settings:recovery'; K = 'reset this pc reinstall fix problems using windows update go back' }
+    @{ T = 'Troubleshoot'; P = 'System > Troubleshoot'; U = 'ms-settings:troubleshoot'; K = 'troubleshooters fix problems' }
+    @{ T = 'Clipboard'; P = 'System > Clipboard'; U = 'ms-settings:clipboard'; K = 'clipboard history win v' }
+    @{ T = 'Multitasking'; P = 'System > Multitasking'; U = 'ms-settings:multitasking'; K = 'snap windows alt tab virtual desktops' }
+    @{ T = 'Date & time'; P = 'Time & language > Date & time'; U = 'ms-settings:dateandtime'; K = 'clock time zone sync time' }
+    @{ T = 'Language & region'; P = 'Time & language > Language & region'; U = 'ms-settings:regionlanguage'; K = 'language region keyboard layout input' }
+    @{ T = 'Sign-in options'; P = 'Accounts > Sign-in options'; U = 'ms-settings:signinoptions'; K = 'password pin windows hello sign in' }
+    @{ T = 'Windows Security'; P = 'Privacy & security > Windows Security'; U = 'ms-settings:windowsdefender'; K = 'defender antivirus virus firewall security' }
+    @{ T = 'Sound Control Panel'; P = 'Control Panel > Sound'; Exe = 'control.exe'; Arg = 'mmsys.cpl'; K = 'classic sound playback recording devices exclusive mode sample rate spatial mmsys' }
+    @{ T = 'Device Manager'; P = 'Windows tool'; Exe = 'mmc.exe'; Arg = 'devmgmt.msc'; K = 'drivers devices hardware devmgmt' }
+    @{ T = 'Task Manager'; P = 'Windows tool'; Exe = 'taskmgr.exe'; Arg = ''; K = 'processes cpu usage end task taskmgr' }
+    @{ T = 'Reliability Monitor'; P = 'Windows tool'; Exe = 'perfmon.exe'; Arg = '/rel'; K = 'crash history reliability errors app crashes perfmon' }
+)
+function Open-ZdWinSetting($w) {
+    try {
+        if ($w.U) { Start-Process $w.U }
+        elseif ($w.Arg) { Start-Process -FilePath $w.Exe -ArgumentList $w.Arg }
+        else { Start-Process -FilePath $w.Exe }
+    } catch { Show-Toast "$($w.T) could not be opened: $($_.Exception.Message)" '#FF9F0A' }
+}
+
+# ---------------------------------------------------------------- 6. Sleep and wake, battery health
+$SleepCheckCode = @'
+$o = @{}
+foreach ($a in 'requests', 'lastwake', 'waketimers') { $o[$a] = try { (& powercfg.exe "/$a" 2>&1 | Out-String).Trim() } catch { "$($_.Exception.Message)" } }
+$o['wake'] = @(try { & powercfg.exe /devicequery wake_armed 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ } } catch { @() })
+$o
+'@
+function Start-SleepCheck {
+    if ($script:SleepBusy) { return 'Already reading...' }
+    $script:SleepBusy = $true
+    Start-Background $SleepCheckCode @() {
+        param($out, $errs)
+        $script:SleepBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'powercfg did not answer.' '#FF9F0A'; return }
+        $wake = @($r.wake)
+        Show-ZdReport 'Why won''t my PC sleep?' 'Windows'' own answers (powercfg). The grey boxes show its text as it is, in your Windows language. Nothing was changed.' @(
+            @{ H = "Devices allowed to wake the PC ($($wake.Count))"; Mono = ($wake -join "`n")
+               Note = 'Each of these can wake your PC from sleep. A mouse that gets bumped and network cards are the usual cause. To stop one: Device Manager > double-click the device > Power Management > untick "Allow this device to wake the computer".' }
+            @{ H = 'What keeps the PC awake right now (powercfg /requests)'; Mono = $r.requests
+               Note = 'Each heading (DISPLAY, SYSTEM, AWAYMODE, EXECUTION, PERFCOUNT, ACTIVELOCKSCREEN) lists the apps, drivers or services asking Windows to stay awake. Only "None" under every heading means nothing blocks sleep. Audio playing in a browser, a game launcher downloading and remote-play apps are common causes.' }
+            @{ H = 'What woke the PC last time (powercfg /lastwake)'; Mono = $r.lastwake
+               Note = 'The device or timer behind the last wake-up. A network adapter, mouse or USB device here means that device woke it; an empty list usually means the power button.' }
+            @{ H = 'Timers that will wake the PC (powercfg /waketimers)'; Mono = $r.waketimers
+               Note = 'Apps and scheduled tasks that set a timer to wake the PC, often Windows Update maintenance. Control Panel > Power Options > Change plan settings > Change advanced power settings > Sleep > Allow wake timers switches them off. Needs ZeroDelay to run as administrator to list them.' }
+        )
+    }
+    'Reading sleep and wake information...'
+}
+# powercfg /batteryreport /xml (the XML is not translated): design and full-charge capacity in mWh, cycle count
+function Read-BatteryReportXml([string]$Xml) {
+    if (-not $Xml) { return $null }
+    try { $doc = New-Object Xml.XmlDocument; $doc.LoadXml($Xml) } catch { return $null }
+    $design = [double]0; $full = [double]0; $cycles = $null; $n = 0
+    foreach ($b in @($doc.SelectNodes("//*[local-name()='Batteries']/*[local-name()='Battery']"))) {
+        $d = $b.SelectSingleNode("*[local-name()='DesignCapacity']"); $f = $b.SelectSingleNode("*[local-name()='FullChargeCapacity']"); $c = $b.SelectSingleNode("*[local-name()='CycleCount']")
+        $dv = [double]0; $fv = [double]0
+        if ($d -and [double]::TryParse($d.InnerText, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$dv)) { $design += $dv }
+        if ($f -and [double]::TryParse($f.InnerText, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$fv)) { $full += $fv }
+        $cv = 0; if ($c -and [int]::TryParse($c.InnerText, [ref]$cv) -and $cv -gt 0) { $cycles = [int]$cycles + $cv }
+        $n++
+    }
+    if (-not $n -or $design -le 0) { return $null }
+    @{ Design = $design; Full = $full; Cycles = $cycles; Pct = [int][Math]::Round(100 * $full / $design); Count = $n }
+}
+function Format-BatteryHealth($b) {
+    if (-not $b) { return 'Windows'' battery report has no capacity figures for this battery.' }
+    $cyc = if ($b.Cycles) { ", $($b.Cycles) charge cycles" } else { ' (the battery does not report its cycle count)' }
+    $head = "Battery holds $($b.Pct)% of its original capacity$cyc. Original: $([int]($b.Design / 1000)) Wh, now: $([int]($b.Full / 1000)) Wh."
+    $adv = if ($b.Pct -ge 80) { 'Healthy: nothing to do.' }
+           elseif ($b.Pct -ge 60) { 'Worn: expect clearly shorter battery life. Game plugged in (laptops also run slower on battery). If your laptop maker''s app (Lenovo Vantage, ASUS Armoury Crate, Dell Power Manager, MSI Center, HP) can limit charging to about 80%, turn that on when the laptop mostly stays plugged in: it slows further wear.' }
+           else { 'Heavily worn: consider a replacement battery, especially if the laptop shuts down suddenly under load or at a high percentage. Until then, game plugged in.' }
+    "$head`n`n$adv"
+}
+$BatteryCheckCode = @'
+param($f)
+try { & powercfg.exe /batteryreport /xml /output $f 2>&1 | Out-Null } catch {}
+if (Test-Path -LiteralPath $f) { $x = [IO.File]::ReadAllText($f); Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue; $x } else { '' }
+'@
+function Start-BatteryCheck {
+    $f = Join-Path $env:TEMP ("zd-battery-{0}.xml" -f [guid]::NewGuid().ToString('N'))
+    Start-Background $BatteryCheckCode @($f) {
+        param($out, $errs)
+        $x = "$(Get-WorkerResult $out)"
+        $b = Read-BatteryReportXml $x
+        [void](Show-ZdDialog (Format-BatteryHealth $b) 'Battery health' 'OK' $(if ($b -and $b.Pct -lt 60) { 'Warning' } else { 'Information' }))
+    }
+    'Reading the battery report...'
+}
+
 function New-AppsPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
@@ -18745,8 +19264,8 @@ $CleanTargets = @(
     @{ Key = 'deliveryopt'; Title = 'Delivery Optimization cache'; Default = $true; Age = 0; Cmd = 'Delete-DeliveryOptimizationCache'
        Desc = 'Pieces of updates Windows keeps to share with other PCs.'
        Dirs = @("$env:WINDIR\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache") }
-    @{ Key = 'dumps'; Title = 'Crash dumps and error reports'; Default = $true; Age = 0
-       Desc = 'Files Windows and apps write when something crashes. Only useful to developers.'
+    @{ Key = 'dumps'; Title = 'Crash dumps and error reports'; Default = $true; Age = 720
+       Desc = 'Files Windows and apps write when something crashes, older than 30 days. Newer ones are kept: ZeroDelay''s crash checks and Reliability Monitor read them.'
        Dirs = @("$env:WINDIR\Minidump", "$env:LOCALAPPDATA\CrashDumps", "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
                 "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue")
        Files = @("$env:WINDIR\MEMORY.DMP") }
@@ -18936,8 +19455,8 @@ function New-MemoryPage {
           <TextBlock Text='In use' Foreground='#A1A1A6' FontSize='12'/>
           <TextBlock x:Name='Used' FontSize='30' FontWeight='Bold'/>
         </StackPanel>
-        <Button x:Name='Purge' Grid.Column='1' Content='Free standby memory' Style='{DynamicResource Btn}' VerticalAlignment='Top'
-                ToolTip='Clears the standby list once (what ISLC and Mem Reduct do). Your apps keep all their memory.'/>
+        <Button x:Name='CloseBg' Grid.Column='1' Content='Close background apps' Style='{DynamicResource Btn}' VerticalAlignment='Top'
+                ToolTip='Pick the apps you are not using and close them: the only thing that really frees RAM.'/>
       </Grid>
       <Grid Height='10' Margin='0,12,0,0'>
         <Border CornerRadius='5' Background='#3A3A3C'/>
@@ -18961,14 +19480,17 @@ function New-MemoryPage {
     <StackPanel>
       <TextBlock Text='Why there is no RAM cleaner' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
       <TextBlock Foreground='#A1A1A6' FontSize='12.5' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'
-        Text='&#x2022;  Standby memory is a cache of files you used recently. It already counts as available: Windows hands it to Fortnite instantly, so a big standby number is normal and good.&#x0a;&#x2022;  Most RAM cleaners force every app to give its memory back. Windows then has to read it all back from the disk, which causes the very stutter they promise to fix. ZeroDelay does not do that.&#x0a;&#x2022;  Free standby memory clears the cache once. It only helps on the rare PCs where a full standby list causes stutter (what ISLC fixes); on most PCs nothing changes.'/>
+        Text='&#x2022;  Standby memory is a cache of files you used recently. It already counts as available: Windows hands it to Fortnite instantly, so a big standby number is normal and good.&#x0a;&#x2022;  Most RAM cleaners force every app to give its memory back. Windows then has to read it all back from the disk, which causes the very stutter they promise to fix. ZeroDelay does not do that.&#x0a;&#x2022;  Clearing standby memory throws that cache away, so your game reads those files from the disk again and may stutter for a while. It only helps on the rare PCs where a full standby list itself causes stutter (what ISLC fixes), so it is tucked away below.'/>
+      <Button x:Name='Purge' Content='Clear standby memory (advanced, may cause stutter)' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Margin='0,10,0,0'
+              ToolTip='Clears the standby cache once, after a warning. Not needed on most PCs.'/>
     </StackPanel>
   </Border>
 </StackPanel>
 "@)
-    $mu = @{}; foreach ($n in 'Used', 'Purge', 'BarUse', 'BarStandby', 'Parts', 'Verdict', 'Top') { $mu[$n] = $root.FindName($n) }
+    $mu = @{}; foreach ($n in 'Used', 'Purge', 'CloseBg', 'BarUse', 'BarStandby', 'Parts', 'Verdict', 'Top') { $mu[$n] = $root.FindName($n) }
     $script:MemUi = $mu
     $mu.Purge.Add_Click({ Invoke-StandbyPurge })
+    $mu.CloseBg.Add_Click({ Show-CloseAppsPicker })
     $mu.Used.Text = 'Reading memory...'
     Update-MemoryPage
     # refresh every 4 s while this page is on screen
@@ -18996,6 +19518,7 @@ function Update-MemoryPage {
 }
 function Show-MemoryPage($d) {
     $mu = $script:MemUi
+    $script:MemTop = @($d.Top)
     $mi = $d.Mi
     if (-not $mi.Total) { return }
     $mu.Used.Text = "$(Format-Size $mi.InUse) of $(Format-Size $mi.Total)"
@@ -19047,7 +19570,59 @@ function Close-AppGroup([string]$Name) {
     })
     $t.Start()
 }
+# 2.1: the page's main action. Lists the biggest apps that are not Windows, a game or anti-cheat; nothing is ticked
+# until you tick it, and only the ticked ones are closed (asked to close first, ended after 3 s like Close-AppGroup).
+function Get-CloseableApps($Top) {
+    $games = @($GameDefs | ForEach-Object { Get-GameProcNames $_ })
+    @($Top | Where-Object { $_ -and $MemNoClose -notcontains $_.Name -and $games -notcontains $_.Name -and $_.Name -notmatch '(?i)anticheat|^vgc$|^vgtray$|^BEService|^FACEIT|^faceit|^EAAntiCheat|^ZeroDelay' -and $_.Name -ne 'powershell' })
+}
+function Show-CloseAppsPicker {
+    $apps = @(Get-CloseableApps $script:MemTop)
+    if (-not $apps.Count) { Show-Toast 'No background apps to close right now.' '#A1A1A6'; return }
+    $i = 0
+    $rows = foreach ($a in $apps) {
+        $a | Add-Member -NotePropertyName Idx -NotePropertyValue $i -Force; $i++
+        "<CheckBox x:Name='M_$($a.Idx)' Margin='0,0,0,8'><TextBlock Text='$(Esc "$($a.Label)$(if ($a.Count -gt 1) { " ($($a.Count))" })  -  $(Format-Size $a.Bytes)")' FontSize='13' Foreground='{DynamicResource Text.Primary}'/></CheckBox>"
+    }
+    $body = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <TextBlock Text='Close background apps' FontSize='22' FontWeight='Bold' Foreground='{DynamicResource Text.Primary}'/>
+  <TextBlock Text='Tick the apps you are not using. Only those are closed: each is asked to close first and ended if it does not. Save your work in them first. Windows, your games and anti-cheat are never listed.' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,6,0,14' TextWrapping='Wrap'/>
+  $($rows -join '')
+  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,14,0,0'>
+    <Button x:Name='Cancel' Content='Cancel' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0' MinWidth='90'/>
+    <Button x:Name='Go' Content='Close the ticked apps' Style='{DynamicResource Zd.Button.Primary}' MinWidth='150'/>
+  </StackPanel>
+</StackPanel>
+"@)
+    $script:CloseApps = $apps; $script:CloseBody = $body
+    $body.FindName('Cancel').Add_Click({ Hide-Animated $ui.Wizard 200 })
+    $body.FindName('Go').Add_Click({
+        $pick = @($script:CloseApps | Where-Object { $script:CloseBody.FindName("M_$($_.Idx)").IsChecked })
+        Hide-Animated $ui.Wizard 200
+        if (-not $pick.Count) { Show-Toast 'Nothing closed.' '#A1A1A6'; return }
+        Stop-AppGroups @($pick | ForEach-Object { $_.Name })
+    })
+    $ui.WizardBody.Content = $body
+    $ui.Wizard.Visibility = 'Visible'
+    if ($script:Anim) { Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220; Show-Animated $ui.WizardBody 24 380 60 }
+}
+function Stop-AppGroups([string[]]$Names) {
+    foreach ($n in $Names) { foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) { try { if ($p.MainWindowHandle -ne [IntPtr]::Zero) { [void]$p.CloseMainWindow() } } catch {} } }
+    $script:CloseNames = $Names
+    $t = New-Object Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromSeconds(3)
+    $t.Add_Tick({ param($s, $e)
+        $s.Stop()
+        foreach ($n in @($script:CloseNames)) { Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+        Show-Toast "Closed: $(@($script:CloseNames) -join ', ')." '#30D158'
+        if ($script:MemUi) { Update-MemoryPage }
+    })
+    $t.Start()
+}
 function Invoke-StandbyPurge {
+    $ok = Show-ZdDialog ("Clear standby memory?`n`nStandby memory is Windows' cache of files you used recently, and it already counts as free. Clearing it means your game and apps read those files from the disk again, which may cause stutter for a while.`n`nOnly use this if you have the rare problem where a full standby list itself causes stutter. On most PCs it does nothing useful.") 'Clear standby memory' 'YesNo' 'Warning'
+    if ($ok -ne 'Yes') { return }
     $before = Get-MemInfo
     $rc = [MemTools]::PurgeStandby()
     if ($rc -eq -1) { Show-Toast 'Windows did not give ZeroDelay permission to clear standby memory.' '#FF9F0A'; return }
@@ -24154,6 +24729,7 @@ function Update-RecentChanges {
 # filter chip on the Tweaks page, so nothing is lost: Select-NavPage still takes any page or area name.
 $MainNav = @('Home', 'Games', 'Events', 'Tweaks', 'Checks', 'Tools', 'Settings')
 $CheckActions = @('Check', 'Test', 'Run test', 'Test ping')
+$CheckActions += @('Repair Windows', 'Fix updates', 'Test RAM')   # 2.1 tools: on the Checks page (Repairs, PC and Windows)
 # a card that only looks and reports (it changes nothing): these live on the Checks page
 function Test-CheckCard($t) { [bool]($t.Action -and $CheckActions -contains $t.Action) }
 # which menu item a page or area belongs to
@@ -27444,7 +28020,7 @@ $ui.RestoreAll.Add_Click({
 # ===================================================== 2.1 Ctrl+K: search everything (Linear / Raycast / Winhance)
 # One box for tweaks, checks, tools and pages, games and settings. The index is built once, on first open; each
 # keystroke filters it in memory. Words match in any order (title, description, area); title-prefix matches rank first.
-$PalGroups = [ordered]@{ Tweak = 'Tweaks'; Check = 'Checks'; Tool = 'Tools'; Game = 'Games'; Setting = 'Settings' }
+$PalGroups = [ordered]@{ Tweak = 'Tweaks'; Check = 'Checks'; Tool = 'Tools'; Game = 'Games'; Setting = 'Settings'; WinSetting = 'Windows settings' }
 $PalPageInfo = [ordered]@{
     Home     = 'Your PC at a glance, Boost now, your last match and recent changes.'
     Games    = 'Your games: settings, Game Mode and match stats for each one.'
@@ -27495,6 +28071,8 @@ function Get-PaletteIndex {
     }
     foreach ($g in $GameDefs) { $l.Add((New-PalEntry 'Game' "$($g.Title)" "$($g.Sub)" $g.Glyph $g "$($g.Proc) game" ($i++))) }
     $l.Add((New-PalEntry 'Setting' 'Settings' 'Tray, start with Windows, re-apply changed settings, match reports, updates, Game Mode with any game, pause all tweaks' ([char]0xE713) 'Settings' 'options preferences' ($i++)))
+    # 2.1: Windows' own Settings pages and tools (ranked after ZeroDelay's results, see Find-PaletteResults)
+    foreach ($w in $ZdWinSettings) { $l.Add((New-PalEntry 'WinSetting' "$($w.T)" "$($w.P)" ([char]0xE8A7) $w "$($w.K) windows settings" ($i++) "Opens Windows: $($w.P)")) }
     $script:PalIndex = $l
     , $l
 }
@@ -27527,6 +28105,7 @@ function Find-PaletteResults([string]$Query, $Index, [int]$Max = 12) {
             $s = if ($inT -eq $toks.Count) { 20 + [Math]::Min(9, $toks.Count - $wp) } else { 30 + 3 * ($toks.Count - $inT) }
         }
         if ($mid) { $s += 50 }
+        if ($e.Kind -eq 'WinSetting') { $s += 100 }   # Windows' own pages come after every ZeroDelay result
         $hits.Add([pscustomobject]@{ E = $e; S = $s; G = $gi[$e.Kind]; O = $e.Order })
     }
     $sorted = @($hits | Sort-Object S, G, O)
@@ -27684,6 +28263,7 @@ function Invoke-PaletteItem($e) {
             Select-NavPage 'Checks'; Update-Filter; Show-TweakDetail $t
         }
         'Game' { Select-NavPage 'Games'; Show-GameDetail $e.Ref }
+        'WinSetting' { Open-ZdWinSetting $e.Ref }
         default { Select-NavPage "$($e.Ref)" }
     }
     if (($e.Kind -eq 'Tweak' -or $e.Kind -eq 'Check') -and $e.Ref.Card) {
