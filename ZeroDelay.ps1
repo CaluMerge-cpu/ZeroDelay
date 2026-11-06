@@ -7292,6 +7292,604 @@ function Get-R6DataCenterReport {
     $l += 'Ubisoft staff describe this setting for PC. It has not been confirmed for Siege X; if the game ignores it, it does no harm.'
     $l -join "`n"
 }
+# ======================================================= 2.1 health checks: helpers
+# These read event logs, CIM classes and registry values only. Events are read by provider and id, and only their
+# numeric or invariant data fields are used, never the translated message text, so they work in every Windows language.
+
+# runs a report function in the background worker and shows its text; the window never waits for the event log
+$script:HealthBusy = @{}
+function Start-HealthReport([string]$Fn, [string]$Title) {
+    if ($script:HealthBusy[$Fn]) { throw 'This check is already running.' }
+    $script:HealthBusy[$Fn] = $true
+    Invoke-Worker 'param($fn, $title) @{ Fn = $fn; Title = $title; Text = $(try { "$(& $fn)" } catch { "This check could not finish: $($_.Exception.Message)" }) }' @($Fn, $Title) {
+        param($out, $errs)
+        $r = Get-WorkerResult $out
+        if ($r -is [hashtable] -and $r.ContainsKey('Text')) { $script:HealthBusy[$r.Fn] = $false; [void](Show-ZdDialog $r.Text $r.Title 'OK' 'Information') }
+        else { $script:HealthBusy.Clear(); Show-Toast 'The check could not run.' '#FF9F0A' }
+    }
+}
+# Get-WinEvent with a filter: Ok is false only when the log could not be read ("no events" is a normal, empty result)
+function Get-HcEvents([hashtable]$Filter, [int]$Max = 1000) {
+    $r = [pscustomobject]@{ Ok = $true; Events = @() }
+    try { $r.Events = @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction Stop) }
+    catch { if ("$($_.FullyQualifiedErrorId)" -notmatch 'NoMatchingEventsFound|NoMatchingProvidersFound|NoMatchingLogsFound') { $r.Ok = $false } }
+    $r
+}
+function Get-HcProp($Event, [int]$Index) {
+    try { if ($Event.Properties -and $Event.Properties.Count -gt $Index) { return $Event.Properties[$Index].Value } } catch {}
+    $null
+}
+function Get-HcPlural([int]$n, [string]$Word, [string]$Plural = '') { if ($n -eq 1) { "1 $Word" } else { "$n $(if ($Plural) { $Plural } else { $Word + 's' })" } }
+function Get-HcDate($d) { try { ([datetime]$d).ToString('d MMM yyyy HH:mm') } catch { '?' } }
+function Get-HcSystemDriveLetter { $d = "$env:SystemDrive".TrimEnd(':'); if ($d -match '^[A-Za-z]$') { $d.ToUpper() } else { 'C' } }
+
+# --- 1. crash timeline: Kernel-Power 41, EventLog 6008 and WER bug checks (1001) of the last 30 days
+# stop code (hex, no 0x) -> name, plain meaning, kind of advice
+function Get-StopCodeInfo([uint32]$Code) {
+    # 0x1000007E-style codes are the same bug check with a flag bit set
+    if ($Code -ge 268435456 -and $Code -lt 536870912) { $Code = $Code - 268435456 }
+    $k = '{0:X}' -f $Code
+    $t = @{
+        '0'   = @('no blue screen', 'the PC lost power or was switched off hard: power cut, power supply (PSU) problem, an unstable overclock / EXPO / XMP / undervolt, overheating, or the power button held down', 'power')
+        'A'   = @('IRQL_NOT_LESS_OR_EQUAL', 'a driver touched memory it should not (driver bug, sometimes unstable RAM)', 'driver')
+        'D1'  = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', 'a driver crashed (network, audio, RGB/fan and anti-cheat drivers are common causes)', 'driver')
+        '1E'  = @('KMODE_EXCEPTION_NOT_HANDLED', 'a driver or memory error', 'memory')
+        '7E'  = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'a driver or memory error', 'memory')
+        '3B'  = @('SYSTEM_SERVICE_EXCEPTION', 'a driver or memory error', 'memory')
+        '50'  = @('PAGE_FAULT_IN_NONPAGED_AREA', 'bad memory data: unstable RAM / EXPO / XMP, or a driver bug', 'memory')
+        '1A'  = @('MEMORY_MANAGEMENT', 'memory corruption: unstable RAM / EXPO / XMP, or a driver bug', 'memory')
+        '19'  = @('BAD_POOL_HEADER', 'memory corruption by a driver or unstable RAM', 'memory')
+        'C2'  = @('BAD_POOL_CALLER', 'a driver misused memory', 'driver')
+        '139' = @('KERNEL_SECURITY_CHECK_FAILURE', 'Windows caught corrupted data: driver bug or unstable RAM', 'memory')
+        '124' = @('WHEA_UNCORRECTABLE_ERROR', 'a hardware error reported by the CPU: unstable overclock, undervolt or EXPO/XMP, too little voltage, or a failing CPU (Intel 13th/14th gen!)', 'hardware')
+        '101' = @('CLOCK_WATCHDOG_TIMEOUT', 'a CPU core stopped answering: unstable CPU overclock or undervolt', 'hardware')
+        '116' = @('VIDEO_TDR_FAILURE', 'the graphics driver hung and could not recover', 'gpu')
+        '117' = @('VIDEO_TDR_TIMEOUT_DETECTED', 'the graphics driver stopped responding', 'gpu')
+        '113' = @('VIDEO_DXGKRNL_FATAL_ERROR', 'a graphics driver error', 'gpu')
+        '119' = @('VIDEO_SCHEDULER_INTERNAL_ERROR', 'a graphics driver error', 'gpu')
+        '10E' = @('VIDEO_MEMORY_MANAGEMENT_INTERNAL', 'a graphics driver error', 'gpu')
+        '141' = @('VIDEO_ENGINE_TIMEOUT_DETECTED', 'the graphics card stopped responding', 'gpu')
+        '9F'  = @('DRIVER_POWER_STATE_FAILURE', 'a driver failed while going to sleep or waking up', 'driver')
+        '133' = @('DPC_WATCHDOG_VIOLATION', 'a driver (often storage or network) took far too long', 'driver')
+        'EF'  = @('CRITICAL_PROCESS_DIED', 'a core Windows process died: damaged system files or a failing drive', 'disk')
+        '7A'  = @('KERNEL_DATA_INPAGE_ERROR', 'Windows could not read data back from the drive', 'disk')
+        '154' = @('UNEXPECTED_STORE_EXCEPTION', 'a storage error (drive or its driver)', 'disk')
+        'F4'  = @('CRITICAL_OBJECT_TERMINATION', 'a core process ended: often a drive that stopped responding', 'disk')
+    }
+    if ($t.ContainsKey($k)) { return [pscustomobject]@{ Hex = "0x$k"; Name = $t[$k][0]; Text = $t[$k][1]; Kind = $t[$k][2] } }
+    [pscustomobject]@{ Hex = "0x$k"; Name = 'blue screen'; Text = 'look the code up in Microsoft''s bug check list'; Kind = 'other' }
+}
+function Get-CrashTimelineReport([int]$Days = 30) {
+    $since = (Get-Date).AddDays(-$Days)
+    $kp = Get-HcEvents @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $since } 500
+    $el = Get-HcEvents @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6008; StartTime = $since } 500
+    $we = Get-HcEvents @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since } 500
+    if (-not $kp.Ok -and -not $el.Ok -and -not $we.Ok) { return 'Could not read Windows'' System log. Run ZeroDelay as administrator and try again.' }
+    $items = New-Object Collections.Generic.List[object]
+    foreach ($e in $kp.Events) {
+        # Kernel-Power 41 data: 0 BugcheckCode, 1-4 parameters, 5 SleepInProgress, 6 PowerButtonTimestamp
+        $code = [uint32]0; try { $code = [uint32](Get-HcProp $e 0) } catch {}
+        $btn = $false; try { $pb = Get-HcProp $e 6; if ($null -ne $pb -and [uint64]$pb -ne 0) { $btn = $true } } catch {}
+        $items.Add([pscustomobject]@{ When = $e.TimeCreated; Code = $code; Button = $btn })
+    }
+    foreach ($e in $el.Events) { $items.Add([pscustomobject]@{ When = $e.TimeCreated; Code = [uint32]0; Button = $false }) }
+    foreach ($e in $we.Events) {
+        # WER 1001 (BugCheck): data 0 is the code and parameters, written as "0x00000124 (0x..., 0x..., ...)" in every language
+        $code = [uint32]0; $s = "$(Get-HcProp $e 0)"
+        if ($s -match '^\s*(0x)?([0-9A-Fa-f]{1,8})\b') { try { $code = [Convert]::ToUInt32($Matches[2], 16) } catch {} }
+        $items.Add([pscustomobject]@{ When = $e.TimeCreated; Code = $code; Button = $false })
+    }
+    # the three events of one crash are written within minutes of each other: one incident each
+    $inc = New-Object Collections.Generic.List[object]; $cur = $null
+    foreach ($i in ($items | Where-Object { $_.When } | Sort-Object When)) {
+        if ($cur -and ($i.When - $cur.Last).TotalMinutes -le 15) {
+            $cur.Last = $i.When; if (-not $cur.Code -and $i.Code) { $cur.Code = $i.Code }; if ($i.Button) { $cur.Button = $true }
+        } else { $cur = [pscustomobject]@{ When = $i.When; Last = $i.When; Code = $i.Code; Button = $i.Button }; $inc.Add($cur) }
+    }
+    $l = @()
+    if (-not $kp.Ok -or -not $we.Ok) { $l += 'Part of the System log could not be read, so this list may be incomplete.'; $l += '' }
+    if (-not $inc.Count) { $l += "No crashes, blue screens or sudden restarts in the last $Days days. Good."; return ($l -join "`n") }
+    $bsod = @($inc | Where-Object { $_.Code }).Count
+    $l += "$(Get-HcPlural $inc.Count 'crash or sudden restart' 'crashes or sudden restarts') in the last $Days days ($(Get-HcPlural $bsod 'blue screen')):"
+    $l += ''
+    $kinds = @{}
+    $show = @($inc | Sort-Object When -Descending)
+    foreach ($c in ($show | Select-Object -First 15)) {
+        $info = Get-StopCodeInfo $c.Code; $kinds[$info.Kind] = $true
+        if ($c.Code) { $l += "$(Get-HcDate $c.When)  blue screen $($info.Hex) $($info.Name): $($info.Text)." }
+        elseif ($c.Button) { $l += "$(Get-HcDate $c.When)  no blue screen, the power button was held down." }
+        else { $l += "$(Get-HcDate $c.When)  no blue screen: $($info.Text)." }
+    }
+    if ($show.Count -gt 15) { $l += "... and $($show.Count - 15) older ones." }
+    foreach ($c in ($show | Select-Object -Skip 15)) { $kinds[(Get-StopCodeInfo $c.Code).Kind] = $true }
+    $l += ''; $l += 'What to do:'
+    if ($kinds['hardware']) { $l += '- Hardware errors: run "Scan for hardware errors (WHEA)" in Repair. Undo CPU/GPU overclocks and undervolts and test without EXPO/XMP for a few days. On Intel 13th/14th gen also run the microcode check.' }
+    if ($kinds['memory']) { $l += '- Memory errors: test the RAM (Windows Memory Diagnostic: Win+R, mdsched; or MemTest86) and try without EXPO/XMP. If the RAM passes, update chipset, graphics and network drivers.' }
+    if ($kinds['gpu']) { $l += '- Graphics driver: do a clean reinstall of the graphics driver and remove any GPU overclock. The "Graphics driver hang history" check shows more.' }
+    if ($kinds['driver']) { $l += '- Driver crash: update chipset, network, audio and graphics drivers, remove RGB/fan tools you do not need, and run "Devices with problems".' }
+    if ($kinds['disk']) { $l += '- Storage: run "Disk error history" and "Check drive health"; check the drive''s cable or slot.' }
+    if ($kinds['power']) { $l += '- Restarts without a blue screen: check the power supply and its cables, temperatures, and any overclock / EXPO / XMP / undervolt. A power cut or holding the power button also shows up here, so one alone means little.' }
+    if ($kinds['other']) { $l += '- Other codes: search Microsoft''s bug check reference for the code shown.' }
+    $l -join "`n"
+}
+
+# --- 2. game and app crash culprit: Application Error 1000 and Application Hang 1002
+function Get-HcModuleHint([string]$Module, [string]$App) {
+    $m = $Module.ToLowerInvariant()
+    if (-not $m -or $m -eq 'unknown') { return 'unknown module' }
+    if ($App -and $m -eq $App.ToLowerInvariant()) { return 'the program''s own code' }
+    switch -Regex ($m) {
+        '^(nvwgf2um|nvd3dum|nvoglv|nvlddmkm|nvcuda|nvapi|nvgpucomp|nvrtum)' { return 'NVIDIA graphics driver' }
+        '^(atiumd|atidxx|amdxx|amdxc|atio6axx|amdvlk|aticfx|amdihk)' { return 'AMD graphics driver' }
+        '^(igd|igxe|igc64|igvk|igdusc|igdgmm)' { return 'Intel graphics driver' }
+        '^(d3d11|d3d12|d3d12core|dxgi|d3d9|dxcore)\.dll' { return 'DirectX: usually the graphics driver underneath' }
+        '^discordhook' { return 'Discord overlay' }
+        '^gameoverlayrenderer' { return 'Steam overlay' }
+        '^(rtsshooks|rtss)' { return 'RivaTuner / MSI Afterburner overlay' }
+        '^(nvspcap|nvcamera|nvshare|nvoverlay)' { return 'NVIDIA overlay / recording' }
+        '^(owclient|overwolf|overlay)' { return 'an overlay (Overwolf or similar)' }
+        '^(easyanticheat|eac|beclient|vgk|vgc)' { return 'anti-cheat' }
+        '^(ntdll|kernelbase|ucrtbase|msvcp|vcruntime|kernel32|combase)' { return 'a Windows runtime file: the fault is in the program itself (or a mod/overlay it loaded)' }
+        '^(clr|coreclr|clrjit)\.dll' { return '.NET runtime: the program''s own error' }
+        '^(xinput|dinput|gameinput)' { return 'controller input' }
+    }
+    ''
+}
+function Get-HcExceptionText([string]$Code) {
+    switch ($Code) {
+        'c0000005' { 'access violation' }
+        'c0000409' { 'the program stopped itself on purpose (fail-fast)' }
+        'c0000374' { 'memory (heap) corruption' }
+        'c000001d' { 'illegal CPU instruction: often an unstable CPU overclock or undervolt' }
+        'c00000fd' { 'stack overflow' }
+        'c0000006' { 'could not read the file from disk' }
+        'c0000142' { 'a DLL failed to start' }
+        'e0434352' { '.NET error' }
+        '80000003' { 'debug breakpoint' }
+        default { '' }
+    }
+}
+function ConvertTo-HcExceptionCode($v) {
+    if ($null -eq $v) { return '' }
+    if ($v -is [int] -or $v -is [uint32] -or $v -is [long]) { return ('{0:x8}' -f [uint32]([int64]$v -band 4294967295)) }
+    ("$v".Trim().ToLowerInvariant() -replace '^0x', '')
+}
+function Get-AppCrashReport([int]$Days = 30) {
+    $since = (Get-Date).AddDays(-$Days)
+    $cr = Get-HcEvents @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $since } 2000
+    $hg = Get-HcEvents @{ LogName = 'Application'; ProviderName = 'Application Hang'; Id = 1002; StartTime = $since } 1000
+    if (-not $cr.Ok -and -not $hg.Ok) { return 'Could not read Windows'' Application log. Run ZeroDelay as administrator and try again.' }
+    # Application Error 1000 data: 0 app, 1 app version, 3 faulting module, 4 module version, 6 exception code
+    $rows = @(foreach ($e in $cr.Events) {
+        [pscustomobject]@{ App = "$(Get-HcProp $e 0)"; Module = "$(Get-HcProp $e 3)"; Code = (ConvertTo-HcExceptionCode (Get-HcProp $e 6)); When = $e.TimeCreated }
+    })
+    $hangs = @(foreach ($e in $hg.Events) { [pscustomobject]@{ App = "$(Get-HcProp $e 0)"; When = $e.TimeCreated } })
+    $l = @()
+    if (-not $cr.Ok -or -not $hg.Ok) { $l += 'Part of the Application log could not be read, so this may be incomplete.'; $l += '' }
+    if (-not $rows.Count -and -not $hangs.Count) { $l += "No program crashed or froze in the last $Days days. Good."; return ($l -join "`n") }
+    $apps = @($rows | Group-Object App).Count
+    $l += "Last $Days days: $(Get-HcPlural $rows.Count 'crash' 'crashes') in $(Get-HcPlural $apps 'program'), $(Get-HcPlural $hangs.Count 'freeze')."
+    $hints = @{}
+    if ($rows.Count) {
+        $l += ''; $l += 'Most frequent crashes (program / file it crashed in):'
+        $groups = @($rows | Group-Object { "$($_.App)|$($_.Module)" } | Sort-Object Count -Descending)
+        foreach ($g in ($groups | Select-Object -First 8)) {
+            $f = $g.Group[0]; $h = Get-HcModuleHint $f.Module $f.App; if ($h) { $hints[$h] = $true }
+            $codes = @($g.Group | ForEach-Object { $_.Code } | Where-Object { $_ } | Select-Object -Unique)
+            $ct = ''; if ($codes.Count) { $x = Get-HcExceptionText $codes[0]; $ct = ", code $($codes[0])$(if ($x) { " ($x)" })"; if ($codes[0] -eq 'c000001d') { $hints['cpu'] = $true } }
+            $last = ($g.Group | Sort-Object When -Descending | Select-Object -First 1).When
+            $l += "- $($f.App) in $(if ($f.Module) { $f.Module } else { 'unknown module' })$(if ($h) { " = $h" }): $($g.Count)x, last $(Get-HcDate $last)$ct"
+        }
+        if ($groups.Count -gt 8) { $l += "... and $($groups.Count - 8) more." }
+    }
+    if ($hangs.Count) {
+        $l += ''; $l += 'Programs that froze ("not responding" and closed):'
+        foreach ($g in (@($hangs | Group-Object App | Sort-Object Count -Descending) | Select-Object -First 5)) { $l += "- $($g.Name): $($g.Count)x" }
+    }
+    $l += ''; $l += 'What it means:'
+    $gpu = @($hints.Keys | Where-Object { $_ -match 'graphics driver|DirectX' })
+    if ($gpu.Count) { $l += '- Crashes in the graphics driver: do a clean reinstall of the driver (or try the previous version) and remove any GPU overclock or undervolt.' }
+    if (@($hints.Keys | Where-Object { $_ -match 'overlay' }).Count) { $l += '- An overlay is involved: turn that overlay off for the game (Discord, Steam, RivaTuner/Afterburner, NVIDIA or Overwolf) and see if the crashes stop.' }
+    if ($hints['anti-cheat']) { $l += '- Anti-cheat crashed: repair the game in its launcher; that reinstalls the anti-cheat.' }
+    if ($hints['cpu']) { $l += '- "Illegal instruction" crashes point at an unstable CPU: undo overclocks/undervolts, and on Intel 13th/14th gen run the microcode check.' }
+    if (@($hints.Keys | Where-Object { $_ -match 'Windows runtime|own code|\.NET' }).Count) { $l += '- Crashes in the program''s own code or a Windows runtime file: verify/repair the game files in the launcher and update the game. If many different programs crash like this, test RAM and remove overclocks.' }
+    if (-not $hints.Count) { $l += '- Repair the game files in its launcher and update the graphics driver.' }
+    $l -join "`n"
+}
+
+# --- 3. graphics driver hangs: Display 4101 ("stopped responding and recovered") and live kernel dumps
+function Get-GpuHangReport([int]$Days = 30, [string]$Root = '') {
+    if (-not $Root) { $Root = Join-Path $(if ($env:SystemRoot) { $env:SystemRoot } else { 'C:\Windows' }) 'LiveKernelReports' }
+    $since = (Get-Date).AddDays(-$Days)
+    $ev = Get-HcEvents @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101; StartTime = $since } 500
+    $l = @()
+    if (-not $ev.Ok) { $l += 'Could not read the System log for graphics driver resets.' }
+    elseif (-not $ev.Events.Count) { $l += "No graphics driver resets in the last $Days days." }
+    else {
+        $l += "The graphics driver stopped responding and was restarted $(Get-HcPlural $ev.Events.Count 'time') in the last $Days days (the screen goes black for a moment, or the game crashes):"
+        foreach ($e in ($ev.Events | Sort-Object TimeCreated -Descending | Select-Object -First 8)) {
+            $drv = "$(Get-HcProp $e 0)"; $l += "- $(Get-HcDate $e.TimeCreated)$(if ($drv -match '^[\w.\-]{2,40}$') { " ($drv)" })"
+        }
+        if ($ev.Events.Count -gt 8) { $l += "... and $($ev.Events.Count - 8) more." }
+    }
+    $l += ''
+    $dumps = $null
+    try { $dumps = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.dmp' -ErrorAction Stop) } catch {}
+    $wd = 0
+    if ($null -eq $dumps) { $l += 'Could not read the LiveKernelReports folder (needs administrator rights).' }
+    elseif (-not $dumps.Count) { $l += 'No hang reports in LiveKernelReports.' }
+    else {
+        $l += "Windows saved $(Get-HcPlural $dumps.Count 'hang report') in $Root :"
+        $names = @{ 'WATCHDOG' = 'graphics driver hang'; 'PoW32kWatchdog' = 'display froze on sleep/wake'; 'NDIS' = 'network driver'; 'USBHUB3' = 'USB device'; 'USBXHCI' = 'USB controller' }
+        foreach ($g in (@($dumps | Group-Object { if ($_.Directory.Name -ne (Split-Path $Root -Leaf)) { $_.Directory.Name } else { ($_.BaseName -split '-')[0] } }) | Sort-Object Count -Descending | Select-Object -First 6)) {
+            $new = ($g.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+            $what = $names[$g.Name]; if ($g.Name -match 'WATCHDOG') { $wd += $g.Count }
+            $l += "- $($g.Name)$(if ($what) { " ($what)" }): $($g.Count), newest $(Get-HcDate $new)"
+        }
+    }
+    $l += ''
+    if (($ev.Ok -and $ev.Events.Count) -or $wd) {
+        $l += 'What to do:'
+        $l += '- Do a clean reinstall of the graphics driver ("Perform a clean installation" / factory reset in the NVIDIA app or AMD Software, or DDU in Safe Mode), or go back one driver version.'
+        $l += '- Remove GPU overclocks and undervolts (MSI Afterburner, Adrenalin tuning). Factory-overclocked cards sometimes need -50 to -100 MHz.'
+        $l += '- Check the graphics card''s power cables and run "Check the graphics card''s slot speed".'
+        $l += '- If another tool changed Windows'' hang recovery (TDR), the Repair card "Turn GPU hang recovery back on" puts it back.'
+    } else { $l += 'Nothing points at the graphics driver. Good.' }
+    $l -join "`n"
+}
+
+# --- 4. disk error history, plus an optional read-only file-system scan (Repair-Volume -Scan)
+function Get-DiskErrorReport([int]$Days = 30) {
+    $since = (Get-Date).AddDays(-$Days)
+    $specs = @(
+        @{ P = 'disk'; Id = 7; T = 'bad block: part of the drive could not be read'; S = 3 }
+        @{ P = 'disk'; Id = 51; T = 'error while Windows moved memory to or from the drive (cable, USB or failing drive)'; S = 2 }
+        @{ P = 'disk'; Id = 153; T = 'Windows had to retry a read or write'; S = 2 }
+        @{ P = 'disk'; Id = 157; T = 'the drive disappeared (fine for a USB drive you unplugged; for an internal drive: cable, power or slot)'; S = 1 }
+        @{ P = 'stornvme'; Id = 129; T = 'the NVMe drive stopped responding and Windows reset it (freezes of several seconds)'; S = 2 }
+        @{ P = 'storahci'; Id = 129; T = 'the SATA drive stopped responding and Windows reset it (freezes of several seconds)'; S = 2 }
+        @{ P = 'Ntfs'; Id = 55; T = 'the file system has damage'; S = 3 }
+        @{ P = 'Microsoft-Windows-Ntfs'; Id = 55; T = 'the file system has damage'; S = 3 }
+        @{ P = 'Ntfs'; Id = 98; T = 'a drive needs a file-system check'; S = 3 }
+        @{ P = 'Microsoft-Windows-Ntfs'; Id = 98; T = 'a drive needs a file-system check'; S = 3 }
+    )
+    $l = @(); $bad = 0; $sev = 0; $fails = 0; $rows = @()
+    foreach ($s in $specs) {
+        $r = Get-HcEvents @{ LogName = 'System'; ProviderName = $s.P; Id = $s.Id; StartTime = $since } 500
+        if (-not $r.Ok) { $fails++; continue }
+        # Ntfs 98 is also written at every start as "volume is healthy" (information level): count only warnings and errors
+        $ev = @($r.Events | Where-Object { $s.Id -ne 98 -or ($_.Level -ge 1 -and $_.Level -le 3) })
+        if (-not $ev.Count) { continue }
+        $disks = @($ev | ForEach-Object { "$(Get-HcProp $_ 0)" } | Where-Object { $_ -match 'Harddisk(\d+)' } | ForEach-Object { [void]($_ -match 'Harddisk(\d+)'); "disk $($Matches[1])" } | Select-Object -Unique)
+        $last = ($ev | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+        $rows += "- $(Get-HcPlural $ev.Count 'time') ($($s.P) $($s.Id)$(if ($disks.Count) { ', ' + ($disks -join ', ') })): $($s.T). Last $(Get-HcDate $last)."
+        $bad += $ev.Count; if ($s.S -gt $sev) { $sev = $s.S }
+    }
+    if ($fails -eq $specs.Count) { return 'Could not read Windows'' System log for disk errors. Run ZeroDelay as administrator and try again.' }
+    if (-not $rows.Count) { $l += "No disk or file-system errors in the last $Days days. Good." }
+    else {
+        $l += "Disk and file-system errors in the last $Days days:"; $l += $rows; $l += ''
+        if ($sev -ge 3) { $l += 'Bad blocks or file-system damage: back up important files now. Then run "Check drive health" to see the drive''s wear and error counters, and the file-system check below.' }
+        elseif ($sev -ge 2) { $l += 'Resets and retries cause freezes of a few seconds. Update the drive''s firmware (Samsung Magician, WD Dashboard, Crucial Storage Executive...), check its cable or M.2 slot, and run "Check drive health".' }
+        else { $l += 'Only drives that disappeared. If that was a USB drive you unplugged, it is fine.' }
+    }
+    if ($fails) { $l += ''; $l += 'Some event sources could not be read, so this list may be incomplete.' }
+    $l -join "`n"
+}
+function Format-RepairScanResult([string]$Result, [string]$Drive) {
+    switch -Regex ($Result) {
+        '^NoErrorsFound$' { return "Drive $Drive`: no file-system errors found. Good." }
+        '^ErrorsFixed$' { return "Drive $Drive`: errors were found and fixed." }
+        '^ScanNeeded$' { return "Drive $Drive`: Windows wants a full scan. Run this check again; if it keeps saying so, restart the PC and try once more." }
+        '^SpotFixNeeded$' { return "Drive $Drive`: Windows found a few file-system errors it can fix quickly (a spot fix). For the Windows drive this happens during the next restart and takes seconds to about a minute." }
+        '^FullRepairNeeded$' { return "Drive $Drive`: the file system needs a full offline repair. Back up important files first. Then, in an administrator PowerShell, run: Repair-Volume -DriveLetter $Drive -OfflineScanAndFix  and restart; it can take a long time. ZeroDelay does not start this for you." }
+        '^TIMEOUT$' { return "Drive $Drive`: the scan took longer than 5 minutes and was stopped. Nothing was changed. Try again when the PC is idle." }
+        '^\s*$' { return "Drive $Drive`: Windows gave no answer. Try again after a restart." }
+        '^ERR:(.*)$' { return "Drive $Drive`: the scan could not run ($($Matches[1].Trim())). It needs administrator rights and an NTFS or ReFS drive." }
+        default { return "Drive $Drive`: Windows answered: $Result" }
+    }
+}
+# runs Repair-Volume in a separate job inside the worker, so a slow scan can be stopped after $Seconds
+$HcRepairVolumeCode = @'
+param($drive, $mode, $seconds)
+$j = Start-Job -ScriptBlock { param($d, $m) if ($m -eq 'SpotFix') { "$(Repair-Volume -DriveLetter $d -SpotFix -ErrorAction Stop)" } else { "$(Repair-Volume -DriveLetter $d -Scan -ErrorAction Stop)" } } -ArgumentList $drive, $mode
+$r = ''
+if (Wait-Job $j -Timeout $seconds) { $r = try { "$(Receive-Job $j -ErrorAction Stop)".Trim() } catch { 'ERR:' + $_.Exception.Message } }
+else { Stop-Job $j; $r = 'TIMEOUT' }
+Remove-Job $j -Force -ErrorAction SilentlyContinue
+@{ Result = $r; Drive = $drive; Mode = $mode }
+'@
+function Start-HcRepairVolume([string]$Drive, [string]$Mode) {
+    if ($script:HealthBusy['repair-volume']) { throw 'A file-system check is already running.' }
+    $script:HealthBusy['repair-volume'] = $true
+    Show-Toast "Checking drive $Drive`: in the background..."
+    Invoke-Worker $HcRepairVolumeCode @($Drive, $Mode, 300) {
+        param($out, $errs)
+        $script:HealthBusy['repair-volume'] = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'The file-system check could not run.' '#FF9F0A'; return }
+        if ($r.Mode -eq 'SpotFix') {
+            $msg = if ($r.Result -match '^(TIMEOUT|ERR:)') { Format-RepairScanResult $r.Result $r.Drive } else { "Drive $($r.Drive): the spot fix is set up (Windows answered: $(if ($r.Result) { $r.Result } else { 'OK' })). For the Windows drive it runs during the next restart. Run this check again afterwards." }
+            [void](Show-ZdDialog $msg 'File-system check' 'OK' 'Information'); return
+        }
+        $msg = Format-RepairScanResult $r.Result $r.Drive
+        if ($r.Result -eq 'SpotFixNeeded') {
+            if ((Show-ZdDialog "$msg`n`nSet up the spot fix now? Windows fixes only the logged errors; your files stay where they are." 'File-system check' 'YesNo' 'Question') -eq 'Yes') { Start-HcRepairVolume $r.Drive 'SpotFix' }
+        } else { [void](Show-ZdDialog $msg 'File-system check' 'OK' $(if ($r.Result -eq 'NoErrorsFound') { 'Information' } else { 'Warning' })) }
+    }
+}
+function Start-DiskErrorCheck {
+    if ($script:HealthBusy['Get-DiskErrorReport']) { throw 'The disk check is already running.' }
+    $script:HealthBusy['Get-DiskErrorReport'] = $true
+    Invoke-Worker 'param($x) @{ Text = $(try { "$(Get-DiskErrorReport)" } catch { "Could not read the disk error history: $($_.Exception.Message)" }) }' @(0) {
+        param($out, $errs)
+        $script:HealthBusy['Get-DiskErrorReport'] = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'The disk check could not run.' '#FF9F0A'; return }
+        $d = Get-HcSystemDriveLetter
+        $q = "$($r.Text)`n`nCheck the file system on drive $d`: now? Windows reads the drive while you keep using the PC (usually 1 to 5 minutes) and changes nothing. ZeroDelay never runs chkdsk /r."
+        if ((Show-ZdDialog $q 'Disk error history' 'YesNo' 'Question') -eq 'Yes') { Start-HcRepairVolume $d 'Scan' }
+    }
+}
+
+# --- 5. devices with problems (Device Manager's yellow triangles), by ConfigManagerErrorCode
+function Get-HcDeviceCodeText([int]$Code) {
+    switch ($Code) {
+        1  { 'not set up correctly: its driver is missing' }
+        3  { 'its driver is damaged, or Windows ran low on memory' }
+        10 { 'cannot start: usually a wrong or outdated driver' }
+        12 { 'not enough free resources: another device conflicts with it' }
+        14 { 'needs a restart to work' }
+        18 { 'its drivers need to be reinstalled' }
+        19 { 'its settings in the registry are damaged: uninstall the device and scan for hardware changes' }
+        21 { 'Windows is removing it: restart' }
+        22 { 'disabled in Device Manager (fine if you turned it off yourself)' }
+        24 { 'not present or not working, or its drivers are not all installed' }
+        28 { 'no driver installed' }
+        29 { 'turned off in the BIOS' }
+        31 { 'not working: Windows cannot load its driver' }
+        32 { 'its driver''s service is disabled' }
+        39 { 'its driver is damaged or missing' }
+        43 { 'Windows stopped it because it reported problems (often a failing device, cable or driver)' }
+        45 { 'not connected right now' }
+        52 { 'its driver''s signature cannot be checked (unsigned driver or Secure Boot problem)' }
+        default { "problem code $Code" }
+    }
+}
+function Get-DeviceProblemReport {
+    $dev = $null
+    try { $dev = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop) } catch { return 'Could not read the device list from Windows.' }
+    $dev = @($dev | Where-Object { $_ })
+    $bad = @($dev | Where-Object { [int]$_.ConfigManagerErrorCode -ne 45 }); $gone = @($dev | Where-Object { [int]$_.ConfigManagerErrorCode -eq 45 })
+    $l = @()
+    if (-not $bad.Count) { $l += 'No device has a problem. Good.' }
+    else {
+        $l += "$(Get-HcPlural $bad.Count 'device') with a problem:"
+        foreach ($d in ($bad | Sort-Object { [int]$_.ConfigManagerErrorCode } | Select-Object -First 15)) {
+            $n = "$($d.Name)"; if (-not $n) { $n = "$($d.DeviceID)" }
+            $l += "- $n$(if ($d.PNPClass) { " ($($d.PNPClass))" }): code $([int]$d.ConfigManagerErrorCode), $(Get-HcDeviceCodeText ([int]$d.ConfigManagerErrorCode))."
+        }
+        if ($bad.Count -gt 15) { $l += "... and $($bad.Count - 15) more." }
+        $l += ''
+        $l += 'What to do: install the driver from the device or board maker''s site (for chipset, network and audio: your motherboard or laptop support page), or in Device Manager right-click the device > Uninstall device, then Action > Scan for hardware changes. A code 43 on a USB device: try another port or cable.'
+    }
+    if ($gone.Count) {
+        $l += ''
+        $l += "Also $(Get-HcPlural $gone.Count 'device') Windows remembers but that is not connected now (code 45). That is normal for things you unplugged$(if ($gone.Count -le 5) { ': ' + ((@($gone | ForEach-Object { "$($_.Name)" } | Where-Object { $_ })) -join ', ') })."
+    }
+    $l -join "`n"
+}
+
+# --- 6. Intel 13th/14th gen desktop CPUs and the Vmin-shift microcode
+function Test-IntelVminCpu([string]$Name) { [bool]($Name -match 'Intel' -and $Name -match '\bi[579]-1[34]\d{3}(K|KF|KS|F)?\b') }
+# 'Update Revision' (REG_BINARY): on Intel the revision is the upper 4 bytes of 8 (00 00 00 00 2B 01 00 00 = 0x12B);
+# some systems store it in the lower 4 bytes or as 4 bytes only. Rev is $null when the layout is unclear.
+function Get-MicrocodeRevision([byte[]]$Bytes) {
+    $raw = if ($Bytes) { ($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ' } else { '' }
+    $rev = $null
+    if ($Bytes -and $Bytes.Count -ge 8) {
+        $lo = [BitConverter]::ToUInt32($Bytes, 0); $hi = [BitConverter]::ToUInt32($Bytes, 4)
+        if ($lo -eq 0 -and $hi -ne 0) { $rev = $hi } elseif ($hi -eq 0 -and $lo -ne 0) { $rev = $lo }
+    } elseif ($Bytes -and $Bytes.Count -eq 4) { $rev = [BitConverter]::ToUInt32($Bytes, 0) }
+    [pscustomobject]@{ Rev = $rev; Raw = $raw }
+}
+function Get-IntelMicrocodeReport {
+    $cpu = ''
+    try { $cpu = "$((Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name)".Trim() } catch {}
+    if (-not $cpu) { return 'Could not read the processor name.' }
+    if (-not (Test-IntelVminCpu $cpu)) { return "$cpu is not one of the Intel 13th/14th gen desktop processors affected by the instability bug. Nothing to do." }
+    $b = $null
+    try { $b = [byte[]](Get-ItemProperty -LiteralPath 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction Stop).'Update Revision' } catch {}
+    $m = Get-MicrocodeRevision $b
+    $l = @("Processor: $cpu")
+    if ($null -eq $m.Rev) {
+        $l += "Could not read the microcode version$(if ($m.Raw) { " (raw value: $($m.Raw))" })."
+        $l += 'Check your BIOS version instead: it must be from August 2024 or newer and mention Intel microcode 0x12B or later.'
+        return ($l -join "`n")
+    }
+    $l += ('Microcode: 0x{0:X}' -f $m.Rev); $l += ''
+    if ($m.Rev -ge 0x12F) { $l += 'This has Intel''s latest recommended microcode (0x12F or newer). Good.' }
+    elseif ($m.Rev -ge 0x12B) { $l += 'This has Intel''s fix for the instability bug (0x12B). A newer BIOS with 0x12F (2025) is Intel''s latest recommendation; install it when your board maker offers it.' }
+    else {
+        $l += 'Update your BIOS: this is older than Intel''s fix for the instability bug (0x12B).'
+        $l += 'On 13th/14th gen desktop CPUs, too high voltage slowly damages the processor ("Vmin shift"); it shows as game crashes, "out of video memory" errors and blue screens that get worse over time. The fix only prevents further damage, so install it soon: download the newest BIOS for your exact motherboard from the board maker''s site.'
+    }
+    $l += ''; $l += 'If the CPU already crashes with the fix installed, Intel has extended the warranty of these processors by 2 years: contact Intel or the seller.'
+    $l -join "`n"
+}
+
+# --- 7. Secure Boot and the 2023 certificates that replace the 2011 ones
+function Get-SecureBoot2023Report {
+    $state = 'unknown'
+    try { $state = if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'on' } else { 'off' } }
+    catch { if ($_.Exception -is [PlatformNotSupportedException] -or "$($_.FullyQualifiedErrorId)" -match 'NotSupported') { $state = 'legacy' } }
+    $sv = $null
+    try { $sv = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing' -ErrorAction Stop } catch {}
+    $status = if ($sv) { "$($sv.UEFICA2023Status)" } else { '' }
+    $err = if ($sv -and $null -ne $sv.UEFICA2023Error) { [int64]$sv.UEFICA2023Error } else { 0 }
+    $inDb = $null
+    if ($state -eq 'on' -or $state -eq 'off') {
+        try { $db = Get-SecureBootUEFI -Name db -ErrorAction Stop; $inDb = [bool]([Text.Encoding]::ASCII.GetString($db.Bytes) -match 'Windows UEFI CA 2023') } catch {}
+    }
+    $l = @()
+    $l += switch ($state) {
+        'on' { 'Secure Boot: on.' }
+        'off' { 'Secure Boot: off. Games whose anti-cheat requires it (Call of Duty, Battlefield 6, VALORANT, Fortnite tournaments) will not start. Turn it on in the BIOS (the Call of Duty / Battlefield 6 Secure Boot cards show the steps).' }
+        'legacy' { 'Secure Boot: not available, because the PC starts in legacy (CSM/BIOS) mode. Games that require Secure Boot need UEFI mode; switching needs the drive converted to GPT (Microsoft''s mbr2gpt tool), so back up first.' }
+        default { 'Secure Boot: could not be read (run ZeroDelay as administrator).' }
+    }
+    $l += ''
+    $have = ($status -eq 'Updated') -or ($inDb -eq $true)
+    if ($have) { $l += 'The new 2023 Secure Boot certificates are installed. Nothing to do.' }
+    elseif ($status -eq 'InProgress') { $l += 'Windows is installing the new 2023 Secure Boot certificates. Restart the PC (sometimes twice) and check again.' }
+    else {
+        $l += "The new 2023 Secure Boot certificates are $(if ($status -eq 'NotStarted' -or $inDb -eq $false) { 'not installed yet' } else { 'not confirmed on this PC' })$(if ($status) { " (Windows reports: $status)" })."
+        $l += 'Microsoft''s 2011 Secure Boot certificates expire in 2026. A PC without the 2023 ones keeps starting, but stops getting Secure Boot security fixes, and games whose anti-cheat depends on Secure Boot depend on these too.'
+        $l += 'Fix: install all Windows updates and restart (Windows rolls the certificates out itself). If it stays like this, install the newest BIOS from your motherboard or PC maker; many include the 2023 certificates.'
+    }
+    if ($err) { $l += ''; $l += "Windows reported an error while updating the certificates (code $err). A BIOS update from your board maker usually fixes this." }
+    $l += ''; $l += 'ZeroDelay only reads these values; it never changes Secure Boot.'
+    $l -join "`n"
+}
+
+# --- 8. BitLocker / device encryption and the recovery key
+function Get-BitLockerKeyReport {
+    $sd = "$(Get-HcSystemDriveLetter):"
+    $v = $null; $readErr = $false
+    try { $v = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter = '$sd'" -ErrorAction Stop) | Select-Object -First 1 } catch { $readErr = $true }
+    $l = @()
+    if (-not $v) {
+        $prev = $null; try { $prev = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' -ErrorAction Stop).PreventDeviceEncryption } catch {}
+        $l += "Could not read the encryption status of drive $sd$(if ($readErr) { ' (it needs administrator rights, or this Windows edition has no BitLocker)' })."
+        if ($null -ne $prev -and [int]$prev -eq 1) { $l += 'Automatic device encryption is blocked on this PC, so Windows will not encrypt the drive by itself.' }
+        $l += 'Check it yourself: Settings > Privacy & security > Device encryption (Home) or Settings > System > Storage > Advanced > BitLocker (Pro).'
+        return ($l -join "`n")
+    }
+    $types = @(); $kpOk = $true
+    try {
+        $ids = @((Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectors -Arguments @{ KeyProtectorType = [uint32]0 } -ErrorAction Stop).VolumeKeyProtectorID)
+        foreach ($id in ($ids | Where-Object { $_ })) { $types += [int](Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectorType -Arguments @{ VolumeKeyProtectorID = $id } -ErrorAction Stop).KeyProtectorType }
+    } catch { $kpOk = $false }
+    $prot = [int]$v.ProtectionStatus; $conv = if ($null -ne $v.ConversionStatus) { [int]$v.ConversionStatus } else { -1 }
+    $hasKey = $types -contains 3
+    if ($prot -eq 1) { $l += "Drive $sd is encrypted with BitLocker / device encryption, and protection is on." }
+    elseif ($conv -eq 1 -or $conv -eq 2 -or $conv -eq 4) { $l += "Drive $sd is encrypted$(if ($conv -ne 1) { ' (encryption not finished yet)' }), but protection is suspended right now. Windows does this during BIOS and some updates; it turns back on by itself after a restart." }
+    else {
+        $l += "Drive $sd is not encrypted. Nothing can lock you out at start-up."
+        $l += 'Note: a fresh Windows 11 24H2 (or newer) install signed in with a Microsoft account turns on device encryption by itself on most PCs, so check again after a reinstall.'
+        return ($l -join "`n")
+    }
+    $l += ''
+    if (-not $kpOk) { $l += 'Could not read which keys protect it.' }
+    elseif ($hasKey) { $l += 'A 48-digit recovery key exists. Make sure you can find it BEFORE you update the BIOS, change BIOS settings (fTPM/PTT, Secure Boot, CSM), reset the BIOS or swap the motherboard or CPU: any of these can make Windows ask for the key at start-up, and without it the drive cannot be opened.' }
+    else { $l += 'No recovery key is set up for this drive. If the TPM or BIOS changes, there is no way back in. Add one in BitLocker settings ("Back up your recovery key"), or in an administrator terminal: manage-bde -protectors -add C: -RecoveryPassword, and write the 48-digit number down.' }
+    $l += ''
+    $l += 'Where to find the key:'
+    $l += '- Online: sign in at aka.ms/myrecoverykey with the Microsoft account used on this PC (work PCs: ask IT).'
+    $l += "- On this PC: open Terminal as administrator, run  manage-bde -protectors -get $sd  and write down the 48-digit number. Keep it on paper or your phone, not only on this PC."
+    $l -join "`n"
+}
+
+# --- 9. is this Windows version still getting security updates?
+# End of security updates per build: Home/Pro (Pro Education, Pro for Workstations) and Enterprise/Education.
+# From Microsoft's Windows 10 / 11 release-information and lifecycle pages, checked November 2026; dates are the
+# last Patch Tuesday. Esu = end of consumer Extended Security Updates for Windows 10 22H2. Update this table yearly.
+function Get-WinSupportDates {
+    @{
+        19044 = @{ Name = 'Windows 10 21H2'; Home = '2023-06-13'; Ent = '2024-06-11' }
+        19045 = @{ Name = 'Windows 10 22H2'; Home = '2025-10-14'; Ent = '2025-10-14'; Esu = '2026-10-13' }
+        22000 = @{ Name = 'Windows 11 21H2'; Home = '2023-10-10'; Ent = '2024-10-08' }
+        22621 = @{ Name = 'Windows 11 22H2'; Home = '2024-10-08'; Ent = '2025-10-14' }
+        22631 = @{ Name = 'Windows 11 23H2'; Home = '2025-11-11'; Ent = '2026-11-10' }
+        26100 = @{ Name = 'Windows 11 24H2'; Home = '2026-10-13'; Ent = '2027-10-12' }
+        26200 = @{ Name = 'Windows 11 25H2'; Home = '2027-10-12'; Ent = '2028-10-10' }
+    }
+}
+function Get-WinSupportReport([datetime]$Today = (Get-Date), [int]$Build = 0) {
+    if (-not $Build) { $Build = [Environment]::OSVersion.Version.Build }
+    $cv = $null; try { $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch {}
+    $ed = if ($cv) { "$($cv.EditionID)" } else { '' }
+    $ubr = if ($cv -and $null -ne $cv.UBR) { ".$($cv.UBR)" } else { '' }
+    $dv = if ($cv -and $cv.DisplayVersion) { " $($cv.DisplayVersion)" } else { '' }
+    $os = if ($Build -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+    $l = @("You run $os$dv, build $Build$ubr$(if ($ed) { ", edition $ed" }).", '')
+    $up = if ($os -eq 'Windows 11') { 'Install the newest version for free: Settings > Windows Update > turn on "Get the latest updates as soon as they are available" and install the feature update (Windows 11 25H2), or use Microsoft''s Installation Assistant.' } else { 'Upgrade to Windows 11 (free if the PC meets its requirements: Settings > Windows Update, or PC Health Check). If the PC cannot run Windows 11, check Microsoft''s Extended Security Updates offers.' }
+    if ($ed -match 'EnterpriseS|IoTEnterpriseS|ServerRdsh|^Server') { $l += 'This is a long-term (LTSC) or special edition with its own support dates. Check them with Microsoft (Windows lifecycle pages).'; return ($l -join "`n") }
+    $tab = Get-WinSupportDates
+    $ci = [Globalization.CultureInfo]::InvariantCulture
+    if (-not $tab.ContainsKey($Build)) {
+        $max = ($tab.Keys | Measure-Object -Maximum).Maximum
+        if ($Build -gt $max) { $l += 'This version is newer than ZeroDelay''s list, so it is almost certainly still getting security updates. Keep Windows Update on.' }
+        else { $l += "This version no longer gets security updates. $up" }
+        return ($l -join "`n")
+    }
+    $row = $tab[$Build]
+    $ent = $ed -match 'Enterprise|Education' -and $ed -notmatch '^Professional'
+    $end = [datetime]::ParseExact($(if ($ent) { $row.Ent } else { $row.Home }), 'yyyy-MM-dd', $ci)
+    $endTxt = $end.ToString('d MMMM yyyy')
+    if ($Today.Date -le $end) {
+        $days = [int]($end - $Today.Date).TotalDays
+        $l += "$($row.Name) gets security updates until $endTxt ($days days from now). You are covered."
+        if ($days -le 90) { $l += "That is soon. $up" }
+        else { $l += 'Keep Windows Update on and install the monthly updates.' }
+    } else {
+        $l += "$($row.Name) stopped getting security updates on $endTxt."
+        if ($row.Esu) {
+            $esu = [datetime]::ParseExact($row.Esu, 'yyyy-MM-dd', $ci)
+            if ($Today.Date -le $esu) { $l += "Only PCs enrolled in Extended Security Updates (ESU) still get fixes, until $($esu.ToString('d MMMM yyyy')). Check with Microsoft: Settings > Windows Update shows whether this PC is enrolled." }
+            else { $l += "The free/paid consumer Extended Security Updates (ESU) ran until $($esu.ToString('d MMMM yyyy')). Businesses can buy further years; check with Microsoft if this PC is enrolled." }
+        }
+        $l += ''
+        $l += 'Windows still works, but security holes found since then are not fixed, and anti-cheat and new games drop old versions over time.'
+        $l += $up
+    }
+    $l -join "`n"
+}
+
+# --- 10. pending restart and restore points
+function Get-RestartRestoreReport {
+    $l = @()
+    $why = @()
+    try { if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $why += 'Windows updates or features' } } catch {}
+    try { if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $why += 'Windows Update' } } catch {}
+    $pfr = $false
+    try { $p = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop).PendingFileRenameOperations; if (@($p | Where-Object { $_ }).Count) { $pfr = $true } } catch {}
+    $boot = $null
+    try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Select-Object -First 1; if ($os -and $os.LastBootUpTime) { $boot = [datetime]$os.LastBootUpTime } } catch {}
+    $up = if ($boot) { [int][Math]::Floor(((Get-Date) - $boot).TotalDays) } else { -1 }
+    $upTxt = if ($up -lt 0) { 'unknown' } elseif ($up -eq 0) { 'less than a day' } else { Get-HcPlural $up 'day' }
+    if ($why.Count) {
+        $l += "A restart is waiting ($($why -join ', ')). The PC has been running for $upTxt since the last restart, so Windows has waited up to that long."
+        $l += 'Until you restart, updates (including game, driver and security fixes) are not finished, and some games or anti-cheat refuse to start. Restart (not Shut down) before your next session.'
+    } else {
+        $l += "No Windows restart is pending. Last restart: $(if ($up -ge 0) { "$upTxt ago" } else { 'unknown' })."
+        if ($up -ge 14) { $l += 'Restart now and then: memory leaks and stuck drivers build up over weeks.' }
+    }
+    if ($pfr) { $l += 'An installer has also queued files to replace at the next restart.' }
+    if ($up -ge 1) { $l += 'Tip: with Fast Startup, Shut down does not count as a restart; use Restart.' }
+    $l += ''
+    $pol = $null; try { $pol = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction Stop).DisableSR } catch {}
+    $rps = $null; try { $rps = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -ErrorAction Stop).RPSessionInterval } catch {}
+    $pts = $null; $ptErr = $false
+    try { $pts = @(Get-ComputerRestorePoint -ErrorAction Stop) } catch { $ptErr = $true }
+    $newest = $null
+    foreach ($p in @($pts)) {
+        if (-not $p) { continue }
+        $d = $null
+        try { $d = if ($p.CreationTime -is [datetime]) { $p.CreationTime } else { [Management.ManagementDateTimeConverter]::ToDateTime("$($p.CreationTime)") } } catch {}
+        if ($d -and (-not $newest -or $d -gt $newest.When)) { $newest = [pscustomobject]@{ When = $d; Desc = "$($p.Description)" } }
+    }
+    $off = ($null -ne $pol -and [int]$pol -eq 1) -or ($null -ne $rps -and [int]$rps -eq 0)
+    if ($newest) {
+        $age = [int][Math]::Floor(((Get-Date) - $newest.When).TotalDays)
+        $l += "Last restore point: $(if ($age -le 0) { 'today' } else { "$(Get-HcPlural $age 'day') ago" }) ($(Get-HcDate $newest.When)$(if ($newest.Desc) { ', ' + $newest.Desc }))."
+        if ($age -gt 30) { $l += 'That is old. Make a fresh one before you change drivers or settings: Start > "Create a restore point" > Create.' }
+    } elseif ($ptErr) { $l += 'Could not read the restore points (needs administrator rights).' }
+    else { $l += 'There are no restore points on this PC.' }
+    if ($off) { $l += "System Restore is turned off$(if ($null -ne $pol -and [int]$pol -eq 1) { ' by a policy (the Repair card "Turn System Restore and shadow copies back on" fixes that)' }). Turn it on: Start > ""Create a restore point"" > select drive $(Get-HcSystemDriveLetter): > Configure > Turn on system protection." }
+    elseif (-not $newest -and -not $ptErr) { $l += "If System Restore is off: Start > ""Create a restore point"" > select drive $(Get-HcSystemDriveLetter): > Configure > Turn on system protection." }
+    $l -join "`n"
+}
 
 $Tweaks = @(
     # ---------------------------------------------------------------- System
@@ -11666,6 +12264,78 @@ $Tweaks = @(
        Test  = { if ($script:Backup.Custom.ContainsKey('rxbuffers')) { $true } elseif ((Get-RxDropAdapters).Count) { $false } else { $null } }
        On    = { Set-RxBuffersUp 'rxbuffers' }
        Off   = { Reset-AdvPropEach 'rxbuffers' '*ReceiveBuffers' { param($n) $null } } }
+
+    # ======================================================= 2.1 health checks
+    @{ Id = 'crash-timeline'; Cat = 'Repair'; Icon = [char]0xE7BA; Action = 'Check'; Lat = $false
+       Title = 'Crash timeline (last 30 days)'
+       Desc  = 'Lists every blue screen and sudden restart of the last 30 days from Windows'' own log, with the stop code in plain words: power or overclock problem, hardware error, graphics driver, memory or a driver, and what to check next.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-code-reference2'
+       Run   = { Start-HealthReport 'Get-CrashTimelineReport' 'Crash timeline'; 'Reading the System log...' } }
+
+    @{ Id = 'app-crashes'; Cat = 'Repair'; Icon = [char]0xE7BA; Action = 'Check'; Lat = $false
+       Title = 'Which file crashes your games?'
+       Desc  = 'Groups the last 30 days of program crashes and freezes by game and by the file they crashed in, and names the usual suspects: the NVIDIA, AMD or Intel graphics driver, DirectX, or an overlay (Discord, Steam, RivaTuner, Overwolf).'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows/win32/wer/windows-error-reporting'
+       Run   = { Start-HealthReport 'Get-AppCrashReport' 'Game and app crashes'; 'Reading the Application log...' } }
+
+    @{ Id = 'gpu-hangs'; Cat = 'Graphics'; Icon = [char]0xE7F4; Action = 'Check'; Lat = $false
+       Title = 'Graphics driver hang history'
+       Desc  = 'Counts how often the graphics driver stopped responding and was reset in the last 30 days (a black flash or a game crash), plus the hang reports Windows saved in LiveKernelReports, and what to do about them.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/display/timeout-detection-and-recovery'
+       Run   = { Start-HealthReport 'Get-GpuHangReport' 'Graphics driver hangs'; 'Reading the graphics driver history...' } }
+
+    @{ Id = 'disk-errors'; Cat = 'Storage'; Icon = [char]0xEDA2; Action = 'Check'; Lat = $false
+       Title = 'Disk error history and file-system check'
+       Desc  = 'Reads 30 days of bad blocks, retried reads, drive resets and file-system damage from Windows'' log. Then offers Windows'' own online file-system scan of the Windows drive (read-only, runs while you use the PC) and, only if it asks for one, a quick spot fix at the next restart.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/powershell/module/storage/repair-volume'
+       Run   = { Start-DiskErrorCheck; 'Reading the disk error history...' } }
+
+    @{ Id = 'device-problems'; Cat = 'System'; Icon = [char]0xE772; Action = 'Check'; Lat = $false
+       Title = 'Devices with problems'
+       Desc  = 'Lists the devices Device Manager marks with a yellow triangle (missing driver, cannot start, stopped with code 43...) with what each code means and how to fix it. Devices that are only unplugged are listed separately.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/install/device-manager-error-messages'
+       Run   = { Start-HealthReport 'Get-DeviceProblemReport' 'Devices with problems'; 'Reading the device list...' } }
+
+    @{ Id = 'intel-microcode'; Cat = 'System'; Icon = [char]0xE950; Action = 'Check'; Lat = $false
+       Requires = { Test-IntelVminCpu (Get-CpuName) }
+       Title = 'Intel 13th/14th gen: instability fix installed?'
+       Desc  = 'Reads the CPU microcode version. Intel 13th and 14th gen desktop processors slowly degrade from too high voltage; Intel''s fix comes as microcode 0x12B (0x12F is the latest recommended) in a BIOS update. Older means: update your BIOS soon.'
+       Warn  = ''
+       Source = 'https://community.intel.com/t5/Blogs/Tech-Innovation/Client/Intel-Core-13th-and-14th-Gen-Desktop-Instability-Root-Cause/post/1633446'
+       Run   = { [void](Show-ZdDialog (Get-IntelMicrocodeReport) 'Intel microcode' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'secureboot-2023'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'; Lat = $false
+       Title = 'Secure Boot 2023 certificates'
+       Desc  = 'Microsoft''s 2011 Secure Boot certificates expire in 2026 and are replaced by 2023 ones through Windows Update or a BIOS update. Checks whether Secure Boot is on and whether this PC has the new certificates, which anti-cheat that needs Secure Boot (Call of Duty, Battlefield 6, VALORANT) relies on. Reads only.'
+       Warn  = ''
+       Source = 'https://support.microsoft.com/help/5068202'
+       Run   = { Start-HealthReport 'Get-SecureBoot2023Report' 'Secure Boot certificates'; 'Reading Secure Boot...' } }
+
+    @{ Id = 'bitlocker-key'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'; Lat = $false
+       Title = 'BitLocker: can you find your recovery key?'
+       Desc  = 'Windows 11 24H2 encrypts the drive by itself on many PCs. A BIOS update, fTPM/PTT or Secure Boot change can then ask for a 48-digit recovery key at start-up. Shows whether the Windows drive is encrypted, whether a recovery key exists and where to find it before you touch the BIOS.'
+       Warn  = ''
+       Source = 'https://support.microsoft.com/windows/find-your-bitlocker-recovery-key-6b71ad27-0b89-ea08-f143-056f5ab347d6'
+       Run   = { Start-HealthReport 'Get-BitLockerKeyReport' 'BitLocker recovery key'; 'Reading the encryption status...' } }
+
+    @{ Id = 'win-support'; Cat = 'System'; Icon = [char]0xE777; Action = 'Check'; Lat = $false
+       Title = 'Is Windows still getting security updates?'
+       Desc  = 'Compares your Windows version and edition with Microsoft''s end-of-service dates (Windows 10 22H2 ended in October 2025, Windows 11 24H2 Home/Pro in October 2026) and tells you plainly whether you are covered and how to move to a supported version.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information'
+       Run   = { [void](Show-ZdDialog (Get-WinSupportReport) 'Windows support' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'restart-restore'; Cat = 'System'; Icon = [char]0xE777; Action = 'Check'; Lat = $false
+       Title = 'Restart pending? Last restore point?'
+       Desc  = 'Shows whether Windows is waiting for a restart to finish updates (some games and anti-cheat refuse to start until then), how long the PC has run since the last restart, and how old your newest restore point is.'
+       Warn  = ''
+       Source = 'https://support.microsoft.com/windows/system-restore-a5ae3ed9-07c4-fd56-45ee-096777ecd14e'
+       Run   = { Start-HealthReport 'Get-RestartRestoreReport' 'Restart and restore points'; 'Checking restart and restore points...' } }
 )
 
 # --- NVIDIA driver profile DWORD settings: Nv = @{ Profile; Id; V }. Originals are backed up and restored.
@@ -11860,6 +12530,7 @@ $NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn
             'pack-scan', 'repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services',
             'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready',
             'colorfilter', 'nvllm-global', 'laptop-mux', 'intel-apo', 'laptop-nvcaps', 'apex-datacenter', 'val-netbuffer', 'r6-datacenter', 'wifi-drops', 'rxbuffers')
+$NewIds += @('crash-timeline', 'app-crashes', 'gpu-hangs', 'disk-errors', 'device-problems', 'intel-microcode', 'secureboot-2023', 'bitlocker-key', 'win-support', 'restart-restore')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
