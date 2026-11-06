@@ -17676,36 +17676,51 @@ $AppScanScript = {
     }
     $list
 }
+# 2.1 Uninstall apps page: disk cards on top (All disks + one per drive letter with apps), then a table-like list in one card.
+# Column widths shared by the header row and every app row so the columns line up.
+$AppCols = "<Grid.ColumnDefinitions><ColumnDefinition Width='46'/><ColumnDefinition Width='*'/><ColumnDefinition Width='118'/><ColumnDefinition Width='84'/><ColumnDefinition Width='108'/><ColumnDefinition Width='190'/></Grid.ColumnDefinitions>"
+# letter tiles: token pairs (background, letter) picked from the app's name, so a name always gets the same tile
+$AppTileTones = @(@('Info.Soft', 'Info'), @('Good.Soft', 'Good'), @('Warn.Soft', 'Warn'), @('Accent.Soft', 'AccentFill'), @('Bg.Raised', 'Text.Secondary'))
 function New-AppsPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='20,16' Margin='0,0,0,14'>
+  <ContentControl x:Name='Disks' Focusable='False' Margin='0,0,0,6'/>
+  <Grid Margin='0,0,0,10'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Border Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3' VerticalAlignment='Center'>
+      <WrapPanel x:Name='Seg'/>
+    </Border>
+    <Grid Grid.Column='1' Margin='12,0'>
+      <TextBox x:Name='Find' Padding='32,7,10,7' FontSize='13' Background='{DynamicResource Bg.Surface}' Foreground='{DynamicResource Text.Primary}' BorderBrush='{DynamicResource Border.Subtle}'
+               CaretBrush='{DynamicResource Text.Primary}' VerticalContentAlignment='Center' AutomationProperties.Name='Search apps' ToolTip='Search by name, publisher or disk (for example D:)'/>
+      <TextBlock Text='&#xE721;' FontFamily='{DynamicResource Font.Icons}' FontSize='13' Foreground='{DynamicResource Text.Muted}' Margin='12,0,0,0' VerticalAlignment='Center' IsHitTestVisible='False'/>
+      <TextBlock x:Name='FindHint' Text='Search by name, publisher or disk' FontSize='13' Foreground='{DynamicResource Text.Muted}' Margin='34,0,0,0' VerticalAlignment='Center' IsHitTestVisible='False'/>
+    </Grid>
+    <Button x:Name='Reload' Grid.Column='2' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='34' FontSize='13' Padding='12,0' ToolTip='Read the installed apps again'>
+      <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72C;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Refresh'/></StackPanel>
+    </Button>
+  </Grid>
+  <TextBlock x:Name='Hint' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' Margin='2,0,0,12' TextWrapping='Wrap'/>
+  <Border Style='{DynamicResource Zd.Card}' Padding='0,0,0,6'>
     <StackPanel>
-      <Grid>
-        <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-        <StackPanel Orientation='Horizontal'>
-          <Button x:Name='TabDesk' Content='Programs' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='TabStore' Content='Store apps' Style='{DynamicResource Btn}'/>
-        </StackPanel>
-        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name, publisher or disk (for example D:)'/>
-        <StackPanel Grid.Column='2' Orientation='Horizontal'>
-          <Button x:Name='SortName' Content='A to Z' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='SortSize' Content='Biggest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='SortDate' Content='Newest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='Reload' Content='Refresh' Style='{DynamicResource Btn}'/>
-        </StackPanel>
-      </Grid>
-      <TextBlock x:Name='Hint' FontSize='12' Foreground='#98989D' Margin='0,12,0,0' TextWrapping='Wrap'/>
+      <Border Padding='16,8' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='0,0,0,1'>
+        <Grid>
+          $AppCols
+          <Button x:Name='SortName' Grid.Column='1' Content='Name' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Padding='6,0' Margin='-6,0,0,0' MinHeight='26' FontSize='12' FontWeight='SemiBold' ToolTip='Sort by name'/>
+          <TextBlock Grid.Column='2' Text='Disk' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
+          <Button x:Name='SortSize' Grid.Column='3' Content='Size' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Right' Padding='6,0' Margin='0,0,10,0' MinHeight='26' FontSize='12' FontWeight='SemiBold' ToolTip='Biggest first'/>
+          <Button x:Name='SortDate' Grid.Column='4' Content='Installed' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Padding='6,0' Margin='-6,0,0,0' MinHeight='26' FontSize='12' FontWeight='SemiBold' ToolTip='Newest first'/>
+        </Grid>
+      </Border>
+      <ContentControl x:Name='List' Focusable='False'/>
     </StackPanel>
   </Border>
-  <ContentControl x:Name='List'/>
+  <TextBlock x:Name='Footer' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='2,10,0,0' TextWrapping='Wrap'/>
 </StackPanel>
 "@)
-    $au = @{}; foreach ($n in 'TabDesk', 'TabStore', 'Find', 'SortName', 'SortSize', 'SortDate', 'Reload', 'Hint', 'List') { $au[$n] = $root.FindName($n) }
+    $au = @{}; foreach ($n in 'Disks', 'Seg', 'Find', 'FindHint', 'SortName', 'SortSize', 'SortDate', 'Reload', 'Hint', 'List', 'Footer') { $au[$n] = $root.FindName($n) }
     $script:AppsUi = $au
-    $script:AppsKind = 'desktop'; $script:AppsSort = 'name'; $script:AppsData = $null
-    $au.TabDesk.Add_Click({ $script:AppsKind = 'desktop'; Update-AppsList })
-    $au.TabStore.Add_Click({ $script:AppsKind = 'store'; Update-AppsList })
+    $script:AppsKind = 'desktop'; $script:AppsSort = 'name'; $script:AppsDisk = 'All'; $script:AppsData = $null
     $au.SortName.Add_Click({ $script:AppsSort = 'name'; Update-AppsList })
     $au.SortSize.Add_Click({ $script:AppsSort = 'size'; Update-AppsList })
     $au.SortDate.Add_Click({ $script:AppsSort = 'date'; Update-AppsList })
@@ -17714,7 +17729,10 @@ function New-AppsPage {
     $script:AppsFindTimer = New-Object Windows.Threading.DispatcherTimer
     $script:AppsFindTimer.Interval = [TimeSpan]::FromMilliseconds(250)
     $script:AppsFindTimer.Add_Tick({ $script:AppsFindTimer.Stop(); Update-AppsList })
-    $au.Find.Add_TextChanged({ $script:AppsFindTimer.Stop(); $script:AppsFindTimer.Start() })
+    $au.Find.Add_TextChanged({
+        $script:AppsUi.FindHint.Visibility = if ($script:AppsUi.Find.Text) { 'Collapsed' } else { 'Visible' }
+        $script:AppsFindTimer.Stop(); $script:AppsFindTimer.Start()
+    })
     Start-AppScan
     New-PageScroll $root
 }
@@ -17726,51 +17744,138 @@ function Start-AppScan {
         Update-AppsList
     }
 }
+# "C" for an app on "C:" or "D: (Games)" -> "D"; $null when the scan could not tell
+function Get-AppDiskLetter($app) {
+    if ("$($app.Drive)" -match '^([A-Za-z]):') { return $Matches[1].ToUpper() }
+    $null
+}
+# 412 GB / 1.8 TB
+function Format-DiskSize([double]$Bytes) {
+    if ($Bytes -ge 1TB) { "$([Math]::Round($Bytes / 1TB, 1)) TB" } else { "$([Math]::Round($Bytes / 1GB)) GB" }
+}
+# one entry per drive letter that has apps: its name and how full it is (read once per scan)
+function Get-AppDiskStats($Data) {
+    $letters = @($Data | ForEach-Object { Get-AppDiskLetter $_ } | Where-Object { $_ } | Sort-Object -Unique)
+    foreach ($l in $letters) {
+        $label = ''; $total = 0; $free = 0
+        try { $d = New-Object IO.DriveInfo $l; if ($d.IsReady) { $label = "$($d.VolumeLabel)".Trim(); $total = [double]$d.TotalSize; $free = [double]$d.TotalFreeSpace } } catch {}
+        if (-not $label) {
+            $hit = @($Data | Where-Object { (Get-AppDiskLetter $_) -eq $l -and "$($_.Drive)" -match '\((.+)\)\s*$' } | Select-Object -First 1)
+            if ($hit.Count -and "$($hit[0].Drive)" -match '\((.+)\)\s*$') { $label = $Matches[1].Trim() }
+        }
+        [pscustomobject]@{ Letter = $l; Title = $(if ($label) { "$($l): $label" } else { "$($l):" }); Total = $total; Free = $free }
+    }
+}
+# filter (kind, disk, search) and sort: what the list shows, before the 400-row cap
+function Get-AppsView($Data, [string]$Kind, [string]$Disk, [string]$Query, [string]$Sort) {
+    $items = @($Data | Where-Object { $_.Kind -eq $Kind })
+    if ($Disk -and $Disk -ne 'All') { $items = @($items | Where-Object { (Get-AppDiskLetter $_) -eq $Disk }) }
+    $q = "$Query".Trim()
+    if ($q) {
+        $w = [Management.Automation.WildcardPattern]::Escape($q)   # so [ or * in a search is just text
+        $items = @($items | Where-Object { $_.Name -like "*$w*" -or $_.Publisher -like "*$w*" -or ($_.Drive -and ($_.Drive -like "$w*" -or "$($_.Drive)".Substring(0, 1) -eq $q.TrimEnd(':'))) })
+    }
+    if ($Kind -ne 'desktop') { $Sort = 'name' }   # Store apps report no size or install date
+    switch ($Sort) {
+        'size' { @($items | Sort-Object @{ e = { [double]$_.SizeMb }; Descending = $true }, @{ e = { $_.Name }; Descending = $false }) }
+        'date' { @($items | Sort-Object @{ e = { if ($_.Date) { $_.Date } else { [datetime]::MinValue } }; Descending = $true }, @{ e = { $_.Name }; Descending = $false }) }
+        default { @($items | Sort-Object @{ e = { -not $_.Bloat } }, Name) }
+    }
+}
+# a disk card: icon, name, app count, usage bar (Bad when over 85% full) and "412 GB free of 1 TB"; selected = raised with an accent border
+function New-AppDiskCardXaml([string]$Key, [string]$Title, [int]$Count, [double]$Total, [double]$Free, [bool]$Selected, [string]$Glyph, [string]$Noun) {
+    $bar = ''; $freeText = 'Size unknown'
+    if ($Total -gt 0) {
+        $usedFrac = [Math]::Min(1.0, [Math]::Max(0.0, ($Total - $Free) / $Total))
+        $u = [int][Math]::Round($usedFrac * 1000); $f = 1000 - $u
+        $tone = if ($usedFrac -gt 0.85) { 'Bad' } else { 'Info' }
+        $bar = "<Border Height='4' CornerRadius='2' Background='{DynamicResource Border.Subtle}' Margin='0,12,0,0' ClipToBounds='True'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='$($u)*'/><ColumnDefinition Width='$($f)*'/></Grid.ColumnDefinitions><Border CornerRadius='2' Background='{DynamicResource $tone}'/></Grid></Border>"
+        $freeText = "$(Format-DiskSize $Free) free of $(Format-DiskSize $Total)"
+    }
+    $bg = if ($Selected) { 'Bg.Raised' } else { 'Bg.Surface' }
+    $br = if ($Selected) { 'AccentFill' } else { 'Border.Subtle' }
+    $hover = if ($Selected) { '' } else { "<ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Card' Property='BorderBrush' Value='{DynamicResource Border.Strong}'/></Trigger></ControlTemplate.Triggers>" }
+    $countText = "$Count $Noun$(if ($Count -ne 1) { 's' })"
+    "<Button x:Name='D_$Key' CommandParameter='$Key' Width='232' Margin='0,0,10,10' Cursor='Hand' FocusVisualStyle='{DynamicResource Zd.FocusRing}' AutomationProperties.Name='$(Esc "$Title, $countText, $freeText")' ToolTip='$(Esc "Show only what is on $Title")'>" +
+    "<Button.Template><ControlTemplate TargetType='Button'><Border x:Name='Card' Background='{DynamicResource $bg}' BorderBrush='{DynamicResource $br}' BorderThickness='1' CornerRadius='12' Padding='14,12' SnapsToDevicePixels='True'><ContentPresenter/></Border>$hover</ControlTemplate></Button.Template>" +
+    "<StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+    "<TextBlock Text='$Glyph' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='{DynamicResource $(if ($Selected) { 'AccentFill' } else { 'Text.Secondary' })}' VerticalAlignment='Center'/>" +
+    "<TextBlock Grid.Column='1' Text='$(Esc $Title)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='10,0,8,0' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>" +
+    "<TextBlock Grid.Column='2' Text='$Count' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' ToolTip='$(Esc $countText)'/></Grid>" +
+    "$bar<TextBlock Text='$(Esc $freeText)' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,$(if ($bar) { '8' } else { '12' }),0,0'/></StackPanel></Button>"
+}
+# one ~54 px app row: icon tile, name (+ Often unused) with the publisher under it, disk, size, installed, the two buttons
+function New-AppRowXaml($a, [int]$i) {
+    $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
+    $letter = if ($nm) { Esc $nm.Substring(0, 1).ToUpper() } else { '?' }
+    $tone = $AppTileTones[[Math]::Abs(("$($a.Name)".GetHashCode())) % $AppTileTones.Count]
+    $tag = if ($a.Bloat) { "<Border DockPanel.Dock='Right' Background='{DynamicResource Warn.Soft}' CornerRadius='5' Padding='7,1,7,2' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='{DynamicResource Warn}'/></Border>" } else { '' }
+    $tip = if ($a.Version) { " ToolTip='$(Esc "Version $($a.Version)")'" } else { '' }
+    $pub = if ("$($a.Publisher)".Trim()) { "<TextBlock Text='$(Esc ("$($a.Publisher)".Trim()))' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/>" } else { '' }
+    $dash = "<TextBlock Text='&#x2014;' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'"
+    $disk = if ($a.Drive) { "<TextBlock Grid.Column='2' Text='$(Esc $a.Drive)' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' TextTrimming='CharacterEllipsis' Margin='0,0,8,0'/>" } else { "$dash Grid.Column='2'/>" }
+    $size = if ($a.SizeMb) { "<TextBlock Grid.Column='3' Text='$(Esc (Format-Size ($a.SizeMb * 1MB)))' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' HorizontalAlignment='Right' Margin='0,0,16,0'/>" } else { "$dash Grid.Column='3' HorizontalAlignment='Right' Margin='0,0,16,0'/>" }
+    $date = if ($a.Date) { "<TextBlock Grid.Column='4' Text='$(Esc $a.Date.ToString('d MMM yyyy'))' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center'/>" } else { "$dash Grid.Column='4'/>" }
+    $forceTip = if ($a.Kind -eq 'store') { 'Removes it for every account on this PC and stops Windows from installing it again for new accounts.' } else { 'Skips the app''s own uninstaller: closes it, then deletes its files, settings, shortcuts, services and tasks. For apps whose normal uninstall fails.' }
+    "<Border Style='{StaticResource AppRow}'$(if ($i -gt 0) { " BorderThickness='0,1,0,0'" })><Grid MinHeight='54'>$AppCols" +
+    "<Grid Width='32' Height='32' HorizontalAlignment='Left' VerticalAlignment='Center'>" +
+    "<Border x:Name='T_$i' CornerRadius='8' Background='{DynamicResource $($tone[0])}'><TextBlock Text='$letter' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource $($tone[1])}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
+    "<Image x:Name='I_$i' Width='28' Height='28' HorizontalAlignment='Center' VerticalAlignment='Center' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>" +
+    "<StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='0,0,12,0'><DockPanel HorizontalAlignment='Left'>$tag<TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'$tip/></DockPanel>$pub</StackPanel>" +
+    "$disk$size$date" +
+    "<StackPanel Grid.Column='5' Orientation='Horizontal' HorizontalAlignment='Right' VerticalAlignment='Center'>" +
+    "<Button x:Name='U_$i' Content='Uninstall' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='30' Padding='12,0' FontSize='12' Margin='0,0,4,0' AutomationProperties.Name='$(Esc "Uninstall $($a.Name)")'/>" +
+    "<Button x:Name='F_$i' Content='Force remove' Style='{DynamicResource Zd.Button.Ghost}' MinHeight='30' Padding='10,0' FontSize='12' Foreground='{DynamicResource Bad}' AutomationProperties.Name='$(Esc "Force remove $($a.Name)")' ToolTip='$(Esc $forceTip)'/>" +
+    "</StackPanel></Grid></Border>"
+}
 function Update-AppsList {
     $au = $script:AppsUi
     if ($null -eq $script:AppsData) { return }
-    foreach ($b in 'TabDesk', 'TabStore') {
-        $on = ($b -eq 'TabDesk') -eq ($script:AppsKind -eq 'desktop')
-        if ($on) { $au[$b].Background = ConvertTo-Brush '#0071E3'; $au[$b].Foreground = ConvertTo-Brush '#FFFFFF' }
-        else { $au[$b].ClearValue([Windows.Controls.Control]::BackgroundProperty); $au[$b].ClearValue([Windows.Controls.Control]::ForegroundProperty) }
-    }
+    $isDesk = $script:AppsKind -eq 'desktop'
     $desk = @($script:AppsData | Where-Object { $_.Kind -eq 'desktop' }); $store = @($script:AppsData | Where-Object { $_.Kind -eq 'store' })
-    $au.TabDesk.Content = "Programs ($($desk.Count))"; $au.TabStore.Content = "Store apps ($($store.Count))"
-    foreach ($b in 'SortSize', 'SortDate') { $au[$b].Visibility = if ($script:AppsKind -eq 'desktop') { 'Visible' } else { 'Collapsed' } }
-    foreach ($b in 'SortName', 'SortSize', 'SortDate') { $au[$b].FontWeight = if ($b -eq "Sort$($script:AppsSort)") { 'Bold' } else { 'Normal' } }
-    $q = $au.Find.Text.Trim()
-    $items = if ($script:AppsKind -eq 'desktop') { $desk } else { $store }
-    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" -or ($_.Drive -and ($_.Drive -like "$q*" -or "$($_.Drive)".Substring(0, 1) -eq $q.TrimEnd(':'))) }) }
-    $items = switch ($script:AppsSort) {
-        'size' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { [double]$_.SizeMb } -Descending) } else { @($items | Sort-Object Name) } }
-        'date' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { if ($_.Date) { $_.Date } else { [datetime]::MinValue } } -Descending) } else { @($items | Sort-Object Name) } }
-        default { @($items | Sort-Object @{ e = { -not $_.Bloat } }, Name) }
+    $kindItems = if ($isDesk) { $desk } else { $store }
+    $noun = if ($isDesk) { 'program' } else { 'app' }
+    # Programs / Store apps
+    $au.Seg.Children.Clear()
+    [void]$au.Seg.Children.Add((New-Segment "Programs ($($desk.Count))" $isDesk { param($s, $e) $script:AppsKind = 'desktop'; Update-AppsList } 'desktop'))
+    [void]$au.Seg.Children.Add((New-Segment "Store apps ($($store.Count))" (-not $isDesk) { param($s, $e) $script:AppsKind = 'store'; Update-AppsList } 'store'))
+    # disk cards (drive sizes read once per scan)
+    if (-not [object]::ReferenceEquals($script:AppsDiskFor, $script:AppsData)) { $script:AppsDiskStats = @(Get-AppDiskStats $script:AppsData); $script:AppsDiskFor = $script:AppsData }
+    $stats = @($script:AppsDiskStats)
+    if ($script:AppsDisk -ne 'All' -and -not ($stats | Where-Object { $_.Letter -eq $script:AppsDisk })) { $script:AppsDisk = 'All' }
+    if ($stats.Count) {
+        $sumT = 0.0; $sumF = 0.0; foreach ($d in $stats) { $sumT += $d.Total; $sumF += $d.Free }
+        $cards = @(New-AppDiskCardXaml 'All' 'All disks' $kindItems.Count $sumT $sumF ($script:AppsDisk -eq 'All') '&#xE71D;' $noun)
+        foreach ($d in $stats) {
+            $n = @($kindItems | Where-Object { (Get-AppDiskLetter $_) -eq $d.Letter }).Count
+            $cards += New-AppDiskCardXaml $d.Letter $d.Title $n $d.Total $d.Free ($script:AppsDisk -eq $d.Letter) '&#xEDA2;' $noun
+        }
+        $wrap = [ZdTheme]::Parse("<WrapPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($cards -join '')</WrapPanel>")
+        foreach ($k in @('All') + @($stats | ForEach-Object { $_.Letter })) {
+            $wrap.FindName("D_$k").Add_Click({ param($s, $e) $script:AppsDisk = "$($s.CommandParameter)"; Update-AppsList })
+        }
+        $au.Disks.Content = $wrap; $au.Disks.Visibility = 'Visible'
+    } else { $au.Disks.Content = $null; $au.Disks.Visibility = 'Collapsed' }
+    # sort headers: the active one gets primary text and a down arrow; Store apps only sort by name
+    $sort = if ($isDesk) { $script:AppsSort } else { 'name' }
+    $arrow = " $([char]0x2193)"
+    foreach ($h in @(@('SortName', 'name', 'Name'), @('SortSize', 'size', 'Size'), @('SortDate', 'date', 'Installed'))) {
+        $b = $au[$h[0]]; $on = $sort -eq $h[1]
+        $b.Content = "$($h[2])$(if ($on) { $arrow })"
+        $b.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, $(if ($on) { 'Text.Primary' } else { 'Text.Muted' }))
+        if ($h[1] -ne 'name') { $b.IsEnabled = $isDesk }
     }
-    $au.Hint.Text = if ($script:AppsKind -eq 'desktop') { "Each program's own uninstaller opens when you press Uninstall: follow its steps. Showing $($items.Count)." }
-                    else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them. Showing $($items.Count)." }
-    $rows = for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
-        $a = $items[$i]
-        $sub = @($(if ($a.Drive) { "disk $($a.Drive)" }), $a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
-        $tag = if ($a.Bloat) { "<Border Background='#4E3E28' CornerRadius='5' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='#FF9F0A'/></Border>" } else { '' }
-        # icon slot: a letter tile in the app's own colour, covered by the real icon when there is one
-        $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
-        $letter = if ($nm) { Esc $nm.Substring(0, 1).ToUpper() } else { '?' }
-        $tint = $AppTileColors[[Math]::Abs(("$($a.Name)".GetHashCode())) % $AppTileColors.Count]
-        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='10' Padding='12,10,16,10' Margin='0,0,0,6'><Grid>" +
-        "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
-        "<Grid Width='36' Height='36' Margin='0,0,14,0' VerticalAlignment='Center'>" +
-        "<Border x:Name='T_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='16' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
-        "<Image x:Name='I_$i' Width='32' Height='32' HorizontalAlignment='Center' VerticalAlignment='Center' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>" +
-        "<StackPanel Grid.Column='1' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>$tag</StackPanel>" +
-        "<TextBlock Text='$(Esc ($sub -join '  ·  '))' FontSize='12' Foreground='#98989D' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/></StackPanel>" +
-        "<StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center' Margin='12,0,0,0'>" +
-        "<Button x:Name='U_$i' Content='Uninstall' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,6,0'/>" +
-        "<Button x:Name='F_$i' Content='Force remove' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Foreground='#FF453A' ToolTip='$(Esc $(if ($a.Kind -eq 'store') { 'Removes it for every account on this PC and stops Windows from installing it again for new accounts.' } else { 'Skips the app''s own uninstaller: closes it, then deletes its files, settings, shortcuts, services and tasks. For apps whose normal uninstall fails.' }))'/>" +
-        "</StackPanel></Grid></Border>"
+    $items = @(Get-AppsView $script:AppsData $script:AppsKind $script:AppsDisk $au.Find.Text $script:AppsSort)
+    $au.Hint.Text = if ($isDesk) { 'Uninstall opens the program''s own uninstaller. Force remove is for programs whose uninstaller fails: it deletes the files, settings and shortcuts itself. Pick a disk above to see only what is installed there.' }
+                    else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them." }
+    $shown = [Math]::Min(400, $items.Count)
+    $rows = for ($i = 0; $i -lt $shown; $i++) { New-AppRowXaml $items[$i] $i }
+    if (-not $items.Count) {
+        $msg = if ($au.Find.Text.Trim()) { 'Nothing matches.' } elseif ($script:AppsDisk -ne 'All') { "No $($noun)s on this disk." } else { "No $($noun)s found." }
+        $rows = @("<TextBlock Text='$(Esc $msg)' Foreground='{DynamicResource Text.Muted}' FontSize='13' Margin='16,14,16,8'/>")
     }
-    if (-not $items.Count) { $rows = @("<TextBlock Text='Nothing matches.' Foreground='#98989D' FontSize='13' Margin='4,4,0,0'/>") }
-    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($rows -join '')</StackPanel>")
-    for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'><StackPanel.Resources><Style x:Key='AppRow' TargetType='Border'><Setter Property='Background' Value='Transparent'/><Setter Property='BorderBrush' Value='{DynamicResource Border.Subtle}'/><Setter Property='Padding' Value='16,0'/><Setter Property='SnapsToDevicePixels' Value='True'/><Style.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter Property='Background' Value='{DynamicResource Bg.Raised}'/></Trigger></Style.Triggers></Style></StackPanel.Resources>$($rows -join '')</StackPanel>")
+    for ($i = 0; $i -lt $shown; $i++) {
         $img = Get-AppIconSource $items[$i]
         if ($img) { $panel.FindName("I_$i").Source = $img; $panel.FindName("T_$i").Visibility = 'Collapsed' }
         $b = $panel.FindName("U_$i"); $b.Tag = $items[$i]
@@ -17779,6 +17884,15 @@ function Update-AppsList {
         $b.Add_Click({ param($s, $e) Invoke-ForceRemove $s.Tag })
     }
     $au.List.Content = $panel
+    # footer: count, total size, how uninstalling works
+    $parts = @("$($items.Count) $(if ($isDesk) { 'program' } else { 'Store app' })$(if ($items.Count -ne 1) { 's' })")
+    if ($isDesk) {
+        $mb = 0.0; foreach ($a in $items) { if ($a.SizeMb) { $mb += [double]$a.SizeMb } }
+        if ($mb -gt 0) { $parts += Format-Size ($mb * 1MB) }
+        $parts += "each program's own uninstaller opens when you press Uninstall"
+    } else { $parts += 'removed for your Windows account only' }
+    if ($items.Count -gt $shown) { $parts += "showing the first $shown" }
+    $au.Footer.Text = $parts -join '  ·  '
 }
 # App icons: made once from the PNG bytes the scan collected, then reused when the list is filtered or sorted.
 $AppTileColors = @('#5E5CE6', '#0A84FF', '#30B0C7', '#34C759', '#FF9F0A', '#FF6482', '#BF5AF2', '#AC8E68', '#8E8E93')
