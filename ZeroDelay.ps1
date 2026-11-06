@@ -13084,13 +13084,13 @@ function Show-TweakDetail($t) {
     $ui.DetWarn.Text = "$($t.Warn)"; $ui.DetWarnBox.Visibility = if ("$($t.Warn)".Trim()) { 'Visible' } else { 'Collapsed' }
     $ui.DetSource.Tag = "$($t.Source)"; $ui.DetSource.Visibility = if ("$($t.Source)" -match '^https?://') { 'Visible' } else { 'Collapsed' }
     $ui.DetDefault.Tag = $t
-    $ui.DetDefault.Visibility = if ($t.Toggle -and ($t.State -or $script:Staged.ContainsKey($t.Id))) { 'Visible' } else { 'Collapsed' }
-    $ui.DetDefault.Content = if ($script:Staged.ContainsKey($t.Id)) { 'Keep it as it is' } else { 'Back to Windows default' }
+    $ui.DetDefault.Visibility = if ($t.Toggle -and ($t.State -or $script:Staged.Contains($t.Id))) { 'Visible' } else { 'Collapsed' }
+    $ui.DetDefault.Content = if ($script:Staged.Contains($t.Id)) { 'Keep it as it is' } else { 'Back to Windows default' }
 }
 $ui.DetSource.Add_Click({ param($s, $e) if ("$($s.Tag)" -match '^https?://') { Start-Process "$($s.Tag)" } })
 $ui.DetDefault.Add_Click({ param($s, $e)
     $t = $s.Tag; if (-not $t) { return }
-    if ($script:Staged.ContainsKey($t.Id)) { Set-TweakStaged $t ([bool]$t.State) } else { Set-TweakStaged $t $false }
+    if ($script:Staged.Contains($t.Id)) { Set-TweakStaged $t ([bool]$t.State) } else { Set-TweakStaged $t $false }
 })
 
 # Switches on the Tweaks and Checks lists are collected and applied together from the bar at the bottom
