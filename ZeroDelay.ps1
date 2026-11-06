@@ -39,7 +39,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '2.1.0'
+$AppVersion = '2.1.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -17768,6 +17768,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.1.1' = @(
+        @{ T = 'Presets fixed'; D = 'The Competitive and Max presets on Home now pick their tweaks (they opened with nothing in 2.1.0). Safe was not affected.' }
+        @{ T = 'Power plans put back exactly'; D = 'Switching the Ultimate Performance card off removes the copy of the plan it made, your original plan comes back whatever order the Ultimate and ZeroDelay plans are switched off in, and Game Mode no longer leaves the ZeroDelay plan behind when it ends.' }
+        @{ T = 'No pause on the first game page'; D = 'The background helper starts up right after ZeroDelay opens, so the first page that uses it opens at once.' }
+    )
     '2.1.0' = @(
         @{ T = 'Tweaks, easier to read'; D = 'One list grouped by area, each with how many are on. Every tweak says Safe, Moderate or Advanced and what is true now (Optimized or Windows default). Click one to see exactly what it changes and when not to use it. Switches are collected and applied together from the bar at the bottom, with one Undo.' }
         @{ T = 'Proof on Home'; D = 'Your last match comes first, with how its FPS, 1% lows, ping and stutters compare to your usual, and when it stuttered. Presets Safe, Competitive and Max, and your recent changes with Undo.' }
@@ -29240,6 +29245,11 @@ if ($Snapshot) {
     # every card's Requires and state test runs directly (errors are not swallowed), every card is refreshed and every
     # main page is built. Only reads: nothing is switched on. Writes one section per profile to <snapshot>.pcmatrix.txt.
     if ($env:ZD_PCMATRIX -and $env:GITHUB_ACTIONS -eq 'true') {
+        # the real app warms the worker up once its window is idle (see 'worker warm-up'); this hook runs before the window
+        # exists, so it does the same first, or the first page that uses the worker pays the one-time cost
+        $zdWarm = [Diagnostics.Stopwatch]::StartNew()
+        for ($wi = 0; $wi -lt 3; $wi++) { Invoke-Worker 'param() $null' @() { param($out, $errs) } }
+        [Console]::WriteLine(('PCMATRIX worker warm-up: {0} ms' -f $zdWarm.ElapsedMilliseconds))
         function Get-ZdPcProfiles {
             $eth = @{ Name = 'Ethernet'; Desc = 'Intel(R) Ethernet Controller I226-V'; Wifi = $false; Up = $true; Speed = '2.5 Gbps' }
             $wifi = @{ Name = 'Wi-Fi'; Desc = 'Intel(R) Wi-Fi 6E AX211 160MHz'; Wifi = $true; Up = $true; Speed = '1.2 Gbps' }
