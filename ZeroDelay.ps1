@@ -9327,7 +9327,7 @@ $Tweaks = @(
        Title = "Don't start the Windows hypervisor"
        Desc  = 'With Hyper-V, WSL2, Sandbox or Memory Integrity installed, Windows itself runs on a hypervisor, which adds overhead to interrupts and memory access. Microsoft''s gaming guide suggests turning it off.'
        Warn  = 'You use WSL2, Docker, Hyper-V, Windows Sandbox or an Android emulator, or your work PC needs Credential Guard. Lowers kernel security protections. If BitLocker is on, keep your recovery key at hand.'
-       Requires = { (Get-CimInstance Win32_ComputerSystem -Property HypervisorPresent).HypervisorPresent -or (Get-HypervisorLaunch) -eq 'Off' }
+       Requires = { (Get-CimInstance Win32_ComputerSystem -Property HypervisorPresent -ErrorAction SilentlyContinue).HypervisorPresent -or (Get-HypervisorLaunch) -eq 'Off' }
        Test  = { (Get-HypervisorLaunch) -eq 'Off' }
        On    = {
            if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = (Get-HypervisorLaunch) } }
