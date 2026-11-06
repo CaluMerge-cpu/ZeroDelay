@@ -2649,17 +2649,14 @@ function Update-PresetChips {
     }
     $h.PresetChips.Visibility = 'Visible'
     foreach ($name in $script:PresetNames) {
-        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$name' Padding='14,5' Margin='0' FontSize='13' MinHeight='28'/>")
-        $c.Tag = $name
-        $c.Add_Click({ param($s, $e)
+        # 2.1: the shared segmented-control item (selected = raised tone, primary text)
+        $c = New-Segment $name ($name -eq $state) { param($s, $e)
             $g = $script:GameSel; if (-not $g) { return }
             $window.Cursor = [Windows.Input.Cursors]::Wait
             try { [void](Invoke-GamePreset $g $s.Tag) } catch { Show-Toast "$($s.Tag): $($_.Exception.Message)" '#FF9F0A' }
             $window.Cursor = $null
             Update-PresetChips; Update-GameTools
-        })
-        $sel = $name -eq $state
-        $c.Background = ConvertTo-Brush $(if ($sel) { '#2B323B' } else { '#00000000' }); $c.Foreground = ConvertTo-Brush $(if ($sel) { '#F2F4F7' } else { '#9AA3AF' }); if ($sel) { $c.FontWeight = 'SemiBold' }
+        } $name
         [void]$h.PresetChips.Children.Add($c)
     }
     $h.PresetNote.Text = if ($waiting) { "Waiting for $($g.Title) to close: $waiting setting$(if ($waiting -ne 1) { 's' }) of $($rec.Name) will be applied then." }
@@ -21835,13 +21832,17 @@ function Get-GameStatsPlay($g) {
 # reads the open game's sessions in the background and draws "Your stats" when they arrive
 function Update-GameStats {
     $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.Stats) { return }
-    if ($h.StatsFor -ne $g.Id) { Show-GameStats $g $null $true; $h.StatsFor = $g.Id }
+    if ($h.StatsFor -ne $g.Id) { Show-GameStats $g $null $true; Update-GameStrip $null $true; $h.StatsFor = $g.Id }
     Invoke-Worker $GameStatsCode @($g.Id) {
         param($out, $errs)
         $res = Get-WorkerResult $out
         $g = $script:GameSel; if (-not $g -or -not $script:GamesUi) { return }
         if ($res -is [hashtable] -and $res.Id -ne $g.Id) { return }
-        Show-GameStats $g $(if ($res -is [hashtable]) { $res.Data } else { $null }) $false
+        $data = if ($res -is [hashtable]) { $res.Data } else { $null }
+        # 2.1 stats strip: the newest report (Reports are oldest first)
+        $last = if ($data -and @($data.Reports).Count) { @($data.Reports)[-1] } else { $null }
+        Update-GameStrip $last $false
+        Show-GameStats $g $data $false
     }
 }
 # number for a chart: $null for missing or non-numeric values
@@ -22585,14 +22586,15 @@ function New-GamesPage {
     <TextBlock x:Name='MoreSub' Text='Not installed on this PC. Install one and ZeroDelay finds it by itself, with its logo and its settings.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,0,0,14' Visibility='Collapsed'/>
     <WrapPanel x:Name='MoreTiles'/>
   </StackPanel>
-  <Grid x:Name='Detail' Visibility='Collapsed'>
-    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='320'/></Grid.ColumnDefinitions>
-    <StackPanel Margin='0,0,18,0'>
+  <!-- 2.1 game page (Steam / GOG game pages, ExitLag's route view): hero, the last match of this game as a stats
+       strip, then tabs (Route · Tweaks for the game · Checks · Trends) instead of stacked cards -->
+  <StackPanel x:Name='Detail' Visibility='Collapsed'>
       <Button x:Name='Back' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='10,6' Margin='0,0,0,14'>
-        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72B;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' Margin='0,1,8,0'/><TextBlock Text='All games'/></StackPanel>
+        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72B;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Margin='0,1,8,0'/><TextBlock Text='All games'/></StackPanel>
       </Button>
-      <!-- 2.0 hero: game art faded into the page background, logo + title, Start Game in the accent with the Game Mode chip -->
-      <Border x:Name='Hero' CornerRadius='16' Margin='0,0,0,16' ClipToBounds='True' MinHeight='260'>
+      <!-- hero: game art faded into the page background; title, publisher, anti-cheat note and preset on the left,
+           Start Game / Stop Game Mode with the Game Mode chips on the right -->
+      <Border x:Name='Hero' CornerRadius='16' Margin='0,0,0,12' ClipToBounds='True' MinHeight='280'>
         <Grid>
           <Border x:Name='HeroFade' CornerRadius='16'>
             <Border.Background>
@@ -22601,97 +22603,161 @@ function New-GamesPage {
               </LinearGradientBrush>
             </Border.Background>
           </Border>
-          <TextBlock x:Name='HeroGlyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,10,20,0'/>
-          <StackPanel VerticalAlignment='Bottom' Margin='24,24,24,22'>
-            <StackPanel Orientation='Horizontal'>
-              <Border x:Name='HeroLogo' Width='64' Height='64' CornerRadius='14' Margin='0,0,16,0' VerticalAlignment='Center' Visibility='Collapsed' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'/>
-              <TextBlock x:Name='HeroTitle' FontFamily='{DynamicResource Font.Display}' FontSize='32' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>
+          <TextBlock x:Name='HeroGlyph' FontFamily='{DynamicResource Font.Icons}' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,10,20,0'/>
+          <Grid VerticalAlignment='Bottom' Margin='24,24,24,22'>
+            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+            <StackPanel VerticalAlignment='Bottom'>
+              <StackPanel Orientation='Horizontal'>
+                <Border x:Name='HeroLogo' Width='64' Height='64' CornerRadius='14' Margin='0,0,16,0' VerticalAlignment='Center' Visibility='Collapsed' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'/>
+                <StackPanel VerticalAlignment='Center'>
+                  <TextBlock x:Name='HeroTitle' FontFamily='{DynamicResource Font.Display}' FontSize='32' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'/>
+                  <TextBlock x:Name='HeroSub' FontSize='13' Foreground='{DynamicResource Text.Secondary}' Margin='0,2,0,0'/>
+                  <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
+                    <TextBlock Text='&#xE83D;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Top' Margin='0,2,6,0'/>
+                    <TextBlock x:Name='HeroAc' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' MaxWidth='460'/>
+                  </StackPanel>
+                </StackPanel>
+              </StackPanel>
+              <StackPanel Orientation='Horizontal' Margin='0,18,0,0'>
+                <TextBlock Text='Preset' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,0,10,0'/>
+                <Border Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3'><WrapPanel x:Name='PresetChips'/></Border>
+              </StackPanel>
+              <TextBlock x:Name='PresetNote' FontSize='11.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' MaxWidth='520' HorizontalAlignment='Left' Margin='0,8,0,0'/>
             </StackPanel>
-            <WrapPanel Margin='0,16,0,0'>
-              <Button x:Name='Play' Style='{DynamicResource Zd.Button.Primary}' MinHeight='44' Padding='22,0' Margin='0,0,12,8' AutomationProperties.Name='Start Game'>
-                <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' VerticalAlignment='Center' Margin='0,1,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='16' FontWeight='SemiBold'/></StackPanel>
-              </Button>
-              <Border x:Name='GmChip' Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,8,8' VerticalAlignment='Center'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/></Border>
-              <Border x:Name='AutoChip' Style='{DynamicResource Zd.Chip}' Padding='10,4,12,4' Margin='0,0,8,8' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
-              <Border Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,0,8' VerticalAlignment='Center'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}'/></Border>
-            </WrapPanel>
-            <TextBlock x:Name='PlayNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' MaxWidth='560' HorizontalAlignment='Left' Margin='0,4,0,0'/>
-          </StackPanel>
+            <StackPanel Grid.Column='1' VerticalAlignment='Bottom' Margin='24,0,0,0' MaxWidth='400'>
+              <StackPanel Orientation='Horizontal' HorizontalAlignment='Right'>
+                <Button x:Name='StopGm' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='44' Padding='18,0' Margin='0,0,10,0' Visibility='Collapsed' AutomationProperties.Name='Stop Game Mode'>
+                  <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE71A;' FontFamily='{DynamicResource Font.Icons}' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Stop Game Mode' FontSize='14'/></StackPanel>
+                </Button>
+                <Button x:Name='Play' Style='{DynamicResource Zd.Button.Primary}' MinHeight='44' Padding='22,0' AutomationProperties.Name='Start Game'>
+                  <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='{DynamicResource Font.Icons}' FontSize='15' VerticalAlignment='Center' Margin='0,1,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='16' FontWeight='SemiBold'/></StackPanel>
+                </Button>
+              </StackPanel>
+              <WrapPanel HorizontalAlignment='Right' Margin='0,12,0,0'>
+                <Border x:Name='GmChip' Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,8,8' VerticalAlignment='Center'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/></Border>
+                <Border x:Name='AutoChip' Style='{DynamicResource Zd.Chip}' Padding='10,4,12,4' Margin='0,0,8,8' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
+                <Border Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,0,8' VerticalAlignment='Center'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}'/></Border>
+              </WrapPanel>
+              <TextBlock x:Name='PlayNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' TextAlignment='Right' HorizontalAlignment='Right' Margin='0,2,0,0'/>
+            </StackPanel>
+          </Grid>
         </Grid>
       </Border>
-      <Border x:Name='AutoCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
-        <StackPanel>
-          <TextBlock Text='WHEN THIS GAME STARTS' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
-          <TextBlock x:Name='AutoSum' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,12'/>
-          <Grid Margin='0,0,0,8'>
-            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-            <StackPanel><TextBlock Text='Apply its tweaks when it starts' FontSize='13' FontWeight='SemiBold'/><TextBlock Text='Switches on the recommended tweaks for this game that are still off. Changes to its settings files wait until the game closes.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,20,0'/></StackPanel>
-            <ToggleButton x:Name='AutoTw' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
-          </Grid>
-          <StackPanel x:Name='AutoOpts' Margin='16,0,0,0' Visibility='Collapsed'>
-            <Grid Margin='0,0,0,8'>
-              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-              <TextBlock Text='Also change its settings files after it closes' FontSize='12.5' VerticalAlignment='Center'/>
-              <ToggleButton x:Name='AutoLater' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
-            </Grid>
-            <Grid>
-              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-              <TextBlock Text='Put the tweaks back when the game closes' FontSize='12.5' VerticalAlignment='Center'/>
-              <ToggleButton x:Name='AutoBack' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
-            </Grid>
-          </StackPanel>
-        </StackPanel>
-      </Border>
-      <Border x:Name='ServerCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
+      <!-- stats strip: the newest match report of this game (Update-GameStrip) -->
+      <Border x:Name='Strip' Style='{DynamicResource Zd.Card}' Padding='22,14' Margin='0,0,0,18' AutomationProperties.Name='Last match of this game'>
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-          <StackPanel>
-            <TextBlock Text='GAME SERVER' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
-            <Button x:Name='ServerBtn' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='12,8' Margin='0,8,0,0'>
-              <StackPanel Orientation='Horizontal'><TextBlock x:Name='ServerText' Text='Automatic'/><TextBlock Text='&#xE70D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Margin='10,3,0,0'/></StackPanel>
-            </Button>
-            <Popup x:Name='ServerPop' PlacementTarget='{Binding ElementName=ServerBtn}' Placement='Bottom' VerticalOffset='6' StaysOpen='False' AllowsTransparency='True' PopupAnimation='Fade'>
-              <Border CornerRadius='12' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' Padding='6' Margin='0,0,10,12'>
-                <ScrollViewer Style='{DynamicResource OverlayScroll}' MaxHeight='360' VerticalScrollBarVisibility='Auto'><StackPanel x:Name='ServerList' MinWidth='280'/></ScrollViewer>
-              </Border>
-            </Popup>
-            <TextBlock x:Name='ServerHint' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,10,0,0' MaxWidth='420' HorizontalAlignment='Left'/>
-          </StackPanel>
-          <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-            <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
-            <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
-            <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+          <WrapPanel x:Name='StripStats' VerticalAlignment='Center'/>
+          <TextBlock x:Name='StripEmpty' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' TextWrapping='Wrap' Visibility='Collapsed'/>
+          <StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='16,0,0,0'>
+            <TextBlock x:Name='StripWhen' FontSize='13' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Right'/>
+            <TextBlock x:Name='StripLen' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Right' Margin='0,2,0,0'/>
           </StackPanel>
         </Grid>
       </Border>
-      <Border Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,18'>
-        <StackPanel>
-          <TextBlock Text='YOUR ROUTE, LIVE' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
-          <Grid x:Name='Route' Margin='0,16,0,0'>
-            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+      <!-- tabs: selected = primary text over a 2 px accent line (Update-GameTabs) -->
+      <Grid Margin='0,0,0,16'>
+        <Border Height='1' Background='{DynamicResource Border.Subtle}' VerticalAlignment='Bottom'/>
+        <StackPanel x:Name='Tabs' Orientation='Horizontal'/>
+      </Grid>
+      <StackPanel x:Name='TabRoute'>
+        <Border x:Name='ServerCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text='GAME SERVER' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+              <Button x:Name='ServerBtn' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='12,8' Margin='0,8,0,0'>
+                <StackPanel Orientation='Horizontal'><TextBlock x:Name='ServerText' Text='Automatic'/><TextBlock Text='&#xE70D;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Margin='10,3,0,0'/></StackPanel>
+              </Button>
+              <Popup x:Name='ServerPop' PlacementTarget='{Binding ElementName=ServerBtn}' Placement='Bottom' VerticalOffset='6' StaysOpen='False' AllowsTransparency='True' PopupAnimation='Fade'>
+                <Border CornerRadius='12' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' Padding='6' Margin='0,0,10,12'>
+                  <ScrollViewer Style='{DynamicResource OverlayScroll}' MaxHeight='360' VerticalScrollBarVisibility='Auto'><StackPanel x:Name='ServerList' MinWidth='280'/></ScrollViewer>
+                </Border>
+              </Popup>
+              <TextBlock x:Name='ServerHint' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,10,0,0' MaxWidth='420' HorizontalAlignment='Left'/>
+            </StackPanel>
+            <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+              <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/></StackPanel>
+              <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/></StackPanel>
+              <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/></StackPanel>
+            </StackPanel>
           </Grid>
-          <TextBlock x:Name='RouteNote' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,14,0,0'/>
-        </StackPanel>
-      </Border>
-      <StackPanel x:Name='Stats' Margin='0,14,0,0'/>
-    </StackPanel>
-    <Border Grid.Column='1' Style='{DynamicResource Zd.Card}' Padding='18' VerticalAlignment='Top'>
-      <StackPanel>
-        <TextBlock Text='Preset' FontSize='15' FontWeight='SemiBold'/>
-        <Border HorizontalAlignment='Left' Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3' Margin='0,12,0,8'><WrapPanel x:Name='PresetChips'/></Border>
-        <TextBlock x:Name='PresetNote' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,0,0,16'/>
-        <TextBlock Text='Game tools' FontSize='15' FontWeight='SemiBold'/>
-        <WrapPanel x:Name='ToolChips' Margin='0,12,0,8'/>
-        <StackPanel x:Name='ToolList'/>
+        </Border>
+        <Border Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,18'>
+          <StackPanel>
+            <TextBlock Text='YOUR ROUTE, LIVE' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+            <Grid x:Name='Route' Margin='0,16,0,0'>
+              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+            </Grid>
+            <TextBlock x:Name='RouteNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,14,0,0'/>
+          </StackPanel>
+        </Border>
       </StackPanel>
-    </Border>
-  </Grid>
+      <StackPanel x:Name='TabTweaks' Visibility='Collapsed'>
+        <Border x:Name='AutoCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
+          <StackPanel>
+            <TextBlock Text='WHEN THIS GAME STARTS' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+            <TextBlock x:Name='AutoSum' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,6,0,12'/>
+            <Grid Margin='0,0,0,8'>
+              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+              <StackPanel><TextBlock Text='Apply its tweaks when it starts' FontSize='13' FontWeight='SemiBold'/><TextBlock Text='Switches on the recommended tweaks for this game that are still off. Changes to its settings files wait until the game closes.' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,20,0'/></StackPanel>
+              <ToggleButton x:Name='AutoTw' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
+            </Grid>
+            <StackPanel x:Name='AutoOpts' Margin='16,0,0,0' Visibility='Collapsed'>
+              <Grid Margin='0,0,0,8'>
+                <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+                <TextBlock Text='Also change its settings files after it closes' FontSize='12.5' VerticalAlignment='Center'/>
+                <ToggleButton x:Name='AutoLater' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
+              </Grid>
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+                <TextBlock Text='Put the tweaks back when the game closes' FontSize='12.5' VerticalAlignment='Center'/>
+                <ToggleButton x:Name='AutoBack' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
+              </Grid>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+        <Border Style='{DynamicResource Zd.Card}' Padding='14,12' Margin='0,0,0,18'><StackPanel x:Name='TweakList'/></Border>
+      </StackPanel>
+      <StackPanel x:Name='TabChecks' Visibility='Collapsed'>
+        <TextBlock Text='Checks, tests and guides for this game. They look and explain; switches are under its Tweaks tab.' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,0,0,10'/>
+        <WrapPanel x:Name='ToolChips' Margin='0,0,0,6'/>
+        <Border Style='{DynamicResource Zd.Card}' Padding='14,12' Margin='0,0,0,18'><StackPanel x:Name='ToolList'/></Border>
+      </StackPanel>
+      <StackPanel x:Name='TabTrends' Visibility='Collapsed'>
+        <StackPanel x:Name='Stats'/>
+      </StackPanel>
+  </StackPanel>
 </Grid>
 "@)
     $h = @{ Root = $root }
     foreach ($n in 'Library', 'Tiles', 'MoreHead', 'MoreSub', 'MoreTiles', 'ServerCard', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroLogo', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
-                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats', 'AutoChip', 'AutoGm', 'AutoGmText', 'AutoCard', 'AutoSum', 'AutoTw', 'AutoOpts', 'AutoLater', 'AutoBack', 'PresetChips', 'PresetNote') { $h[$n] = $root.FindName($n) }
+                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats', 'AutoChip', 'AutoGm', 'AutoGmText', 'AutoCard', 'AutoSum', 'AutoTw', 'AutoOpts', 'AutoLater', 'AutoBack', 'PresetChips', 'PresetNote',
+                   'HeroSub', 'HeroAc', 'StopGm', 'Strip', 'StripStats', 'StripEmpty', 'StripWhen', 'StripLen', 'Tabs', 'TabRoute', 'TabTweaks', 'TabChecks', 'TabTrends', 'TweakList') { $h[$n] = $root.FindName($n) }
     $script:GamesUi = $h
+    # 2.1 tabs under the stats strip: each one shows one of the page's sections (Update-GameTabs)
+    $h.TabBtns = @{}
+    foreach ($tn in $GameTabNames) {
+        $tb = [ZdTheme]::Parse(@"
+<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Button.Ghost}' Padding='0' MinHeight='0' Margin='0,0,26,0' AutomationProperties.Name='$tn'>
+  <StackPanel>
+    <TextBlock Text='$tn' FontSize='14' Margin='2,6,2,10'/>
+    <Border Height='2' CornerRadius='1' Background='{DynamicResource AccentFill}' Visibility='Hidden'/>
+  </StackPanel>
+</Button>
+"@)
+        $tb.Tag = $tn
+        $tb.Add_Click({ param($s, $e) $script:GameTab = $s.Tag; Update-GameTabs })
+        [void]$h.Tabs.Children.Add($tb); $h.TabBtns[$tn] = $tb
+    }
+    if (-not $script:GameTab) { $script:GameTab = 'Route' }
+    $h.Strip.Add_MouseLeftButtonUp({ if ($script:GamesUi.StripReport) { Select-NavPage 'Matches' } })
+    $h.StopGm.Add_Click({
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        try { $msg = Disable-ZDGameMode; Suspend-GameModeAuto; Show-Toast "$msg".Trim() '#30D158' } catch { Show-Toast $_.Exception.Message '#FF9F0A' }
+        $window.Cursor = $null
+        Update-GameModeUi; Update-GameDetail
+    })
     Initialize-GameAutoUi $h
     foreach ($g in $GameDefs) {
         $tile = New-GameTile $g
@@ -22741,7 +22807,7 @@ function New-GamesPage {
         $script:GamesTimer.Add_Tick({ try { Update-GameDetailTick } catch { $script:GamesTimer.Stop(); Stop-RouteMonitor; Write-CrashLog $_.Exception 'game page' } })
         $script:GamesTimer.Start()
     }
-    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail; Update-GameStats } }
+    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail; Update-GameStats; Update-GameTabs } }
     if ($env:ZD_GAME) { $g0 = $GameDefs | Where-Object { $_.Id -eq $env:ZD_GAME } | Select-Object -First 1; if ($g0) { Show-GameDetail $g0 } }
     New-PageScroll $root
 }
@@ -22754,6 +22820,7 @@ function Show-GameDetail($g) {
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.From)), 0))
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.To)), 1))
     $h.HeroTitle.Text = $g.Title; $h.HeroGlyph.Text = [string]$g.Glyph
+    $h.HeroSub.Text = "$($g.Sub)"; $h.HeroAc.Text = Get-GameAcNote $g
     $art = Get-GameArt $g 'header'
     if ($art) {
         $ib = New-Object Windows.Media.ImageBrush $art; $ib.Stretch = 'UniformToFill'; $ib.AlignmentY = 'Top'
@@ -22791,6 +22858,7 @@ function Show-GameDetail($g) {
     Update-GameAutoUi
     Update-GameDetail
     Update-GameStats
+    Update-GameTabs
     if ($script:Anim) { Show-Animated $h.Detail 12 260 }
 }
 function Hide-GameDetail {
@@ -22819,6 +22887,7 @@ function Update-GameDetail {
     $gm = Test-ZDGameMode
     $h.GmChipText.Text = Get-GameModeChipText $g
     $h.GmChip.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($gm) { 'Good.Soft' } else { 'Bg.Raised' }))
+    $h.StopGm.Visibility = if ($gm) { 'Visible' } else { 'Collapsed' }
     $inst = try { [bool](& $g.Installed) } catch { $false }
     $h.Play.IsEnabled = $inst   # the 2.0 button dims itself when disabled
     $p = if ($inst) { Get-Process $g.Proc -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
@@ -22887,55 +22956,150 @@ function Update-GameTools {
     $listed = @($g.Tools | ForEach-Object { $_.Id })
     $auto = @($Tweaks | Where-Object { $gcat -and $_.Cat -eq $gcat -and $_.Toggle -and $listed -notcontains $_.Id } | ForEach-Object { @{ Id = $_.Id; Kind = 'Settings' } })
     $all = @(@($g.Tools | Where-Object { $_.Kind -eq 'Settings' }) + $auto + @($g.Tools | Where-Object { $_.Kind -ne 'Settings' }))
-    $kinds = @('All') + @($all | ForEach-Object { $_.Kind } | Select-Object -Unique | Sort-Object { @('Settings', 'Network', 'FPS', 'Repair').IndexOf($_) })
+    # 2.1: switches go to the "Tweaks for <game>" tab; checks, tests and guides to the Checks tab with the filter chips
+    $sw = New-Object Collections.ArrayList; $ck = New-Object Collections.ArrayList
+    foreach ($tool in $all) {
+        $t = $Tweaks | Where-Object { $_.Id -eq $tool.Id } | Select-Object -First 1
+        if (-not $t -or ($inst -and $t.Hidden)) { continue }
+        if ($t.Toggle) { [void]$sw.Add($t) } else { [void]$ck.Add(@{ T = $t; Kind = $tool.Kind }) }
+    }
+    $kinds = @('All') + @($ck | ForEach-Object { $_.Kind } | Select-Object -Unique | Sort-Object { @('Settings', 'Network', 'FPS', 'Repair').IndexOf($_) })
     if ($kinds -notcontains $script:GameToolKind) { $script:GameToolKind = 'All' }
     $h.ToolChips.Children.Clear()
     foreach ($k in $kinds) {
-        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$k' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
-        $c.Tag = $k; $c.Add_Click({ param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools })
-        $c.Background = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0071E3' } else { '#15181D' }); $c.Foreground = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0A0B0C' } else { '#9AA3AF' })
-        [void]$h.ToolChips.Children.Add($c)
+        [void]$h.ToolChips.Children.Add((New-Chip $k ($k -eq $script:GameToolKind) { param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools } $k))
     }
-    $h.ToolList.Children.Clear()
+    $h.ToolChips.Visibility = if ($kinds.Count -gt 2) { 'Visible' } else { 'Collapsed' }
+    $h.TweakList.Children.Clear(); $h.ToolList.Children.Clear()
+    $note = {
+        param($panel, [string]$text)
+        $tb = New-Object Windows.Controls.TextBlock; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 12.5; $tb.Margin = '8,4,8,8'; $tb.Text = $text
+        $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+        [void]$panel.Children.Add($tb)
+    }
     if (-not $inst) {
-        $tb = New-Object Windows.Controls.TextBlock; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 12; $tb.Margin = '0,0,0,10'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'
-        $tb.Text = "$($g.Title) is not installed on this PC. This is what ZeroDelay offers for it once it is:"
-        [void]$h.ToolList.Children.Add($tb)
+        foreach ($p in @($h.TweakList, $h.ToolList)) { & $note $p "$($g.Title) is not installed on this PC. This is what ZeroDelay offers for it once it is:" }
     }
-    foreach ($tool in $all) {
-        if ($script:GameToolKind -ne 'All' -and $tool.Kind -ne $script:GameToolKind) { continue }
-        $t = $Tweaks | Where-Object { $_.Id -eq $tool.Id } | Select-Object -First 1
-        if (-not $t -or ($inst -and $t.Hidden)) { continue }
-        $desc = "$($t.Desc)"; if ($desc.Length -gt 90) { $desc = $desc.Substring(0, 87).TrimEnd() + '...' }
-        $isSwitch = [bool]$t.Toggle
-        $right = if ($isSwitch) { "<ToggleButton x:Name='Sw' Grid.Column='2' Style='{DynamicResource Switch}' VerticalAlignment='Center' Margin='6,0,0,0'/>" } else { "<TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#98989D' VerticalAlignment='Center'/>" }
-        $tag = if ($isSwitch) { 'Border' } else { 'Button' }
-        $row = [ZdTheme]::Parse(@"
+    foreach ($t in $sw) { [void]$h.TweakList.Children.Add((New-GameToolRow $t $inst)) }
+    if (-not $sw.Count) { & $note $h.TweakList "No switches for $($g.Title) yet. Its checks and guides are under Checks." }
+    $shown = 0
+    foreach ($c in $ck) {
+        if ($script:GameToolKind -ne 'All' -and $c.Kind -ne $script:GameToolKind) { continue }
+        [void]$h.ToolList.Children.Add((New-GameToolRow $c.T $inst)); $shown++
+    }
+    if (-not $shown) { & $note $h.ToolList 'Nothing of this kind for this game yet.' }
+    $h.TweakCount = $sw.Count
+    Update-GameTabs
+}
+# one row in the Tweaks or Checks tab of a game page: a switch, or a button that runs the check or opens the guide
+function New-GameToolRow($t, [bool]$inst) {
+    $desc = "$($t.Desc)"; if ($desc.Length -gt 90) { $desc = $desc.Substring(0, 87).TrimEnd() + '...' }
+    $isSwitch = [bool]$t.Toggle
+    $right = if ($isSwitch) { "<ToggleButton x:Name='Sw' Grid.Column='2' Style='{DynamicResource Switch}' VerticalAlignment='Center' Margin='6,0,0,0' AutomationProperties.Name='$(Esc $t.Title)'/>" } else { "<TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='{DynamicResource Font.Icons}' FontSize='11' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>" }
+    $tag = if ($isSwitch) { 'Border' } else { 'Button' }
+    $row = [ZdTheme]::Parse(@"
 <$tag xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' $(if ($isSwitch) { "Background='Transparent' Padding='8,8' CornerRadius='10'" } else { "Style='{DynamicResource Btn}' Background='Transparent' HorizontalContentAlignment='Stretch' Padding='8,8'" }) Margin='0,0,0,2'>
   <Grid>
     <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-    <Border Width='32' Height='32' CornerRadius='9' Background='#2C2C2E' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$t.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <Border Width='32' Height='32' CornerRadius='9' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$t.Icon)' FontFamily='{DynamicResource Font.Icons}' FontSize='14' Foreground='{DynamicResource Accent}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
     <StackPanel Grid.Column='1' Margin='10,0,6,0'>
-      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>
-      <TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/>
+      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+      <TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,0,0'/>
     </StackPanel>
     $right
   </Grid>
 </$tag>
 "@)
-        if ($isSwitch) {
-            $sw = $row.FindName('Sw'); $sw.Tag = $t
-            $sw.IsChecked = [bool]$t.State; $sw.IsEnabled = $inst -and $null -ne $t.State
-            $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools; Update-PresetChips })
-        } else {
-            $row.Tag = $t
-            $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
-            $row.IsEnabled = $inst
-        }
-        if (-not $inst) { $row.Opacity = 0.55 }
-        [void]$h.ToolList.Children.Add($row)
+    if ($isSwitch) {
+        $sw = $row.FindName('Sw'); $sw.Tag = $t
+        $sw.IsChecked = [bool]$t.State; $sw.IsEnabled = $inst -and $null -ne $t.State
+        $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools; Update-PresetChips })
+    } else {
+        $row.Tag = $t
+        $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
+        $row.IsEnabled = $inst
     }
-    if ($h.ToolList.Children.Count -eq [int](-not $inst)) { $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Nothing of this kind for this game yet.'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'; $tb.FontSize = 12; [void]$h.ToolList.Children.Add($tb) }
+    if (-not $inst) { $row.Opacity = 0.55 }
+    $row
+}
+# --- 2.1 game page: tabs, anti-cheat note and the stats strip
+$GameTabNames = @('Route', 'Tweaks', 'Checks', 'Trends')
+# anti-cheat per game, where the tweak code names it (the rest get the general note)
+$GameAntiCheat = @{ fortnite = 'Easy Anti-Cheat'; rematch = 'Easy Anti-Cheat'; rocketleague = 'Easy Anti-Cheat'; apex = 'Easy Anti-Cheat'; thefinals = 'Easy Anti-Cheat'
+                    cs2 = 'VAC'; valorant = 'Vanguard'; cod = 'Ricochet'; bf6 = 'EA Javelin'; roblox = 'Hyperion' }
+function Get-GameAcNote($g) {
+    $what = 'ZeroDelay changes Windows, the graphics driver and settings files, never the game''s program or its memory.'
+    $ac = $GameAntiCheat[$g.Id]
+    if ($ac) { "Works beside ${ac}: $what" } else { "Anti-cheat: $what" }
+}
+# shows the picked tab's section; selected = primary text over the accent line, the others secondary
+function Update-GameTabs {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.TabBtns) { return }
+    if ($GameTabNames -notcontains $script:GameTab) { $script:GameTab = 'Route' }
+    foreach ($tn in $GameTabNames) {
+        $b = $h.TabBtns[$tn]; $on = $tn -eq $script:GameTab
+        $label = if ($tn -eq 'Tweaks') { "Tweaks for $($g.Title) ($([int]$h.TweakCount))" } else { $tn }
+        $txt = $b.Content.Children[0]; $txt.Text = $label
+        [Windows.Automation.AutomationProperties]::SetName($b, $label)
+        $txt.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($on) { 'Text.Primary' } else { 'Text.Secondary' }))
+        $txt.FontWeight = if ($on) { 'SemiBold' } else { 'Medium' }
+        $b.Content.Children[1].Visibility = if ($on) { 'Visible' } else { 'Hidden' }
+        $h["Tab$tn"].Visibility = if ($on) { 'Visible' } else { 'Collapsed' }
+    }
+}
+# one number in the stats strip: mono value, small unit, label under it; $Key = the colour token
+function New-GameStripStat([string]$Label, [string]$Text, [string]$Unit, [string]$Key) {
+    $sp = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,2,36,2' AutomationProperties.Name='$(Esc "$Label $Text $Unit")'>
+  <StackPanel Orientation='Horizontal'>
+    <TextBlock Text='$(Esc $Text)' FontFamily='{DynamicResource Font.Mono}' FontSize='22' FontWeight='SemiBold' Typography.NumeralAlignment='Tabular'/>
+    <TextBlock Text='$(Esc $Unit)' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='3,0,0,4'/>
+  </StackPanel>
+  <TextBlock Text='$(Esc $Label)' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' Margin='0,1,0,0'/>
+</StackPanel>
+"@)
+    $sp.Children[0].Children[0].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $Key)
+    $sp
+}
+# the strip under the hero: the newest match report of this game ($r; $null = none yet, or still reading with $Loading)
+function Update-GameStrip($r, [bool]$Loading) {
+    $h = $script:GamesUi; if (-not $h -or -not $h.Strip) { return }
+    $h.StripStats.Children.Clear(); $h.StripWhen.Text = ''; $h.StripLen.Text = ''; $h.StripReport = $r
+    if (-not $r) {
+        $h.StripStats.Visibility = 'Collapsed'; $h.StripEmpty.Visibility = 'Visible'
+        $h.StripEmpty.Text = if ($Loading) { 'Reading your last match...' } else { 'Play a match with ZeroDelay open and your numbers show up here.' }
+        $h.Strip.Cursor = $null; $h.Strip.ToolTip = $null
+        return
+    }
+    $h.StripStats.Visibility = 'Visible'; $h.StripEmpty.Visibility = 'Collapsed'
+    $h.Strip.Cursor = [Windows.Input.Cursors]::Hand; $h.Strip.ToolTip = 'Open the match reports'
+    $avg = if ($r.Fps) { ConvertTo-StatNumber $r.Fps.Avg } else { $null }
+    $low = if ($r.Fps) { ConvertTo-StatNumber $r.Fps.Low1 } else { $null }
+    $ping = ConvertTo-StatNumber $r.PingAvg; $loss = ConvertTo-StatNumber $r.LossPct
+    $mins = ConvertTo-StatNumber $r.Minutes; $sc = ConvertTo-StatNumber $r.StutterCount
+    $spm = if ($null -ne $sc -and $mins -gt 0) { $sc / $mins } else { $null }
+    $keys = @{ good = 'Good'; warn = 'Warn'; bad = 'Bad' }
+    $items = @(
+        @{ L = 'Avg FPS'; V = $avg; F = '{0:0}'; U = ''; S = 'idle' }
+        @{ L = '1% low'; V = $low; F = '{0:0}'; U = ''; S = (Get-MatchMetricState 'low1' $low $avg) }
+        @{ L = $(if ($r.PingRegion) { "Ping · $($r.PingRegion)" } else { 'Ping' }); V = $ping; F = '{0:0}'; U = 'ms'; S = (Get-MatchMetricState 'ping' $ping) }
+        @{ L = 'Packet loss'; V = $loss; F = '{0:0.#}'; U = '%'; S = (Get-MatchMetricState 'loss' $loss) }
+        @{ L = 'Stutters'; V = $spm; F = '{0:0.#}'; U = '/min'; S = (Get-MatchMetricState 'stut' $spm) }
+    )
+    foreach ($m in $items) {
+        $txt = if ($null -eq $m.V) { '-' } else { $m.F -f $m.V }
+        $key = if ($null -eq $m.V) { 'Text.Muted' } elseif ($keys.ContainsKey($m.S)) { $keys[$m.S] } else { 'Text.Primary' }
+        [void]$h.StripStats.Children.Add((New-GameStripStat $m.L $txt $(if ($null -eq $m.V) { '' } else { $m.U }) $key))
+    }
+    $end = $null
+    try { if ($r.End) { $end = [datetime]$r.End } elseif ($r.Start) { $end = ([datetime]$r.Start).AddMinutes([double]$mins) } } catch { $end = $null }
+    if ($end) {
+        $ago = (Get-Date) - $end
+        $h.StripWhen.Text = if ($ago.TotalMinutes -lt 1) { 'just now' } elseif ($ago.TotalMinutes -lt 60) { "$([int][Math]::Floor($ago.TotalMinutes)) min ago" }
+            elseif ($ago.TotalHours -lt 24) { "$([int][Math]::Floor($ago.TotalHours)) h ago" } elseif ($ago.TotalDays -lt 2) { 'yesterday' }
+            elseif ($ago.TotalDays -lt 7) { "$([int][Math]::Floor($ago.TotalDays)) days ago" } else { $end.ToString('d MMM') }
+    }
+    $h.StripLen.Text = if ($mins) { "last match · $([int]$mins) min" } else { 'last match' }
 }
 
 # --- Boost page: how much of the recommended setup is on, the parts of the PC it covers, Boost now and Restore
