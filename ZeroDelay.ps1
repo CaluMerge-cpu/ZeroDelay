@@ -24328,7 +24328,9 @@ function New-GameTile($g) {
   </Grid>
 </Border>
 "@)
+    $iw = [Diagnostics.Stopwatch]::StartNew()
     $ok = try { [bool](& $g.Installed) } catch { $false }
+    if ($Snapshot -and $iw.ElapsedMilliseconds -gt 150) { [Console]::WriteLine(('STARTUP games page: install check for {0} took {1} ms' -f $g.Id, $iw.ElapsedMilliseconds)) }
     $g.InstalledNow = $ok
     if (-not $ok) { $b.Opacity = 0.82 }
     # pictures already read this session go on now; the rest come from Start-GameImageFetch (New-GamesPage)
@@ -24531,14 +24533,21 @@ function New-GamesPage {
         $window.Cursor = $null
         Update-GameModeUi; Update-GameDetail
     })
+    Write-StartupMark 'games page: layout parsed'
     Initialize-GameAutoUi $h
+    Write-StartupMark 'games page: auto Game Mode UI'
+    $gsw = [Diagnostics.Stopwatch]::StartNew(); $gInst = 0.0; $gParse = 0.0
     foreach ($g in $GameDefs) {
+        $t0 = $gsw.Elapsed.TotalMilliseconds
         $tile = New-GameTile $g
+        $gParse += $gsw.Elapsed.TotalMilliseconds - $t0
         if ($tile.Tag.InstalledNow) { [void]$h.Tiles.Children.Add($tile) } else { [void]$h.MoreTiles.Children.Add($tile) }
     }
+    if ($Snapshot) { [Console]::WriteLine(('STARTUP games page: {0} tiles in {1:N0} ms' -f @($GameDefs).Count, $gParse)) }
     if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
     Start-GameImageFetch $GameDefs
     Start-GameArtFetch
+    Write-StartupMark 'games page: image fetch started'
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
         $n = [ZdTheme]::Parse(@"
@@ -29457,6 +29466,8 @@ if ($Snapshot) {
         $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($script:SnapWait)
         $script:SnapTimer.Add_Tick({ $script:SnapTimer.Stop(); Save-Snapshot })
         $script:SnapTimer.Start()
+        # counted from the first frame: if the 1 s timer above has not saved by then, the dispatcher timers have stalled
+        if ($script:ZdKickReady) { [ZdKick]::Every($window.Dispatcher, [int](($script:SnapWait + 8) * 1000), [Action]{ if (-not $script:SnapDone) { [Console]::WriteLine('SNAP kick: the dispatcher timer did not fire, saved from a thread-pool timer'); Save-Snapshot } }) }
     })
     # if the window never reports it rendered (seen on busy CI machines), take the picture anyway
     $script:SnapFallback = New-Object Windows.Threading.DispatcherTimer
@@ -29474,7 +29485,7 @@ public static class ZdKick {
     }
 }
 '@
-        [ZdKick]::Every($window.Dispatcher, [int](($script:SnapWait + 8) * 1000), [Action]{ if (-not $script:SnapDone) { [Console]::WriteLine('SNAP kick: the dispatcher timer did not fire, saved from a thread-pool timer'); Save-Snapshot } })
+        $script:ZdKickReady = $true
     } catch { [Console]::Error.WriteLine("SNAP kick unavailable: $($_.Exception.Message)") }
     function Save-Snapshot {
         if ($script:SnapDone) { return }
