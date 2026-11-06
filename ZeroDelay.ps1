@@ -13,6 +13,7 @@ param(
     [string]$Page,        # dev: category to show first
     [switch]$Tray         # start hidden in the system tray (used by "Start with Windows")
 )
+$script:ZdClock = [Diagnostics.Stopwatch]::StartNew()   # startup timing for dev renders (Write-StartupMark)
 
 # --- Self-elevate (HKLM tweaks, powercfg and network adapters need admin) ---
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -28,6 +29,9 @@ if (-not $NoElevate -and -not $principal.IsInRole([Security.Principal.WindowsBui
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+# a WMI query on the window's thread gives up after 30 s instead of waiting out WMI's own 3-minute timeout, so a busy
+# or stuck WMI service cannot freeze the window that long (the background workers keep WMI's default)
+$PSDefaultParameterValues['Get-CimInstance:OperationTimeoutSec'] = 30
 try { [Windows.Media.Animation.Timeline]::DesiredFrameRateProperty.OverrideMetadata([Windows.Media.Animation.Timeline], (New-Object Windows.FrameworkPropertyMetadata ([object][int]240))) } catch {}
 if (-not $Snapshot) {
     $created = $false
@@ -35,7 +39,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '2.0.0'
+$AppVersion = '2.1.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -113,7 +117,9 @@ if (-not $Snapshot -and -not $Tray) {
     })
     $script:SplashHandle = $splashPs.BeginInvoke()
 }
-function Set-SplashStatus([string]$Text) { if ($script:Splash) { $script:Splash.Status = $Text } }
+function Set-SplashStatus([string]$Text) { if ($script:Splash) { $script:Splash.Status = $Text }; Write-StartupMark $Text }
+# dev renders (-Snapshot) print how long each startup stage took, so CI shows where the time to the first window goes
+function Write-StartupMark([string]$What) { if ($Snapshot) { [Console]::WriteLine(('STARTUP {0,7} ms  {1}' -f $script:ZdClock.ElapsedMilliseconds, $What)) } }
 function Close-Splash { if ($script:Splash) { $script:Splash.Close = $true } }
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
@@ -517,6 +523,8 @@ using System.Threading;
 public static class ZdWatchdog {
     static Thread ui, watcher; static long lastBeat; static string logPath = "", version = "";
     static volatile string step = "starting"; static volatile bool dumped, frozen;
+    // dev renders (-Snapshot): the report also goes to the error output, so a CI run that times out shows where
+    public static volatile bool Echo;
     public static string Step { get { return step; } set { step = value ?? ""; } }
     public static void Beat() {
         long was = Interlocked.Exchange(ref lastBeat, DateTime.UtcNow.Ticks);
@@ -546,7 +554,9 @@ public static class ZdWatchdog {
 #pragma warning restore 618
                 } catch (Exception e) { stack = "stack unavailable: " + e.Message; }
             }
-            try { System.IO.File.AppendAllText(logPath, "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window has not responded for " + Math.Round(secs) + " s. Step: " + step + "\r\n" + stack + "\r\n"); } catch { }
+            string txt = "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window has not responded for " + Math.Round(secs) + " s. Step: " + step + "\r\n" + stack + "\r\n";
+            try { System.IO.File.AppendAllText(logPath, txt); } catch { }
+            if (Echo) { try { Console.Error.WriteLine("WATCHDOG " + txt); Console.Error.Flush(); } catch { } }
         }
     }
 }
@@ -1191,6 +1201,16 @@ function Get-ActivePowerScheme {
     if ($line -match "($GuidRx)\s+\((.*)\)\s*$") { return @{ Guid = $Matches[1]; Name = $Matches[2] } }
     @{ Guid = $null; Name = 'unknown' }
 }
+# The plan the Ultimate Performance card switches to. Windows names it in the display language ("Ultimative Leistung",
+# "Performances optimales"), so besides the English names it is recognised by GUID: High performance, the Ultimate
+# template and the copy this card made (remembered under 'power:plan').
+function Test-UltimatePlan($Scheme) {
+    if (-not $Scheme) { return $false }
+    if ("$($Scheme.Name)" -match 'Ultimate Performance|High performance') { return $true }
+    $g = "$($Scheme.Guid)"
+    if (-not $g) { return $false }
+    [bool]($g -eq $HighPerfGuid -or $g -eq $UltimateTemplate -or ($script:Backup -and $script:Backup.Custom -and $g -eq "$($script:Backup.Custom['power:plan'])"))
+}
 
 function Get-RefreshRate {
     $d = @(Get-Displays)
@@ -1604,7 +1624,11 @@ function Get-CreatorExes {
     }
 }
 $ObsIni = "$env:APPDATA\obs-studio\global.ini"
-function Get-PrPrefsFile { Get-ChildItem "$env:USERPROFILE\Documents\Adobe\Premiere Pro\*\Profile-*\Adobe Premiere Pro Prefs" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+# Documents is often not %USERPROFILE%\Documents (OneDrive backup: ...\OneDrive\Dokumente, or moved to another drive): ask Windows
+function Get-PrPrefsFile {
+    $docs = @([Environment]::GetFolderPath('MyDocuments'), "$env:USERPROFILE\Documents") | Where-Object { $_ } | Select-Object -Unique
+    @($docs | ForEach-Object { Get-ChildItem "$_\Adobe\Premiere Pro\*\Profile-*\Adobe Premiere Pro Prefs" -ErrorAction SilentlyContinue }) | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
 function Get-AePrefsFile { Get-ChildItem "$env:APPDATA\Adobe\After Effects\*\Adobe After Effects * Prefs.txt" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'indep' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
 function Get-MemBalancerFile { Get-ChildItem "$env:APPDATA\Adobe\dynamiclinkmanager\*\memorybalancer*.xml" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
 function Test-CreatorPc { @(Get-CreatorExes).Count -gt 0 -or (Test-Path $ObsIni) -or [bool](Get-PrPrefsFile) -or [bool](Get-AePrefsFile) }
@@ -2649,17 +2673,14 @@ function Update-PresetChips {
     }
     $h.PresetChips.Visibility = 'Visible'
     foreach ($name in $script:PresetNames) {
-        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$name' Padding='14,5' Margin='0' FontSize='13' MinHeight='28'/>")
-        $c.Tag = $name
-        $c.Add_Click({ param($s, $e)
+        # 2.1: the shared segmented-control item (selected = raised tone, primary text)
+        $c = New-Segment $name ($name -eq $state) { param($s, $e)
             $g = $script:GameSel; if (-not $g) { return }
             $window.Cursor = [Windows.Input.Cursors]::Wait
             try { [void](Invoke-GamePreset $g $s.Tag) } catch { Show-Toast "$($s.Tag): $($_.Exception.Message)" '#FF9F0A' }
             $window.Cursor = $null
             Update-PresetChips; Update-GameTools
-        })
-        $sel = $name -eq $state
-        $c.Background = ConvertTo-Brush $(if ($sel) { '#2B323B' } else { '#00000000' }); $c.Foreground = ConvertTo-Brush $(if ($sel) { '#F2F4F7' } else { '#9AA3AF' }); if ($sel) { $c.FontWeight = 'SemiBold' }
+        } $name
         [void]$h.PresetChips.Children.Add($c)
     }
     $h.PresetNote.Text = if ($waiting) { "Waiting for $($g.Title) to close: $waiting setting$(if ($waiting -ne 1) { 's' }) of $($rec.Name) will be applied then." }
@@ -3296,8 +3317,9 @@ $raw = (& pathping.exe -n -q 25 -p 150 -w 800 $ip 2>&1 | Out-String)
 }
 function Get-RouteVerdict([string]$Raw, [string]$Target) {
     # hop lines of the statistics block: "  3   12ms     0/ 25 =  0%     0/ 25 =  0%  10.0.0.1" ("---" = that router ignores probes)
-    $hops = foreach ($m in [regex]::Matches($Raw, '(?m)^\s*(\d+)\s+(\d+ms|---)\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\S+)')) {
-        [pscustomobject]@{ Hop = [int]$m.Groups[1].Value; Rtt = $(if ($m.Groups[2].Value -eq '---') { $null } else { [int]($m.Groups[2].Value -replace 'ms') }); Loss = [int]$m.Groups[5].Value; Ip = $m.Groups[9].Value }
+    # the unit is translated in some languages ("12мс"), so any letters after the number are accepted
+    $hops = foreach ($m in [regex]::Matches($Raw, '(?m)^\s*(\d+)\s+(\d+[^\d\s/=%]*|---)\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\d+)/\s*(\d+)\s*=\s*(\d+)%\s+(\S+)')) {
+        [pscustomobject]@{ Hop = [int]$m.Groups[1].Value; Rtt = $(if ($m.Groups[2].Value -eq '---') { $null } else { [int]($m.Groups[2].Value -replace '\D') }); Loss = [int]$m.Groups[5].Value; Ip = $m.Groups[9].Value }
     }
     try { Set-Clipboard -Value $Raw } catch {}
     if (-not $hops) { return "The route could not be measured (some networks block it). The full output was copied to your clipboard.`n`n$($Raw.Trim().Substring(0, [Math]::Min(700, $Raw.Trim().Length)))" }
@@ -5187,8 +5209,9 @@ function Get-BcdCurrent {
         $h
     } 30
 }
-# A bcdedit Yes in the languages Windows ships most
-function Test-BcdYes($v) { "$v" -match '^(Yes|Ja|Oui|Sí|Si|Sì|Sim|Tak|Evet|Ano|Igen|Kyllä)$' }
+# A bcdedit Yes / No in the languages Windows ships (bcdedit translates them: "Да" on Russian, "是" on Chinese Windows)
+function Test-BcdYes($v) { "$v".Trim() -match '^(Yes|Ja|Oui|Sí|Si|Sì|Sim|Tak|Evet|Ano|Áno|Igen|Kyllä|Da|Да|Так|Jah|Jā|Taip|Ναι|是|はい|예|כן|نعم|ใช่|Có)$' }
+function Test-BcdNo($v) { "$v".Trim() -match '^(No|Nein|Non|Não|Nie|Hayır|Nee|Ne|Nem|Ei|Nej|Nei|Nu|Nē|Нет|Ні|Не|Όχι|否|いいえ|아니요|לא|لا|ไม่ใช่|Không)$' }
 # Boot values that stop Easy Anti-Cheat
 $script:BcdAntiCheat = @(
     @{ N = 'testsigning'; Rule = 'yes'; What = 'test signing on: unsigned test drivers may load, and Easy Anti-Cheat refuses to start' }
@@ -5227,7 +5250,7 @@ function Get-BcdFindings($Rules, $Bcd = $null) {
     if ($null -eq $Bcd) { return }
     foreach ($r in $Rules) {
         $v = $Bcd[$r.N]; if ($null -eq $v) { continue }
-        $bad = switch ($r.Rule) { 'yes' { Test-BcdYes $v } 'any' { $true } 'notzero' { "$v" -notmatch '^(0|0x0|No|Nein|Non)$' } default { "$v" -eq $r.Rule } }
+        $bad = switch ($r.Rule) { 'yes' { Test-BcdYes $v } 'any' { $true } 'notzero' { "$v" -notmatch '^(0|0x0)$' -and -not (Test-BcdNo $v) } default { "$v" -eq $r.Rule } }
         if ($bad) { [pscustomobject]@{ N = $r.N; Value = $v; What = $r.What } }
     }
 }
@@ -5252,7 +5275,7 @@ function Invoke-BcdRepairOff([string]$Id) {
     $bcd = if ($b -is [System.Collections.IDictionary]) { $b['Bcd'] } elseif ($b) { $b.Bcd } else { $null }
     $fail = @()
     foreach ($e in @(Get-ZdPairs $bcd)) {
-        $val = if (Test-BcdYes $e.Value) { 'yes' } elseif ("$($e.Value)" -match '^(No|Nein|Non|Não|Nie|Hayır|Nee|Ne|Nem|Ei)$') { 'no' } else { "$($e.Value)" }
+        $val = if (Test-BcdYes $e.Value) { 'yes' } elseif (Test-BcdNo $e.Value) { 'no' } else { "$($e.Value)" }
         bcdedit /set '{current}' $e.Name $val | Out-Null; if ($LASTEXITCODE -ne 0) { $fail += $e.Name }
     }
     Clear-ReadCache
@@ -5930,7 +5953,9 @@ $dv = Get-ItemProperty $dk -ErrorAction SilentlyContinue
 $r.Prov = [bool]($dv -and $null -ne $dv.ProvAcSettingIndex)
 if ($r.BalancedExists) {
     $o = @(powercfg /qh $balanced $sub $set 2>$null)
-    foreach ($l in $o) { if ($l -match 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)') { $r.MinCores = [Convert]::ToInt32($Matches[1], 16); break } }
+    # the AC index is the second-last hex value: the labels are translated ("Aktueller Wechselstrom-Energieeinstellungsindex")
+    $hex = @($o | Where-Object { $_ -match ':\s*0x[0-9a-fA-F]+\s*$' } | ForEach-Object { [Convert]::ToInt32(($_ -replace '.*0x', '').Trim(), 16) })
+    if ($hex.Count -ge 2) { $r.MinCores = $hex[-2] }
 }
 if ($r.MinCores -lt 0) {
     $uv = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$balanced\$sub\$set" -ErrorAction SilentlyContinue
@@ -5941,12 +5966,15 @@ if ($r.MinCores -lt 0) {
 $r.Running = [bool](Get-Process ($exeName -replace '\.exe$') -ErrorAction SilentlyContinue)
 if ($r.Running) {
     try {
-        $c = Get-Counter '\Processor Information(*)\Parking Status' -ErrorAction Stop
-        $smp = @($c.CounterSamples | Where-Object { $_.InstanceName -notmatch '_Total' })
+        # Get-Counter only knows the counter names of the Windows language ("\Prozessorinformationen(*)\Parkstatus"):
+        # elsewhere the same counter is read through its language-neutral WMI class
+        $smp = $null
+        try { $smp = @((Get-Counter '\Processor Information(*)\Parking Status' -ErrorAction Stop).CounterSamples | Where-Object { $_.InstanceName -notmatch '_Total' } | ForEach-Object { [pscustomobject]@{ Name = $_.InstanceName; V = $_.CookedValue } }) }
+        catch { $smp = @(Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop | Where-Object { $_.Name -notmatch '_Total' } | ForEach-Object { [pscustomobject]@{ Name = "$($_.Name)"; V = $_.ParkingStatus } }) }
         $r.Cores = $smp.Count
-        $parked = @($smp | Where-Object { $_.CookedValue -eq 1 })
+        $parked = @($smp | Where-Object { $_.V -eq 1 })
         $r.Parked = $parked.Count
-        $r.ParkedNames = (($parked | ForEach-Object { $_.InstanceName -replace '^0,', '' } | Sort-Object { [int]$_ }) -join ', ')
+        $r.ParkedNames = (($parked | ForEach-Object { $_.Name -replace '^0,', '' } | Sort-Object { [int]$_ }) -join ', ')
     } catch {}
 }
 $r.Tools = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(ProcessLasso|ProcessGovernor|CoreDirector|RazerCortex|Hone)' } | ForEach-Object { $_.ProcessName } | Sort-Object -Unique)
@@ -6776,7 +6804,18 @@ try {
     $d = @(); $i = @()
     foreach ($s in $c) { foreach ($x in $s.CounterSamples) { if ($x.Path -match 'dpc') { $d += [double]$x.CookedValue } else { $i += [double]$x.CookedValue } } }
     if ($d.Count) { $dpc = ($d | Measure-Object -Average).Average }; if ($i.Count) { $int = ($i | Measure-Object -Average).Average }
-} catch {}
+} catch {
+    # non-English Windows: Get-Counter wants translated counter names, the WMI class is the same everywhere
+    try {
+        $d = @(); $i = @()
+        for ($k = 0; $k -lt 5; $k++) {
+            Start-Sleep -Seconds 1
+            $x = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop | Select-Object -First 1
+            if ($x) { $d += [double]$x.PercentDPCTime; $i += [double]$x.PercentInterruptTime }
+        }
+        if ($d.Count) { $dpc = ($d | Measure-Object -Average).Average; $int = ($i | Measure-Object -Average).Average }
+    } catch {}
+}
 # a hashtable: Get-WorkerResult unwraps the top-level object, which strips a pscustomobject's properties
 @{ MaxUs = $g[0]; Over2 = $g[1]; Over5 = $g[2]; Samples = $g[3]; P99Us = $g[4]; MedUs = $g[5]; Dpc = $dpc; Int = $int }
 '@ @(5) {
@@ -7080,6 +7119,8 @@ function Get-WifiReport {
     if ("$o" -match 'denied|location') { return 'Windows did not allow reading the Wi-Fi details. On Windows 11 24H2 and newer this needs Location: Settings > Privacy & security > Location > on, and "Let desktop apps access your location" on. Then run this check again.' }
     $get = { param($label) foreach ($l in $o) { if ($l -match "^\s*$label\s*:\s*(.+)$") { return $Matches[1].Trim() } }; $null }
     $state = & $get 'State'; $sig = & $get 'Signal'; $band = & $get 'Band'; $radio = & $get 'Radio type'; $ch = & $get 'Channel'; $ssid = & $get 'SSID'; $rx = & $get 'Receive rate \(Mbps\)'
+    # other languages name the band line differently ("Bande", "Frequenzband") and write 2,4 with a comma: find it by its value
+    if (-not $band) { foreach ($l in $o) { if ($l -match ':\s*(\d+(?:[.,]\d+)?\s*GHz)\s*$') { $band = $Matches[1]; break } } }
     if (-not $sig) {
         if ($state -and $state -notmatch '^connected') { return 'Wi-Fi is not connected right now.' }
         return "ZeroDelay could not read the details in your Windows language. This is what Windows reports:`n`n" + (($o | Where-Object { $_.Trim() } | Select-Object -First 18) -join "`n")
@@ -7088,7 +7129,7 @@ function Get-WifiReport {
     $warn = @()
     $pct = if ($sig -match '(\d+)') { [int]$Matches[1] } else { 100 }
     if ($pct -lt 60) { $warn += "Weak signal ($pct%). Move closer to the router, keep walls and metal out of the way, or use a cable. A weak signal causes retries, which show up as ping spikes." }
-    if ("$band$ch" -match '2\.4' -or ($ch -match '^\d+$' -and [int]$ch -le 14)) { $warn += 'You are on 2.4 GHz, which is crowded and shares the air with Bluetooth headphones and controllers. Use your router''s 5 GHz network, or turn on Wi-Fi: prefer the 5 GHz band.' }
+    if ("$band" -match '^\s*2[.,]4' -or "$band$ch" -match '2\.4' -or ($ch -match '^\d+$' -and [int]$ch -le 14)) { $warn += 'You are on 2.4 GHz, which is crowded and shares the air with Bluetooth headphones and controllers. Use your router''s 5 GHz network, or turn on Wi-Fi: prefer the 5 GHz band.' }
     if ($radio -match '802\.11[abgn]$') { $warn += "Your connection uses an older Wi-Fi standard ($radio). If your router supports Wi-Fi 5 or 6 (802.11ac/ax), check that it is on and that this PC's driver is current." }
     if (Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -like '*Wi-Fi Direct Virtual Adapter*' -and $_.Status -eq 'Up' }) { $warn += 'Mobile hotspot or Wi-Fi Direct is on. The Wi-Fi card then shares its airtime between two networks; turn the hotspot off while you play.' }
     if ($warn.Count) { $s + "`n" + ($warn -join "`n`n") } else { $s + "`nThis looks good. If your ping still spikes, run Test the link to your router." }
@@ -7192,11 +7233,42 @@ $Ifeo  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Executio
 $GpuPrefKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
 $LayersKey  = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
 
+# ================================================================ 2.1 Windows cleanup helpers
+# The AllowRecallEnablement policy applies from Windows 11 24H2 build 26100.3915 (KB5055627) on (WindowsAI Policy CSP).
+function Test-RecallPolicySupported {
+    $b = [Environment]::OSVersion.Version.Build
+    if ($b -ne 26100) { return ($b -gt 26100) }
+    $ubr = 0; [void][int]::TryParse("$(Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'UBR')", [ref]$ubr)
+    $ubr -ge 3915
+}
+# The Copilot app from the Store (Microsoft.Copilot). The Windows Copilot provider package has another name and is not matched.
+function Get-CopilotAppx { @(Get-AppxPackage -Name 'Microsoft.Copilot*' -ErrorAction SilentlyContinue | Where-Object { -not $_.IsFramework }) }
+# Windows 11 shows the old full right-click menu when this COM class has an empty InprocServer32 (Default) value.
+$ClassicMenuSubKey = 'Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+function Test-ClassicMenu {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$ClassicMenuSubKey\InprocServer32")
+    if (-not $k) { return $false }
+    try { ($k.GetValueNames() -contains '') -and "$($k.GetValue(''))" -eq '' } finally { $k.Close() }
+}
+# Explorer reads the menu choice when it starts. Stops Explorer in this session only; Windows starts it again by
+# itself as the signed-in user (AutoRestartShell). Only if it has not come back after 5 s is it started from here.
+function Restart-ExplorerShell {
+    if ($Snapshot) { return }
+    $sess = (Get-Process -Id $PID).SessionId
+    Get-Process explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sess } | Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 250
+        if (Get-Process explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sess }) { return }
+    }
+    Start-Process explorer.exe
+}
+
 # ================================================================ research round 2.0 helpers
-# Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11
+# Wi-Fi connected on the 6 GHz band right now (Wi-Fi 6E/7): netsh shows "Band : 6 GHz" on Windows 11. The label is
+# translated ("Bande", "Frequenzband"), so match the value: no other line of the interface list ends in "6 GHz"
 function Test-WifiOn6Ghz {
     $o = try { netsh wlan show interfaces 2>$null | Out-String } catch { '' }
-    [bool]($o -match '(?m)^\s*Band\s*:\s*6(\.\d+)?\s*GHz')
+    [bool]($o -match '(?m):\s*6([.,]\d+)?\s*GHz\s*$')
 }
 # wired adapters that dropped incoming packets for lack of receive buffers: at least 100 discards and at least 0.01% of
 # what they received since start-up (a few discards are normal, for example packets for protocols Windows does not run)
@@ -7260,6 +7332,604 @@ function Get-R6DataCenterReport {
     $l += 'Ubisoft staff describe this setting for PC. It has not been confirmed for Siege X; if the game ignores it, it does no harm.'
     $l -join "`n"
 }
+# ======================================================= 2.1 health checks: helpers
+# These read event logs, CIM classes and registry values only. Events are read by provider and id, and only their
+# numeric or invariant data fields are used, never the translated message text, so they work in every Windows language.
+
+# runs a report function in the background worker and shows its text; the window never waits for the event log
+$script:HealthBusy = @{}
+function Start-HealthReport([string]$Fn, [string]$Title) {
+    if ($script:HealthBusy[$Fn]) { throw 'This check is already running.' }
+    $script:HealthBusy[$Fn] = $true
+    Invoke-Worker 'param($fn, $title) @{ Fn = $fn; Title = $title; Text = $(try { "$(& $fn)" } catch { "This check could not finish: $($_.Exception.Message)" }) }' @($Fn, $Title) {
+        param($out, $errs)
+        $r = Get-WorkerResult $out
+        if ($r -is [hashtable] -and $r.ContainsKey('Text')) { $script:HealthBusy[$r.Fn] = $false; [void](Show-ZdDialog $r.Text $r.Title 'OK' 'Information') }
+        else { $script:HealthBusy.Clear(); Show-Toast 'The check could not run.' '#FF9F0A' }
+    }
+}
+# Get-WinEvent with a filter: Ok is false only when the log could not be read ("no events" is a normal, empty result)
+function Get-HcEvents([hashtable]$Filter, [int]$Max = 1000) {
+    $r = [pscustomobject]@{ Ok = $true; Events = @() }
+    try { $r.Events = @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction Stop) }
+    catch { if ("$($_.FullyQualifiedErrorId)" -notmatch 'NoMatchingEventsFound|NoMatchingProvidersFound|NoMatchingLogsFound') { $r.Ok = $false } }
+    $r
+}
+function Get-HcProp($Event, [int]$Index) {
+    try { if ($Event.Properties -and $Event.Properties.Count -gt $Index) { return $Event.Properties[$Index].Value } } catch {}
+    $null
+}
+function Get-HcPlural([int]$n, [string]$Word, [string]$Plural = '') { if ($n -eq 1) { "1 $Word" } else { "$n $(if ($Plural) { $Plural } else { $Word + 's' })" } }
+function Get-HcDate($d) { try { ([datetime]$d).ToString('d MMM yyyy HH:mm') } catch { '?' } }
+function Get-HcSystemDriveLetter { $d = "$env:SystemDrive".TrimEnd(':'); if ($d -match '^[A-Za-z]$') { $d.ToUpper() } else { 'C' } }
+
+# --- 1. crash timeline: Kernel-Power 41, EventLog 6008 and WER bug checks (1001) of the last 30 days
+# stop code (hex, no 0x) -> name, plain meaning, kind of advice
+function Get-StopCodeInfo([uint32]$Code) {
+    # 0x1000007E-style codes are the same bug check with a flag bit set
+    if ($Code -ge 268435456 -and $Code -lt 536870912) { $Code = $Code - 268435456 }
+    $k = '{0:X}' -f $Code
+    $t = @{
+        '0'   = @('no blue screen', 'the PC lost power or was switched off hard: power cut, power supply (PSU) problem, an unstable overclock / EXPO / XMP / undervolt, overheating, or the power button held down', 'power')
+        'A'   = @('IRQL_NOT_LESS_OR_EQUAL', 'a driver touched memory it should not (driver bug, sometimes unstable RAM)', 'driver')
+        'D1'  = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', 'a driver crashed (network, audio, RGB/fan and anti-cheat drivers are common causes)', 'driver')
+        '1E'  = @('KMODE_EXCEPTION_NOT_HANDLED', 'a driver or memory error', 'memory')
+        '7E'  = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'a driver or memory error', 'memory')
+        '3B'  = @('SYSTEM_SERVICE_EXCEPTION', 'a driver or memory error', 'memory')
+        '50'  = @('PAGE_FAULT_IN_NONPAGED_AREA', 'bad memory data: unstable RAM / EXPO / XMP, or a driver bug', 'memory')
+        '1A'  = @('MEMORY_MANAGEMENT', 'memory corruption: unstable RAM / EXPO / XMP, or a driver bug', 'memory')
+        '19'  = @('BAD_POOL_HEADER', 'memory corruption by a driver or unstable RAM', 'memory')
+        'C2'  = @('BAD_POOL_CALLER', 'a driver misused memory', 'driver')
+        '139' = @('KERNEL_SECURITY_CHECK_FAILURE', 'Windows caught corrupted data: driver bug or unstable RAM', 'memory')
+        '124' = @('WHEA_UNCORRECTABLE_ERROR', 'a hardware error reported by the CPU: unstable overclock, undervolt or EXPO/XMP, too little voltage, or a failing CPU (Intel 13th/14th gen!)', 'hardware')
+        '101' = @('CLOCK_WATCHDOG_TIMEOUT', 'a CPU core stopped answering: unstable CPU overclock or undervolt', 'hardware')
+        '116' = @('VIDEO_TDR_FAILURE', 'the graphics driver hung and could not recover', 'gpu')
+        '117' = @('VIDEO_TDR_TIMEOUT_DETECTED', 'the graphics driver stopped responding', 'gpu')
+        '113' = @('VIDEO_DXGKRNL_FATAL_ERROR', 'a graphics driver error', 'gpu')
+        '119' = @('VIDEO_SCHEDULER_INTERNAL_ERROR', 'a graphics driver error', 'gpu')
+        '10E' = @('VIDEO_MEMORY_MANAGEMENT_INTERNAL', 'a graphics driver error', 'gpu')
+        '141' = @('VIDEO_ENGINE_TIMEOUT_DETECTED', 'the graphics card stopped responding', 'gpu')
+        '9F'  = @('DRIVER_POWER_STATE_FAILURE', 'a driver failed while going to sleep or waking up', 'driver')
+        '133' = @('DPC_WATCHDOG_VIOLATION', 'a driver (often storage or network) took far too long', 'driver')
+        'EF'  = @('CRITICAL_PROCESS_DIED', 'a core Windows process died: damaged system files or a failing drive', 'disk')
+        '7A'  = @('KERNEL_DATA_INPAGE_ERROR', 'Windows could not read data back from the drive', 'disk')
+        '154' = @('UNEXPECTED_STORE_EXCEPTION', 'a storage error (drive or its driver)', 'disk')
+        'F4'  = @('CRITICAL_OBJECT_TERMINATION', 'a core process ended: often a drive that stopped responding', 'disk')
+    }
+    if ($t.ContainsKey($k)) { return [pscustomobject]@{ Hex = "0x$k"; Name = $t[$k][0]; Text = $t[$k][1]; Kind = $t[$k][2] } }
+    [pscustomobject]@{ Hex = "0x$k"; Name = 'blue screen'; Text = 'look the code up in Microsoft''s bug check list'; Kind = 'other' }
+}
+function Get-CrashTimelineReport([int]$Days = 30) {
+    $since = (Get-Date).AddDays(-$Days)
+    $kp = Get-HcEvents @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $since } 500
+    $el = Get-HcEvents @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6008; StartTime = $since } 500
+    $we = Get-HcEvents @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $since } 500
+    if (-not $kp.Ok -and -not $el.Ok -and -not $we.Ok) { return 'Could not read Windows'' System log. Run ZeroDelay as administrator and try again.' }
+    $items = New-Object Collections.Generic.List[object]
+    foreach ($e in $kp.Events) {
+        # Kernel-Power 41 data: 0 BugcheckCode, 1-4 parameters, 5 SleepInProgress, 6 PowerButtonTimestamp
+        $code = [uint32]0; try { $code = [uint32](Get-HcProp $e 0) } catch {}
+        $btn = $false; try { $pb = Get-HcProp $e 6; if ($null -ne $pb -and [uint64]$pb -ne 0) { $btn = $true } } catch {}
+        $items.Add([pscustomobject]@{ When = $e.TimeCreated; Code = $code; Button = $btn })
+    }
+    foreach ($e in $el.Events) { $items.Add([pscustomobject]@{ When = $e.TimeCreated; Code = [uint32]0; Button = $false }) }
+    foreach ($e in $we.Events) {
+        # WER 1001 (BugCheck): data 0 is the code and parameters, written as "0x00000124 (0x..., 0x..., ...)" in every language
+        $code = [uint32]0; $s = "$(Get-HcProp $e 0)"
+        if ($s -match '^\s*(0x)?([0-9A-Fa-f]{1,8})\b') { try { $code = [Convert]::ToUInt32($Matches[2], 16) } catch {} }
+        $items.Add([pscustomobject]@{ When = $e.TimeCreated; Code = $code; Button = $false })
+    }
+    # the three events of one crash are written within minutes of each other: one incident each
+    $inc = New-Object Collections.Generic.List[object]; $cur = $null
+    foreach ($i in ($items | Where-Object { $_.When } | Sort-Object When)) {
+        if ($cur -and ($i.When - $cur.Last).TotalMinutes -le 15) {
+            $cur.Last = $i.When; if (-not $cur.Code -and $i.Code) { $cur.Code = $i.Code }; if ($i.Button) { $cur.Button = $true }
+        } else { $cur = [pscustomobject]@{ When = $i.When; Last = $i.When; Code = $i.Code; Button = $i.Button }; $inc.Add($cur) }
+    }
+    $l = @()
+    if (-not $kp.Ok -or -not $we.Ok) { $l += 'Part of the System log could not be read, so this list may be incomplete.'; $l += '' }
+    if (-not $inc.Count) { $l += "No crashes, blue screens or sudden restarts in the last $Days days. Good."; return ($l -join "`n") }
+    $bsod = @($inc | Where-Object { $_.Code }).Count
+    $l += "$(Get-HcPlural $inc.Count 'crash or sudden restart' 'crashes or sudden restarts') in the last $Days days ($(Get-HcPlural $bsod 'blue screen')):"
+    $l += ''
+    $kinds = @{}
+    $show = @($inc | Sort-Object When -Descending)
+    foreach ($c in ($show | Select-Object -First 15)) {
+        $info = Get-StopCodeInfo $c.Code; $kinds[$info.Kind] = $true
+        if ($c.Code) { $l += "$(Get-HcDate $c.When)  blue screen $($info.Hex) $($info.Name): $($info.Text)." }
+        elseif ($c.Button) { $l += "$(Get-HcDate $c.When)  no blue screen, the power button was held down." }
+        else { $l += "$(Get-HcDate $c.When)  no blue screen: $($info.Text)." }
+    }
+    if ($show.Count -gt 15) { $l += "... and $($show.Count - 15) older ones." }
+    foreach ($c in ($show | Select-Object -Skip 15)) { $kinds[(Get-StopCodeInfo $c.Code).Kind] = $true }
+    $l += ''; $l += 'What to do:'
+    if ($kinds['hardware']) { $l += '- Hardware errors: run "Scan for hardware errors (WHEA)" in Repair. Undo CPU/GPU overclocks and undervolts and test without EXPO/XMP for a few days. On Intel 13th/14th gen also run the microcode check.' }
+    if ($kinds['memory']) { $l += '- Memory errors: test the RAM (Windows Memory Diagnostic: Win+R, mdsched; or MemTest86) and try without EXPO/XMP. If the RAM passes, update chipset, graphics and network drivers.' }
+    if ($kinds['gpu']) { $l += '- Graphics driver: do a clean reinstall of the graphics driver and remove any GPU overclock. The "Graphics driver hang history" check shows more.' }
+    if ($kinds['driver']) { $l += '- Driver crash: update chipset, network, audio and graphics drivers, remove RGB/fan tools you do not need, and run "Devices with problems".' }
+    if ($kinds['disk']) { $l += '- Storage: run "Disk error history" and "Check drive health"; check the drive''s cable or slot.' }
+    if ($kinds['power']) { $l += '- Restarts without a blue screen: check the power supply and its cables, temperatures, and any overclock / EXPO / XMP / undervolt. A power cut or holding the power button also shows up here, so one alone means little.' }
+    if ($kinds['other']) { $l += '- Other codes: search Microsoft''s bug check reference for the code shown.' }
+    $l -join "`n"
+}
+
+# --- 2. game and app crash culprit: Application Error 1000 and Application Hang 1002
+function Get-HcModuleHint([string]$Module, [string]$App) {
+    $m = $Module.ToLowerInvariant()
+    if (-not $m -or $m -eq 'unknown') { return 'unknown module' }
+    if ($App -and $m -eq $App.ToLowerInvariant()) { return 'the program''s own code' }
+    switch -Regex ($m) {
+        '^(nvwgf2um|nvd3dum|nvoglv|nvlddmkm|nvcuda|nvapi|nvgpucomp|nvrtum)' { return 'NVIDIA graphics driver' }
+        '^(atiumd|atidxx|amdxx|amdxc|atio6axx|amdvlk|aticfx|amdihk)' { return 'AMD graphics driver' }
+        '^(igd|igxe|igc64|igvk|igdusc|igdgmm)' { return 'Intel graphics driver' }
+        '^(d3d11|d3d12|d3d12core|dxgi|d3d9|dxcore)\.dll' { return 'DirectX: usually the graphics driver underneath' }
+        '^discordhook' { return 'Discord overlay' }
+        '^gameoverlayrenderer' { return 'Steam overlay' }
+        '^(rtsshooks|rtss)' { return 'RivaTuner / MSI Afterburner overlay' }
+        '^(nvspcap|nvcamera|nvshare|nvoverlay)' { return 'NVIDIA overlay / recording' }
+        '^(owclient|overwolf|overlay)' { return 'an overlay (Overwolf or similar)' }
+        '^(easyanticheat|eac|beclient|vgk|vgc)' { return 'anti-cheat' }
+        '^(ntdll|kernelbase|ucrtbase|msvcp|vcruntime|kernel32|combase)' { return 'a Windows runtime file: the fault is in the program itself (or a mod/overlay it loaded)' }
+        '^(clr|coreclr|clrjit)\.dll' { return '.NET runtime: the program''s own error' }
+        '^(xinput|dinput|gameinput)' { return 'controller input' }
+    }
+    ''
+}
+function Get-HcExceptionText([string]$Code) {
+    switch ($Code) {
+        'c0000005' { 'access violation' }
+        'c0000409' { 'the program stopped itself on purpose (fail-fast)' }
+        'c0000374' { 'memory (heap) corruption' }
+        'c000001d' { 'illegal CPU instruction: often an unstable CPU overclock or undervolt' }
+        'c00000fd' { 'stack overflow' }
+        'c0000006' { 'could not read the file from disk' }
+        'c0000142' { 'a DLL failed to start' }
+        'e0434352' { '.NET error' }
+        '80000003' { 'debug breakpoint' }
+        default { '' }
+    }
+}
+function ConvertTo-HcExceptionCode($v) {
+    if ($null -eq $v) { return '' }
+    if ($v -is [int] -or $v -is [uint32] -or $v -is [long]) { return ('{0:x8}' -f [uint32]([int64]$v -band 4294967295)) }
+    ("$v".Trim().ToLowerInvariant() -replace '^0x', '')
+}
+function Get-AppCrashReport([int]$Days = 30) {
+    $since = (Get-Date).AddDays(-$Days)
+    $cr = Get-HcEvents @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $since } 2000
+    $hg = Get-HcEvents @{ LogName = 'Application'; ProviderName = 'Application Hang'; Id = 1002; StartTime = $since } 1000
+    if (-not $cr.Ok -and -not $hg.Ok) { return 'Could not read Windows'' Application log. Run ZeroDelay as administrator and try again.' }
+    # Application Error 1000 data: 0 app, 1 app version, 3 faulting module, 4 module version, 6 exception code
+    $rows = @(foreach ($e in $cr.Events) {
+        [pscustomobject]@{ App = "$(Get-HcProp $e 0)"; Module = "$(Get-HcProp $e 3)"; Code = (ConvertTo-HcExceptionCode (Get-HcProp $e 6)); When = $e.TimeCreated }
+    })
+    $hangs = @(foreach ($e in $hg.Events) { [pscustomobject]@{ App = "$(Get-HcProp $e 0)"; When = $e.TimeCreated } })
+    $l = @()
+    if (-not $cr.Ok -or -not $hg.Ok) { $l += 'Part of the Application log could not be read, so this may be incomplete.'; $l += '' }
+    if (-not $rows.Count -and -not $hangs.Count) { $l += "No program crashed or froze in the last $Days days. Good."; return ($l -join "`n") }
+    $apps = @($rows | Group-Object App).Count
+    $l += "Last $Days days: $(Get-HcPlural $rows.Count 'crash' 'crashes') in $(Get-HcPlural $apps 'program'), $(Get-HcPlural $hangs.Count 'freeze')."
+    $hints = @{}
+    if ($rows.Count) {
+        $l += ''; $l += 'Most frequent crashes (program / file it crashed in):'
+        $groups = @($rows | Group-Object { "$($_.App)|$($_.Module)" } | Sort-Object Count -Descending)
+        foreach ($g in ($groups | Select-Object -First 8)) {
+            $f = $g.Group[0]; $h = Get-HcModuleHint $f.Module $f.App; if ($h) { $hints[$h] = $true }
+            $codes = @($g.Group | ForEach-Object { $_.Code } | Where-Object { $_ } | Select-Object -Unique)
+            $ct = ''; if ($codes.Count) { $x = Get-HcExceptionText $codes[0]; $ct = ", code $($codes[0])$(if ($x) { " ($x)" })"; if ($codes[0] -eq 'c000001d') { $hints['cpu'] = $true } }
+            $last = ($g.Group | Sort-Object When -Descending | Select-Object -First 1).When
+            $l += "- $($f.App) in $(if ($f.Module) { $f.Module } else { 'unknown module' })$(if ($h) { " = $h" }): $($g.Count)x, last $(Get-HcDate $last)$ct"
+        }
+        if ($groups.Count -gt 8) { $l += "... and $($groups.Count - 8) more." }
+    }
+    if ($hangs.Count) {
+        $l += ''; $l += 'Programs that froze ("not responding" and closed):'
+        foreach ($g in (@($hangs | Group-Object App | Sort-Object Count -Descending) | Select-Object -First 5)) { $l += "- $($g.Name): $($g.Count)x" }
+    }
+    $l += ''; $l += 'What it means:'
+    $gpu = @($hints.Keys | Where-Object { $_ -match 'graphics driver|DirectX' })
+    if ($gpu.Count) { $l += '- Crashes in the graphics driver: do a clean reinstall of the driver (or try the previous version) and remove any GPU overclock or undervolt.' }
+    if (@($hints.Keys | Where-Object { $_ -match 'overlay' }).Count) { $l += '- An overlay is involved: turn that overlay off for the game (Discord, Steam, RivaTuner/Afterburner, NVIDIA or Overwolf) and see if the crashes stop.' }
+    if ($hints['anti-cheat']) { $l += '- Anti-cheat crashed: repair the game in its launcher; that reinstalls the anti-cheat.' }
+    if ($hints['cpu']) { $l += '- "Illegal instruction" crashes point at an unstable CPU: undo overclocks/undervolts, and on Intel 13th/14th gen run the microcode check.' }
+    if (@($hints.Keys | Where-Object { $_ -match 'Windows runtime|own code|\.NET' }).Count) { $l += '- Crashes in the program''s own code or a Windows runtime file: verify/repair the game files in the launcher and update the game. If many different programs crash like this, test RAM and remove overclocks.' }
+    if (-not $hints.Count) { $l += '- Repair the game files in its launcher and update the graphics driver.' }
+    $l -join "`n"
+}
+
+# --- 3. graphics driver hangs: Display 4101 ("stopped responding and recovered") and live kernel dumps
+function Get-GpuHangReport([int]$Days = 30, [string]$Root = '') {
+    if (-not $Root) { $Root = Join-Path $(if ($env:SystemRoot) { $env:SystemRoot } else { 'C:\Windows' }) 'LiveKernelReports' }
+    $since = (Get-Date).AddDays(-$Days)
+    $ev = Get-HcEvents @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101; StartTime = $since } 500
+    $l = @()
+    if (-not $ev.Ok) { $l += 'Could not read the System log for graphics driver resets.' }
+    elseif (-not $ev.Events.Count) { $l += "No graphics driver resets in the last $Days days." }
+    else {
+        $l += "The graphics driver stopped responding and was restarted $(Get-HcPlural $ev.Events.Count 'time') in the last $Days days (the screen goes black for a moment, or the game crashes):"
+        foreach ($e in ($ev.Events | Sort-Object TimeCreated -Descending | Select-Object -First 8)) {
+            $drv = "$(Get-HcProp $e 0)"; $l += "- $(Get-HcDate $e.TimeCreated)$(if ($drv -match '^[\w.\-]{2,40}$') { " ($drv)" })"
+        }
+        if ($ev.Events.Count -gt 8) { $l += "... and $($ev.Events.Count - 8) more." }
+    }
+    $l += ''
+    $dumps = $null
+    try { $dumps = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.dmp' -ErrorAction Stop) } catch {}
+    $wd = 0
+    if ($null -eq $dumps) { $l += 'Could not read the LiveKernelReports folder (needs administrator rights).' }
+    elseif (-not $dumps.Count) { $l += 'No hang reports in LiveKernelReports.' }
+    else {
+        $l += "Windows saved $(Get-HcPlural $dumps.Count 'hang report') in $Root :"
+        $names = @{ 'WATCHDOG' = 'graphics driver hang'; 'PoW32kWatchdog' = 'display froze on sleep/wake'; 'NDIS' = 'network driver'; 'USBHUB3' = 'USB device'; 'USBXHCI' = 'USB controller' }
+        foreach ($g in (@($dumps | Group-Object { if ($_.Directory.Name -ne (Split-Path $Root -Leaf)) { $_.Directory.Name } else { ($_.BaseName -split '-')[0] } }) | Sort-Object Count -Descending | Select-Object -First 6)) {
+            $new = ($g.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+            $what = $names[$g.Name]; if ($g.Name -match 'WATCHDOG') { $wd += $g.Count }
+            $l += "- $($g.Name)$(if ($what) { " ($what)" }): $($g.Count), newest $(Get-HcDate $new)"
+        }
+    }
+    $l += ''
+    if (($ev.Ok -and $ev.Events.Count) -or $wd) {
+        $l += 'What to do:'
+        $l += '- Do a clean reinstall of the graphics driver ("Perform a clean installation" / factory reset in the NVIDIA app or AMD Software, or DDU in Safe Mode), or go back one driver version.'
+        $l += '- Remove GPU overclocks and undervolts (MSI Afterburner, Adrenalin tuning). Factory-overclocked cards sometimes need -50 to -100 MHz.'
+        $l += '- Check the graphics card''s power cables and run "Check the graphics card''s slot speed".'
+        $l += '- If another tool changed Windows'' hang recovery (TDR), the Repair card "Turn GPU hang recovery back on" puts it back.'
+    } else { $l += 'Nothing points at the graphics driver. Good.' }
+    $l -join "`n"
+}
+
+# --- 4. disk error history, plus an optional read-only file-system scan (Repair-Volume -Scan)
+function Get-DiskErrorReport([int]$Days = 30) {
+    $since = (Get-Date).AddDays(-$Days)
+    $specs = @(
+        @{ P = 'disk'; Id = 7; T = 'bad block: part of the drive could not be read'; S = 3 }
+        @{ P = 'disk'; Id = 51; T = 'error while Windows moved memory to or from the drive (cable, USB or failing drive)'; S = 2 }
+        @{ P = 'disk'; Id = 153; T = 'Windows had to retry a read or write'; S = 2 }
+        @{ P = 'disk'; Id = 157; T = 'the drive disappeared (fine for a USB drive you unplugged; for an internal drive: cable, power or slot)'; S = 1 }
+        @{ P = 'stornvme'; Id = 129; T = 'the NVMe drive stopped responding and Windows reset it (freezes of several seconds)'; S = 2 }
+        @{ P = 'storahci'; Id = 129; T = 'the SATA drive stopped responding and Windows reset it (freezes of several seconds)'; S = 2 }
+        @{ P = 'Ntfs'; Id = 55; T = 'the file system has damage'; S = 3 }
+        @{ P = 'Microsoft-Windows-Ntfs'; Id = 55; T = 'the file system has damage'; S = 3 }
+        @{ P = 'Ntfs'; Id = 98; T = 'a drive needs a file-system check'; S = 3 }
+        @{ P = 'Microsoft-Windows-Ntfs'; Id = 98; T = 'a drive needs a file-system check'; S = 3 }
+    )
+    $l = @(); $bad = 0; $sev = 0; $fails = 0; $rows = @()
+    foreach ($s in $specs) {
+        $r = Get-HcEvents @{ LogName = 'System'; ProviderName = $s.P; Id = $s.Id; StartTime = $since } 500
+        if (-not $r.Ok) { $fails++; continue }
+        # Ntfs 98 is also written at every start as "volume is healthy" (information level): count only warnings and errors
+        $ev = @($r.Events | Where-Object { $s.Id -ne 98 -or ($_.Level -ge 1 -and $_.Level -le 3) })
+        if (-not $ev.Count) { continue }
+        $disks = @($ev | ForEach-Object { "$(Get-HcProp $_ 0)" } | Where-Object { $_ -match 'Harddisk(\d+)' } | ForEach-Object { [void]($_ -match 'Harddisk(\d+)'); "disk $($Matches[1])" } | Select-Object -Unique)
+        $last = ($ev | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+        $rows += "- $(Get-HcPlural $ev.Count 'time') ($($s.P) $($s.Id)$(if ($disks.Count) { ', ' + ($disks -join ', ') })): $($s.T). Last $(Get-HcDate $last)."
+        $bad += $ev.Count; if ($s.S -gt $sev) { $sev = $s.S }
+    }
+    if ($fails -eq $specs.Count) { return 'Could not read Windows'' System log for disk errors. Run ZeroDelay as administrator and try again.' }
+    if (-not $rows.Count) { $l += "No disk or file-system errors in the last $Days days. Good." }
+    else {
+        $l += "Disk and file-system errors in the last $Days days:"; $l += $rows; $l += ''
+        if ($sev -ge 3) { $l += 'Bad blocks or file-system damage: back up important files now. Then run "Check drive health" to see the drive''s wear and error counters, and the file-system check below.' }
+        elseif ($sev -ge 2) { $l += 'Resets and retries cause freezes of a few seconds. Update the drive''s firmware (Samsung Magician, WD Dashboard, Crucial Storage Executive...), check its cable or M.2 slot, and run "Check drive health".' }
+        else { $l += 'Only drives that disappeared. If that was a USB drive you unplugged, it is fine.' }
+    }
+    if ($fails) { $l += ''; $l += 'Some event sources could not be read, so this list may be incomplete.' }
+    $l -join "`n"
+}
+function Format-RepairScanResult([string]$Result, [string]$Drive) {
+    switch -Regex ($Result) {
+        '^NoErrorsFound$' { return "Drive $Drive`: no file-system errors found. Good." }
+        '^ErrorsFixed$' { return "Drive $Drive`: errors were found and fixed." }
+        '^ScanNeeded$' { return "Drive $Drive`: Windows wants a full scan. Run this check again; if it keeps saying so, restart the PC and try once more." }
+        '^SpotFixNeeded$' { return "Drive $Drive`: Windows found a few file-system errors it can fix quickly (a spot fix). For the Windows drive this happens during the next restart and takes seconds to about a minute." }
+        '^FullRepairNeeded$' { return "Drive $Drive`: the file system needs a full offline repair. Back up important files first. Then, in an administrator PowerShell, run: Repair-Volume -DriveLetter $Drive -OfflineScanAndFix  and restart; it can take a long time. ZeroDelay does not start this for you." }
+        '^TIMEOUT$' { return "Drive $Drive`: the scan took longer than 5 minutes and was stopped. Nothing was changed. Try again when the PC is idle." }
+        '^\s*$' { return "Drive $Drive`: Windows gave no answer. Try again after a restart." }
+        '^ERR:(.*)$' { return "Drive $Drive`: the scan could not run ($($Matches[1].Trim())). It needs administrator rights and an NTFS or ReFS drive." }
+        default { return "Drive $Drive`: Windows answered: $Result" }
+    }
+}
+# runs Repair-Volume in a separate job inside the worker, so a slow scan can be stopped after $Seconds
+$HcRepairVolumeCode = @'
+param($drive, $mode, $seconds)
+$j = Start-Job -ScriptBlock { param($d, $m) if ($m -eq 'SpotFix') { "$(Repair-Volume -DriveLetter $d -SpotFix -ErrorAction Stop)" } else { "$(Repair-Volume -DriveLetter $d -Scan -ErrorAction Stop)" } } -ArgumentList $drive, $mode
+$r = ''
+if (Wait-Job $j -Timeout $seconds) { $r = try { "$(Receive-Job $j -ErrorAction Stop)".Trim() } catch { 'ERR:' + $_.Exception.Message } }
+else { Stop-Job $j; $r = 'TIMEOUT' }
+Remove-Job $j -Force -ErrorAction SilentlyContinue
+@{ Result = $r; Drive = $drive; Mode = $mode }
+'@
+function Start-HcRepairVolume([string]$Drive, [string]$Mode) {
+    if ($script:HealthBusy['repair-volume']) { throw 'A file-system check is already running.' }
+    $script:HealthBusy['repair-volume'] = $true
+    Show-Toast "Checking drive $Drive`: in the background..."
+    Invoke-Worker $HcRepairVolumeCode @($Drive, $Mode, 300) {
+        param($out, $errs)
+        $script:HealthBusy['repair-volume'] = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'The file-system check could not run.' '#FF9F0A'; return }
+        if ($r.Mode -eq 'SpotFix') {
+            $msg = if ($r.Result -match '^(TIMEOUT|ERR:)') { Format-RepairScanResult $r.Result $r.Drive } else { "Drive $($r.Drive): the spot fix is set up (Windows answered: $(if ($r.Result) { $r.Result } else { 'OK' })). For the Windows drive it runs during the next restart. Run this check again afterwards." }
+            [void](Show-ZdDialog $msg 'File-system check' 'OK' 'Information'); return
+        }
+        $msg = Format-RepairScanResult $r.Result $r.Drive
+        if ($r.Result -eq 'SpotFixNeeded') {
+            if ((Show-ZdDialog "$msg`n`nSet up the spot fix now? Windows fixes only the logged errors; your files stay where they are." 'File-system check' 'YesNo' 'Question') -eq 'Yes') { Start-HcRepairVolume $r.Drive 'SpotFix' }
+        } else { [void](Show-ZdDialog $msg 'File-system check' 'OK' $(if ($r.Result -eq 'NoErrorsFound') { 'Information' } else { 'Warning' })) }
+    }
+}
+function Start-DiskErrorCheck {
+    if ($script:HealthBusy['Get-DiskErrorReport']) { throw 'The disk check is already running.' }
+    $script:HealthBusy['Get-DiskErrorReport'] = $true
+    Invoke-Worker 'param($x) @{ Text = $(try { "$(Get-DiskErrorReport)" } catch { "Could not read the disk error history: $($_.Exception.Message)" }) }' @(0) {
+        param($out, $errs)
+        $script:HealthBusy['Get-DiskErrorReport'] = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'The disk check could not run.' '#FF9F0A'; return }
+        $d = Get-HcSystemDriveLetter
+        $q = "$($r.Text)`n`nCheck the file system on drive $d`: now? Windows reads the drive while you keep using the PC (usually 1 to 5 minutes) and changes nothing. ZeroDelay never runs chkdsk /r."
+        if ((Show-ZdDialog $q 'Disk error history' 'YesNo' 'Question') -eq 'Yes') { Start-HcRepairVolume $d 'Scan' }
+    }
+}
+
+# --- 5. devices with problems (Device Manager's yellow triangles), by ConfigManagerErrorCode
+function Get-HcDeviceCodeText([int]$Code) {
+    switch ($Code) {
+        1  { 'not set up correctly: its driver is missing' }
+        3  { 'its driver is damaged, or Windows ran low on memory' }
+        10 { 'cannot start: usually a wrong or outdated driver' }
+        12 { 'not enough free resources: another device conflicts with it' }
+        14 { 'needs a restart to work' }
+        18 { 'its drivers need to be reinstalled' }
+        19 { 'its settings in the registry are damaged: uninstall the device and scan for hardware changes' }
+        21 { 'Windows is removing it: restart' }
+        22 { 'disabled in Device Manager (fine if you turned it off yourself)' }
+        24 { 'not present or not working, or its drivers are not all installed' }
+        28 { 'no driver installed' }
+        29 { 'turned off in the BIOS' }
+        31 { 'not working: Windows cannot load its driver' }
+        32 { 'its driver''s service is disabled' }
+        39 { 'its driver is damaged or missing' }
+        43 { 'Windows stopped it because it reported problems (often a failing device, cable or driver)' }
+        45 { 'not connected right now' }
+        52 { 'its driver''s signature cannot be checked (unsigned driver or Secure Boot problem)' }
+        default { "problem code $Code" }
+    }
+}
+function Get-DeviceProblemReport {
+    $dev = $null
+    try { $dev = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop) } catch { return 'Could not read the device list from Windows.' }
+    $dev = @($dev | Where-Object { $_ })
+    $bad = @($dev | Where-Object { [int]$_.ConfigManagerErrorCode -ne 45 }); $gone = @($dev | Where-Object { [int]$_.ConfigManagerErrorCode -eq 45 })
+    $l = @()
+    if (-not $bad.Count) { $l += 'No device has a problem. Good.' }
+    else {
+        $l += "$(Get-HcPlural $bad.Count 'device') with a problem:"
+        foreach ($d in ($bad | Sort-Object { [int]$_.ConfigManagerErrorCode } | Select-Object -First 15)) {
+            $n = "$($d.Name)"; if (-not $n) { $n = "$($d.DeviceID)" }
+            $l += "- $n$(if ($d.PNPClass) { " ($($d.PNPClass))" }): code $([int]$d.ConfigManagerErrorCode), $(Get-HcDeviceCodeText ([int]$d.ConfigManagerErrorCode))."
+        }
+        if ($bad.Count -gt 15) { $l += "... and $($bad.Count - 15) more." }
+        $l += ''
+        $l += 'What to do: install the driver from the device or board maker''s site (for chipset, network and audio: your motherboard or laptop support page), or in Device Manager right-click the device > Uninstall device, then Action > Scan for hardware changes. A code 43 on a USB device: try another port or cable.'
+    }
+    if ($gone.Count) {
+        $l += ''
+        $l += "Also $(Get-HcPlural $gone.Count 'device') Windows remembers but that is not connected now (code 45). That is normal for things you unplugged$(if ($gone.Count -le 5) { ': ' + ((@($gone | ForEach-Object { "$($_.Name)" } | Where-Object { $_ })) -join ', ') })."
+    }
+    $l -join "`n"
+}
+
+# --- 6. Intel 13th/14th gen desktop CPUs and the Vmin-shift microcode
+function Test-IntelVminCpu([string]$Name) { [bool]($Name -match 'Intel' -and $Name -match '\bi[579]-1[34]\d{3}(K|KF|KS|F)?\b') }
+# 'Update Revision' (REG_BINARY): on Intel the revision is the upper 4 bytes of 8 (00 00 00 00 2B 01 00 00 = 0x12B);
+# some systems store it in the lower 4 bytes or as 4 bytes only. Rev is $null when the layout is unclear.
+function Get-MicrocodeRevision([byte[]]$Bytes) {
+    $raw = if ($Bytes) { ($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ' } else { '' }
+    $rev = $null
+    if ($Bytes -and $Bytes.Count -ge 8) {
+        $lo = [BitConverter]::ToUInt32($Bytes, 0); $hi = [BitConverter]::ToUInt32($Bytes, 4)
+        if ($lo -eq 0 -and $hi -ne 0) { $rev = $hi } elseif ($hi -eq 0 -and $lo -ne 0) { $rev = $lo }
+    } elseif ($Bytes -and $Bytes.Count -eq 4) { $rev = [BitConverter]::ToUInt32($Bytes, 0) }
+    [pscustomobject]@{ Rev = $rev; Raw = $raw }
+}
+function Get-IntelMicrocodeReport {
+    $cpu = ''
+    try { $cpu = "$((Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name)".Trim() } catch {}
+    if (-not $cpu) { return 'Could not read the processor name.' }
+    if (-not (Test-IntelVminCpu $cpu)) { return "$cpu is not one of the Intel 13th/14th gen desktop processors affected by the instability bug. Nothing to do." }
+    $b = $null
+    try { $b = [byte[]](Get-ItemProperty -LiteralPath 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction Stop).'Update Revision' } catch {}
+    $m = Get-MicrocodeRevision $b
+    $l = @("Processor: $cpu")
+    if ($null -eq $m.Rev) {
+        $l += "Could not read the microcode version$(if ($m.Raw) { " (raw value: $($m.Raw))" })."
+        $l += 'Check your BIOS version instead: it must be from August 2024 or newer and mention Intel microcode 0x12B or later.'
+        return ($l -join "`n")
+    }
+    $l += ('Microcode: 0x{0:X}' -f $m.Rev); $l += ''
+    if ($m.Rev -ge 0x12F) { $l += 'This has Intel''s latest recommended microcode (0x12F or newer). Good.' }
+    elseif ($m.Rev -ge 0x12B) { $l += 'This has Intel''s fix for the instability bug (0x12B). A newer BIOS with 0x12F (2025) is Intel''s latest recommendation; install it when your board maker offers it.' }
+    else {
+        $l += 'Update your BIOS: this is older than Intel''s fix for the instability bug (0x12B).'
+        $l += 'On 13th/14th gen desktop CPUs, too high voltage slowly damages the processor ("Vmin shift"); it shows as game crashes, "out of video memory" errors and blue screens that get worse over time. The fix only prevents further damage, so install it soon: download the newest BIOS for your exact motherboard from the board maker''s site.'
+    }
+    $l += ''; $l += 'If the CPU already crashes with the fix installed, Intel has extended the warranty of these processors by 2 years: contact Intel or the seller.'
+    $l -join "`n"
+}
+
+# --- 7. Secure Boot and the 2023 certificates that replace the 2011 ones
+function Get-SecureBoot2023Report {
+    $state = 'unknown'
+    try { $state = if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'on' } else { 'off' } }
+    catch { if ($_.Exception -is [PlatformNotSupportedException] -or "$($_.FullyQualifiedErrorId)" -match 'NotSupported') { $state = 'legacy' } }
+    $sv = $null
+    try { $sv = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing' -ErrorAction Stop } catch {}
+    $status = if ($sv) { "$($sv.UEFICA2023Status)" } else { '' }
+    $err = if ($sv -and $null -ne $sv.UEFICA2023Error) { [int64]$sv.UEFICA2023Error } else { 0 }
+    $inDb = $null
+    if ($state -eq 'on' -or $state -eq 'off') {
+        try { $db = Get-SecureBootUEFI -Name db -ErrorAction Stop; $inDb = [bool]([Text.Encoding]::ASCII.GetString($db.Bytes) -match 'Windows UEFI CA 2023') } catch {}
+    }
+    $l = @()
+    $l += switch ($state) {
+        'on' { 'Secure Boot: on.' }
+        'off' { 'Secure Boot: off. Games whose anti-cheat requires it (Call of Duty, Battlefield 6, VALORANT, Fortnite tournaments) will not start. Turn it on in the BIOS (the Call of Duty / Battlefield 6 Secure Boot cards show the steps).' }
+        'legacy' { 'Secure Boot: not available, because the PC starts in legacy (CSM/BIOS) mode. Games that require Secure Boot need UEFI mode; switching needs the drive converted to GPT (Microsoft''s mbr2gpt tool), so back up first.' }
+        default { 'Secure Boot: could not be read (run ZeroDelay as administrator).' }
+    }
+    $l += ''
+    $have = ($status -eq 'Updated') -or ($inDb -eq $true)
+    if ($have) { $l += 'The new 2023 Secure Boot certificates are installed. Nothing to do.' }
+    elseif ($status -eq 'InProgress') { $l += 'Windows is installing the new 2023 Secure Boot certificates. Restart the PC (sometimes twice) and check again.' }
+    else {
+        $l += "The new 2023 Secure Boot certificates are $(if ($status -eq 'NotStarted' -or $inDb -eq $false) { 'not installed yet' } else { 'not confirmed on this PC' })$(if ($status) { " (Windows reports: $status)" })."
+        $l += 'Microsoft''s 2011 Secure Boot certificates expire in 2026. A PC without the 2023 ones keeps starting, but stops getting Secure Boot security fixes, and games whose anti-cheat depends on Secure Boot depend on these too.'
+        $l += 'Fix: install all Windows updates and restart (Windows rolls the certificates out itself). If it stays like this, install the newest BIOS from your motherboard or PC maker; many include the 2023 certificates.'
+    }
+    if ($err) { $l += ''; $l += "Windows reported an error while updating the certificates (code $err). A BIOS update from your board maker usually fixes this." }
+    $l += ''; $l += 'ZeroDelay only reads these values; it never changes Secure Boot.'
+    $l -join "`n"
+}
+
+# --- 8. BitLocker / device encryption and the recovery key
+function Get-BitLockerKeyReport {
+    $sd = "$(Get-HcSystemDriveLetter):"
+    $v = $null; $readErr = $false
+    try { $v = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter = '$sd'" -ErrorAction Stop) | Select-Object -First 1 } catch { $readErr = $true }
+    $l = @()
+    if (-not $v) {
+        $prev = $null; try { $prev = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' -ErrorAction Stop).PreventDeviceEncryption } catch {}
+        $l += "Could not read the encryption status of drive $sd$(if ($readErr) { ' (it needs administrator rights, or this Windows edition has no BitLocker)' })."
+        if ($null -ne $prev -and [int]$prev -eq 1) { $l += 'Automatic device encryption is blocked on this PC, so Windows will not encrypt the drive by itself.' }
+        $l += 'Check it yourself: Settings > Privacy & security > Device encryption (Home) or Settings > System > Storage > Advanced > BitLocker (Pro).'
+        return ($l -join "`n")
+    }
+    $types = @(); $kpOk = $true
+    try {
+        $ids = @((Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectors -Arguments @{ KeyProtectorType = [uint32]0 } -ErrorAction Stop).VolumeKeyProtectorID)
+        foreach ($id in ($ids | Where-Object { $_ })) { $types += [int](Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectorType -Arguments @{ VolumeKeyProtectorID = $id } -ErrorAction Stop).KeyProtectorType }
+    } catch { $kpOk = $false }
+    $prot = [int]$v.ProtectionStatus; $conv = if ($null -ne $v.ConversionStatus) { [int]$v.ConversionStatus } else { -1 }
+    $hasKey = $types -contains 3
+    if ($prot -eq 1) { $l += "Drive $sd is encrypted with BitLocker / device encryption, and protection is on." }
+    elseif ($conv -eq 1 -or $conv -eq 2 -or $conv -eq 4) { $l += "Drive $sd is encrypted$(if ($conv -ne 1) { ' (encryption not finished yet)' }), but protection is suspended right now. Windows does this during BIOS and some updates; it turns back on by itself after a restart." }
+    else {
+        $l += "Drive $sd is not encrypted. Nothing can lock you out at start-up."
+        $l += 'Note: a fresh Windows 11 24H2 (or newer) install signed in with a Microsoft account turns on device encryption by itself on most PCs, so check again after a reinstall.'
+        return ($l -join "`n")
+    }
+    $l += ''
+    if (-not $kpOk) { $l += 'Could not read which keys protect it.' }
+    elseif ($hasKey) { $l += 'A 48-digit recovery key exists. Make sure you can find it BEFORE you update the BIOS, change BIOS settings (fTPM/PTT, Secure Boot, CSM), reset the BIOS or swap the motherboard or CPU: any of these can make Windows ask for the key at start-up, and without it the drive cannot be opened.' }
+    else { $l += 'No recovery key is set up for this drive. If the TPM or BIOS changes, there is no way back in. Add one in BitLocker settings ("Back up your recovery key"), or in an administrator terminal: manage-bde -protectors -add C: -RecoveryPassword, and write the 48-digit number down.' }
+    $l += ''
+    $l += 'Where to find the key:'
+    $l += '- Online: sign in at aka.ms/myrecoverykey with the Microsoft account used on this PC (work PCs: ask IT).'
+    $l += "- On this PC: open Terminal as administrator, run  manage-bde -protectors -get $sd  and write down the 48-digit number. Keep it on paper or your phone, not only on this PC."
+    $l -join "`n"
+}
+
+# --- 9. is this Windows version still getting security updates?
+# End of security updates per build: Home/Pro (Pro Education, Pro for Workstations) and Enterprise/Education.
+# From Microsoft's Windows 10 / 11 release-information and lifecycle pages, checked November 2026; dates are the
+# last Patch Tuesday. Esu = end of consumer Extended Security Updates for Windows 10 22H2. Update this table yearly.
+function Get-WinSupportDates {
+    @{
+        19044 = @{ Name = 'Windows 10 21H2'; Home = '2023-06-13'; Ent = '2024-06-11' }
+        19045 = @{ Name = 'Windows 10 22H2'; Home = '2025-10-14'; Ent = '2025-10-14'; Esu = '2026-10-13' }
+        22000 = @{ Name = 'Windows 11 21H2'; Home = '2023-10-10'; Ent = '2024-10-08' }
+        22621 = @{ Name = 'Windows 11 22H2'; Home = '2024-10-08'; Ent = '2025-10-14' }
+        22631 = @{ Name = 'Windows 11 23H2'; Home = '2025-11-11'; Ent = '2026-11-10' }
+        26100 = @{ Name = 'Windows 11 24H2'; Home = '2026-10-13'; Ent = '2027-10-12' }
+        26200 = @{ Name = 'Windows 11 25H2'; Home = '2027-10-12'; Ent = '2028-10-10' }
+    }
+}
+function Get-WinSupportReport([datetime]$Today = (Get-Date), [int]$Build = 0) {
+    if (-not $Build) { $Build = [Environment]::OSVersion.Version.Build }
+    $cv = $null; try { $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop } catch {}
+    $ed = if ($cv) { "$($cv.EditionID)" } else { '' }
+    $ubr = if ($cv -and $null -ne $cv.UBR) { ".$($cv.UBR)" } else { '' }
+    $dv = if ($cv -and $cv.DisplayVersion) { " $($cv.DisplayVersion)" } else { '' }
+    $os = if ($Build -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+    $l = @("You run $os$dv, build $Build$ubr$(if ($ed) { ", edition $ed" }).", '')
+    $up = if ($os -eq 'Windows 11') { 'Install the newest version for free: Settings > Windows Update > turn on "Get the latest updates as soon as they are available" and install the feature update (Windows 11 25H2), or use Microsoft''s Installation Assistant.' } else { 'Upgrade to Windows 11 (free if the PC meets its requirements: Settings > Windows Update, or PC Health Check). If the PC cannot run Windows 11, check Microsoft''s Extended Security Updates offers.' }
+    if ($ed -match 'EnterpriseS|IoTEnterpriseS|ServerRdsh|^Server') { $l += 'This is a long-term (LTSC) or special edition with its own support dates. Check them with Microsoft (Windows lifecycle pages).'; return ($l -join "`n") }
+    $tab = Get-WinSupportDates
+    $ci = [Globalization.CultureInfo]::InvariantCulture
+    if (-not $tab.ContainsKey($Build)) {
+        $max = ($tab.Keys | Measure-Object -Maximum).Maximum
+        if ($Build -gt $max) { $l += 'This version is newer than ZeroDelay''s list, so it is almost certainly still getting security updates. Keep Windows Update on.' }
+        else { $l += "This version no longer gets security updates. $up" }
+        return ($l -join "`n")
+    }
+    $row = $tab[$Build]
+    $ent = $ed -match 'Enterprise|Education' -and $ed -notmatch '^Professional'
+    $end = [datetime]::ParseExact($(if ($ent) { $row.Ent } else { $row.Home }), 'yyyy-MM-dd', $ci)
+    $endTxt = $end.ToString('d MMMM yyyy')
+    if ($Today.Date -le $end) {
+        $days = [int]($end - $Today.Date).TotalDays
+        $l += "$($row.Name) gets security updates until $endTxt ($days days from now). You are covered."
+        if ($days -le 90) { $l += "That is soon. $up" }
+        else { $l += 'Keep Windows Update on and install the monthly updates.' }
+    } else {
+        $l += "$($row.Name) stopped getting security updates on $endTxt."
+        if ($row.Esu) {
+            $esu = [datetime]::ParseExact($row.Esu, 'yyyy-MM-dd', $ci)
+            if ($Today.Date -le $esu) { $l += "Only PCs enrolled in Extended Security Updates (ESU) still get fixes, until $($esu.ToString('d MMMM yyyy')). Check with Microsoft: Settings > Windows Update shows whether this PC is enrolled." }
+            else { $l += "The free/paid consumer Extended Security Updates (ESU) ran until $($esu.ToString('d MMMM yyyy')). Businesses can buy further years; check with Microsoft if this PC is enrolled." }
+        }
+        $l += ''
+        $l += 'Windows still works, but security holes found since then are not fixed, and anti-cheat and new games drop old versions over time.'
+        $l += $up
+    }
+    $l -join "`n"
+}
+
+# --- 10. pending restart and restore points
+function Get-RestartRestoreReport {
+    $l = @()
+    $why = @()
+    try { if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $why += 'Windows updates or features' } } catch {}
+    try { if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $why += 'Windows Update' } } catch {}
+    $pfr = $false
+    try { $p = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop).PendingFileRenameOperations; if (@($p | Where-Object { $_ }).Count) { $pfr = $true } } catch {}
+    $boot = $null
+    try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Select-Object -First 1; if ($os -and $os.LastBootUpTime) { $boot = [datetime]$os.LastBootUpTime } } catch {}
+    $up = if ($boot) { [int][Math]::Floor(((Get-Date) - $boot).TotalDays) } else { -1 }
+    $upTxt = if ($up -lt 0) { 'unknown' } elseif ($up -eq 0) { 'less than a day' } else { Get-HcPlural $up 'day' }
+    if ($why.Count) {
+        $l += "A restart is waiting ($($why -join ', ')). The PC has been running for $upTxt since the last restart, so Windows has waited up to that long."
+        $l += 'Until you restart, updates (including game, driver and security fixes) are not finished, and some games or anti-cheat refuse to start. Restart (not Shut down) before your next session.'
+    } else {
+        $l += "No Windows restart is pending. Last restart: $(if ($up -ge 0) { "$upTxt ago" } else { 'unknown' })."
+        if ($up -ge 14) { $l += 'Restart now and then: memory leaks and stuck drivers build up over weeks.' }
+    }
+    if ($pfr) { $l += 'An installer has also queued files to replace at the next restart.' }
+    if ($up -ge 1) { $l += 'Tip: with Fast Startup, Shut down does not count as a restart; use Restart.' }
+    $l += ''
+    $pol = $null; try { $pol = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction Stop).DisableSR } catch {}
+    $rps = $null; try { $rps = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -ErrorAction Stop).RPSessionInterval } catch {}
+    $pts = $null; $ptErr = $false
+    try { $pts = @(Get-ComputerRestorePoint -ErrorAction Stop) } catch { $ptErr = $true }
+    $newest = $null
+    foreach ($p in @($pts)) {
+        if (-not $p) { continue }
+        $d = $null
+        try { $d = if ($p.CreationTime -is [datetime]) { $p.CreationTime } else { [Management.ManagementDateTimeConverter]::ToDateTime("$($p.CreationTime)") } } catch {}
+        if ($d -and (-not $newest -or $d -gt $newest.When)) { $newest = [pscustomobject]@{ When = $d; Desc = "$($p.Description)" } }
+    }
+    $off = ($null -ne $pol -and [int]$pol -eq 1) -or ($null -ne $rps -and [int]$rps -eq 0)
+    if ($newest) {
+        $age = [int][Math]::Floor(((Get-Date) - $newest.When).TotalDays)
+        $l += "Last restore point: $(if ($age -le 0) { 'today' } else { "$(Get-HcPlural $age 'day') ago" }) ($(Get-HcDate $newest.When)$(if ($newest.Desc) { ', ' + $newest.Desc }))."
+        if ($age -gt 30) { $l += 'That is old. Make a fresh one before you change drivers or settings: Start > "Create a restore point" > Create.' }
+    } elseif ($ptErr) { $l += 'Could not read the restore points (needs administrator rights).' }
+    else { $l += 'There are no restore points on this PC.' }
+    if ($off) { $l += "System Restore is turned off$(if ($null -ne $pol -and [int]$pol -eq 1) { ' by a policy (the Repair card "Turn System Restore and shadow copies back on" fixes that)' }). Turn it on: Start > ""Create a restore point"" > select drive $(Get-HcSystemDriveLetter): > Configure > Turn on system protection." }
+    elseif (-not $newest -and -not $ptErr) { $l += "If System Restore is off: Start > ""Create a restore point"" > select drive $(Get-HcSystemDriveLetter): > Configure > Turn on system protection." }
+    $l -join "`n"
+}
 
 $Tweaks = @(
     # ---------------------------------------------------------------- System
@@ -7305,18 +7975,22 @@ $Tweaks = @(
        Title = 'Ultimate Performance power plan'
        Desc  = 'Keeps CPU cores awake and at full clock so frames are never waiting on power saving.'
        Warn  = 'You are on a laptop running on battery. Battery life and fan noise will get noticeably worse.'
-       Test  = { (Get-ActivePowerScheme).Name -match 'Ultimate Performance|High performance' }
+       Test  = { Test-UltimatePlan (Get-ActivePowerScheme) }
        On    = {
            if (-not $script:Backup.Custom.ContainsKey('power')) { $script:Backup.Custom['power'] = (Get-ActivePowerScheme).Guid }
            $target = $null
-           $existing = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' } | Select-Object -First 1
+           $list = @(powercfg /list)
+           $existing = $list | Where-Object { $_ -match 'Ultimate Performance' } | Select-Object -First 1
+           $mine = "$($script:Backup.Custom['power:plan'])"
            if ($existing -and $existing -match $GuidRx) { $target = $Matches[0] }
+           elseif ($mine -and ($list | Where-Object { $_ -match [regex]::Escape($mine) })) { $target = $mine }   # non-English name, made earlier
            else {
                $out = powercfg -duplicatescheme $UltimateTemplate 2>$null
                if ($LASTEXITCODE -eq 0 -and "$out" -match $GuidRx) { $target = $Matches[0] } else { $target = $HighPerfGuid }
            }
            powercfg /setactive $target 2>$null
            if ($LASTEXITCODE -ne 0) { throw 'Windows refused the plan (common on Modern Standby laptops).' }
+           $script:Backup.Custom['power:plan'] = $target
        }
        Off   = {
            $prev = $script:Backup.Custom['power']
@@ -7324,6 +7998,7 @@ $Tweaks = @(
            if (-not $prev) { throw 'No other power plan to switch back to.' }
            powercfg /setactive $prev 2>$null
            $script:Backup.Custom.Remove('power')
+           $script:Backup.Custom.Remove('power:plan')
        } }
 
     @{ Id = 'gamemode'; Cat = 'System'; Icon = [char]0xE7FC; Rec = $true
@@ -8045,15 +8720,19 @@ $Tweaks = @(
 
     @{ Id = 'cleanlogs'; Cat = 'Storage'; Icon = [char]0xE74D; Action = 'Clean now'
        Title = 'Clear logs and crash dumps'
-       Desc  = 'Deletes old Windows crash dumps and error reports, plus old Fortnite logs and crash folders.'
+       Desc  = 'Deletes old Windows crash dumps and error reports, plus old Fortnite logs and crash folders. Blue-screen minidumps, LiveKernelReports (graphics driver resets) and archived error reports from the last 30 days are kept: ZeroDelay''s crash checks and Reliability Monitor read them.'
        Warn  = ''
        Run   = {
            $bytes = 0; $cut = (Get-Date).AddHours(-1)
+           # crash evidence the crash checks and Reliability Monitor read: only files older than 30 days go
+           $evidence = @("$env:WINDIR\Minidump", "$env:WINDIR\LiveKernelReports", "$env:ProgramData\Microsoft\Windows\WER\ReportArchive")
+           $keepCut = (Get-Date).AddDays(-30)
            $targets = @("$env:WINDIR\Minidump", "$env:WINDIR\LiveKernelReports", "$env:LOCALAPPDATA\CrashDumps",
                         "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
                         "$env:LOCALAPPDATA\FortniteGame\Saved\Logs", "$env:LOCALAPPDATA\FortniteGame\Saved\Crashes")
            foreach ($dir in $targets | Where-Object { Test-Path $_ }) {
-               Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut } | ForEach-Object {
+               $c = if ($evidence -contains $dir) { $keepCut } else { $cut }
+               Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $c } | ForEach-Object {
                    $len = $_.Length; try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $bytes += $len } catch {}
                }
            }
@@ -8547,8 +9226,9 @@ $Tweaks = @(
        Tasks = @( '\Microsoft\Windows\Maps\MapsUpdateTask', '\Microsoft\Windows\Maps\MapsToastTask' ) }
 
     @{ Id = 'task-wer'; Cat = 'Services'; Icon = [char]0xE823; Rec = $false
+       Requires = { Test-TweakHasBackup 'task-wer' }   # 2.1: retired; shown only so people who switched it on can switch it off
        Title = 'Turn off error report queue task'
-       Desc  = 'Stops the task that uploads queued crash reports in the background.'
+       Desc  = 'Stops the task that uploads queued crash reports in the background. Retired in 2.1: this Windows Error Reporting task feeds Reliability Monitor and the crash reports ZeroDelay''s crash checks read, so it is no longer offered. Switch it off to restore the task.'
        Warn  = 'You want your crash reports sent so bugs get fixed.'
        Tasks = @( '\Microsoft\Windows\Windows Error Reporting\QueueReporting' ) }
 
@@ -8647,7 +9327,7 @@ $Tweaks = @(
        Title = "Don't start the Windows hypervisor"
        Desc  = 'With Hyper-V, WSL2, Sandbox or Memory Integrity installed, Windows itself runs on a hypervisor, which adds overhead to interrupts and memory access. Microsoft''s gaming guide suggests turning it off.'
        Warn  = 'You use WSL2, Docker, Hyper-V, Windows Sandbox or an Android emulator, or your work PC needs Credential Guard. Lowers kernel security protections. If BitLocker is on, keep your recovery key at hand.'
-       Requires = { (Get-CimInstance Win32_ComputerSystem -Property HypervisorPresent).HypervisorPresent -or (Get-HypervisorLaunch) -eq 'Off' }
+       Requires = { (Get-CimInstance Win32_ComputerSystem -Property HypervisorPresent -ErrorAction SilentlyContinue).HypervisorPresent -or (Get-HypervisorLaunch) -eq 'Off' }
        Test  = { (Get-HypervisorLaunch) -eq 'Off' }
        On    = {
            if (-not $script:Backup.Custom.ContainsKey($t.Id)) { $script:Backup.Custom[$t.Id] = @{ Value = (Get-HypervisorLaunch) } }
@@ -9628,7 +10308,7 @@ $Tweaks = @(
        }
        Off   = {
            $b = $script:Backup.Custom[$t.Id]
-           if ($b) { foreach ($p in $(if ($b -is [System.Collections.IDictionary]) { $b.GetEnumerator() } else { $b.PSObject.Properties })) { $val = if ("$($p.Value)" -match '^(Yes|Ja|Oui|Sí|Si|Sim|Tak|Evet)$') { 'yes' } elseif ("$($p.Value)" -match '^(No|Nein|Non|Nie|Hayır|Não|Nee)$') { 'no' } else { "$($p.Value)" }; bcdedit /set '{current}' $p.Name $val | Out-Null } }
+           if ($b) { foreach ($p in $(if ($b -is [System.Collections.IDictionary]) { $b.GetEnumerator() } else { $b.PSObject.Properties })) { $val = if (Test-BcdYes $p.Value) { 'yes' } elseif (Test-BcdNo $p.Value) { 'no' } else { "$($p.Value)" }; bcdedit /set '{current}' $p.Name $val | Out-Null } }
            $script:Backup.Custom.Remove($t.Id)
        } }
 
@@ -11544,6 +12224,154 @@ $Tweaks = @(
            }
        } }
 
+    # ======================================================= 2.1 Windows cleanup
+    # Lock-screen ads (RotatingLockScreenOverlayEnabled, SubscribedContent-338387Enabled) are already in 'tips', and
+    # Edge Startup Boost is already in 'edgebg', so they are not repeated here (two cards on one value break undo).
+    @{ Id = 'recall-remove'; Cat = 'Background'; Icon = [char]0xE72E; Rec = $false; Badge = 'restart'
+       Requires = { (Test-RecallPolicySupported) -or (Test-TweakHasBackup 'recall-remove') }
+       Title = 'Remove Recall completely'
+       Desc  = 'Windows policy that makes Recall unavailable and removes it from the PC, instead of only pausing snapshots like "Turn off Recall snapshots". Takes effect after a restart.'
+       Warn  = 'You use Recall. Snapshots it already saved are deleted with it.'
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowsai'
+       Reg   = @( @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'; N = 'AllowRecallEnablement'; V = 0; D = $null; M = 1 } ) }
+
+    @{ Id = 'ai-paintnotepad'; Cat = 'Background'; Icon = [char]0xE70F; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22621 -or (Test-TweakHasBackup 'ai-paintnotepad') }
+       Title = 'Turn off AI in Paint and Notepad'
+       Desc  = 'Hides Cocreator, Generative fill and Image Creator in Paint, and the AI writing features in Notepad. Takes effect the next time the app opens.'
+       Warn  = 'You use the AI image or text features in these apps.'
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowsai'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'; N = 'DisableCocreator'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'; N = 'DisableGenerativeFill'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'; N = 'DisableImageCreator'; V = 1; D = $null; M = 0 }
+           # less certain: from the Notepad policy template, not listed in the WindowsAI CSP page; harmless if Notepad ignores it
+           @{ P = 'HKLM:\SOFTWARE\Policies\WindowsNotepad'; N = 'DisableAIFeatures'; V = 1; D = $null; M = 0 }
+       ) }
+
+    @{ Id = 'copilot-app'; Cat = 'Background'; Icon = [char]0xE74D; Rec = $false
+       Requires = { (@(Get-CopilotAppx).Count -gt 0) -or (Test-TweakHasBackup 'copilot-app') }
+       Title = 'Uninstall the Copilot app'
+       Desc  = 'Removes the Copilot app for your account. Since Windows 11 24H2 Copilot is a normal Store app and the old "Turn off Copilot" policy no longer applies to it, so uninstalling is the only way on Home and Pro.'
+       Warn  = 'You use Copilot or the Copilot key. Undo reinstalls it from the Microsoft Store.'
+       Source = 'https://learn.microsoft.com/en-us/windows/client-management/manage-windows-copilot'
+       Test  = {
+           if (@(Get-CopilotAppx).Count) { return $false }
+           if (Test-TweakHasBackup 'copilot-app') { return $true }
+           $null
+       }
+       On    = {
+           $pk = @(Get-CopilotAppx)
+           if (-not $script:Backup.Custom.ContainsKey('copilot-app')) { $script:Backup.Custom['copilot-app'] = @($pk | ForEach-Object { $_.Name }) }
+           foreach ($p in $pk) { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop }
+       }
+       Off   = {
+           if (@(Get-CopilotAppx).Count) { [void]$script:Backup.Custom.Remove('copilot-app'); return }
+           $ok = $false
+           if (Get-Command winget -ErrorAction SilentlyContinue) {
+               try {
+                   $p = Start-Process winget -ArgumentList 'install --id 9NHT9RB2F4HD -e --source msstore --accept-package-agreements --accept-source-agreements' -WindowStyle Hidden -PassThru
+                   if ($p.WaitForExit(180000)) { $ok = @(Get-CopilotAppx).Count -gt 0 }
+               } catch {}
+           }
+           if ($ok) { [void]$script:Backup.Custom.Remove('copilot-app'); return }
+           # explorer.exe opens the Store as you, not as administrator
+           Start-Process explorer.exe -ArgumentList '"ms-windows-store://pdp/?productid=9NHT9RB2F4HD"'
+           throw 'Opened Copilot in the Microsoft Store: click Get to reinstall it.'
+       } }
+
+    @{ Id = 'start-recs'; Cat = 'Background'; Icon = [char]0xE946; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22000 -or (Test-TweakHasBackup 'start-recs') }
+       Title = 'Start menu: no recommended apps or account nags'
+       Desc  = 'Removes promoted apps from Start''s Recommended section and the Microsoft account reminders on your profile picture. Your recent files stay.'
+       Warn  = 'You like app suggestions in Start.'
+       Source = 'https://learn.microsoft.com/en-us/windows/configuration/start/'
+       Reg   = @(
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'Start_IrisRecommendations'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'Start_AccountNotifications'; V = 0; D = 1; M = 1 }
+       ) }
+
+    @{ Id = 'settings-ads'; Cat = 'Background'; Icon = [char]0xE713; Rec = $false
+       Title = 'No suggestions in Settings and File Explorer'
+       Desc  = 'Stops suggested content in the Settings app and OneDrive and other sync-provider ads in File Explorer. "Turn off tips and suggestions" covers Start, tips and the lock screen; this covers these two places.'
+       Warn  = 'You want Windows to suggest features in Settings.'
+       Source = 'https://learn.microsoft.com/en-us/windows/privacy/manage-connections-from-windows-operating-system-components-to-microsoft-services'
+       Reg   = @(
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-338393Enabled'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-353694Enabled'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; N = 'SubscribedContent-353696Enabled'; V = 0; D = 1; M = 1 }
+           @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'ShowSyncProviderNotifications'; V = 0; D = 1; M = 1 }
+       ) }
+
+    @{ Id = 'edge-clutter'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Requires = { (Test-AppInstalled 'msedge.exe' @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe")) -or (Test-TweakHasBackup 'edge-clutter') }
+       Title = 'Edge: no shopping, Rewards or recommendations'
+       Desc  = 'Turns off Edge''s shopping assistant, Microsoft Rewards, pop-up recommendations, the first-run tour and new desktop shortcuts after updates. Startup Boost is in "Stop Edge running in the background".'
+       Warn  = 'You use Edge''s coupons or Rewards. Edge will show "Managed by your organization".'
+       Source = 'https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'EdgeShoppingAssistantEnabled'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'ShowMicrosoftRewards'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'ShowRecommendationsEnabled'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; N = 'HideFirstRunExperience'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate'; N = 'CreateDesktopShortcutDefault'; V = 0; D = $null; M = 1 }
+       ) }
+
+    @{ Id = 'brave-clutter'; Cat = 'Background'; Icon = [char]0xE774; Rec = $false
+       Requires = { (Test-AppInstalled 'brave.exe' @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe")) -or (Test-TweakHasBackup 'brave-clutter') }
+       Title = 'Brave: no AI chat, Wallet, Rewards, VPN, News or Tor'
+       Desc  = 'Switches off Brave''s extra features (Leo AI chat, crypto Wallet, Rewards, VPN, News and Tor windows) by policy, so they stop showing and running. The ad and tracker blocking stays.'
+       Warn  = 'You use any of these Brave features. Brave will show "Managed by your organization".'
+       Source = 'https://support.brave.com/hc/en-us/articles/360039248271-Group-Policy'
+       Reg   = @(
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveAIChatEnabled'; V = 0; D = $null; M = 1 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveRewardsDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveWalletDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveVPNDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'BraveNewsDisabled'; V = 1; D = $null; M = 0 }
+           @{ P = 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'; N = 'TorDisabled'; V = 1; D = $null; M = 0 }
+       ) }
+
+    @{ Id = 'classicmenu'; Cat = 'Visuals'; Icon = [char]0xE700; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22000 -or (Test-TweakHasBackup 'classicmenu') }
+       Title = 'Classic right-click menu'
+       Desc  = 'Brings back the full Windows 10 style right-click menu, so you do not have to click "Show more options". The taskbar and open File Explorer windows restart once to apply it.'
+       Warn  = 'You prefer the compact Windows 11 menu.'
+       Source = 'https://learn.microsoft.com/en-us/windows/win32/shell/context-menu-handlers'
+       Test  = { Test-ClassicMenu }
+       On    = {
+           if (-not $script:Backup.Custom.ContainsKey('classicmenu')) {
+               $old = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($ClassicMenuSubKey)
+               $script:Backup.Custom['classicmenu'] = @{ Existed = [bool]$old }
+               if ($old) { $old.Close() }
+           }
+           $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$ClassicMenuSubKey\InprocServer32")
+           try { $k.SetValue('', '', [Microsoft.Win32.RegistryValueKind]::String) } finally { $k.Close() }
+           Restart-ExplorerShell
+       }
+       Off   = {
+           $b = $script:Backup.Custom['classicmenu']
+           # a key that was there before ZeroDelay is left alone; one ZeroDelay made (or no backup) is deleted
+           if (-not ($b -and $b.Existed)) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($ClassicMenuSubKey, $false) }
+           [void]$script:Backup.Custom.Remove('classicmenu')
+           Restart-ExplorerShell
+       } }
+
+    @{ Id = 'fileext'; Cat = 'System'; Icon = [char]0xE8A5; Rec = $true
+       Title = 'Show file extensions'
+       Desc  = 'File Explorer shows the ending of every file name (.exe, .pdf, .zip), so a fake "setup.pdf.exe" sent as a game mod or cheat cannot pass as a document.'
+       Warn  = 'Never. You just see the full file names.'
+       Source = 'https://support.microsoft.com/en-us/windows/common-file-name-extensions-in-windows-da4a4430-8e76-89c5-59f7-1cdbbc75cb01'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; N = 'HideFileExt'; V = 0; D = 1; M = 1 } ) }
+
+    @{ Id = 'taskbar-endtask'; Cat = 'System'; Icon = [char]0xE711; Rec = $false
+       Requires = { [Environment]::OSVersion.Version.Build -ge 22631 -or (Test-TweakHasBackup 'taskbar-endtask') }
+       Title = '"End task" when you right-click the taskbar'
+       Desc  = 'Adds End task to the right-click menu of apps on the taskbar, so a frozen game closes without opening Task Manager. This is the switch in Settings > System > For developers.'
+       Warn  = 'You worry about closing an app by accident: End task does not ask to save.'
+       Source = 'https://learn.microsoft.com/en-us/windows/apps/get-started/developer-mode-features-and-debugging'
+       Reg   = @( @{ P = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings'; N = 'TaskbarEndTask'; V = 1; D = $null; M = 0 } ) }
+
     # ======================================================= research round 2.0 (sources in each card's Source / text)
     # ---------------------------------------------------------------- Windows and graphics
     @{ Id = 'colorfilter'; Cat = 'Visuals'; Icon = [char]0xE790; Rec = $false; Lat = $true; Badge = 'signout'
@@ -11611,6 +12439,52 @@ $Tweaks = @(
        Source = 'https://devtrackers.gg/r6-siege/p/bb8a00f7-connectivity-multiplayer-server-issues'
        Run   = { [void](Show-ZdDialog (Get-R6DataCenterReport) 'Siege data center' 'OK' 'Information'); 'Shown.' } }
 
+    # ======================================================= 2.1 tools (helpers: "2.1 tools" block before New-AppsPage)
+    @{ Id = 'winrepair'; Cat = 'Repair'; Icon = [char]0xE90F; Action = 'Repair Windows'; Lat = $false
+       Title = 'Repair Windows files (DISM + SFC)'
+       Desc  = 'Microsoft''s own repair in one click: DISM checks the Windows component store and repairs it from Windows Update only if it is damaged, then System File Checker (sfc /scannow) repairs Windows files. Takes 15 to 45 minutes in the background; nothing of yours is deleted.'
+       Warn  = 'You are about to play: the disk and processor stay busy until it finishes. ZeroDelay refuses to start while a game is running.'
+       Source = 'https://support.microsoft.com/help/929833'
+       Run   = { Start-WindowsRepair } }
+
+    @{ Id = 'wu-repair'; Cat = 'Repair'; Icon = [char]0xE895; Action = 'Fix updates'; Lat = $false
+       Title = 'Windows Update stuck or failing'
+       Desc  = 'Shows your last successful update and the updates that failed recently, with the error codes in plain words. Offers Microsoft''s reset: stops the update services, renames the download cache (SoftwareDistribution) and catalog (catroot2) to .old, and starts the services again. Takes 1 to 2 minutes.'
+       Warn  = 'An update is installing right now (let it finish first), or Game Mode is on (it pauses updates).'
+       Source = 'https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/additional-resources-for-windows-update'
+       Run   = { Show-WuRepair } }
+
+    @{ Id = 'memtest'; Cat = 'System'; Icon = [char]0xE950; Action = 'Test RAM'; Lat = $false
+       Title = 'Test your RAM (Windows Memory Diagnostic)'
+       Desc  = 'Random crashes, blue screens or corrupted game files can be faulty RAM or an unstable XMP/EXPO profile. Shows the result of the last memory test, and schedules Windows'' own test: it runs at the next restart for 15 to 30 minutes.'
+       Warn  = 'You need the PC in the next half hour: the test runs before Windows starts and cannot be paused.'
+       Source = 'https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/stop-code-error-troubleshooting'
+       Run   = { Show-MemTest } }
+
+    @{ Id = 'gm-hotkey'; Cat = 'System'; Icon = [char]0xE765; Rec = $false; Lat = $false
+       Title = 'Game Mode hotkey (Ctrl+Alt+G)'
+       Desc  = 'Off by default. Press Ctrl+Alt+G anywhere, also in a game or with ZeroDelay in the tray, to switch ZeroDelay Game Mode on or off. Works while ZeroDelay is running. If another app already uses Ctrl+Alt+G, ZeroDelay tells you and the switch stays off.'
+       Warn  = 'A game or app you use has its own Ctrl+Alt+G shortcut: the first one to register it wins.'
+       Source = 'https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey'
+       Test  = { [bool](Get-Setting 'gmhotkey' $false) }
+       On    = { Enable-ZdGmHotkey }
+       Off   = { Disable-ZdGmHotkey } }
+
+    @{ Id = 'sleep-check'; Cat = 'Power'; Icon = [char]0xE708; Action = 'Check'; Lat = $false
+       Title = 'Why won''t my PC sleep (or why does it wake up)?'
+       Desc  = 'Shows what keeps your PC awake right now, what woke it last, the timers that will wake it, and every device allowed to wake it (a mouse or network card is the usual cause). Uses Windows'' powercfg; nothing is changed.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options'
+       Run   = { Start-SleepCheck } }
+
+    @{ Id = 'battery-health'; Cat = 'Power'; Icon = [char]0xE83F; Action = 'Check'; Lat = $false
+       Requires = { [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue) }
+       Title = 'Laptop battery health'
+       Desc  = 'Reads Windows'' battery report: how much of its original capacity your battery still holds and how many charge cycles it has done, with what to do about it. Nothing is changed.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options'
+       Run   = { Start-BatteryCheck } }
+
     # ---------------------------------------------------------------- network
     @{ Id = 'wifi-drops'; Cat = 'Network'; Icon = [char]0xE701; Action = 'Check'; Lat = $true
        Requires = { [bool](Get-WifiAdapters).Count }
@@ -11629,6 +12503,78 @@ $Tweaks = @(
        Test  = { if ($script:Backup.Custom.ContainsKey('rxbuffers')) { $true } elseif ((Get-RxDropAdapters).Count) { $false } else { $null } }
        On    = { Set-RxBuffersUp 'rxbuffers' }
        Off   = { Reset-AdvPropEach 'rxbuffers' '*ReceiveBuffers' { param($n) $null } } }
+
+    # ======================================================= 2.1 health checks
+    @{ Id = 'crash-timeline'; Cat = 'Repair'; Icon = [char]0xE7BA; Action = 'Check'; Lat = $false
+       Title = 'Crash timeline (last 30 days)'
+       Desc  = 'Lists every blue screen and sudden restart of the last 30 days from Windows'' own log, with the stop code in plain words: power or overclock problem, hardware error, graphics driver, memory or a driver, and what to check next.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-code-reference2'
+       Run   = { Start-HealthReport 'Get-CrashTimelineReport' 'Crash timeline'; 'Reading the System log...' } }
+
+    @{ Id = 'app-crashes'; Cat = 'Repair'; Icon = [char]0xE7BA; Action = 'Check'; Lat = $false
+       Title = 'Which file crashes your games?'
+       Desc  = 'Groups the last 30 days of program crashes and freezes by game and by the file they crashed in, and names the usual suspects: the NVIDIA, AMD or Intel graphics driver, DirectX, or an overlay (Discord, Steam, RivaTuner, Overwolf).'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows/win32/wer/windows-error-reporting'
+       Run   = { Start-HealthReport 'Get-AppCrashReport' 'Game and app crashes'; 'Reading the Application log...' } }
+
+    @{ Id = 'gpu-hangs'; Cat = 'Graphics'; Icon = [char]0xE7F4; Action = 'Check'; Lat = $false
+       Title = 'Graphics driver hang history'
+       Desc  = 'Counts how often the graphics driver stopped responding and was reset in the last 30 days (a black flash or a game crash), plus the hang reports Windows saved in LiveKernelReports, and what to do about them.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/display/timeout-detection-and-recovery'
+       Run   = { Start-HealthReport 'Get-GpuHangReport' 'Graphics driver hangs'; 'Reading the graphics driver history...' } }
+
+    @{ Id = 'disk-errors'; Cat = 'Storage'; Icon = [char]0xEDA2; Action = 'Check'; Lat = $false
+       Title = 'Disk error history and file-system check'
+       Desc  = 'Reads 30 days of bad blocks, retried reads, drive resets and file-system damage from Windows'' log. Then offers Windows'' own online file-system scan of the Windows drive (read-only, runs while you use the PC) and, only if it asks for one, a quick spot fix at the next restart.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/powershell/module/storage/repair-volume'
+       Run   = { Start-DiskErrorCheck; 'Reading the disk error history...' } }
+
+    @{ Id = 'device-problems'; Cat = 'System'; Icon = [char]0xE772; Action = 'Check'; Lat = $false
+       Title = 'Devices with problems'
+       Desc  = 'Lists the devices Device Manager marks with a yellow triangle (missing driver, cannot start, stopped with code 43...) with what each code means and how to fix it. Devices that are only unplugged are listed separately.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows-hardware/drivers/install/device-manager-error-messages'
+       Run   = { Start-HealthReport 'Get-DeviceProblemReport' 'Devices with problems'; 'Reading the device list...' } }
+
+    @{ Id = 'intel-microcode'; Cat = 'System'; Icon = [char]0xE950; Action = 'Check'; Lat = $false
+       Requires = { Test-IntelVminCpu (Get-CpuName) }
+       Title = 'Intel 13th/14th gen: instability fix installed?'
+       Desc  = 'Reads the CPU microcode version. Intel 13th and 14th gen desktop processors slowly degrade from too high voltage; Intel''s fix comes as microcode 0x12B (0x12F is the latest recommended) in a BIOS update. Older means: update your BIOS soon.'
+       Warn  = ''
+       Source = 'https://community.intel.com/t5/Blogs/Tech-Innovation/Client/Intel-Core-13th-and-14th-Gen-Desktop-Instability-Root-Cause/post/1633446'
+       Run   = { [void](Show-ZdDialog (Get-IntelMicrocodeReport) 'Intel microcode' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'secureboot-2023'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'; Lat = $false
+       Title = 'Secure Boot 2023 certificates'
+       Desc  = 'Microsoft''s 2011 Secure Boot certificates expire in 2026 and are replaced by 2023 ones through Windows Update or a BIOS update. Checks whether Secure Boot is on and whether this PC has the new certificates, which anti-cheat that needs Secure Boot (Call of Duty, Battlefield 6, VALORANT) relies on. Reads only.'
+       Warn  = ''
+       Source = 'https://support.microsoft.com/help/5068202'
+       Run   = { Start-HealthReport 'Get-SecureBoot2023Report' 'Secure Boot certificates'; 'Reading Secure Boot...' } }
+
+    @{ Id = 'bitlocker-key'; Cat = 'System'; Icon = [char]0xE72E; Action = 'Check'; Lat = $false
+       Title = 'BitLocker: can you find your recovery key?'
+       Desc  = 'Windows 11 24H2 encrypts the drive by itself on many PCs. A BIOS update, fTPM/PTT or Secure Boot change can then ask for a 48-digit recovery key at start-up. Shows whether the Windows drive is encrypted, whether a recovery key exists and where to find it before you touch the BIOS.'
+       Warn  = ''
+       Source = 'https://support.microsoft.com/windows/find-your-bitlocker-recovery-key-6b71ad27-0b89-ea08-f143-056f5ab347d6'
+       Run   = { Start-HealthReport 'Get-BitLockerKeyReport' 'BitLocker recovery key'; 'Reading the encryption status...' } }
+
+    @{ Id = 'win-support'; Cat = 'System'; Icon = [char]0xE777; Action = 'Check'; Lat = $false
+       Title = 'Is Windows still getting security updates?'
+       Desc  = 'Compares your Windows version and edition with Microsoft''s end-of-service dates (Windows 10 22H2 ended in October 2025, Windows 11 24H2 Home/Pro in October 2026) and tells you plainly whether you are covered and how to move to a supported version.'
+       Warn  = ''
+       Source = 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information'
+       Run   = { [void](Show-ZdDialog (Get-WinSupportReport) 'Windows support' 'OK' 'Information'); 'Checked.' } }
+
+    @{ Id = 'restart-restore'; Cat = 'System'; Icon = [char]0xE777; Action = 'Check'; Lat = $false
+       Title = 'Restart pending? Last restore point?'
+       Desc  = 'Shows whether Windows is waiting for a restart to finish updates (some games and anti-cheat refuse to start until then), how long the PC has run since the last restart, and how old your newest restore point is.'
+       Warn  = ''
+       Source = 'https://support.microsoft.com/windows/system-restore-a5ae3ed9-07c4-fd56-45ee-096777ecd14e'
+       Run   = { Start-HealthReport 'Get-RestartRestoreReport' 'Restart and restore points'; 'Checking restart and restore points...' } }
 )
 
 # --- NVIDIA driver profile DWORD settings: Nv = @{ Profile; Id; V }. Originals are backed up and restored.
@@ -11823,6 +12769,9 @@ $NewIds = @('fn-bottleneck', 'fn-epicquality', 'fn-audiocheck', 'fn-qoslog', 'fn
             'pack-scan', 'repair-bcd-anticheat', 'repair-bcd-limits', 'repair-uac', 'repair-tdr', 'repair-vss', 'repair-wu-services',
             'repair-defender', 'repair-ifeo-junk', 'repair-gamesvcs', 'win-activation', 'ping', 'fn-subping', 'tournament-ready',
             'colorfilter', 'nvllm-global', 'laptop-mux', 'intel-apo', 'laptop-nvcaps', 'apex-datacenter', 'val-netbuffer', 'r6-datacenter', 'wifi-drops', 'rxbuffers')
+$NewIds += @('recall-remove', 'ai-paintnotepad', 'copilot-app', 'start-recs', 'settings-ads', 'edge-clutter', 'brave-clutter', 'classicmenu', 'fileext', 'taskbar-endtask')
+$NewIds += @('winrepair', 'wu-repair', 'memtest', 'gm-hotkey', 'sleep-check', 'battery-health')
+$NewIds += @('crash-timeline', 'app-crashes', 'gpu-hangs', 'disk-errors', 'device-problems', 'intel-microcode', 'secureboot-2023', 'bitlocker-key', 'win-support', 'restart-restore')
 foreach ($t in $Tweaks) { if ($NewIds -contains $t.Id) { $t.New = $true } }
 foreach ($t in $Tweaks) { if ($t.Cat -eq 'CS2' -and -not $t.Requires) { $t.Requires = { Test-Cs2Installed } } }
 
@@ -12618,9 +13567,14 @@ if ($script:Glass) {
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="24,0,0,0">
           <Grid Width="220" Margin="0,0,8,0">
-            <TextBox x:Name="Search" Padding="32,7,10,7" FontSize="13" Background="#2C2C2E" Foreground="#F5F5F7" BorderBrush="#38383A" CaretBrush="#F5F5F7" VerticalContentAlignment="Center"/>
+            <TextBox x:Name="Search" Padding="32,7,58,7" FontSize="13" Background="#2C2C2E" Foreground="#F5F5F7" BorderBrush="#38383A" CaretBrush="#F5F5F7" VerticalContentAlignment="Center"/>
             <TextBlock Text="&#xE721;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="13" Foreground="#98989D" Margin="12,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
             <TextBlock x:Name="SearchHint" Text="Search" FontSize="13" Foreground="#98989D" Margin="35,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+            <!-- 2.1: Ctrl+K opens the search-everything palette; the hint is also clickable -->
+            <Border x:Name="SearchKbd" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,8,0" CornerRadius="5" Padding="6,1,6,2" Cursor="Hand"
+                    Background="{DynamicResource Bg.Raised}" BorderBrush="{DynamicResource Border.Strong}" BorderThickness="1" ToolTip="Search everything (Ctrl+K)">
+              <TextBlock Text="Ctrl K" FontFamily="{DynamicResource Font.Mono}" FontSize="10.5" Foreground="{DynamicResource Text.Muted}"/>
+            </Border>
           </Grid>
           <Button x:Name="MoreBtn" Content="&#xE712;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="14" Style="{StaticResource Btn}" Margin="0,0,8,0" Padding="12,8"
                   ToolTip="Restore point and undo everything"/>
@@ -12712,8 +13666,33 @@ if ($script:Glass) {
       </StackPanel>
 
       <ScrollViewer x:Name="Scroller" Grid.Row="2" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="18,0,2,18">
-        <WrapPanel x:Name="Cards" Margin="14,14,14,14"/>
+        <!-- 2.1: one column of rows (Windows Settings, Winhance), grouped by area; details on the right -->
+        <StackPanel x:Name="Cards" Margin="14,6,14,96" MaxWidth="1040"/>
       </ScrollViewer>
+      <Border x:Name="Detail" Grid.Row="2" HorizontalAlignment="Right" Width="340" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1,0,0,0" Visibility="Collapsed">
+        <ScrollViewer Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="24,4,20,96">
+          <StackPanel>
+            <TextBlock Text="DETAILS" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Text.Muted}"/>
+            <TextBlock x:Name="DetTitle" Text="Pick a tweak to see what it changes." FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,10,0,10" Foreground="{DynamicResource Text.Primary}"/>
+            <WrapPanel x:Name="DetChips" Margin="0,0,0,8"/>
+            <TextBlock x:Name="DetDesc" FontSize="13" LineHeight="20" LineStackingStrategy="BlockLineHeight" TextWrapping="Wrap" Foreground="{DynamicResource Text.Secondary}"/>
+            <StackPanel x:Name="DetChangesBox" Visibility="Collapsed">
+              <TextBlock Text="WHAT IT CHANGES" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Text.Muted}" Margin="0,18,0,0"/>
+              <Border Background="{DynamicResource Bg.Surface}" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1" CornerRadius="8" Padding="10,8" Margin="0,8,0,0">
+                <TextBlock x:Name="DetChanges" FontFamily="Cascadia Mono, Consolas" FontSize="11.5" LineHeight="18" LineStackingStrategy="BlockLineHeight" TextWrapping="Wrap" Foreground="{DynamicResource Text.Secondary}"/>
+              </Border>
+            </StackPanel>
+            <StackPanel x:Name="DetWarnBox" Visibility="Collapsed">
+              <TextBlock Text="DON'T USE IF" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Text.Muted}" Margin="0,18,0,0"/>
+              <TextBlock x:Name="DetWarn" FontSize="13" LineHeight="20" LineStackingStrategy="BlockLineHeight" TextWrapping="Wrap" Foreground="{DynamicResource Text.Secondary}" Margin="0,8,0,0"/>
+            </StackPanel>
+            <WrapPanel Margin="0,20,0,0">
+              <Button x:Name="DetDefault" Content="Back to Windows default" Style="{StaticResource Zd.Button.Secondary}" Margin="0,0,8,8" Visibility="Collapsed"/>
+              <Button x:Name="DetSource" Content="Source &#x2197;" Style="{StaticResource Zd.Button.Secondary}" Margin="0,0,8,8" Visibility="Collapsed"/>
+            </WrapPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
       <!-- 2.0: shown when filters or search match no card -->
       <Border x:Name="EmptyState" Grid.Row="2" Visibility="Collapsed" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="32,14,32,0" MaxWidth="520"
               Background="{DynamicResource Bg.Surface}" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1" CornerRadius="12" Padding="20">
@@ -12730,6 +13709,21 @@ if ($script:Glass) {
         <StackPanel x:Name="StripItems" Orientation="Horizontal" HorizontalAlignment="Right"/>
       </Grid>
 
+      <!-- 2.1: switches on Tweaks are collected here and applied together (Discord, Winhance review) -->
+      <Grid x:Name="PendingBar" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,22" Visibility="Collapsed">
+        <Border CornerRadius="12" Background="#15181D">
+          <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.5" Color="Black"/></Border.Effect>
+        </Border>
+        <Border CornerRadius="12" Background="#15181D" BorderBrush="#2B323B" BorderThickness="1" Padding="18,8,8,8">
+          <StackPanel Orientation="Horizontal">
+            <Ellipse Width="8" Height="8" Fill="{DynamicResource AccentFill}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+            <TextBlock x:Name="PendingText" FontSize="13.5" Foreground="{DynamicResource Text.Primary}" VerticalAlignment="Center" Margin="0,0,18,0"/>
+            <Button x:Name="PendingDiscard" Content="Discard" Style="{StaticResource Zd.Button.Ghost}" MinHeight="34" Margin="0,0,6,0"/>
+            <Button x:Name="PendingReview" Content="Review" Style="{StaticResource Zd.Button.Secondary}" MinHeight="34" Margin="0,0,6,0"/>
+            <Button x:Name="PendingApply" Content="Apply" Style="{StaticResource Zd.Button.Primary}" MinHeight="34"/>
+          </StackPanel>
+        </Border>
+      </Grid>
       <Grid x:Name="Toast" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Right" Margin="0,0,28,24" Visibility="Collapsed">
         <Border CornerRadius="12" Background="#15181D">
           <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.45" Color="Black"/></Border.Effect>
@@ -12755,11 +13749,56 @@ if ($script:Glass) {
         </Border>
       </Grid>
     </Grid>
+    <!-- 2.1 Ctrl+K: search everything (tweaks, checks, tools, games, settings). Code: Show-Palette and friends. -->
+    <Grid x:Name="Palette" Grid.ColumnSpan="2" Background="#8C000000" Visibility="Collapsed">
+      <Grid x:Name="PalPanel" Width="600" Margin="24,96,24,24" VerticalAlignment="Top" HorizontalAlignment="Center">
+        <Border CornerRadius="14" Background="{DynamicResource Bg.Raised}">
+          <Border.Effect><DropShadowEffect BlurRadius="48" ShadowDepth="16" Direction="270" Opacity="0.55" Color="Black"/></Border.Effect>
+        </Border>
+        <Border CornerRadius="14" Background="{DynamicResource Bg.Raised}" BorderBrush="{DynamicResource Border.Strong}" BorderThickness="1">
+          <DockPanel>
+            <Grid DockPanel.Dock="Top" Height="56">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBlock Text="&#xE721;" FontFamily="{DynamicResource Font.Icons}" FontSize="16" Foreground="{DynamicResource Text.Muted}" Margin="20,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+              <TextBox x:Name="PalInput" Grid.Column="1" Margin="10,0,12,0" Padding="0" FontSize="16" Background="Transparent" BorderThickness="0"
+                       Foreground="{DynamicResource Text.Primary}" CaretBrush="{DynamicResource Text.Primary}" VerticalContentAlignment="Center"
+                       AutomationProperties.Name="Search everything"/>
+              <TextBlock x:Name="PalHint" Grid.Column="1" Margin="12,0,12,0" Text="Search tweaks, checks, tools, games and settings" FontSize="16"
+                         Foreground="{DynamicResource Text.Muted}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" IsHitTestVisible="False"/>
+              <Border Grid.Column="2" Margin="0,0,16,0" CornerRadius="5" Padding="6,1,6,2" VerticalAlignment="Center" BorderBrush="{DynamicResource Border.Strong}" BorderThickness="1">
+                <TextBlock Text="Esc" FontFamily="{DynamicResource Font.Mono}" FontSize="11" Foreground="{DynamicResource Text.Muted}"/>
+              </Border>
+            </Grid>
+            <Border DockPanel.Dock="Top" Height="1" Background="{DynamicResource Border.Subtle}"/>
+            <Border DockPanel.Dock="Bottom" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="0,1,0,0" Padding="16,9,16,10">
+              <TextBlock Text="↑ ↓ move  ·  Enter open  ·  Space switch on or off  ·  Searches tweaks, checks, tools, games and settings"
+                         FontSize="11.5" Foreground="{DynamicResource Text.Muted}" TextTrimming="CharacterEllipsis"/>
+            </Border>
+            <ScrollViewer x:Name="PalScroll" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" MaxHeight="440" Padding="8,6,8,8" Focusable="False">
+              <StackPanel x:Name="PalList"/>
+            </ScrollViewer>
+          </DockPanel>
+        </Border>
+      </Grid>
+    </Grid>
   </Grid>
 </Window>
 '@)
 
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+# Small screens and high scaling (1366x768, 1920x1080 at 150%): a 1380x880 window centred on a smaller work area puts its
+# title bar above the screen edge, where it cannot be dragged. Fit the window (and its minimum) into the work area.
+if (-not $Snapshot) {
+    try {
+        $wa = [Windows.SystemParameters]::WorkArea
+        if ($wa.Width -gt 0 -and $wa.Height -gt 0) {
+            if ($window.MinWidth -gt $wa.Width) { $window.MinWidth = $wa.Width }
+            if ($window.MinHeight -gt $wa.Height) { $window.MinHeight = $wa.Height }
+            if ($window.Width -gt $wa.Width) { $window.Width = $wa.Width }
+            if ($window.Height -gt $wa.Height) { $window.Height = $wa.Height }
+        }
+    } catch {}
+}
 
 # --- App logo: mint rounded square with a dark lightning bolt (same as the sidebar badge).
 function New-LogoBitmap([int]$Size) {
@@ -12849,7 +13888,10 @@ $ui = @{}
 foreach ($n in 'ChipViewsBox', 'ResultCount', 'ShowAllOn', 'EmptyState', 'EmptyTitle', 'EmptyText', 'EmptyReset', 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
             'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon', 'ToastUndo',
-            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas') { $ui[$n] = $window.FindName($n) }
+            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas',
+            'Detail', 'DetTitle', 'DetChips', 'DetDesc', 'DetChangesBox', 'DetChanges', 'DetWarnBox', 'DetWarn', 'DetDefault', 'DetSource',
+            'PendingBar', 'PendingText', 'PendingDiscard', 'PendingReview', 'PendingApply',
+            'Palette', 'PalPanel', 'PalInput', 'PalHint', 'PalScroll', 'PalList', 'SearchKbd') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
     restart  = @{ Color = '#0A84FF'; Label = 'Needs restart'; Tip = 'Takes effect after you restart the PC.' }
@@ -12990,6 +14032,167 @@ function Start-CountUp($tb, [int]$to, [string]$suffix = '', [int]$ms = 600) {
     if (-not $script:CountOn) { [Windows.Media.CompositionTarget]::add_Rendering($script:CountHandler); $script:CountOn = $true }
 }
 
+# ===================================================== 2.1 Tweaks: risk, details, collected switches, groups
+# Risk in three words (O&O ShutUp10++, WinUtil, Hone): Safe = recommended for most PCs; Moderate = helps on some PCs,
+# read "Don't use if"; Advanced = for experienced users. Cards that only show a guide or a check carry none.
+$RiskInfo = @{
+    'Safe'     = @{ Tone = 'Good'; Tip = 'Recommended for most PCs, and one click to undo.' }
+    'Moderate' = @{ Tone = 'Warn'; Tip = 'Helps on some PCs. Read "Don''t use if" in the details first.' }
+    'Advanced' = @{ Tone = 'Bad';  Tip = 'For experienced users: can cause problems on some hardware. Still one click to undo.' }
+}
+function Get-TweakRisk($t) {
+    if ($t.Header -or $t.Action -or $t.Picker -or $t.Preset) { return $null }
+    if ($t.Badge -eq 'advanced') { 'Advanced' } elseif ($t.Rec) { 'Safe' } else { 'Moderate' }
+}
+# what a tweak changes, in the words Windows uses: registry values, power plan settings, driver settings, files
+function Get-TweakChangeText($t) {
+    $l = New-Object Collections.Generic.List[string]
+    foreach ($e in @($t.Reg)) {
+        if (-not $e) { continue }
+        $def = if ($null -eq $e.D) { 'not set' } else { "$($e.D)" }
+        $l.Add("$($e.P -replace '^HKLM:\\', 'HKLM\' -replace '^HKCU:\\', 'HKCU\')\$($e.N) = $($e.V)   (Windows: $def)")
+    }
+    if ($t.Power) { $l.Add("Power plan setting $($t.Power.Set) = $($t.Power.V)   (Windows: $($t.Power.D))") }
+    if ($t.Nv) { $l.Add(('NVIDIA driver, {0}: setting 0x{1:X8} = {2}' -f $t.Nv.Profile, [int64]$t.Nv.Id, $t.Nv.V)) }
+    if ($t.Ini) { foreach ($k in $t.Ini.Keys) { $l.Add("Fortnite settings file: $k = $($t.Ini[$k][0])   (default: $(if ($null -eq $t.Ini[$k][1]) { 'not set' } else { $t.Ini[$k][1] }))") } }
+    if ($t.Tasks) { foreach ($k in @($t.Tasks)) { $l.Add("Scheduled task off: $k") } }
+    if ($t.Dx) { $l.Add("DirectX graphics setting: $($t.Dx.K) = $($t.Dx.V)") }
+    if (-not $l.Count -and ($t.On -or $t.Off)) { $l.Add('Done by ZeroDelay''s own steps (the original is saved first). The source explains what changes.') }
+    $l -join "`n"
+}
+$script:DetailTweak = $null
+function Show-TweakDetail($t) {
+    if (-not $t -or $t.Header -or $t.GroupHead) { return }
+    if ($script:DetailTweak -and $script:DetailTweak.Card) { $script:DetailTweak.Card.ClearValue([Windows.Controls.Border]::BorderBrushProperty) }
+    $script:DetailTweak = $t
+    if ($t.Card) { $t.Card.BorderBrush = $window.FindResource('AccentFill') }
+    $ui.DetTitle.Text = $t.Title
+    $ui.DetChips.Children.Clear()
+    $risk = Get-TweakRisk $t
+    $chips = @()
+    if ($risk) { $chips += , @($risk, $RiskInfo[$risk].Tone) }
+    $area = ($Categories | Where-Object { $_.Name -eq $t.Cat } | Select-Object -First 1).Title
+    if ($area) { $chips += , @($area, $null) }
+    if ($t.Badge -in 'restart', 'signout') { $chips += , @($BadgeInfo[$t.Badge].Label, $null) }
+    foreach ($c in $chips) {
+        $x = "<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Chip}' Margin='0,0,6,6'$(if ($c[1]) { " Background='{DynamicResource $($c[1]).Soft}'" })><TextBlock Text='$(Esc $c[0])'$(if ($c[1]) { " Foreground='{DynamicResource $($c[1])}'" })/></Border>"
+        [void]$ui.DetChips.Children.Add([ZdTheme]::Parse($x))
+    }
+    $ui.DetDesc.Text = "$($t.Desc)"
+    $ch = Get-TweakChangeText $t
+    $ui.DetChanges.Text = $ch; $ui.DetChangesBox.Visibility = if ($ch) { 'Visible' } else { 'Collapsed' }
+    $ui.DetWarn.Text = "$($t.Warn)"; $ui.DetWarnBox.Visibility = if ("$($t.Warn)".Trim()) { 'Visible' } else { 'Collapsed' }
+    $ui.DetSource.Tag = "$($t.Source)"; $ui.DetSource.Visibility = if ("$($t.Source)" -match '^https?://') { 'Visible' } else { 'Collapsed' }
+    $ui.DetDefault.Tag = $t
+    $ui.DetDefault.Visibility = if ($t.Toggle -and ($t.State -or $script:Staged.Contains($t.Id))) { 'Visible' } else { 'Collapsed' }
+    $ui.DetDefault.Content = if ($script:Staged.Contains($t.Id)) { 'Keep it as it is' } else { 'Back to Windows default' }
+}
+$ui.DetSource.Add_Click({ param($s, $e) if ("$($s.Tag)" -match '^https?://') { Start-Process "$($s.Tag)" } })
+$ui.DetDefault.Add_Click({ param($s, $e)
+    $t = $s.Tag; if (-not $t) { return }
+    if ($script:Staged.Contains($t.Id)) { Set-TweakStaged $t ([bool]$t.State) } else { Set-TweakStaged $t $false }
+})
+
+# Switches on the Tweaks and Checks lists are collected and applied together from the bar at the bottom
+# (Discord's unsaved-changes bar, Winhance's review): Id -> wanted state. Nothing changes until Apply.
+$script:Staged = [ordered]@{}
+function Set-TweakStaged($t, [bool]$want) {
+    if ($null -eq $t.State) { Update-Card $t; return }
+    if ($want -eq [bool]$t.State) { $script:Staged.Remove($t.Id) } else { $script:Staged[$t.Id] = @{ T = $t; On = $want } }
+    Update-Card $t
+    Update-PendingBar
+    if ($script:DetailTweak -eq $t) { Show-TweakDetail $t }
+}
+function Update-PendingBar {
+    $n = $script:Staged.Count
+    if (-not $n) { if ($ui.PendingBar.Visibility -eq 'Visible') { Hide-Animated $ui.PendingBar 160 }; return }
+    $rs = @($script:Staged.Values | Where-Object { $_.T.Badge -eq 'restart' }).Count
+    $so = @($script:Staged.Values | Where-Object { $_.T.Badge -eq 'signout' }).Count
+    $ui.PendingText.Text = "$n $(if ($n -eq 1) { 'change' } else { 'changes' }) not applied yet" +
+        $(if ($rs) { "  ·  $rs $(if ($rs -eq 1) { 'needs' } else { 'need' }) a restart" } elseif ($so) { "  ·  $so $(if ($so -eq 1) { 'needs' } else { 'need' }) a sign-out" })
+    $ui.PendingApply.Content = "Apply $n"
+    if ($ui.PendingBar.Visibility -ne 'Visible') { $ui.PendingBar.Visibility = 'Visible'; Show-Animated $ui.PendingBar 16 240 }
+}
+function Clear-Staged {
+    $list = @($script:Staged.Values); $script:Staged.Clear()
+    foreach ($x in $list) { Update-Card $x.T }
+    Update-PendingBar
+}
+# applies every collected switch as one batch; one message, one Undo for the batch, History keeps each change
+function Invoke-StagedApply {
+    $list = @($script:Staged.Values); if (-not $list.Count) { return }
+    $script:Staged.Clear(); Update-PendingBar
+    $window.Cursor = [Windows.Input.Cursors]::Wait
+    $done = @(); $fail = @()
+    foreach ($x in $list) {
+        Clear-ReadCache
+        try { if ($x.On) { Invoke-TweakOn $x.T } else { Invoke-TweakOff $x.T }; $done += $x } catch { $fail += "$($x.T.Title): $($_.Exception.Message)" }
+        Update-Card $x.T
+    }
+    Update-Summary
+    $window.Cursor = $null
+    $script:LastBatch = @($done)
+    $note = if (@($done | Where-Object { $_.T.Badge -eq 'restart' }).Count) { ' Restart your PC to finish.' } elseif (@($done | Where-Object { $_.T.Badge -eq 'signout' }).Count) { ' Sign out and back in to finish.' } else { '' }
+    if ($fail.Count) { Show-Toast ("Applied $($done.Count) of $($list.Count). " + ($fail -join '  ·  ')) '#FF9F0A' }
+    else {
+        Show-Toast "Applied $($done.Count) $(if ($done.Count -eq 1) { 'change' } else { 'changes' }).$note" '#30D158' {
+            foreach ($x in $script:LastBatch) { Clear-ReadCache; try { if ($x.On) { Invoke-TweakOff $x.T } else { Invoke-TweakOn $x.T } } catch {}; Update-Card $x.T }
+            Update-Summary; Show-Toast 'Undone: everything is as it was before.' '#30D158'
+        }
+    }
+    if ($script:DetailTweak) { Show-TweakDetail $script:DetailTweak }
+}
+$ui.PendingApply.Add_Click({ Invoke-StagedApply })
+$ui.PendingDiscard.Add_Click({ Clear-Staged; if ($script:DetailTweak) { Show-TweakDetail $script:DetailTweak } })
+$ui.PendingReview.Add_Click({
+    $lines = foreach ($x in $script:Staged.Values) { "$(if ($x.On) { 'Switch on:  ' } else { 'Switch off: ' }) $($x.T.Title)$(if ($x.T.Badge -eq 'restart') { '  (restart)' } elseif ($x.T.Badge -eq 'signout') { '  (sign-out)' })" }
+    $r = Show-ZdDialog ("These changes are applied together. Each one saves the original first, and Undo takes the whole batch back.`n`n" + ($lines -join "`n")) 'Review changes' 'OKCancel' 'Question'
+    if ($r -eq 'OK') { Invoke-StagedApply }
+})
+
+# Rows are grouped by area on Tweaks, each group with a header: its name, "12/18 on" and a fold (Hone 1.4)
+$script:FoldedAreas = @{}
+$script:GroupHeads = @{}
+function New-GroupHeader([string]$Cat) {
+    $title = ($Categories | Where-Object { $_.Name -eq $Cat } | Select-Object -First 1).Title; if (-not $title) { $title = $Cat }
+    $h = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Background='Transparent' Cursor='Hand' Padding='4,16,4,8' AutomationProperties.Name='$(Esc $title)'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <TextBlock x:Name='Chev' Text='&#xE70D;' FontFamily='{DynamicResource Font.Icons}' FontSize='11' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,1,10,0'/>
+    <TextBlock Grid.Column='1' Text='$(Esc $title)' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center'/>
+    <TextBlock x:Name='Count' Grid.Column='2' FontFamily='Cascadia Mono, Consolas' FontSize='12' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='0,0,12,0'/>
+    <Border Grid.Column='3' Width='80' Height='4' CornerRadius='2' Background='{DynamicResource Border.Subtle}' VerticalAlignment='Center'>
+      <Border x:Name='Bar' Height='4' CornerRadius='2' Background='{DynamicResource AccentFill}' HorizontalAlignment='Left' Width='0'/>
+    </Border>
+  </Grid>
+</Border>
+"@)
+    $h.Tag = @{ GroupHead = $true; Cat = $Cat; Chev = $h.FindName('Chev'); Count = $h.FindName('Count'); Bar = $h.FindName('Bar') }
+    $h.Add_MouseLeftButtonUp({ param($s, $e) $c = $s.Tag.Cat; $script:FoldedAreas[$c] = -not $script:FoldedAreas[$c]; Update-Filter })
+    $script:GroupHeads[$Cat] = $h
+    $h
+}
+# after Update-Filter has decided which rows show: headers for the groups that have rows, folded groups collapsed
+function Update-GroupHeads([bool]$On) {
+    $g = @{}
+    foreach ($t in $Tweaks) {
+        if (-not $t.Card -or $t.Header -or $t.Card.Visibility -ne 'Visible') { continue }
+        $c = "$($t.Cat)"; if (-not $g[$c]) { $g[$c] = @{ N = 0; Sw = 0; On = 0 } }
+        $g[$c].N++; if ($t.Toggle -and $null -ne $t.State) { $g[$c].Sw++; if ($t.State) { $g[$c].On++ } }
+    }
+    foreach ($c in @($script:GroupHeads.Keys)) {
+        $h = $script:GroupHeads[$c]; $i = $g[$c]
+        if (-not $On -or -not $i) { $h.Visibility = 'Collapsed'; continue }
+        $h.Visibility = 'Visible'
+        $fold = [bool]$script:FoldedAreas[$c] -and $script:TweakArea -eq 'All'
+        $h.Tag.Chev.Text = [string][char]$(if ($fold) { 0xE76C } else { 0xE70D })
+        $h.Tag.Count.Text = if ($i.Sw) { "$($i.On)/$($i.Sw) on" } else { "$($i.N)" }
+        $h.Tag.Bar.Width = if ($i.Sw) { 80 * $i.On / $i.Sw } else { 0 }
+        if ($fold) { foreach ($t in $Tweaks) { if ("$($t.Cat)" -eq $c -and $t.Card -and -not $t.Header) { $t.Card.Visibility = 'Collapsed' } } }
+    }
+}
+
 function New-SectionHeader($t) {
     $h = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,24,16,12'>
@@ -13004,19 +14207,20 @@ function New-SectionHeader($t) {
 function New-Card($t) {
     if ($t.Header) { return New-SectionHeader $t }
     if ($t.Extra -eq 'builder') { return New-PotatoStudio $t }
-    # 2.0 TweakCard (design\DESIGN.md): icon, title and control on one line; what it does; "Don't use if" on the card
-    # face, not in a tooltip; tags. Named parts other code uses: Toggle, ActionBtn, Extra, Warn, ActivePill, RecTag.
+    # 2.1 row (design\DESIGN.md, stage 11): icon, title with small tags, one line of what it does, the state in words
+    # ("Optimized" / "Windows default") and the switch. "Don't use if", what it changes and the source are in the
+    # details panel on the right. Named parts other code uses: Toggle, ActionBtn, Extra, Warn, ActivePill, RecTag, StateText.
     $tags = New-Object Collections.Generic.List[string]
-    if ($t.Lat) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' ToolTip='Affects input delay, frame time or ping'><StackPanel Orientation='Horizontal'><Ellipse Width='6' Height='6' Fill='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock Text='Input delay'/></StackPanel></Border>") }
-    if ($t.Rec) { $tags.Add("<Border x:Name='RecTag' Style='{DynamicResource Zd.Chip}' ToolTip='Included when you press Boost now'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource AccentFill}' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended'/></StackPanel></Border>") }
-    if ($t.New) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource Info.Soft}'><TextBlock Text='New' Foreground='{DynamicResource Info}'/></Border>") }
-    if ($t.Badge) {
+    $risk = Get-TweakRisk $t
+    if ($risk) { $rc = $RiskInfo[$risk]; $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $($rc.Tone).Soft}' Margin='0,0,6,2' ToolTip='$(Esc $rc.Tip)'><TextBlock Text='$risk' Foreground='{DynamicResource $($rc.Tone)}'/></Border>") }
+    if ($t.Rec) { $tags.Add("<Border x:Name='RecTag' Style='{DynamicResource Zd.Chip}' Margin='0,0,6,2' ToolTip='Included when you press Boost now'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource AccentFill}' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended'/></StackPanel></Border>") }
+    if ($t.Lat) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Margin='0,0,6,2' ToolTip='Affects input delay, frame time or ping'><StackPanel Orientation='Horizontal'><Ellipse Width='6' Height='6' Fill='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock Text='Input delay'/></StackPanel></Border>") }
+    if ($t.New) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource Info.Soft}' Margin='0,0,6,2'><TextBlock Text='New' Foreground='{DynamicResource Info}'/></Border>") }
+    if ($t.Badge -in 'restart', 'signout') {
         $b = $BadgeInfo[$t.Badge]
-        $tone = if ($t.Badge -eq 'advanced') { 'Info' } else { 'Warn' }
-        $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $tone.Soft}' Cursor='Help' ToolTip='$(Esc $b.Tip)'><TextBlock Text='$(Esc $b.Label)' Foreground='{DynamicResource $tone}'/></Border>")
+        $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Margin='0,0,6,2' Cursor='Help' ToolTip='$(Esc $b.Tip)'><TextBlock Text='$(Esc $b.Label)'/></Border>")
     }
     $src = if ("$($t.Source)" -match '^https?://') { "$($t.Source)" } else { '' }
-    if ($src) { $tags.Add("<Border x:Name='SrcChip' Style='{DynamicResource Zd.Chip}' Cursor='Hand' ToolTip='$(Esc $src)'><TextBlock Text='Source &#x2197;'/></Border>") }
     if ($t.Id -eq 'vrrcap') { $c = Get-VrrCap; if ($c) { $t.Action = "Set $c FPS" } }
     $pill = if ($t.Preset) { "<Border x:Name='ActivePill' Background='{DynamicResource Good.Soft}' CornerRadius='6' Padding='8,2,9,3' Margin='0,0,8,0' VerticalAlignment='Center' Visibility='Collapsed'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,4,0'/><TextBlock Text='Active' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Good}'/></StackPanel></Border>" } else { '' }
     $control = $pill + $(if ($t.Picker) { '' } elseif ($t.Action) {
@@ -13027,37 +14231,32 @@ function New-Card($t) {
     $glyph = '&#x{0:X};' -f [int][char]$t.Icon
     $cardXaml = @"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-        Style='{DynamicResource Zd.Card}' Width='342' Height='252' VerticalAlignment='Top' Margin='0,0,16,16' AutomationProperties.Name='$(Esc $t.Title)'>
+        Style='{DynamicResource Zd.Card}' Padding='14,12,16,12' Margin='0,0,0,8' Cursor='Hand' AutomationProperties.Name='$(Esc $t.Title)'>
   <Grid>
-    <Grid.RowDefinitions>
-      <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/>
-    </Grid.RowDefinitions>
+    <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
     <Grid>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-      <Border Width='32' Height='32' CornerRadius='8' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Top'>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <Border Width='32' Height='32' CornerRadius='8' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Center'>
         <TextBlock Text='$glyph' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='$(if ($t.Lat) { '{DynamicResource Good}' } else { '{DynamicResource Text.Secondary}' })' HorizontalAlignment='Center' VerticalAlignment='Center'/>
       </Border>
-      <TextBlock Grid.Column='1' Text='$(Esc $t.Title)' ToolTip='$(Esc $t.Title)' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'
-                 TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='42' LineHeight='21' LineStackingStrategy='BlockLineHeight' VerticalAlignment='Center' Margin='12,0,10,0'/>
-      <StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Top'>$control</StackPanel>
+      <StackPanel Grid.Column='1' Margin='14,0,14,0' VerticalAlignment='Center'>
+        <WrapPanel>
+          <TextBlock Text='$(Esc $t.Title)' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis' VerticalAlignment='Center' Margin='0,0,10,2'/>
+          $($tags -join '')
+        </WrapPanel>
+        <TextBlock Text='$(Esc $t.Desc)' ToolTip='$(Esc $t.Desc)' Foreground='{DynamicResource Text.Secondary}' FontSize='12.5' TextTrimming='CharacterEllipsis' Margin='0,2,0,0'/>
+        <Grid x:Name='Warn' Visibility='Collapsed'/>
+      </StackPanel>
+      <TextBlock x:Name='StateText' Grid.Column='2' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,0,14,0'/>
+      <StackPanel Grid.Column='3' Orientation='Horizontal' VerticalAlignment='Center'>$control</StackPanel>
     </Grid>
-    <TextBlock Grid.Row='1' Text='$(Esc $t.Desc)' ToolTip='$(Esc $t.Desc)' Foreground='{DynamicResource Text.Secondary}' FontSize='13.5' LineHeight='19' LineStackingStrategy='BlockLineHeight'
-               TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='57' Margin='0,10,0,0'/>
-    <Grid x:Name='Warn' Grid.Row='2' Margin='0,8,0,0' ToolTip='$(Esc "Don't use if: $($t.Warn)")' AutomationProperties.Name='$(Esc "Don't use if: $($t.Warn)")'>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-      <TextBlock Text='&#xE946;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,6,0'/>
-      <TextBlock Grid.Column='1' FontSize='12' LineHeight='17' LineStackingStrategy='BlockLineHeight' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='34'>
-        <Run Text="Don't use if:" FontWeight='SemiBold'/> <Run Text='$(Esc $t.Warn)'/>
-      </TextBlock>
-    </Grid>
-    <ContentControl x:Name='Extra' Grid.Row='3' Margin='0,10,0,0'/>
-    <WrapPanel Grid.Row='4' VerticalAlignment='Bottom' Margin='0,10,0,-6' ClipToBounds='True' MaxHeight='30'>$($tags -join '')</WrapPanel>
+    <ContentControl x:Name='Extra' Grid.Row='1' Margin='46,12,0,0'/>
   </Grid>
 </Border>
 "@
     $card = [ZdTheme]::Parse($cardXaml)
-    $sc = $card.FindName('SrcChip')
-    if ($sc) { $sc.Tag = $src; $sc.Add_MouseLeftButtonUp({ param($s, $e) Start-Process $s.Tag }) }
+    $t.StateText = $card.FindName('StateText')
+    $card.Add_MouseLeftButtonUp({ param($s, $e) Show-TweakDetail $s.Tag })
     $card.Tag = $t
     $t.Card = $card
     $t.Toggle = $card.FindName('Toggle')
@@ -13065,7 +14264,7 @@ function New-Card($t) {
 
     if ($t.Toggle) {
         $t.Toggle.Tag = $t
-        $t.Toggle.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked) })
+        $t.Toggle.Add_Click({ param($s, $e) Set-TweakStaged $s.Tag ([bool]$s.IsChecked) })
     }
     if ($t.Extra -eq 'fps') {
         $panel = [ZdTheme]::Parse(@"
@@ -13102,26 +14301,22 @@ function New-Card($t) {
         $extra.Content = $script:PingText
     }
     if ($t.Extra -eq 'builder') {
-        $card.Height = 432
         $extra.Content = New-BuilderPanel $t
     }
     if ($t.Extra -eq 'preset') {
-        $card.Height = 432
         $t.PreviewHost = $extra
         Update-PresetPreview $t
     }
-    if ($t.Action -or -not $t.Warn) { $card.FindName('Warn').Visibility = 'Collapsed' }
     $btn = $card.FindName('ActionBtn')
     if ($btn) { $btn.Tag = $t; $t.ActionBtn = $btn; $btn.Add_Click({ param($s, $e) Invoke-Action $s.Tag $s }) }
     if ($t.Extra -eq 'gamemode') {
-        $card.Height = 432
         $extra.Content = New-GameModePanel $t
     }
     if ($t.Extra -eq 'session') {
-        $card.Height = 432
         $extra.Content = New-SessionPanel $t
         Update-SessionCard
     }
+    if ($null -eq $extra.Content) { $extra.Visibility = 'Collapsed' }
     $card
 }
 
@@ -13160,7 +14355,7 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
             </Border>
             <TextBlock Text='$(Esc $Title)' FontSize='18' FontWeight='SemiBold' Foreground='{DynamicResource Label}' VerticalAlignment='Center' Margin='14,0,0,0' TextWrapping='Wrap' MaxWidth='330'/>
           </StackPanel>
-          <ScrollViewer Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' MaxHeight='440' Margin='0,16,0,0'>
+          <ScrollViewer x:Name='MsgScroll' Style='{DynamicResource OverlayScroll}' VerticalScrollBarVisibility='Auto' MaxHeight='440' Margin='0,16,0,0'>
             <TextBlock x:Name='Msg' FontSize='13.5' Foreground='{DynamicResource Label2}' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'/>
           </ScrollViewer>
           <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,22,0,0'>$bx</StackPanel>
@@ -13173,6 +14368,8 @@ function Show-ZdDialog([string]$Message, [string]$Title = 'ZeroDelay', [string]$
     $dlg.Resources.MergedDictionaries.Add($window.Resources)
     Set-RoundClip $dlg.FindName('Card') 16
     $dlg.FindName('Msg').Text = $Message
+    # small screens / high scaling (1366x768 at 125% leaves about 580 px): keep the buttons on screen, the text scrolls
+    try { $wa = [Windows.SystemParameters]::WorkArea.Height; if ($wa -gt 0) { $dlg.FindName('MsgScroll').MaxHeight = [Math]::Max(120, [Math]::Min(440, $wa - 230)) } } catch {}
     $script:DlgResult = $escape
     foreach ($b in $btns) {
         $btn = $dlg.FindName("B_$b"); $btn.Tag = $b
@@ -13559,14 +14756,21 @@ function Update-Card($t, $Pre) {
     $reqOk = if ($Pre) { $Pre.Req } elseif ($t.Requires -and $null -eq $state) { & $t.Requires } else { $true }
     $t.Hidden = [bool]($t.ForceHidden -or ($t.Requires -and $null -eq $state -and -not $reqOk))
     if ($t.Hidden) { $t.Card.Visibility = 'Collapsed' }
+    $st = $script:Staged[$t.Id]
     if ($null -eq $state) {
         $t.Toggle.IsEnabled = $false
         $t.Toggle.IsChecked = $false
         $t.Toggle.ToolTip = 'Not available on this PC'
     } else {
         $t.Toggle.IsEnabled = $true
-        $t.Toggle.IsChecked = $state
+        $t.Toggle.IsChecked = if ($st) { $st.On } else { $state }
         $t.Toggle.ToolTip = $null
+    }
+    if ($t.StateText) {
+        # 2.1: the state in words next to the switch, so "on" is never ambiguous (the O&O complaint)
+        $t.StateText.Text = if ($st) { if ($st.On) { 'Will switch on' } else { 'Will switch off' } } elseif ($null -eq $state) { 'Not on this PC' } elseif ($state) { 'Optimized' } else { 'Windows default' }
+        $t.StateText.Foreground = $window.FindResource($(if ($st) { 'AccentFill' } elseif ($state) { 'Text.Secondary' } else { 'Text.Muted' }))
+        $t.StateText.FontWeight = if ($st) { 'SemiBold' } else { 'Normal' }
     }
 }
 
@@ -13575,14 +14779,15 @@ function Update-Summary {
     $on = @($toggles | Where-Object { $_.State }).Count
     $ui.ActiveCount.Text = "$on / $($toggles.Count)"
     $ui.ActiveBar.Width = if ($toggles.Count) { 170 * $on / $toggles.Count } else { 0 }
-    $plan = Get-ActivePowerScheme
+    # the status line's plan: powercfg starts a process, and this runs after every change (a change clears the cache)
+    $plan = Get-Cached 'activescheme' { Get-ActivePowerScheme }
     $fn = if ($script:FortniteExe) { 'Fortnite found' } else { 'Fortnite not found' }
     $run = if (Test-FortniteRunning) { '  ·  Fortnite is running (close it to change game settings)' } else { '' }
     $ui.StatusLine.Text = "$fn  ·  Power plan: $($plan.Name)$run"
     $ui.RestoreAll.IsEnabled = ($script:Backup.Registry.Count -gt 0 -or $script:Backup.Custom.Count -gt 0)
     Update-RestartBar
     if ($script:CurrentCat) { Update-Filter }
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
     if ($script:ActiveUi -and $script:CurrentCat.Name -eq 'Active') { Update-ActivePage }
 }
 
@@ -13885,7 +15090,8 @@ function Get-HealthIssues {
         Add-Issue 1 "$($igpu.Count) monitor(s) run on the CPU graphics" "$(($igpu | ForEach-Object { "$($_.Monitor) ($($_.Hz) Hz)" }) -join ', ') is plugged into the motherboard. Only play on monitors plugged into the graphics card." $null $null
     }
     # --- power
-    if ((Get-ActivePowerScheme).Name -notmatch 'ZeroDelay|Ultimate|High performance') { Add-Issue 2 'Power plan is not a performance plan' 'Power saving lets the CPU drop clocks between frames.' 'zdplan' }
+    $actPlan = Get-ActivePowerScheme
+    if ($actPlan.Name -notmatch 'ZeroDelay|Ultimate|High performance' -and -not (Test-UltimatePlan $actPlan)) { Add-Issue 2 'Power plan is not a performance plan' 'Power saving lets the CPU drop clocks between frames.' 'zdplan' }
     $powerNames = @{ minstate = 'CPU can drop to low clocks between frames'; usbsuspend = 'USB ports can go to sleep'; usb3lpm = 'USB 3 power-saving is on'; usbhub = 'USB hubs can go to sleep' }
     foreach ($id in 'minstate', 'usbsuspend', 'usb3lpm', 'usbhub') {
         if ((St $id) -eq $false) { Add-Issue 2 $powerNames[$id] 'Your power plan still saves power here. Another tool (often ExitLag) may have changed it.' $id }
@@ -14316,16 +15522,21 @@ function ConvertTo-OrderedTable($o) {
     elseif ($o) { $o.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value } }
     $h
 }
-function Get-Drift {
+# Id -> card (the first with that Id), for lookups in loops over many ids
+function Get-TweakIndex { $x = @{}; foreach ($t in $Tweaks) { if ($t.Id -and -not $x.ContainsKey("$($t.Id)")) { $x["$($t.Id)"] = $t } }; $x }
+# $Pre: card states already read in the background worker ($WorkerTestScript results); missing cards are read here
+function Get-Drift($Pre) {
     Clear-ReadCache
     $items = @()
+    $byId = Get-TweakIndex
     foreach ($id in Get-Applied) {
-        $t = $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+        $t = $byId["$id"]
         if (-not $t -or -not $t.Toggle) { continue }
         # Fortnite leaves out keys at their default and cannot be edited while running; skip those cases.
         if ($t.Cs -and (Test-Cs2Running)) { continue }
         if ($t.Ini -and ((Test-FortniteRunning) -or -not (Test-Path $IniPath) -or -not ($t.Ini.Keys | Where-Object { $null -ne (Get-IniValue (Get-Content $IniPath) $_) }))) { continue }
-        if ((Invoke-TweakTest $t) -eq $false) { $items += [pscustomobject]@{ Kind = 'tweak'; T = $t; Title = $t.Title } }
+        $st = if ($Pre -is [hashtable] -and $Pre.ContainsKey("$($t.Id)")) { $Pre["$($t.Id)"].State } else { Invoke-TweakTest $t }
+        if ($st -eq $false) { $items += [pscustomobject]@{ Kind = 'tweak'; T = $t; Title = $t.Title } }
     }
     $lp = $script:Backup.Custom['lastpreset']
     if ($lp -and (Test-Path $IniPath) -and -not (Test-FortniteRunning)) {
@@ -14334,7 +15545,7 @@ function Get-Drift {
     }
     $want = $script:Backup.Custom['nvlodvalue']
     if ($want -and (Test-NvAvailable)) {
-        $cur = Get-NvLod
+        $cur = if ($Pre -is [hashtable] -and $Pre.ContainsKey('__nvlod')) { $Pre.__nvlod } else { Get-NvLod }
         if ($null -ne $cur -and $cur -ne [int]$want) { $items += [pscustomobject]@{ Kind = 'nvlod'; Value = [int]$want; Title = 'NVIDIA texture blur (driver update?)' } }
     }
     $items
@@ -14354,12 +15565,32 @@ function Repair-Drift($items) {
     Update-Summary
     "Re-applied $ok setting$(if ($ok -ne 1) { 's' })." + $(if ($failed) { " Could not: $($failed -join ', ')." } else { '' })
 }
+# Every 90 s and when the window gets focus: the cards ZeroDelay switched on are re-read in the background worker
+# (one registry, WMI or driver read each: 1-2 s on the window's thread with many cards on, also while a game runs),
+# then the result is handled here. Dev renders and a missing worker read them here, as before.
 function Invoke-DriftCheck {
     [ZdWatchdog]::Step = 'Invoke-DriftCheck'
     if ($script:DriftBusy) { return }
+    $byId = Get-TweakIndex
+    $specs = @(foreach ($id in Get-Applied) { $t = $byId["$id"]; if ($t -and $t.Toggle) { ConvertTo-WorkerSpec $t } })
+    if ($Snapshot -or -not $script:Worker -or -not $specs.Count) { Complete-DriftCheck $null; return }
+    $script:DriftBusy = $true
+    $script:DriftMark = "$(@(Get-History)[0].Time)"
+    Invoke-Worker $WorkerTestScript @(, $specs) {
+        param($out, $errs)
+        $script:DriftBusy = $false
+        $r = Get-WorkerResult $out
+        # a card switched since the read: read them all again here rather than report a stale state
+        if ($r -isnot [hashtable] -or "$(@(Get-History)[0].Time)" -ne $script:DriftMark) { $r = $null }
+        Complete-DriftCheck $r
+    }
+}
+function Complete-DriftCheck($Pre) {
+    [ZdWatchdog]::Step = 'Complete-DriftCheck'
+    if ($script:DriftBusy) { return }
     $script:DriftBusy = $true
     try {
-        $items = @(Get-Drift)
+        $items = @(Get-Drift $Pre)
         $script:DriftItems = $items
         if (-not $items.Count) { $ui.DriftBar.Visibility = 'Collapsed'; return }
         $trusted = Get-RunningTrustedBoosters
@@ -16525,6 +17756,15 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.1.0' = @(
+        @{ T = 'Tweaks, easier to read'; D = 'One list grouped by area, each with how many are on. Every tweak says Safe, Moderate or Advanced and what is true now (Optimized or Windows default). Click one to see exactly what it changes and when not to use it. Switches are collected and applied together from the bar at the bottom, with one Undo.' }
+        @{ T = 'Proof on Home'; D = 'Your last match comes first, with how its FPS, 1% lows, ping and stutters compare to your usual, and when it stuttered. Presets Safe, Competitive and Max, and your recent changes with Undo.' }
+        @{ T = 'Search everything with Ctrl+K'; D = 'Every tweak, check, tool, game and Windows setting from one box. Enter opens it, Space switches a tweak on or off.' }
+        @{ T = 'New: PC health and repairs'; D = 'Crash timeline, the file that keeps crashing your games, graphics driver resets, disk errors, devices with problems, Intel 13th/14th gen microcode, Secure Boot 2023 certificates, BitLocker key, Windows support status, one-click Windows repair, update repair, memory test, battery health and why the PC will not sleep.' }
+        @{ T = 'New: Windows cleanup'; D = 'Remove Recall, AI in Paint and Notepad, the Copilot app, Start menu and Settings ads, Edge and Brave clutter, the classic right-click menu, file extensions, End task on the taskbar, and a Game Mode hotkey (Ctrl+Alt+G).' }
+        @{ T = 'Game pages and uninstall by disk'; D = 'Each game page shows your last match under its art, with Route, Tweaks, Checks and Trends tabs. Uninstall apps shows each disk with its free space; click one to see only its apps.' }
+        @{ T = 'Faster and works on more PCs'; D = 'Pages open faster, typing in search no longer lags, and non-English Windows, redirected Documents folders and small or high-DPI screens are handled. The Memory tool now closes apps you pick instead of clearing Windows memory, which could cause stutter.' }
+    )
     '2.0.0' = @(
         @{ T = 'A new look'; D = 'ZeroDelay has a new design: darker and calmer, with one accent colour you choose in Settings (six to pick from) and a light mode. Home, Boost now, the tweak cards, the game pages, Checks, Game Mode, Tools and Settings were all rebuilt. Every tweak, check and tool is still here.' }
         @{ T = 'Undo from the message'; D = 'After you switch something on or off, the message at the bottom has an Undo button, so a wrong click is one click to take back.' }
@@ -16995,7 +18235,7 @@ function Invoke-UpdateCheck {
             $why = ($changes | ForEach-Object { $_.Text }) -join ' and '
             $script:Backup.Custom['shaderwarm'] = @{ Since = (Get-Date).ToString('o'); Why = $why; Left = 2 }
             Show-Toast "$((Get-Culture).TextInfo.ToTitleCase($why.Substring(0, 1)) + $why.Substring(1)). Your first match or two may stutter while shaders rebuild: play a warm-up before a cup." '#0A84FF'
-            if ($script:HomeUi) { Update-HomePage }
+            Request-HomeUpdate
             if ($script:EventsUi) { Update-EventsReady }
         }
         Save-Backup
@@ -17072,7 +18312,7 @@ function Complete-MatchReport {
     if (-not $fnRec) { $script:MatchGame = $r.Game; $script:TrendGame = $r.Game }
     if ($script:GameSel -and $script:GameSel.Id -eq $r.Game) { Update-GameStats }
     $w = $script:Backup.Custom['shaderwarm']
-    if ($fnRec -and $w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; if ($script:HomeUi) { Update-HomePage } }
+    if ($fnRec -and $w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; Request-HomeUpdate }
     if ($script:MatchUi) { Update-MatchesPage }
     $n = @($r.Issues).Count
     $sum = if ($n) { "$n thing$(if ($n -ne 1) { 's' }) got in the way." } else { 'Smooth session: nothing got in the way.' }
@@ -17292,7 +18532,8 @@ function Save-MatchReport($r) {
     Get-ChildItem $MatchDir -Filter '*.json' | Group-Object { Get-ReportFileGame $_.Name } | ForEach-Object { $_.Group | Sort-Object Name -Descending | Select-Object -Skip 60 } | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 function Get-MatchReports {
-    if ($Snapshot -and $env:ZD_FAKE_MATCH) { return @(New-FakeMatchReport) }
+    # dev renders: the synthetic report (a 60,000-frame analysis) is built once, not on every Home or game refresh
+    if ($Snapshot -and $env:ZD_FAKE_MATCH) { if (-not $script:FakeReports) { $script:FakeReports = @(New-FakeMatchReport) }; return $script:FakeReports }
     if (-not (Test-Path $MatchDir)) { return @() }
     @(Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | ForEach-Object {
         $f = $_.FullName
@@ -17436,9 +18677,11 @@ function Start-Background([string]$Script, [object[]]$ArgList = @(), [scriptbloc
     $ps = [powershell]::Create()
     [void]$ps.AddScript($Script)
     foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
-    [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $Done })
+    [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $Done; Name = (Get-JobName $Script) })
     Start-BgPoll
 }
+# the first line of a background job's code, for the freeze detector's report
+function Get-JobName([string]$Code) { $l = @("$Code".Trim() -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' / '; if ($l.Length -gt 120) { $l.Substring(0, 120) } else { $l } }
 function Start-BgPoll {
     if (-not $script:BgTimer) {
         $script:BgTimer = New-Object Windows.Threading.DispatcherTimer
@@ -17452,6 +18695,7 @@ function Start-BgPoll {
                 $errs += @($j.PS.Streams.Error)
                 $j.PS.Dispose()
                 if ($j.Worker) { $script:WorkerJob = $null }
+                [ZdWatchdog]::Step = "background result: $($j.Name)"
                 if ($j.Done) { try { & $j.Done @($out) $errs } catch { [Console]::Error.WriteLine("$_ $($_.InvocationInfo.PositionMessage)"); Show-Toast "Something went wrong: $($_.Exception.Message)" '#FF453A' } }
                 if ($j.Worker) { Start-WorkerNext }
             }
@@ -17512,7 +18756,7 @@ function Start-WorkerNext {
         #   (on its own line after param(): one-line jobs such as 'param($fn) @{ ... }' continue on the next line)
         $code = if ($job.Code -match '^\s*param\([^)]*\)') { $job.Code.Insert($Matches[0].Length, "`n`$global:ReadCache = @{}`n") } else { "`$global:ReadCache = @{}`n" + $job.Code }
         [void]$ps.AddScript($code); foreach ($a in $job.Args) { [void]$ps.AddArgument($a) }
-        [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $job.Done })
+        [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $job.Done; Name = (Get-JobName $job.Code) })
     }
     Start-BgPoll
 }
@@ -17559,6 +18803,7 @@ function Start-StateRefresh([scriptblock]$Then) {
 }
 function Complete-StateRefresh {
     [ZdWatchdog]::Step = 'Complete-StateRefresh'
+    if (-not $script:FirstRefreshDone) { Write-StartupMark 'settings read (background)' }
         $res = $script:StateParts
         if (-not $script:StateFail -and $res.Count -gt 1) {
             $script:CurrentNvLod = $res.__nvlod
@@ -17569,7 +18814,7 @@ function Complete-StateRefresh {
         if (-not $script:FirstRefreshDone) { $script:FirstRefreshDone = $true; Test-AfterBoot; Invoke-UpdateCheck }
         Update-RestartBar
         Update-PauseCard
-        if ($script:HomeUi) { Update-HomePage }
+        # (Home was refreshed by Update-Summary above, in both branches)
         if ($script:BoostUi) { Update-BoostPage }
         if ($script:GameSel -and $script:GamesUi) { Update-GameTools }
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
@@ -17676,36 +18921,518 @@ $AppScanScript = {
     }
     $list
 }
+# 2.1 Uninstall apps page: disk cards on top (All disks + one per drive letter with apps), then a table-like list in one card.
+# Column widths shared by the header row and every app row so the columns line up.
+$AppCols = "<Grid.ColumnDefinitions><ColumnDefinition Width='46'/><ColumnDefinition Width='*'/><ColumnDefinition Width='118'/><ColumnDefinition Width='84'/><ColumnDefinition Width='108'/><ColumnDefinition Width='190'/></Grid.ColumnDefinitions>"
+# letter tiles: token pairs (background, letter) picked from the app's name, so a name always gets the same tile
+$AppTileTones = @(@('Info.Soft', 'Info'), @('Good.Soft', 'Good'), @('Warn.Soft', 'Warn'), @('Accent.Soft', 'AccentFill'), @('Bg.Raised', 'Text.Secondary'))
+# ======================================================= 2.1 tools
+# Helpers for the 2.1 tool cards (winrepair, wu-repair, memtest, gm-hotkey, sleep-check, battery-health) and the
+# Windows Settings pages in Ctrl+K. Long work runs in Start-Background (a separate PowerShell); the window never waits.
+
+# --- a read-only report window: an English note per section above the command's own output, shown as it is
+#     (powercfg's text is translated, so ZeroDelay never parses it). $Sections = @( @{ H; Note; Mono } )
+function Show-ZdReport([string]$Title, [string]$Intro, $Sections) {
+    $dlg = [ZdTheme]::Parse(@"
+<Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        Title='$(Esc $Title)' Width='680' SizeToContent='Height' WindowStyle='None' AllowsTransparency='True' Background='Transparent'
+        ResizeMode='NoResize' ShowInTaskbar='False' FontFamily='{DynamicResource Font.UI}'>
+  <Grid Margin='24'>
+    <Border x:Name='Card' CornerRadius='16' Background='{DynamicResource Bg.Raised}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'>
+      <StackPanel Margin='26,22,24,20'>
+        <TextBlock x:Name='Head' FontSize='18' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+        <TextBlock x:Name='Intro' FontSize='13' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,8,0,0'/>
+        <ScrollViewer x:Name='Scroll' VerticalScrollBarVisibility='Auto' MaxHeight='520' Margin='0,10,0,0'>
+          <StackPanel x:Name='Body'/>
+        </ScrollViewer>
+        <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,18,0,0'>
+          <Button x:Name='Copy' Content='Copy text' Style='{DynamicResource Zd.Button.Secondary}' MinWidth='96'/>
+          <Button x:Name='Done' Content='Close' Style='{DynamicResource Zd.Button.Primary}' MinWidth='96' Margin='8,0,0,0'/>
+        </StackPanel>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>
+"@)
+    $dlg.Resources.MergedDictionaries.Add($window.Resources)
+    $dlg.FindName('Head').Text = $Title
+    $dlg.FindName('Intro').Text = $Intro
+    if (-not $Intro) { $dlg.FindName('Intro').Visibility = 'Collapsed' }
+    $body = $dlg.FindName('Body')
+    $copy = New-Object Text.StringBuilder
+    [void]$copy.AppendLine($Title); if ($Intro) { [void]$copy.AppendLine($Intro) }
+    foreach ($s in @($Sections)) {
+        $h = New-Object Windows.Controls.TextBlock
+        $h.Text = "$($s.H)"; $h.FontSize = 14; $h.FontWeight = 'SemiBold'; $h.Margin = '0,14,0,0'; $h.TextWrapping = 'Wrap'
+        $h.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Primary')
+        [void]$body.Children.Add($h)
+        if ($s.Note) {
+            $n = New-Object Windows.Controls.TextBlock
+            $n.Text = "$($s.Note)"; $n.FontSize = 12.5; $n.Margin = '0,4,0,6'; $n.TextWrapping = 'Wrap'
+            $n.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+            [void]$body.Children.Add($n)
+        }
+        $mono = "$($s.Mono)".TrimEnd()
+        if (-not $mono) { $mono = '(no output)' }
+        $tb = New-Object Windows.Controls.TextBox
+        $tb.Text = $mono; $tb.IsReadOnly = $true; $tb.FontSize = 12; $tb.Padding = '10,8'; $tb.BorderThickness = 1
+        $tb.TextWrapping = 'NoWrap'; $tb.MaxHeight = 200
+        $tb.HorizontalScrollBarVisibility = 'Auto'; $tb.VerticalScrollBarVisibility = 'Auto'
+        $tb.SetResourceReference([Windows.Controls.Control]::FontFamilyProperty, 'Font.Mono')
+        $tb.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'Bg.Surface')
+        $tb.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'Text.Primary')
+        $tb.SetResourceReference([Windows.Controls.Control]::BorderBrushProperty, 'Border.Subtle')
+        [void]$body.Children.Add($tb)
+        [void]$copy.AppendLine(''); [void]$copy.AppendLine("== $($s.H)"); [void]$copy.AppendLine($mono)
+    }
+    $script:ReportCopy = $copy.ToString()
+    try { $wa = [Windows.SystemParameters]::WorkArea.Height; if ($wa -gt 0) { $dlg.FindName('Scroll').MaxHeight = [Math]::Max(160, [Math]::Min(520, $wa - 260)) } } catch {}
+    $dlg.FindName('Copy').Add_Click({ param($s, $e) try { [Windows.Clipboard]::SetText($script:ReportCopy); $s.Content = 'Copied' } catch {} })
+    $dlg.FindName('Done').Add_Click({ param($s, $e) [Windows.Window]::GetWindow($s).Close() })
+    $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
+    $dlg.Add_MouseLeftButtonDown({ param($s, $e) try { $s.DragMove() } catch {} })
+    if ($window -and $window.IsVisible) { $dlg.Owner = $window; $dlg.WindowStartupLocation = 'CenterOwner' } else { $dlg.WindowStartupLocation = 'CenterScreen'; $dlg.Topmost = $true }
+    [void]$dlg.ShowDialog()
+}
+function Format-ZdDate([datetime]$When, [datetime]$Now) {
+    $f = if ($When.Year -eq $Now.Year) { 'd MMM' } else { 'd MMM yyyy' }
+    $When.ToString($f, [Globalization.CultureInfo]::InvariantCulture)
+}
+
+# ---------------------------------------------------------------- 1. Repair Windows (DISM + SFC), Microsoft KB 929833
+$WinRepairScanCode = @'
+try { $r = Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop; @{ Ok = $true; State = "$($r.ImageHealthState)" } }
+catch { @{ Ok = $false; Err = "$($_.Exception.Message)" } }
+'@
+$WinRepairRestoreCode = @'
+try { $r = Repair-WindowsImage -Online -RestoreHealth -NoRestart -ErrorAction Stop; @{ Ok = $true; State = "$($r.ImageHealthState)" } }
+catch { @{ Ok = $false; Err = "$($_.Exception.Message)" } }
+'@
+# sfc's own text is translated, so only its exit code is used, plus the [SR] lines it writes to CBS.log (always English)
+# from this run: just the "Cannot repair" ones are counted
+$WinRepairSfcCode = @'
+$start = Get-Date
+$code = -1
+try {
+    $p = Start-Process -FilePath "$env:WINDIR\System32\sfc.exe" -ArgumentList '/scannow' -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+    $code = $p.ExitCode
+} catch { return @{ Ok = $false; Err = "$($_.Exception.Message)"; Code = -1; Cannot = 0 } }
+$cannot = 0
+$log = "$env:WINDIR\Logs\CBS\CBS.log"
+try {
+    $fs = New-Object IO.FileStream $log, 'Open', 'Read', 'ReadWrite'
+    $sr = New-Object IO.StreamReader $fs
+    $from = $start.AddMinutes(-1)
+    while ($null -ne ($l = $sr.ReadLine())) {
+        if ($l.IndexOf('[SR]', [StringComparison]::Ordinal) -lt 0) { continue }
+        if ($l -notmatch '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') { continue }
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$t) -or $t -lt $from) { continue }
+        if ($l -match 'Cannot repair') { $cannot++ }
+    }
+    $sr.Close()
+} catch {}
+@{ Ok = $true; Code = $code; Cannot = $cannot }
+'@
+function Set-WinRepairStep([string]$Text) {
+    $b = $script:WinRepair.Btn
+    if ($b) { try { $b.Content = $Text } catch {} }
+    Show-Toast $Text '#0A84FF'
+}
+function Start-WindowsRepair {
+    if ($script:WinRepair -and $script:WinRepair.Busy) { throw 'Windows repair is already running. ZeroDelay tells you when it is done.' }
+    $run = Find-RunningGame
+    if ($run) { throw "Close $($run.Def.Title) first: the repair keeps the disk and processor busy for a long time." }
+    $r = Show-ZdDialog ("Windows checks its own files and repairs broken ones, in three steps:`n`n1. DISM checks the Windows component store.`n2. DISM repairs it from Windows Update, only if step 1 found damage.`n3. System File Checker (sfc /scannow) repairs Windows files from that store.`n`nThis takes 15 to 45 minutes. Your PC stays usable, but do not play meanwhile: the disk and processor are busy. Nothing of yours is deleted, and you can keep ZeroDelay in the tray.") 'Repair Windows' 'OKCancel' 'Question'
+    if ($r -ne 'OK') { return 'Nothing changed.' }
+    $t = $Tweaks | Where-Object { $_.Id -eq 'winrepair' } | Select-Object -First 1
+    $btn = if ($t) { $t.ActionBtn } else { $null }
+    $script:WinRepair = @{ Busy = $true; Btn = $btn; Orig = $(if ($btn) { $btn.Content } else { $null }); Scan = $null; Restore = $null; Started = Get-Date }
+    Set-WinRepairStep 'Step 1 of 3: checking Windows...'
+    Start-Background $WinRepairScanCode @() { param($out, $errs) Complete-WinRepairScan (Get-WorkerResult $out) }
+    'Windows repair started. It takes 15 to 45 minutes; ZeroDelay tells you when it is done.'
+}
+function Complete-WinRepairScan($r) {
+    $script:WinRepair.Scan = $r
+    if ($r -and $r.Ok -and $r.State -ne 'Healthy') {
+        Set-WinRepairStep 'Step 2 of 3: repairing Windows from Windows Update...'
+        Start-Background $WinRepairRestoreCode @() { param($out, $errs) $script:WinRepair.Restore = Get-WorkerResult $out; Start-WinRepairSfc }
+    } else { Start-WinRepairSfc }
+}
+function Start-WinRepairSfc {
+    Set-WinRepairStep 'Step 3 of 3: checking system files (sfc)...'
+    Start-Background $WinRepairSfcCode @() { param($out, $errs) Complete-WindowsRepair (Get-WorkerResult $out) }
+}
+# plain-words summary of the three steps (pure: used by the test)
+function Format-WinRepairResult($Scan, $Restore, $Sfc) {
+    $l = @()
+    if (-not $Scan -or -not $Scan.Ok) { $l += "1. The Windows check could not run: $(if ($Scan) { $Scan.Err } else { 'no result' })" }
+    elseif ($Scan.State -eq 'Healthy') { $l += '1. Windows component store: no damage found.' }
+    else {
+        $l += '1. Windows component store: damage found.'
+        if ($Restore -and $Restore.Ok -and $Restore.State -eq 'Healthy') { $l += '2. Repaired from Windows Update.' }
+        elseif ($Restore -and $Restore.Ok) { $l += "2. The repair ran but Windows still reports: $($Restore.State). Settings > System > Recovery > 'Fix problems using Windows Update' reinstalls Windows and keeps your files and apps." }
+        else { $l += "2. The repair could not finish: $(if ($Restore) { $Restore.Err } else { 'no result' }). Check your internet connection and run it again." }
+    }
+    if (-not $Sfc -or -not $Sfc.Ok) { $l += "3. System File Checker could not run: $(if ($Sfc) { $Sfc.Err } else { 'no result' })" }
+    elseif ([int]$Sfc.Cannot -gt 0) { $l += "3. System File Checker found $($Sfc.Cannot) damaged file(s) it could not repair. Restart and run this again (it often fixes the rest); if it repeats, use Settings > System > Recovery > 'Fix problems using Windows Update'." }
+    elseif ([int]$Sfc.Code -eq 0) { $l += '3. System files: all fine, or repaired.' }
+    else { $l += "3. System File Checker ended with code $($Sfc.Code) and listed no file it could not repair. If problems continue, restart and run this again." }
+    $bad = (-not $Scan -or -not $Scan.Ok -or ($Scan.State -ne 'Healthy' -and -not ($Restore -and $Restore.State -eq 'Healthy')) -or -not $Sfc -or -not $Sfc.Ok -or [int]$Sfc.Cannot -gt 0)
+    @{ Text = ($l -join "`n`n"); Bad = $bad }
+}
+function Complete-WindowsRepair($sfc) {
+    $w = $script:WinRepair
+    $w.Busy = $false
+    if ($w.Btn) { try { $w.Btn.Content = $w.Orig } catch {} }
+    $res = Format-WinRepairResult $w.Scan $w.Restore $sfc
+    $mins = [int]((Get-Date) - $w.Started).TotalMinutes
+    Add-History 'Repaired Windows files (DISM + SFC)' 'tool' 'winrepair'
+    Show-Toast 'Windows repair finished.' $(if ($res.Bad) { '#FF9F0A' } else { '#30D158' })
+    [void](Show-ZdDialog ("$($res.Text)`n`nTook $mins minutes. Restart your PC when it suits you so every repaired file is in use.") 'Windows repair finished' 'OK' $(if ($res.Bad) { 'Warning' } else { 'Information' }))
+}
+
+# ---------------------------------------------------------------- 2. Windows Update history and reset
+# error codes as numbers or text ("0x80070643", "2147944003", -2147023293) -> "0x80070643"
+function ConvertTo-WuHex($Code) {
+    $s = "$Code".Trim()
+    if ($s -match '^0[xX]([0-9a-fA-F]{1,8})$') { return '0x' + $Matches[1].ToUpperInvariant().PadLeft(8, '0') }
+    $n = [long]0
+    if ([long]::TryParse($s, [ref]$n)) { if ($n -lt 0) { $n += 4294967296 }; return ('0x{0:X8}' -f $n) }
+    $s
+}
+function Get-WuErrorText($Code) {
+    $hex = ConvertTo-WuHex $Code
+    switch ($hex) {
+        '0x800F081F' { 'Windows could not find the files it needs to repair itself. Run "Repair Windows (DISM + SFC)", then try the update again.' }
+        '0x80070002' { 'A file the update expected is missing, usually from a broken or half-finished download. Resetting Windows Update fixes this most of the time.' }
+        '0x80073712' { 'A file Windows needs for updates is damaged or missing. Run "Repair Windows (DISM + SFC)", then try again.' }
+        '0x8024A105' { 'Windows Update could not reach its update service, often after a stuck download. Resetting Windows Update usually fixes it.' }
+        '0x80070643' { 'The update''s installer failed (common for Defender, .NET and recovery-partition updates). Restart and try again; if it repeats, reset Windows Update.' }
+        default { "Error $hex. Resetting Windows Update fixes many update errors; if it repeats, search Microsoft Support for this code." }
+    }
+}
+# $Items: @{ Id = 19 (installed) or 20 (failed); Time; Props = event data values (20: error code, title; 19: title) }
+function Format-WuHistory($Items, [datetime]$Now) {
+    $all = @($Items | Sort-Object { $_.Time } -Descending)
+    $ok = $all | Where-Object { $_.Id -eq 19 } | Select-Object -First 1
+    $out = @()
+    $out += if ($ok) { "Last successful update: $(Format-ZdDate $ok.Time $Now) ($(@($ok.Props)[0]))." } else { 'Last successful update: none in Windows'' update log.' }
+    $fails = @($all | Where-Object { $_.Id -eq 20 -and $_.Time -ge $Now.AddDays(-30) })
+    if (-not $fails.Count) { $out += 'Failed installs in the last 30 days: none.' }
+    else {
+        $out += "Failed installs in the last 30 days: $($fails.Count)."
+        foreach ($f in $fails | Select-Object -First 5) {
+            $p = @($f.Props)
+            $out += "- $(Format-ZdDate $f.Time $Now): $($p[1])`n  $(ConvertTo-WuHex $p[0]): $(Get-WuErrorText $p[0])"
+        }
+    }
+    $out -join "`n"
+}
+$WuResetCode = @'
+$errs = @()
+$svcs = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
+foreach ($s in $svcs) { try { Stop-Service -Name $s -Force -ErrorAction Stop } catch { $errs += "Could not stop $s : $($_.Exception.Message)" } }
+foreach ($s in $svcs) { $o = Get-Service -Name $s -ErrorAction SilentlyContinue; if ($o) { try { $o.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) } catch {} } }
+$renamed = @()
+foreach ($d in "$env:WINDIR\SoftwareDistribution", "$env:WINDIR\System32\catroot2") {
+    if (-not (Test-Path -LiteralPath $d)) { continue }
+    $old = "$d.old"
+    try {
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop }
+        Rename-Item -LiteralPath $d -NewName ([IO.Path]::GetFileName($old)) -ErrorAction Stop
+        $renamed += [IO.Path]::GetFileName($old)
+    } catch { $errs += "Could not rename $d : $($_.Exception.Message)" }
+}
+foreach ($s in 'cryptsvc', 'bits', 'wuauserv', 'msiserver') { try { Start-Service -Name $s -ErrorAction Stop } catch { $errs += "Could not start $s : $($_.Exception.Message)" } }
+@{ Renamed = $renamed; Errors = $errs }
+'@
+function Show-WuRepair {
+    if ($script:WuResetBusy) { throw 'The Windows Update reset is already running.' }
+    $ev = @(try { Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'; Id = 19, 20 } -MaxEvents 300 -ErrorAction Stop } catch { @() })
+    $items = @(foreach ($e in $ev) { @{ Id = $e.Id; Time = $e.TimeCreated; Props = @($e.Properties | ForEach-Object { $_.Value }) } })
+    $rep = Format-WuHistory $items (Get-Date)
+    $r = Show-ZdDialog ("$rep`n`nReset Windows Update? ZeroDelay stops the update services, renames the download cache and catalog to SoftwareDistribution.old and catroot2.old, and starts the services again. Takes 1 to 2 minutes. Updates already installed stay installed; the next check for updates takes a little longer.") 'Windows Update' 'YesNo' 'Question'
+    if ($r -ne 'Yes') { return 'Nothing changed.' }
+    if (Test-ZDGameMode) { throw 'Turn Game Mode off first: it pauses Windows Update while you play.' }
+    $script:WuResetBusy = $true
+    Start-Background $WuResetCode @() {
+        param($out, $errs)
+        $script:WuResetBusy = $false
+        $r = Get-WorkerResult $out
+        $bad = @($r.Errors | Where-Object { $_ }) + @($errs | ForEach-Object { "$_" })
+        Add-History 'Reset Windows Update' 'tool' 'wu-repair'
+        $msg = if (-not $bad.Count) { "Windows Update was reset.`n`nThe old files are kept as $(@($r.Renamed) -join ' and ') in your Windows folder; you can delete them once updates work again. Now open Settings > Windows Update and click Check for updates." }
+               else { "Windows Update was reset only partly:`n`n- $($bad -join "`n- ")`n`nRestart your PC and run this again. If a service is disabled, the card 'Turn Windows Update services back on' fixes that." }
+        Show-Toast $(if ($bad.Count) { 'Windows Update reset: partly done.' } else { 'Windows Update was reset.' }) $(if ($bad.Count) { '#FF9F0A' } else { '#30D158' })
+        [void](Show-ZdDialog $msg 'Windows Update reset' 'OK' $(if ($bad.Count) { 'Warning' } else { 'Information' }))
+    }
+    'Resetting Windows Update (1 to 2 minutes)...'
+}
+
+# ---------------------------------------------------------------- 3. Memory test (Windows Memory Diagnostic)
+# event 1201 / 1101 = no errors, 1202 / 1102 = errors found (provider Microsoft-Windows-MemoryDiagnostics-Results)
+function Format-MemTestResult($Id, $When, [datetime]$Now) {
+    if (-not $Id) { return 'Last memory test: none found on this PC (or Windows has cleared its log since).' }
+    $d = Format-ZdDate ([datetime]$When) $Now
+    switch ([int]$Id) {
+        { $_ -in 1201, 1101 } { "Last memory test: $d, no errors." }
+        { $_ -in 1202, 1102 } { "Last memory test: $d, ERRORS FOUND. Faulty RAM or an unstable XMP/EXPO profile: turn XMP/EXPO off in the BIOS and test again; if errors stay, test one stick at a time." }
+        default { "Last memory test: $d." }
+    }
+}
+function Get-MemTestLast {
+    $e = try { Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'; Id = 1101, 1102, 1201, 1202 } -MaxEvents 1 -ErrorAction Stop | Select-Object -First 1 } catch { $null }
+    if ($e) { Format-MemTestResult $e.Id $e.TimeCreated (Get-Date) } else { Format-MemTestResult $null $null (Get-Date) }
+}
+function Show-MemTest {
+    $last = Get-MemTestLast
+    $r = Show-ZdDialog ("$last`n`nWindows Memory Diagnostic tests your RAM at the next restart. It takes 15 to 30 minutes (longer with a lot of RAM) and the PC cannot be used meanwhile. Windows shows the result after you sign in, and this card shows it next time.`n`nOK opens it: Windows asks whether to restart now or test at the next restart. Save your work first.") 'Memory test' 'OKCancel' 'Question'
+    if ($r -ne 'OK') { return $last }
+    Start-Process -FilePath "$env:WINDIR\System32\MdSched.exe"
+    'Windows Memory Diagnostic is open: choose when to restart.'
+}
+
+# ---------------------------------------------------------------- 4. Game Mode hotkey (Ctrl+Alt+G)
+$ZdHotkeySrc = @'
+using System;
+using System.Runtime.InteropServices;
+public static class ZdHotkey {
+    [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    public const int Id = 0x5A47;
+    static IntPtr owner = IntPtr.Zero;
+    public static int LastError;
+    public static event EventHandler Pressed;
+    public static bool Registered { get { return owner != IntPtr.Zero; } }
+    // mods: 1 Alt, 2 Ctrl, 4 Shift; MOD_NOREPEAT is added so holding the keys fires once
+    public static bool Register(IntPtr hwnd, uint mods, uint vk) {
+        Unregister();
+        if (!RegisterHotKey(hwnd, Id, mods | 0x4000u, vk)) { LastError = Marshal.GetLastWin32Error(); return false; }
+        owner = hwnd; LastError = 0; return true;
+    }
+    public static void Unregister() { if (owner != IntPtr.Zero) { UnregisterHotKey(owner, Id); owner = IntPtr.Zero; } }
+    // an HwndSourceHook for the main window (WM_HOTKEY = 0x0312)
+    public static IntPtr Hook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled) {
+        if (msg == 0x0312 && wParam.ToInt64() == Id) { handled = true; EventHandler p = Pressed; if (p != null) p(null, EventArgs.Empty); }
+        return IntPtr.Zero;
+    }
+}
+'@
+function Register-ZdGmHotkey {
+    try {
+        if (-not ('ZdHotkey' -as [type])) { Add-Type -TypeDefinition $ZdHotkeySrc -ErrorAction Stop }
+        $h = (New-Object Windows.Interop.WindowInteropHelper $window).EnsureHandle()
+        if (-not $script:HotkeyHooked) {
+            $hs = [Windows.Interop.HwndSource]::FromHwnd($h)
+            $script:HotkeyHook = [Delegate]::CreateDelegate([Windows.Interop.HwndSourceHook], [ZdHotkey].GetMethod('Hook'))
+            $hs.AddHook($script:HotkeyHook)
+            # run Game Mode after the key message is handled, never inside the window procedure
+            [ZdHotkey]::add_Pressed([EventHandler] { param($s, $e) [void]$window.Dispatcher.BeginInvoke([action] { Invoke-ZdGmHotkey }) })
+            $script:HotkeyHooked = $true
+        }
+        [ZdHotkey]::Register($h, 3, 0x47)    # Ctrl + Alt + G
+    } catch { $script:HotkeyErr = "$($_.Exception.Message)"; $false }
+}
+function Get-ZdHotkeyFailText {
+    if (('ZdHotkey' -as [type]) -and [ZdHotkey]::LastError -eq 1409) { 'Ctrl+Alt+G is already used by another app, so the Game Mode hotkey stays off. Change or close that app''s shortcut and try again.' }
+    elseif ($script:HotkeyErr) { "The Game Mode hotkey could not be set up: $($script:HotkeyErr)" }
+    else { 'Windows did not allow Ctrl+Alt+G (another app may use it), so the Game Mode hotkey stays off.' }
+}
+function Enable-ZdGmHotkey {
+    if (-not (Register-ZdGmHotkey)) { throw (Get-ZdHotkeyFailText) }
+    $script:Backup.Custom['gmhotkey'] = $true
+}
+function Disable-ZdGmHotkey {
+    if ('ZdHotkey' -as [type]) { [ZdHotkey]::Unregister() }
+    $script:Backup.Custom.Remove('gmhotkey')
+}
+function Invoke-ZdGmHotkey {
+    if ($script:GmHotkeyBusy) { return }
+    $script:GmHotkeyBusy = $true
+    try {
+        if (Test-ZDGameMode) { [void](Disable-ZDGameMode); Suspend-GameModeAuto; $txt = 'Game Mode off (Ctrl+Alt+G)' }
+        else { [void](Enable-ZDGameMode); $txt = 'Game Mode on (Ctrl+Alt+G)' }
+        Show-Toast $txt '#30D158'
+        if (-not $window.IsVisible -and $script:TrayIcon) { try { $script:TrayIcon.ShowBalloonTip(2500, 'ZeroDelay', $txt, 'None') } catch {} }
+    } catch { Show-Toast "Game Mode hotkey: $($_.Exception.Message)" '#FF9F0A' }
+    finally { $script:GmHotkeyBusy = $false }
+}
+# at startup (once the message loop runs, so the window has its handle in normal and tray starts alike)
+function Start-ZdGmHotkeyAtStartup {
+    if (-not (Get-Setting 'gmhotkey' $false)) { return }
+    if (Register-ZdGmHotkey) { return }
+    $script:Backup.Custom.Remove('gmhotkey'); Set-Applied 'gm-hotkey' $false; Save-Backup
+    Show-Toast (Get-ZdHotkeyFailText) '#FF9F0A'
+    $t = $Tweaks | Where-Object { $_.Id -eq 'gm-hotkey' } | Select-Object -First 1
+    if ($t -and $t.Toggle) { Update-Card $t }
+}
+if (-not $Snapshot) { [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ApplicationIdle, [action] { Start-ZdGmHotkeyAtStartup }) }
+
+# ---------------------------------------------------------------- 5. Windows Settings pages in Ctrl+K
+# T = name, P = where it is in Windows, U = ms-settings page (or Exe + Arg for the classic tools), K = extra search words
+$ZdWinSettings = @(
+    @{ T = 'Display'; P = 'System > Display'; U = 'ms-settings:display'; K = 'screen monitor resolution scale scaling hdr refresh rate hz brightness' }
+    @{ T = 'Night light'; P = 'System > Display > Night light'; U = 'ms-settings:nightlight'; K = 'nightlight blue light warm colour color' }
+    @{ T = 'Sound'; P = 'System > Sound'; U = 'ms-settings:sound'; K = 'audio volume speakers headphones headset output input mic' }
+    @{ T = 'Sound devices'; P = 'System > Sound > All sound devices'; U = 'ms-settings:sound-devices'; K = 'audio devices headset mic enable disable output input' }
+    @{ T = 'Volume mixer'; P = 'System > Sound > Volume mixer'; U = 'ms-settings:apps-volume'; K = 'app volume per app audio output device game discord' }
+    @{ T = 'Mouse'; P = 'Bluetooth & devices > Mouse'; U = 'ms-settings:mousetouchpad'; K = 'pointer speed sensitivity enhance pointer precision acceleration scroll touchpad' }
+    @{ T = 'Typing'; P = 'Time & language > Typing'; U = 'ms-settings:typing'; K = 'keyboard autocorrect text suggestions' }
+    @{ T = 'Bluetooth & devices'; P = 'Bluetooth & devices'; U = 'ms-settings:bluetooth'; K = 'bluetooth controller headset pair devices' }
+    @{ T = 'Network status'; P = 'Network & internet'; U = 'ms-settings:network-status'; K = 'internet ethernet connection network reset' }
+    @{ T = 'Wi-Fi'; P = 'Network & internet > Wi-Fi'; U = 'ms-settings:network-wifi'; K = 'wifi wireless wlan' }
+    @{ T = 'Windows Update'; P = 'Windows Update'; U = 'ms-settings:windowsupdate'; K = 'updates check for updates patch' }
+    @{ T = 'Update history'; P = 'Windows Update > Update history'; U = 'ms-settings:windowsupdate-history'; K = 'installed updates uninstall updates kb' }
+    @{ T = 'Storage Sense'; P = 'System > Storage'; U = 'ms-settings:storagesense'; K = 'disk space storage cleanup free up space' }
+    @{ T = 'Power & sleep'; P = 'System > Power'; U = 'ms-settings:powersleep'; K = 'power mode sleep screen timeout' }
+    @{ T = 'Battery saver'; P = 'System > Power & battery'; U = 'ms-settings:batterysaver'; K = 'energy saver battery laptop' }
+    @{ T = 'Xbox Game Bar'; P = 'Gaming > Game Bar'; U = 'ms-settings:gaming-gamebar'; K = 'game bar overlay win g xbox' }
+    @{ T = 'Windows Game Mode'; P = 'Gaming > Game Mode'; U = 'ms-settings:gaming-gamemode'; K = 'game mode gaming' }
+    @{ T = 'Captures'; P = 'Gaming > Captures'; U = 'ms-settings:gaming-gamedvr'; K = 'record recording clips background recording game dvr screenshots' }
+    @{ T = 'Graphics'; P = 'System > Display > Graphics'; U = 'ms-settings:display-advancedgraphics'; K = 'gpu preference hardware accelerated gpu scheduling hags variable refresh rate vrr optimizations for windowed games auto hdr' }
+    @{ T = 'Microphone access'; P = 'Privacy & security > Microphone'; U = 'ms-settings:privacy-microphone'; K = 'mic microphone permission privacy' }
+    @{ T = 'Camera access'; P = 'Privacy & security > Camera'; U = 'ms-settings:privacy-webcam'; K = 'camera webcam permission privacy' }
+    @{ T = 'Location'; P = 'Privacy & security > Location'; U = 'ms-settings:privacy-location'; K = 'location gps privacy' }
+    @{ T = 'Notifications'; P = 'System > Notifications'; U = 'ms-settings:notifications'; K = 'alerts banners do not disturb' }
+    @{ T = 'Focus'; P = 'System > Focus'; U = 'ms-settings:quietmomentshome'; K = 'focus assist do not disturb quiet hours' }
+    @{ T = 'Taskbar'; P = 'Personalization > Taskbar'; U = 'ms-settings:taskbar'; K = 'taskbar tray icons' }
+    @{ T = 'Colours'; P = 'Personalization > Colours'; U = 'ms-settings:personalization-colors'; K = 'colors dark mode light mode accent transparency effects' }
+    @{ T = 'Default apps'; P = 'Apps > Default apps'; U = 'ms-settings:defaultapps'; K = 'default browser file types' }
+    @{ T = 'Installed apps'; P = 'Apps > Installed apps'; U = 'ms-settings:appsfeatures'; K = 'uninstall programs apps features' }
+    @{ T = 'Startup apps'; P = 'Apps > Startup'; U = 'ms-settings:startupapps'; K = 'startup autostart apps at sign in boot' }
+    @{ T = 'About this PC'; P = 'System > About'; U = 'ms-settings:about'; K = 'pc name specs system info windows version edition ram processor' }
+    @{ T = 'Recovery'; P = 'System > Recovery'; U = 'ms-settings:recovery'; K = 'reset this pc reinstall fix problems using windows update go back' }
+    @{ T = 'Troubleshoot'; P = 'System > Troubleshoot'; U = 'ms-settings:troubleshoot'; K = 'troubleshooters fix problems' }
+    @{ T = 'Clipboard'; P = 'System > Clipboard'; U = 'ms-settings:clipboard'; K = 'clipboard history win v' }
+    @{ T = 'Multitasking'; P = 'System > Multitasking'; U = 'ms-settings:multitasking'; K = 'snap windows alt tab virtual desktops' }
+    @{ T = 'Date & time'; P = 'Time & language > Date & time'; U = 'ms-settings:dateandtime'; K = 'clock time zone sync time' }
+    @{ T = 'Language & region'; P = 'Time & language > Language & region'; U = 'ms-settings:regionlanguage'; K = 'language region keyboard layout input' }
+    @{ T = 'Sign-in options'; P = 'Accounts > Sign-in options'; U = 'ms-settings:signinoptions'; K = 'password pin windows hello sign in' }
+    @{ T = 'Windows Security'; P = 'Privacy & security > Windows Security'; U = 'ms-settings:windowsdefender'; K = 'defender antivirus virus firewall security' }
+    @{ T = 'Sound Control Panel'; P = 'Control Panel > Sound'; Exe = 'control.exe'; Arg = 'mmsys.cpl'; K = 'classic sound playback recording devices exclusive mode sample rate spatial mmsys' }
+    @{ T = 'Device Manager'; P = 'Windows tool'; Exe = 'mmc.exe'; Arg = 'devmgmt.msc'; K = 'drivers devices hardware devmgmt' }
+    @{ T = 'Task Manager'; P = 'Windows tool'; Exe = 'taskmgr.exe'; Arg = ''; K = 'processes cpu usage end task taskmgr' }
+    @{ T = 'Reliability Monitor'; P = 'Windows tool'; Exe = 'perfmon.exe'; Arg = '/rel'; K = 'crash history reliability errors app crashes perfmon' }
+)
+function Open-ZdWinSetting($w) {
+    try {
+        if ($w.U) { Start-Process $w.U }
+        elseif ($w.Arg) { Start-Process -FilePath $w.Exe -ArgumentList $w.Arg }
+        else { Start-Process -FilePath $w.Exe }
+    } catch { Show-Toast "$($w.T) could not be opened: $($_.Exception.Message)" '#FF9F0A' }
+}
+
+# ---------------------------------------------------------------- 6. Sleep and wake, battery health
+$SleepCheckCode = @'
+$o = @{}
+foreach ($a in 'requests', 'lastwake', 'waketimers') { $o[$a] = try { (& powercfg.exe "/$a" 2>&1 | Out-String).Trim() } catch { "$($_.Exception.Message)" } }
+$o['wake'] = @(try { & powercfg.exe /devicequery wake_armed 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ } } catch { @() })
+$o
+'@
+function Start-SleepCheck {
+    if ($script:SleepBusy) { return 'Already reading...' }
+    $script:SleepBusy = $true
+    Start-Background $SleepCheckCode @() {
+        param($out, $errs)
+        $script:SleepBusy = $false
+        $r = Get-WorkerResult $out
+        if (-not ($r -is [hashtable])) { Show-Toast 'powercfg did not answer.' '#FF9F0A'; return }
+        $wake = @($r.wake)
+        Show-ZdReport 'Why won''t my PC sleep?' 'Windows'' own answers (powercfg). The grey boxes show its text as it is, in your Windows language. Nothing was changed.' @(
+            @{ H = "Devices allowed to wake the PC ($($wake.Count))"; Mono = ($wake -join "`n")
+               Note = 'Each of these can wake your PC from sleep. A mouse that gets bumped and network cards are the usual cause. To stop one: Device Manager > double-click the device > Power Management > untick "Allow this device to wake the computer".' }
+            @{ H = 'What keeps the PC awake right now (powercfg /requests)'; Mono = $r.requests
+               Note = 'Each heading (DISPLAY, SYSTEM, AWAYMODE, EXECUTION, PERFCOUNT, ACTIVELOCKSCREEN) lists the apps, drivers or services asking Windows to stay awake. Only "None" under every heading means nothing blocks sleep. Audio playing in a browser, a game launcher downloading and remote-play apps are common causes.' }
+            @{ H = 'What woke the PC last time (powercfg /lastwake)'; Mono = $r.lastwake
+               Note = 'The device or timer behind the last wake-up. A network adapter, mouse or USB device here means that device woke it; an empty list usually means the power button.' }
+            @{ H = 'Timers that will wake the PC (powercfg /waketimers)'; Mono = $r.waketimers
+               Note = 'Apps and scheduled tasks that set a timer to wake the PC, often Windows Update maintenance. Control Panel > Power Options > Change plan settings > Change advanced power settings > Sleep > Allow wake timers switches them off. Needs ZeroDelay to run as administrator to list them.' }
+        )
+    }
+    'Reading sleep and wake information...'
+}
+# powercfg /batteryreport /xml (the XML is not translated): design and full-charge capacity in mWh, cycle count
+function Read-BatteryReportXml([string]$Xml) {
+    if (-not $Xml) { return $null }
+    try { $doc = New-Object Xml.XmlDocument; $doc.LoadXml($Xml) } catch { return $null }
+    $design = [double]0; $full = [double]0; $cycles = $null; $n = 0
+    foreach ($b in @($doc.SelectNodes("//*[local-name()='Batteries']/*[local-name()='Battery']"))) {
+        $d = $b.SelectSingleNode("*[local-name()='DesignCapacity']"); $f = $b.SelectSingleNode("*[local-name()='FullChargeCapacity']"); $c = $b.SelectSingleNode("*[local-name()='CycleCount']")
+        $dv = [double]0; $fv = [double]0
+        if ($d -and [double]::TryParse($d.InnerText, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$dv)) { $design += $dv }
+        if ($f -and [double]::TryParse($f.InnerText, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$fv)) { $full += $fv }
+        $cv = 0; if ($c -and [int]::TryParse($c.InnerText, [ref]$cv) -and $cv -gt 0) { $cycles = [int]$cycles + $cv }
+        $n++
+    }
+    if (-not $n -or $design -le 0) { return $null }
+    @{ Design = $design; Full = $full; Cycles = $cycles; Pct = [int][Math]::Round(100 * $full / $design); Count = $n }
+}
+function Format-BatteryHealth($b) {
+    if (-not $b) { return 'Windows'' battery report has no capacity figures for this battery.' }
+    $cyc = if ($b.Cycles) { ", $($b.Cycles) charge cycles" } else { ' (the battery does not report its cycle count)' }
+    $head = "Battery holds $($b.Pct)% of its original capacity$cyc. Original: $([int]($b.Design / 1000)) Wh, now: $([int]($b.Full / 1000)) Wh."
+    $adv = if ($b.Pct -ge 80) { 'Healthy: nothing to do.' }
+           elseif ($b.Pct -ge 60) { 'Worn: expect clearly shorter battery life. Game plugged in (laptops also run slower on battery). If your laptop maker''s app (Lenovo Vantage, ASUS Armoury Crate, Dell Power Manager, MSI Center, HP) can limit charging to about 80%, turn that on when the laptop mostly stays plugged in: it slows further wear.' }
+           else { 'Heavily worn: consider a replacement battery, especially if the laptop shuts down suddenly under load or at a high percentage. Until then, game plugged in.' }
+    "$head`n`n$adv"
+}
+$BatteryCheckCode = @'
+param($f)
+try { & powercfg.exe /batteryreport /xml /output $f 2>&1 | Out-Null } catch {}
+if (Test-Path -LiteralPath $f) { $x = [IO.File]::ReadAllText($f); Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue; $x } else { '' }
+'@
+function Start-BatteryCheck {
+    $f = Join-Path $env:TEMP ("zd-battery-{0}.xml" -f [guid]::NewGuid().ToString('N'))
+    Start-Background $BatteryCheckCode @($f) {
+        param($out, $errs)
+        $x = "$(Get-WorkerResult $out)"
+        $b = Read-BatteryReportXml $x
+        [void](Show-ZdDialog (Format-BatteryHealth $b) 'Battery health' 'OK' $(if ($b -and $b.Pct -lt 60) { 'Warning' } else { 'Information' }))
+    }
+    'Reading the battery report...'
+}
+
 function New-AppsPage {
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-  <Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='12' Padding='20,16' Margin='0,0,0,14'>
+  <ContentControl x:Name='Disks' Focusable='False' Margin='0,0,0,6'/>
+  <Grid Margin='0,0,0,10'>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Border Background='{DynamicResource Bg.Surface}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3' VerticalAlignment='Center'>
+      <WrapPanel x:Name='Seg'/>
+    </Border>
+    <Grid Grid.Column='1' Margin='12,0'>
+      <TextBox x:Name='Find' Padding='32,7,10,7' FontSize='13' Background='{DynamicResource Bg.Surface}' Foreground='{DynamicResource Text.Primary}' BorderBrush='{DynamicResource Border.Subtle}'
+               CaretBrush='{DynamicResource Text.Primary}' VerticalContentAlignment='Center' AutomationProperties.Name='Search apps' ToolTip='Search by name, publisher or disk (for example D:)'/>
+      <TextBlock Text='&#xE721;' FontFamily='{DynamicResource Font.Icons}' FontSize='13' Foreground='{DynamicResource Text.Muted}' Margin='12,0,0,0' VerticalAlignment='Center' IsHitTestVisible='False'/>
+      <TextBlock x:Name='FindHint' Text='Search by name, publisher or disk' FontSize='13' Foreground='{DynamicResource Text.Muted}' Margin='34,0,0,0' VerticalAlignment='Center' IsHitTestVisible='False'/>
+    </Grid>
+    <Button x:Name='Reload' Grid.Column='2' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='34' FontSize='13' Padding='12,0' ToolTip='Read the installed apps again'>
+      <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72C;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Refresh'/></StackPanel>
+    </Button>
+  </Grid>
+  <TextBlock x:Name='Hint' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' Margin='2,0,0,12' TextWrapping='Wrap'/>
+  <Border Style='{DynamicResource Zd.Card}' Padding='0,0,0,6'>
     <StackPanel>
-      <Grid>
-        <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-        <StackPanel Orientation='Horizontal'>
-          <Button x:Name='TabDesk' Content='Programs' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='TabStore' Content='Store apps' Style='{DynamicResource Btn}'/>
-        </StackPanel>
-        <TextBox x:Name='Find' Grid.Column='1' Margin='16,0' Padding='10,6' FontSize='13' Background='#1C1C1E' Foreground='#F5F5F7' BorderBrush='#38383A' CaretBrush='#F5F5F7' VerticalContentAlignment='Center' ToolTip='Search by name, publisher or disk (for example D:)'/>
-        <StackPanel Grid.Column='2' Orientation='Horizontal'>
-          <Button x:Name='SortName' Content='A to Z' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='SortSize' Content='Biggest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='SortDate' Content='Newest' Style='{DynamicResource Btn}' Margin='0,0,8,0'/>
-          <Button x:Name='Reload' Content='Refresh' Style='{DynamicResource Btn}'/>
-        </StackPanel>
-      </Grid>
-      <TextBlock x:Name='Hint' FontSize='12' Foreground='#98989D' Margin='0,12,0,0' TextWrapping='Wrap'/>
+      <Border Padding='16,8' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='0,0,0,1'>
+        <Grid>
+          $AppCols
+          <Button x:Name='SortName' Grid.Column='1' Content='Name' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Padding='6,0' Margin='-6,0,0,0' MinHeight='26' FontSize='12' FontWeight='SemiBold' ToolTip='Sort by name'/>
+          <TextBlock Grid.Column='2' Text='Disk' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
+          <Button x:Name='SortSize' Grid.Column='3' Content='Size' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Right' Padding='6,0' Margin='0,0,10,0' MinHeight='26' FontSize='12' FontWeight='SemiBold' ToolTip='Biggest first'/>
+          <Button x:Name='SortDate' Grid.Column='4' Content='Installed' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Padding='6,0' Margin='-6,0,0,0' MinHeight='26' FontSize='12' FontWeight='SemiBold' ToolTip='Newest first'/>
+        </Grid>
+      </Border>
+      <ContentControl x:Name='List' Focusable='False'/>
     </StackPanel>
   </Border>
-  <ContentControl x:Name='List'/>
+  <TextBlock x:Name='Footer' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='2,10,0,0' TextWrapping='Wrap'/>
 </StackPanel>
 "@)
-    $au = @{}; foreach ($n in 'TabDesk', 'TabStore', 'Find', 'SortName', 'SortSize', 'SortDate', 'Reload', 'Hint', 'List') { $au[$n] = $root.FindName($n) }
+    $au = @{}; foreach ($n in 'Disks', 'Seg', 'Find', 'FindHint', 'SortName', 'SortSize', 'SortDate', 'Reload', 'Hint', 'List', 'Footer') { $au[$n] = $root.FindName($n) }
     $script:AppsUi = $au
-    $script:AppsKind = 'desktop'; $script:AppsSort = 'name'; $script:AppsData = $null
-    $au.TabDesk.Add_Click({ $script:AppsKind = 'desktop'; Update-AppsList })
-    $au.TabStore.Add_Click({ $script:AppsKind = 'store'; Update-AppsList })
+    $script:AppsKind = 'desktop'; $script:AppsSort = 'name'; $script:AppsDisk = 'All'; $script:AppsData = $null
     $au.SortName.Add_Click({ $script:AppsSort = 'name'; Update-AppsList })
     $au.SortSize.Add_Click({ $script:AppsSort = 'size'; Update-AppsList })
     $au.SortDate.Add_Click({ $script:AppsSort = 'date'; Update-AppsList })
@@ -17714,7 +19441,10 @@ function New-AppsPage {
     $script:AppsFindTimer = New-Object Windows.Threading.DispatcherTimer
     $script:AppsFindTimer.Interval = [TimeSpan]::FromMilliseconds(250)
     $script:AppsFindTimer.Add_Tick({ $script:AppsFindTimer.Stop(); Update-AppsList })
-    $au.Find.Add_TextChanged({ $script:AppsFindTimer.Stop(); $script:AppsFindTimer.Start() })
+    $au.Find.Add_TextChanged({
+        $script:AppsUi.FindHint.Visibility = if ($script:AppsUi.Find.Text) { 'Collapsed' } else { 'Visible' }
+        $script:AppsFindTimer.Stop(); $script:AppsFindTimer.Start()
+    })
     Start-AppScan
     New-PageScroll $root
 }
@@ -17726,51 +19456,138 @@ function Start-AppScan {
         Update-AppsList
     }
 }
+# "C" for an app on "C:" or "D: (Games)" -> "D"; $null when the scan could not tell
+function Get-AppDiskLetter($app) {
+    if ("$($app.Drive)" -match '^([A-Za-z]):') { return $Matches[1].ToUpper() }
+    $null
+}
+# 412 GB / 1.8 TB
+function Format-DiskSize([double]$Bytes) {
+    if ($Bytes -ge 1TB) { "$([Math]::Round($Bytes / 1TB, 1)) TB" } else { "$([Math]::Round($Bytes / 1GB)) GB" }
+}
+# one entry per drive letter that has apps: its name and how full it is (read once per scan)
+function Get-AppDiskStats($Data) {
+    $letters = @($Data | ForEach-Object { Get-AppDiskLetter $_ } | Where-Object { $_ } | Sort-Object -Unique)
+    foreach ($l in $letters) {
+        $label = ''; $total = 0; $free = 0
+        try { $d = New-Object IO.DriveInfo $l; if ($d.IsReady) { $label = "$($d.VolumeLabel)".Trim(); $total = [double]$d.TotalSize; $free = [double]$d.TotalFreeSpace } } catch {}
+        if (-not $label) {
+            $hit = @($Data | Where-Object { (Get-AppDiskLetter $_) -eq $l -and "$($_.Drive)" -match '\((.+)\)\s*$' } | Select-Object -First 1)
+            if ($hit.Count -and "$($hit[0].Drive)" -match '\((.+)\)\s*$') { $label = $Matches[1].Trim() }
+        }
+        [pscustomobject]@{ Letter = $l; Title = $(if ($label) { "$($l): $label" } else { "$($l):" }); Total = $total; Free = $free }
+    }
+}
+# filter (kind, disk, search) and sort: what the list shows, before the 400-row cap
+function Get-AppsView($Data, [string]$Kind, [string]$Disk, [string]$Query, [string]$Sort) {
+    $items = @($Data | Where-Object { $_.Kind -eq $Kind })
+    if ($Disk -and $Disk -ne 'All') { $items = @($items | Where-Object { (Get-AppDiskLetter $_) -eq $Disk }) }
+    $q = "$Query".Trim()
+    if ($q) {
+        $w = [Management.Automation.WildcardPattern]::Escape($q)   # so [ or * in a search is just text
+        $items = @($items | Where-Object { $_.Name -like "*$w*" -or $_.Publisher -like "*$w*" -or ($_.Drive -and ($_.Drive -like "$w*" -or "$($_.Drive)".Substring(0, 1) -eq $q.TrimEnd(':'))) })
+    }
+    if ($Kind -ne 'desktop') { $Sort = 'name' }   # Store apps report no size or install date
+    switch ($Sort) {
+        'size' { @($items | Sort-Object @{ e = { [double]$_.SizeMb }; Descending = $true }, @{ e = { $_.Name }; Descending = $false }) }
+        'date' { @($items | Sort-Object @{ e = { if ($_.Date) { $_.Date } else { [datetime]::MinValue } }; Descending = $true }, @{ e = { $_.Name }; Descending = $false }) }
+        default { @($items | Sort-Object @{ e = { -not $_.Bloat } }, Name) }
+    }
+}
+# a disk card: icon, name, app count, usage bar (Bad when over 85% full) and "412 GB free of 1 TB"; selected = raised with an accent border
+function New-AppDiskCardXaml([string]$Key, [string]$Title, [int]$Count, [double]$Total, [double]$Free, [bool]$Selected, [string]$Glyph, [string]$Noun) {
+    $bar = ''; $freeText = 'Size unknown'
+    if ($Total -gt 0) {
+        $usedFrac = [Math]::Min(1.0, [Math]::Max(0.0, ($Total - $Free) / $Total))
+        $u = [int][Math]::Round($usedFrac * 1000); $f = 1000 - $u
+        $tone = if ($usedFrac -gt 0.85) { 'Bad' } else { 'Info' }
+        $bar = "<Border Height='4' CornerRadius='2' Background='{DynamicResource Border.Subtle}' Margin='0,12,0,0' ClipToBounds='True'><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='$($u)*'/><ColumnDefinition Width='$($f)*'/></Grid.ColumnDefinitions><Border CornerRadius='2' Background='{DynamicResource $tone}'/></Grid></Border>"
+        $freeText = "$(Format-DiskSize $Free) free of $(Format-DiskSize $Total)"
+    }
+    $bg = if ($Selected) { 'Bg.Raised' } else { 'Bg.Surface' }
+    $br = if ($Selected) { 'AccentFill' } else { 'Border.Subtle' }
+    $hover = if ($Selected) { '' } else { "<ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Card' Property='BorderBrush' Value='{DynamicResource Border.Strong}'/></Trigger></ControlTemplate.Triggers>" }
+    $countText = "$Count $Noun$(if ($Count -ne 1) { 's' })"
+    "<Button x:Name='D_$Key' CommandParameter='$Key' Width='232' Margin='0,0,10,10' Cursor='Hand' FocusVisualStyle='{DynamicResource Zd.FocusRing}' AutomationProperties.Name='$(Esc "$Title, $countText, $freeText")' ToolTip='$(Esc "Show only what is on $Title")'>" +
+    "<Button.Template><ControlTemplate TargetType='Button'><Border x:Name='Card' Background='{DynamicResource $bg}' BorderBrush='{DynamicResource $br}' BorderThickness='1' CornerRadius='12' Padding='14,12' SnapsToDevicePixels='True'><ContentPresenter/></Border>$hover</ControlTemplate></Button.Template>" +
+    "<StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+    "<TextBlock Text='$Glyph' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='{DynamicResource $(if ($Selected) { 'AccentFill' } else { 'Text.Secondary' })}' VerticalAlignment='Center'/>" +
+    "<TextBlock Grid.Column='1' Text='$(Esc $Title)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Margin='10,0,8,0' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>" +
+    "<TextBlock Grid.Column='2' Text='$Count' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' ToolTip='$(Esc $countText)'/></Grid>" +
+    "$bar<TextBlock Text='$(Esc $freeText)' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,$(if ($bar) { '8' } else { '12' }),0,0'/></StackPanel></Button>"
+}
+# one ~54 px app row: icon tile, name (+ Often unused) with the publisher under it, disk, size, installed, the two buttons
+function New-AppRowXaml($a, [int]$i) {
+    $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
+    $letter = if ($nm) { Esc $nm.Substring(0, 1).ToUpper() } else { '?' }
+    $tone = $AppTileTones[[Math]::Abs(("$($a.Name)".GetHashCode())) % $AppTileTones.Count]
+    $tag = if ($a.Bloat) { "<Border DockPanel.Dock='Right' Background='{DynamicResource Warn.Soft}' CornerRadius='5' Padding='7,1,7,2' Margin='8,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='{DynamicResource Warn}'/></Border>" } else { '' }
+    $tip = if ($a.Version) { " ToolTip='$(Esc "Version $($a.Version)")'" } else { '' }
+    $pub = if ("$($a.Publisher)".Trim()) { "<TextBlock Text='$(Esc ("$($a.Publisher)".Trim()))' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/>" } else { '' }
+    $dash = "<TextBlock Text='&#x2014;' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'"
+    $disk = if ($a.Drive) { "<TextBlock Grid.Column='2' Text='$(Esc $a.Drive)' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' TextTrimming='CharacterEllipsis' Margin='0,0,8,0'/>" } else { "$dash Grid.Column='2'/>" }
+    $size = if ($a.SizeMb) { "<TextBlock Grid.Column='3' Text='$(Esc (Format-Size ($a.SizeMb * 1MB)))' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' HorizontalAlignment='Right' Margin='0,0,16,0'/>" } else { "$dash Grid.Column='3' HorizontalAlignment='Right' Margin='0,0,16,0'/>" }
+    $date = if ($a.Date) { "<TextBlock Grid.Column='4' Text='$(Esc $a.Date.ToString('d MMM yyyy'))' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center'/>" } else { "$dash Grid.Column='4'/>" }
+    $forceTip = if ($a.Kind -eq 'store') { 'Removes it for every account on this PC and stops Windows from installing it again for new accounts.' } else { 'Skips the app''s own uninstaller: closes it, then deletes its files, settings, shortcuts, services and tasks. For apps whose normal uninstall fails.' }
+    "<Border Style='{StaticResource AppRow}'$(if ($i -gt 0) { " BorderThickness='0,1,0,0'" })><Grid MinHeight='54'>$AppCols" +
+    "<Grid Width='32' Height='32' HorizontalAlignment='Left' VerticalAlignment='Center'>" +
+    "<Border x:Name='T_$i' CornerRadius='8' Background='{DynamicResource $($tone[0])}'><TextBlock Text='$letter' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource $($tone[1])}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
+    "<Image x:Name='I_$i' Width='28' Height='28' HorizontalAlignment='Center' VerticalAlignment='Center' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>" +
+    "<StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='0,0,12,0'><DockPanel HorizontalAlignment='Left'>$tag<TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'$tip/></DockPanel>$pub</StackPanel>" +
+    "$disk$size$date" +
+    "<StackPanel Grid.Column='5' Orientation='Horizontal' HorizontalAlignment='Right' VerticalAlignment='Center'>" +
+    "<Button x:Name='U_$i' Content='Uninstall' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='30' Padding='12,0' FontSize='12' Margin='0,0,4,0' AutomationProperties.Name='$(Esc "Uninstall $($a.Name)")'/>" +
+    "<Button x:Name='F_$i' Content='Force remove' Style='{DynamicResource Zd.Button.Ghost}' MinHeight='30' Padding='10,0' FontSize='12' Foreground='{DynamicResource Bad}' AutomationProperties.Name='$(Esc "Force remove $($a.Name)")' ToolTip='$(Esc $forceTip)'/>" +
+    "</StackPanel></Grid></Border>"
+}
 function Update-AppsList {
     $au = $script:AppsUi
     if ($null -eq $script:AppsData) { return }
-    foreach ($b in 'TabDesk', 'TabStore') {
-        $on = ($b -eq 'TabDesk') -eq ($script:AppsKind -eq 'desktop')
-        if ($on) { $au[$b].Background = ConvertTo-Brush '#0071E3'; $au[$b].Foreground = ConvertTo-Brush '#FFFFFF' }
-        else { $au[$b].ClearValue([Windows.Controls.Control]::BackgroundProperty); $au[$b].ClearValue([Windows.Controls.Control]::ForegroundProperty) }
-    }
+    $isDesk = $script:AppsKind -eq 'desktop'
     $desk = @($script:AppsData | Where-Object { $_.Kind -eq 'desktop' }); $store = @($script:AppsData | Where-Object { $_.Kind -eq 'store' })
-    $au.TabDesk.Content = "Programs ($($desk.Count))"; $au.TabStore.Content = "Store apps ($($store.Count))"
-    foreach ($b in 'SortSize', 'SortDate') { $au[$b].Visibility = if ($script:AppsKind -eq 'desktop') { 'Visible' } else { 'Collapsed' } }
-    foreach ($b in 'SortName', 'SortSize', 'SortDate') { $au[$b].FontWeight = if ($b -eq "Sort$($script:AppsSort)") { 'Bold' } else { 'Normal' } }
-    $q = $au.Find.Text.Trim()
-    $items = if ($script:AppsKind -eq 'desktop') { $desk } else { $store }
-    if ($q) { $items = @($items | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" -or ($_.Drive -and ($_.Drive -like "$q*" -or "$($_.Drive)".Substring(0, 1) -eq $q.TrimEnd(':'))) }) }
-    $items = switch ($script:AppsSort) {
-        'size' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { [double]$_.SizeMb } -Descending) } else { @($items | Sort-Object Name) } }
-        'date' { if ($script:AppsKind -eq 'desktop') { @($items | Sort-Object { if ($_.Date) { $_.Date } else { [datetime]::MinValue } } -Descending) } else { @($items | Sort-Object Name) } }
-        default { @($items | Sort-Object @{ e = { -not $_.Bloat } }, Name) }
+    $kindItems = if ($isDesk) { $desk } else { $store }
+    $noun = if ($isDesk) { 'program' } else { 'app' }
+    # Programs / Store apps
+    $au.Seg.Children.Clear()
+    [void]$au.Seg.Children.Add((New-Segment "Programs ($($desk.Count))" $isDesk { param($s, $e) $script:AppsKind = 'desktop'; Update-AppsList } 'desktop'))
+    [void]$au.Seg.Children.Add((New-Segment "Store apps ($($store.Count))" (-not $isDesk) { param($s, $e) $script:AppsKind = 'store'; Update-AppsList } 'store'))
+    # disk cards (drive sizes read once per scan)
+    if (-not [object]::ReferenceEquals($script:AppsDiskFor, $script:AppsData)) { $script:AppsDiskStats = @(Get-AppDiskStats $script:AppsData); $script:AppsDiskFor = $script:AppsData }
+    $stats = @($script:AppsDiskStats)
+    if ($script:AppsDisk -ne 'All' -and -not ($stats | Where-Object { $_.Letter -eq $script:AppsDisk })) { $script:AppsDisk = 'All' }
+    if ($stats.Count) {
+        $sumT = 0.0; $sumF = 0.0; foreach ($d in $stats) { $sumT += $d.Total; $sumF += $d.Free }
+        $cards = @(New-AppDiskCardXaml 'All' 'All disks' $kindItems.Count $sumT $sumF ($script:AppsDisk -eq 'All') '&#xE71D;' $noun)
+        foreach ($d in $stats) {
+            $n = @($kindItems | Where-Object { (Get-AppDiskLetter $_) -eq $d.Letter }).Count
+            $cards += New-AppDiskCardXaml $d.Letter $d.Title $n $d.Total $d.Free ($script:AppsDisk -eq $d.Letter) '&#xEDA2;' $noun
+        }
+        $wrap = [ZdTheme]::Parse("<WrapPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($cards -join '')</WrapPanel>")
+        foreach ($k in @('All') + @($stats | ForEach-Object { $_.Letter })) {
+            $wrap.FindName("D_$k").Add_Click({ param($s, $e) $script:AppsDisk = "$($s.CommandParameter)"; Update-AppsList })
+        }
+        $au.Disks.Content = $wrap; $au.Disks.Visibility = 'Visible'
+    } else { $au.Disks.Content = $null; $au.Disks.Visibility = 'Collapsed' }
+    # sort headers: the active one gets primary text and a down arrow; Store apps only sort by name
+    $sort = if ($isDesk) { $script:AppsSort } else { 'name' }
+    $arrow = " $([char]0x2193)"
+    foreach ($h in @(@('SortName', 'name', 'Name'), @('SortSize', 'size', 'Size'), @('SortDate', 'date', 'Installed'))) {
+        $b = $au[$h[0]]; $on = $sort -eq $h[1]
+        $b.Content = "$($h[2])$(if ($on) { $arrow })"
+        $b.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, $(if ($on) { 'Text.Primary' } else { 'Text.Muted' }))
+        if ($h[1] -ne 'name') { $b.IsEnabled = $isDesk }
     }
-    $au.Hint.Text = if ($script:AppsKind -eq 'desktop') { "Each program's own uninstaller opens when you press Uninstall: follow its steps. Showing $($items.Count)." }
-                    else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them. Showing $($items.Count)." }
-    $rows = for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
-        $a = $items[$i]
-        $sub = @($(if ($a.Drive) { "disk $($a.Drive)" }), $a.Publisher, $(if ($a.Version) { "version $($a.Version)" }), $(if ($a.SizeMb) { Format-Size ($a.SizeMb * 1MB) }), $(if ($a.Date) { "installed $($a.Date.ToString('d MMM yyyy'))" })) | Where-Object { $_ }
-        $tag = if ($a.Bloat) { "<Border Background='#4E3E28' CornerRadius='5' Padding='7,1,7,2' Margin='10,0,0,0' VerticalAlignment='Center'><TextBlock Text='Often unused' FontSize='11' Foreground='#FF9F0A'/></Border>" } else { '' }
-        # icon slot: a letter tile in the app's own colour, covered by the real icon when there is one
-        $nm = "$($a.Name)".Trim() -replace '^[^A-Za-z0-9]+', ''
-        $letter = if ($nm) { Esc $nm.Substring(0, 1).ToUpper() } else { '?' }
-        $tint = $AppTileColors[[Math]::Abs(("$($a.Name)".GetHashCode())) % $AppTileColors.Count]
-        "<Border Background='#2C2C2E' BorderBrush='#38383A' BorderThickness='1' CornerRadius='10' Padding='12,10,16,10' Margin='0,0,0,6'><Grid>" +
-        "<Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
-        "<Grid Width='36' Height='36' Margin='0,0,14,0' VerticalAlignment='Center'>" +
-        "<Border x:Name='T_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='16' FontWeight='SemiBold' Foreground='#FFFFFF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
-        "<Image x:Name='I_$i' Width='32' Height='32' HorizontalAlignment='Center' VerticalAlignment='Center' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>" +
-        "<StackPanel Grid.Column='1' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><TextBlock Text='$(Esc $a.Name)' FontSize='13.5' FontWeight='SemiBold' TextTrimming='CharacterEllipsis'/>$tag</StackPanel>" +
-        "<TextBlock Text='$(Esc ($sub -join '  ·  '))' FontSize='12' Foreground='#98989D' Margin='0,2,0,0' TextTrimming='CharacterEllipsis'/></StackPanel>" +
-        "<StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center' Margin='12,0,0,0'>" +
-        "<Button x:Name='U_$i' Content='Uninstall' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Margin='0,0,6,0'/>" +
-        "<Button x:Name='F_$i' Content='Force remove' Style='{DynamicResource Btn}' Padding='12,5' FontSize='12' Foreground='#FF453A' ToolTip='$(Esc $(if ($a.Kind -eq 'store') { 'Removes it for every account on this PC and stops Windows from installing it again for new accounts.' } else { 'Skips the app''s own uninstaller: closes it, then deletes its files, settings, shortcuts, services and tasks. For apps whose normal uninstall fails.' }))'/>" +
-        "</StackPanel></Grid></Border>"
+    $items = @(Get-AppsView $script:AppsData $script:AppsKind $script:AppsDisk $au.Find.Text $script:AppsSort)
+    $au.Hint.Text = if ($isDesk) { 'Uninstall opens the program''s own uninstaller. Force remove is for programs whose uninstaller fails: it deletes the files, settings and shortcuts itself. Pick a disk above to see only what is installed there.' }
+                    else { "Removed for your Windows account only. Any of these can be reinstalled from the Microsoft Store. Apps marked 'Often unused' come with Windows and most people never open them." }
+    $shown = [Math]::Min(400, $items.Count)
+    $rows = for ($i = 0; $i -lt $shown; $i++) { New-AppRowXaml $items[$i] $i }
+    if (-not $items.Count) {
+        $msg = if ($au.Find.Text.Trim()) { 'Nothing matches.' } elseif ($script:AppsDisk -ne 'All') { "No $($noun)s on this disk." } else { "No $($noun)s found." }
+        $rows = @("<TextBlock Text='$(Esc $msg)' Foreground='{DynamicResource Text.Muted}' FontSize='13' Margin='16,14,16,8'/>")
     }
-    if (-not $items.Count) { $rows = @("<TextBlock Text='Nothing matches.' Foreground='#98989D' FontSize='13' Margin='4,4,0,0'/>") }
-    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>$($rows -join '')</StackPanel>")
-    for ($i = 0; $i -lt [Math]::Min(400, $items.Count); $i++) {
+    $panel = [ZdTheme]::Parse("<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'><StackPanel.Resources><Style x:Key='AppRow' TargetType='Border'><Setter Property='Background' Value='Transparent'/><Setter Property='BorderBrush' Value='{DynamicResource Border.Subtle}'/><Setter Property='Padding' Value='16,0'/><Setter Property='SnapsToDevicePixels' Value='True'/><Style.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter Property='Background' Value='{DynamicResource Bg.Raised}'/></Trigger></Style.Triggers></Style></StackPanel.Resources>$($rows -join '')</StackPanel>")
+    for ($i = 0; $i -lt $shown; $i++) {
         $img = Get-AppIconSource $items[$i]
         if ($img) { $panel.FindName("I_$i").Source = $img; $panel.FindName("T_$i").Visibility = 'Collapsed' }
         $b = $panel.FindName("U_$i"); $b.Tag = $items[$i]
@@ -17779,6 +19596,15 @@ function Update-AppsList {
         $b.Add_Click({ param($s, $e) Invoke-ForceRemove $s.Tag })
     }
     $au.List.Content = $panel
+    # footer: count, total size, how uninstalling works
+    $parts = @("$($items.Count) $(if ($isDesk) { 'program' } else { 'Store app' })$(if ($items.Count -ne 1) { 's' })")
+    if ($isDesk) {
+        $mb = 0.0; foreach ($a in $items) { if ($a.SizeMb) { $mb += [double]$a.SizeMb } }
+        if ($mb -gt 0) { $parts += Format-Size ($mb * 1MB) }
+        $parts += "each program's own uninstaller opens when you press Uninstall"
+    } else { $parts += 'removed for your Windows account only' }
+    if ($items.Count -gt $shown) { $parts += "showing the first $shown" }
+    $au.Footer.Text = $parts -join '  ·  '
 }
 # App icons: made once from the PNG bytes the scan collected, then reused when the list is filtered or sorted.
 $AppTileColors = @('#5E5CE6', '#0A84FF', '#30B0C7', '#34C759', '#FF9F0A', '#FF6482', '#BF5AF2', '#AC8E68', '#8E8E93')
@@ -18118,8 +19944,8 @@ $CleanTargets = @(
     @{ Key = 'deliveryopt'; Title = 'Delivery Optimization cache'; Default = $true; Age = 0; Cmd = 'Delete-DeliveryOptimizationCache'
        Desc = 'Pieces of updates Windows keeps to share with other PCs.'
        Dirs = @("$env:WINDIR\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache") }
-    @{ Key = 'dumps'; Title = 'Crash dumps and error reports'; Default = $true; Age = 0
-       Desc = 'Files Windows and apps write when something crashes. Only useful to developers.'
+    @{ Key = 'dumps'; Title = 'Crash dumps and error reports'; Default = $true; Age = 720
+       Desc = 'Files Windows and apps write when something crashes, older than 30 days. Newer ones are kept: ZeroDelay''s crash checks and Reliability Monitor read them.'
        Dirs = @("$env:WINDIR\Minidump", "$env:LOCALAPPDATA\CrashDumps", "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
                 "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue")
        Files = @("$env:WINDIR\MEMORY.DMP") }
@@ -18309,8 +20135,8 @@ function New-MemoryPage {
           <TextBlock Text='In use' Foreground='#A1A1A6' FontSize='12'/>
           <TextBlock x:Name='Used' FontSize='30' FontWeight='Bold'/>
         </StackPanel>
-        <Button x:Name='Purge' Grid.Column='1' Content='Free standby memory' Style='{DynamicResource Btn}' VerticalAlignment='Top'
-                ToolTip='Clears the standby list once (what ISLC and Mem Reduct do). Your apps keep all their memory.'/>
+        <Button x:Name='CloseBg' Grid.Column='1' Content='Close background apps' Style='{DynamicResource Btn}' VerticalAlignment='Top'
+                ToolTip='Pick the apps you are not using and close them: the only thing that really frees RAM.'/>
       </Grid>
       <Grid Height='10' Margin='0,12,0,0'>
         <Border CornerRadius='5' Background='#3A3A3C'/>
@@ -18334,14 +20160,17 @@ function New-MemoryPage {
     <StackPanel>
       <TextBlock Text='Why there is no RAM cleaner' FontSize='14' FontWeight='SemiBold' Margin='0,0,0,8'/>
       <TextBlock Foreground='#A1A1A6' FontSize='12.5' TextWrapping='Wrap' LineHeight='20' LineStackingStrategy='BlockLineHeight'
-        Text='&#x2022;  Standby memory is a cache of files you used recently. It already counts as available: Windows hands it to Fortnite instantly, so a big standby number is normal and good.&#x0a;&#x2022;  Most RAM cleaners force every app to give its memory back. Windows then has to read it all back from the disk, which causes the very stutter they promise to fix. ZeroDelay does not do that.&#x0a;&#x2022;  Free standby memory clears the cache once. It only helps on the rare PCs where a full standby list causes stutter (what ISLC fixes); on most PCs nothing changes.'/>
+        Text='&#x2022;  Standby memory is a cache of files you used recently. It already counts as available: Windows hands it to Fortnite instantly, so a big standby number is normal and good.&#x0a;&#x2022;  Most RAM cleaners force every app to give its memory back. Windows then has to read it all back from the disk, which causes the very stutter they promise to fix. ZeroDelay does not do that.&#x0a;&#x2022;  Clearing standby memory throws that cache away, so your game reads those files from the disk again and may stutter for a while. It only helps on the rare PCs where a full standby list itself causes stutter (what ISLC fixes), so it is tucked away below.'/>
+      <Button x:Name='Purge' Content='Clear standby memory (advanced, may cause stutter)' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Left' Margin='0,10,0,0'
+              ToolTip='Clears the standby cache once, after a warning. Not needed on most PCs.'/>
     </StackPanel>
   </Border>
 </StackPanel>
 "@)
-    $mu = @{}; foreach ($n in 'Used', 'Purge', 'BarUse', 'BarStandby', 'Parts', 'Verdict', 'Top') { $mu[$n] = $root.FindName($n) }
+    $mu = @{}; foreach ($n in 'Used', 'Purge', 'CloseBg', 'BarUse', 'BarStandby', 'Parts', 'Verdict', 'Top') { $mu[$n] = $root.FindName($n) }
     $script:MemUi = $mu
     $mu.Purge.Add_Click({ Invoke-StandbyPurge })
+    $mu.CloseBg.Add_Click({ Show-CloseAppsPicker })
     $mu.Used.Text = 'Reading memory...'
     Update-MemoryPage
     # refresh every 4 s while this page is on screen
@@ -18369,6 +20198,7 @@ function Update-MemoryPage {
 }
 function Show-MemoryPage($d) {
     $mu = $script:MemUi
+    $script:MemTop = @($d.Top)
     $mi = $d.Mi
     if (-not $mi.Total) { return }
     $mu.Used.Text = "$(Format-Size $mi.InUse) of $(Format-Size $mi.Total)"
@@ -18420,7 +20250,59 @@ function Close-AppGroup([string]$Name) {
     })
     $t.Start()
 }
+# 2.1: the page's main action. Lists the biggest apps that are not Windows, a game or anti-cheat; nothing is ticked
+# until you tick it, and only the ticked ones are closed (asked to close first, ended after 3 s like Close-AppGroup).
+function Get-CloseableApps($Top) {
+    $games = @($GameDefs | ForEach-Object { Get-GameProcNames $_ })
+    @($Top | Where-Object { $_ -and $MemNoClose -notcontains $_.Name -and $games -notcontains $_.Name -and $_.Name -notmatch '(?i)anticheat|^vgc$|^vgtray$|^BEService|^FACEIT|^faceit|^EAAntiCheat|^ZeroDelay' -and $_.Name -ne 'powershell' })
+}
+function Show-CloseAppsPicker {
+    $apps = @(Get-CloseableApps $script:MemTop)
+    if (-not $apps.Count) { Show-Toast 'No background apps to close right now.' '#A1A1A6'; return }
+    $i = 0
+    $rows = foreach ($a in $apps) {
+        $a | Add-Member -NotePropertyName Idx -NotePropertyValue $i -Force; $i++
+        "<CheckBox x:Name='M_$($a.Idx)' Margin='0,0,0,8'><TextBlock Text='$(Esc "$($a.Label)$(if ($a.Count -gt 1) { " ($($a.Count))" })  -  $(Format-Size $a.Bytes)")' FontSize='13' Foreground='{DynamicResource Text.Primary}'/></CheckBox>"
+    }
+    $body = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <TextBlock Text='Close background apps' FontSize='22' FontWeight='Bold' Foreground='{DynamicResource Text.Primary}'/>
+  <TextBlock Text='Tick the apps you are not using. Only those are closed: each is asked to close first and ended if it does not. Save your work in them first. Windows, your games and anti-cheat are never listed.' Foreground='{DynamicResource Text.Secondary}' FontSize='13' Margin='0,6,0,14' TextWrapping='Wrap'/>
+  $($rows -join '')
+  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right' Margin='0,14,0,0'>
+    <Button x:Name='Cancel' Content='Cancel' Style='{DynamicResource Zd.Button.Secondary}' Margin='0,0,8,0' MinWidth='90'/>
+    <Button x:Name='Go' Content='Close the ticked apps' Style='{DynamicResource Zd.Button.Primary}' MinWidth='150'/>
+  </StackPanel>
+</StackPanel>
+"@)
+    $script:CloseApps = $apps; $script:CloseBody = $body
+    $body.FindName('Cancel').Add_Click({ Hide-Animated $ui.Wizard 200 })
+    $body.FindName('Go').Add_Click({
+        $pick = @($script:CloseApps | Where-Object { $script:CloseBody.FindName("M_$($_.Idx)").IsChecked })
+        Hide-Animated $ui.Wizard 200
+        if (-not $pick.Count) { Show-Toast 'Nothing closed.' '#A1A1A6'; return }
+        Stop-AppGroups @($pick | ForEach-Object { $_.Name })
+    })
+    $ui.WizardBody.Content = $body
+    $ui.Wizard.Visibility = 'Visible'
+    if ($script:Anim) { Start-Anim $ui.Wizard ([Windows.UIElement]::OpacityProperty) 0 1 220; Show-Animated $ui.WizardBody 24 380 60 }
+}
+function Stop-AppGroups([string[]]$Names) {
+    foreach ($n in $Names) { foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) { try { if ($p.MainWindowHandle -ne [IntPtr]::Zero) { [void]$p.CloseMainWindow() } } catch {} } }
+    $script:CloseNames = $Names
+    $t = New-Object Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromSeconds(3)
+    $t.Add_Tick({ param($s, $e)
+        $s.Stop()
+        foreach ($n in @($script:CloseNames)) { Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+        Show-Toast "Closed: $(@($script:CloseNames) -join ', ')." '#30D158'
+        if ($script:MemUi) { Update-MemoryPage }
+    })
+    $t.Start()
+}
 function Invoke-StandbyPurge {
+    $ok = Show-ZdDialog ("Clear standby memory?`n`nStandby memory is Windows' cache of files you used recently, and it already counts as free. Clearing it means your game and apps read those files from the disk again, which may cause stutter for a while.`n`nOnly use this if you have the rare problem where a full standby list itself causes stutter. On most PCs it does nothing useful.") 'Clear standby memory' 'YesNo' 'Warning'
+    if ($ok -ne 'Yes') { return }
     $before = Get-MemInfo
     $rc = [MemTools]::PurgeStandby()
     if ($rc -eq -1) { Show-Toast 'Windows did not give ZeroDelay permission to clear standby memory.' '#FF9F0A'; return }
@@ -18528,7 +20410,7 @@ $ProfileScan = {
     $dg = Try-Get { Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard }
     $P.Security = [ordered]@{ Vbs = ([int]$dg.VirtualizationBasedSecurityStatus -eq 2); MemoryIntegrity = (@($dg.SecurityServicesRunning) -contains 2); Hypervisor = [bool]$cs.HypervisorPresent
                               Antivirus = @(Try-Get { Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop } | ForEach-Object { $_.displayName } | Select-Object -Unique) }
-    $plan = (Try-Get { powercfg /getactivescheme }) -replace '^.*\((.*)\)\s*$', '$1'
+    $plan = (Try-Get { powercfg /getactivescheme }) -replace '^[^(]*\((.*)\)\s*$', '$1'   # first "(": "ZeroDelay (Ultimate Performance)" stays whole
     $P.Power = [ordered]@{ Plan = "$plan".Trim(); OnBattery = (@($bat | Where-Object { $_.BatteryStatus -eq 1 }).Count -gt 0) }
     # --- installed apps
     $seen = @{}
@@ -18619,7 +20501,7 @@ function Set-ProfileTailoring {
     $opt = @($p.Software.'Other optimizers')
     if ($opt.Count) { [void]$notes.Add("Other optimizers installed: $($opt -join ', '). They can change the same settings; drift alerts will tell you when they do.") }
     $script:TailorNotes = @($notes)
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
     foreach ($t in $Tweaks) {
         if (-not $t.Card) { continue }
         $tag = $t.Card.FindName('RecTag')
@@ -19009,7 +20891,12 @@ function Assert-GameClosed([string]$Game) { if (Test-GameRunning $Game) { throw 
 # the game's settings file, or $null when the game has not written one yet
 function Get-GameCfgPath([string]$Game) {
     $best = $null
-    foreach ($pat in @($GameCfgPaths[$Game])) {
+    $pats = @($GameCfgPaths[$Game])
+    # games write to the real Documents folder, which OneDrive or a move can put elsewhere under a translated name
+    # (C:\Users\Jörg\OneDrive\Dokumente, D:\Documents): also look there
+    $docs = try { [Environment]::GetFolderPath('MyDocuments') } catch { '' }
+    if ($docs) { $pats += @($pats | Where-Object { "$_" -like '%USERPROFILE%\Documents\*' } | ForEach-Object { $docs + "$_".Substring('%USERPROFILE%\Documents'.Length) }) }
+    foreach ($pat in $pats) {
         if (-not $pat) { continue }
         $p = [Environment]::ExpandEnvironmentVariables($pat)
         if ($p.Contains('{Install}')) { $d = Get-GameInstallDir $Game; if (-not $d) { continue }; $p = $p.Replace('{Install}', $d) }
@@ -21633,13 +23520,17 @@ function Get-GameStatsPlay($g) {
 # reads the open game's sessions in the background and draws "Your stats" when they arrive
 function Update-GameStats {
     $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.Stats) { return }
-    if ($h.StatsFor -ne $g.Id) { Show-GameStats $g $null $true; $h.StatsFor = $g.Id }
+    if ($h.StatsFor -ne $g.Id) { Show-GameStats $g $null $true; Update-GameStrip $null $true; $h.StatsFor = $g.Id }
     Invoke-Worker $GameStatsCode @($g.Id) {
         param($out, $errs)
         $res = Get-WorkerResult $out
         $g = $script:GameSel; if (-not $g -or -not $script:GamesUi) { return }
         if ($res -is [hashtable] -and $res.Id -ne $g.Id) { return }
-        Show-GameStats $g $(if ($res -is [hashtable]) { $res.Data } else { $null }) $false
+        $data = if ($res -is [hashtable]) { $res.Data } else { $null }
+        # 2.1 stats strip: the newest report (Reports are oldest first)
+        $last = if ($data -and @($data.Reports).Count) { @($data.Reports)[-1] } else { $null }
+        Update-GameStrip $last $false
+        Show-GameStats $g $data $false
     }
 }
 # number for a chart: $null for missing or non-numeric values
@@ -22317,6 +24208,7 @@ function Start-GameArtFetch {
         if ($script:GameArtTried[$id] -and ((Get-Date) - $script:GameArtTried[$id]).TotalHours -lt 24) { continue }
         $script:GameArtTried[$id] = Get-Date; $id
     }) | Select-Object -Unique)
+    Write-StartupMark "games page: art to download: $($ids.Count)"
     if (-not $ids.Count) { return }
     $script:GameArtBusy = $true
     Invoke-Worker $GameArtWorkerCode @([string[]]$ids, (Join-Path $DataDir 'art')) {
@@ -22324,7 +24216,94 @@ function Start-GameArtFetch {
         $script:GameArtBusy = $false
         $r = Get-WorkerResult $out; if (-not $r -or -not @($r.Got).Count) { return }
         $u = $script:GamesUi; if (-not $u) { return }
-        foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) { if (-not (Get-GameLogo $t.Tag)) { Set-GameTileArt $t } }
+        Start-GameImageFetch @(@($u.Tiles.Children) + @($u.MoreTiles.Children) | ForEach-Object { $_.Tag })
+    }
+}
+# The tile logos (the shell's icon reader: 3-4 s the first time on a fresh PC) and the downloaded art (a JPEG decode
+# per tile) are read in the background worker as frozen images, so the library opens at once and fills in; a game's
+# logo is read once per session. Dev renders read them in place so the picture is complete.
+$GameImageWorkerCode = @'
+param($Items)
+$res = @{}
+foreach ($it in $Items) {
+    $img = $null; $art = $null
+    if ($it.Logo) {
+        $hb = [ZdShellIcon]::Get($it.Logo, 256)
+        if ($hb -ne [IntPtr]::Zero) {
+            try { $img = [Windows.Interop.Imaging]::CreateBitmapSourceFromHBitmap($hb, [IntPtr]::Zero, [Windows.Int32Rect]::Empty, [Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions()); $img.Freeze() }
+            catch { $img = $null } finally { [void][ZdShellIcon]::DeleteObject($hb) }
+        }
+    }
+    if (-not $img -and $it.Art) {
+        try { $art = New-Object Windows.Media.Imaging.BitmapImage; $art.BeginInit(); $art.CacheOption = 'OnLoad'; $art.DecodePixelWidth = 600; $art.UriSource = New-Object Uri $it.Art; $art.EndInit(); $art.Freeze() } catch { $art = $null }
+    }
+    $res[$it.Id] = @{ HasLogoFile = [bool]$it.Logo; Logo = $img; Art = $art; ArtKey = $it.ArtKey }
+}
+$res
+'@
+function Test-GameLogoKnown($g) { [bool]($g -and $script:GameLogos -and $script:GameLogos.ContainsKey($g.Id)) }
+function Get-GameLogoCached($g) { if (Test-GameLogoKnown $g) { $script:GameLogos[$g.Id] } else { $null } }
+function Set-GameTileLogo($tile, $logo) {
+    $lb = $tile.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
+    $tile.FindName('Big').Visibility = 'Collapsed'; $tile.FindName('Glyph').Visibility = 'Collapsed'
+}
+function Start-GameImageFetch([object[]]$Games) {
+    if (-not $script:GameLogos) { $script:GameLogos = @{} }
+    if (-not $script:GameArt) { $script:GameArt = @{} }
+    if (-not $script:GameImgBusy) { $script:GameImgBusy = @{} }
+    $items = @(foreach ($g in @($Games)) {
+        if (-not $g -or -not $g.Id -or $script:GameImgBusy[$g.Id]) { continue }
+        $logoFile = $null
+        if (-not $script:GameLogos.ContainsKey($g.Id)) {
+            $file = try { & $g.IconFile } catch { $null }
+            if ($file -and (Test-Path -LiteralPath $file)) { $logoFile = "$file" } else { $script:GameLogos[$g.Id] = $null }
+        }
+        $artKey = $null; $artFile = $null
+        $aid = Get-GameSteamId $g
+        if ($aid) { $artKey = "$aid-capsule"; if (-not $script:GameArt[$artKey]) { $f = Get-GameArtFile $aid 'capsule'; if (Test-Path -LiteralPath $f) { $artFile = $f } } }
+        if ($logoFile -or ($artFile -and -not $script:GameLogos[$g.Id])) { @{ Id = "$($g.Id)"; Logo = $logoFile; Art = $artFile; ArtKey = $artKey } }
+    })
+    Write-StartupMark "games page: icon and art files found ($(@($items).Count) to read)"
+    if (-not $items.Count) { Update-GameImages; return }
+    foreach ($it in $items) { $script:GameImgBusy[$it.Id] = $true }
+    if ($Snapshot -and -not $env:ZD_PCMATRIX) { Complete-GameImageFetch (& ([scriptblock]::Create($GameImageWorkerCode)) $items); return }
+    Write-StartupMark 'games page: image worker queued (before)'
+    Invoke-Worker $GameImageWorkerCode @(, $items) {
+        param($out, $errs)
+        $r = Get-WorkerResult $out
+        if ($r -is [hashtable]) { Complete-GameImageFetch $r; return }
+        # no worker: read them here, as before
+        $script:GameImgBusy = @{}
+        $u = $script:GamesUi; if (-not $u) { return }
+        foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) { $lg = Get-GameLogo $t.Tag; if ($lg) { if ($t.FindName('Logo').Visibility -ne 'Visible') { Set-GameTileLogo $t $lg } } elseif (-not ($t.Background -is [Windows.Media.ImageBrush])) { Set-GameTileArt $t } }
+    }
+}
+function Complete-GameImageFetch($r) {
+    if (-not $script:GameLogos) { $script:GameLogos = @{} }
+    if (-not $script:GameArt) { $script:GameArt = @{} }
+    if (-not $script:GameImgBusy) { $script:GameImgBusy = @{} }
+    if ($r -is [hashtable]) {
+        foreach ($id in @($r.Keys)) {
+            $x = $r[$id]; $script:GameImgBusy.Remove($id)
+            if ($x.HasLogoFile) { $script:GameLogos[$id] = $x.Logo }
+            if ($x.Art -and $x.ArtKey) { $script:GameArt[$x.ArtKey] = $x.Art }
+        }
+    }
+    Update-GameImages
+}
+# tiles and the open game page take the pictures that are ready
+function Update-GameImages {
+    $u = $script:GamesUi; if (-not $u) { return }
+    foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) {
+        $g = $t.Tag; if (-not (Test-GameLogoKnown $g)) { continue }
+        $lg = $script:GameLogos[$g.Id]
+        if ($lg) { if ($t.FindName('Logo').Visibility -ne 'Visible') { Set-GameTileLogo $t $lg } }
+        elseif (-not ($t.Background -is [Windows.Media.ImageBrush])) { Set-GameTileArt $t }
+    }
+    $g = $script:GameSel
+    if ($g -and $u.Detail.Visibility -eq 'Visible' -and $u.HeroLogo.Visibility -ne 'Visible') {
+        $lg = Get-GameLogoCached $g
+        if ($lg) { $u.HeroLogo.Background = New-Object Windows.Media.ImageBrush $lg; $u.HeroLogo.Visibility = 'Visible' }
     }
 }
 
@@ -22352,16 +24331,18 @@ function New-GameTile($g) {
   </Grid>
 </Border>
 "@)
+    $iw = [Diagnostics.Stopwatch]::StartNew()
     $ok = try { [bool](& $g.Installed) } catch { $false }
+    if ($Snapshot -and $iw.ElapsedMilliseconds -gt 150) { [Console]::WriteLine(('STARTUP games page: install check for {0} took {1} ms' -f $g.Id, $iw.ElapsedMilliseconds)) }
     $g.InstalledNow = $ok
     if (-not $ok) { $b.Opacity = 0.82 }
-    $logo = Get-GameLogo $g
-    if ($logo) {
-        $lb = $b.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
-        $b.FindName('Big').Visibility = 'Collapsed'; $b.FindName('Glyph').Visibility = 'Collapsed'
-    }
+    # pictures already read this session go on now; the rest come from Start-GameImageFetch (New-GamesPage)
     $b.Tag = $g
-    if (-not $logo) { Set-GameTileArt $b }
+    if (Test-GameLogoKnown $g) {
+        $logo = $script:GameLogos[$g.Id]
+        if ($logo) { Set-GameTileLogo $b $logo }
+        else { $aid = Get-GameSteamId $g; if ($aid -and $script:GameArt -and $script:GameArt["$aid-capsule"]) { Set-GameTileArt $b } }
+    }
     $badge = $b.FindName('Badge'); $bt = $b.FindName('BadgeText')
     $bt.Text = if ($ok) { 'Installed' } else { 'Not found' }
     $badge.Background = ConvertTo-Brush $(if ($ok) { '#4D1F8F4E' } else { '#40FDFDFD' })
@@ -22383,14 +24364,15 @@ function New-GamesPage {
     <TextBlock x:Name='MoreSub' Text='Not installed on this PC. Install one and ZeroDelay finds it by itself, with its logo and its settings.' FontSize='12.5' Foreground='#A1A1A6' Margin='0,0,0,14' Visibility='Collapsed'/>
     <WrapPanel x:Name='MoreTiles'/>
   </StackPanel>
-  <Grid x:Name='Detail' Visibility='Collapsed'>
-    <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='320'/></Grid.ColumnDefinitions>
-    <StackPanel Margin='0,0,18,0'>
+  <!-- 2.1 game page (Steam / GOG game pages, ExitLag's route view): hero, the last match of this game as a stats
+       strip, then tabs (Route · Tweaks for the game · Checks · Trends) instead of stacked cards -->
+  <StackPanel x:Name='Detail' Visibility='Collapsed'>
       <Button x:Name='Back' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='10,6' Margin='0,0,0,14'>
-        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72B;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' Margin='0,1,8,0'/><TextBlock Text='All games'/></StackPanel>
+        <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE72B;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Margin='0,1,8,0'/><TextBlock Text='All games'/></StackPanel>
       </Button>
-      <!-- 2.0 hero: game art faded into the page background, logo + title, Start Game in the accent with the Game Mode chip -->
-      <Border x:Name='Hero' CornerRadius='16' Margin='0,0,0,16' ClipToBounds='True' MinHeight='260'>
+      <!-- hero: game art faded into the page background; title, publisher, anti-cheat note and preset on the left,
+           Start Game / Stop Game Mode with the Game Mode chips on the right -->
+      <Border x:Name='Hero' CornerRadius='16' Margin='0,0,0,12' ClipToBounds='True' MinHeight='280'>
         <Grid>
           <Border x:Name='HeroFade' CornerRadius='16'>
             <Border.Background>
@@ -22399,104 +24381,177 @@ function New-GamesPage {
               </LinearGradientBrush>
             </Border.Background>
           </Border>
-          <TextBlock x:Name='HeroGlyph' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,10,20,0'/>
-          <StackPanel VerticalAlignment='Bottom' Margin='24,24,24,22'>
-            <StackPanel Orientation='Horizontal'>
-              <Border x:Name='HeroLogo' Width='64' Height='64' CornerRadius='14' Margin='0,0,16,0' VerticalAlignment='Center' Visibility='Collapsed' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'/>
-              <TextBlock x:Name='HeroTitle' FontFamily='{DynamicResource Font.Display}' FontSize='32' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' TextTrimming='CharacterEllipsis'/>
+          <TextBlock x:Name='HeroGlyph' FontFamily='{DynamicResource Font.Icons}' FontSize='150' Foreground='#22FDFDFD' HorizontalAlignment='Right' VerticalAlignment='Top' Margin='0,10,20,0'/>
+          <Grid VerticalAlignment='Bottom' Margin='24,24,24,22'>
+            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+            <StackPanel VerticalAlignment='Bottom'>
+              <StackPanel Orientation='Horizontal'>
+                <Border x:Name='HeroLogo' Width='64' Height='64' CornerRadius='14' Margin='0,0,16,0' VerticalAlignment='Center' Visibility='Collapsed' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1'/>
+                <StackPanel VerticalAlignment='Center'>
+                  <TextBlock x:Name='HeroTitle' FontFamily='{DynamicResource Font.Display}' FontSize='32' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'/>
+                  <TextBlock x:Name='HeroSub' FontSize='13' Foreground='{DynamicResource Text.Secondary}' Margin='0,2,0,0'/>
+                  <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
+                    <TextBlock Text='&#xE83D;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Top' Margin='0,2,6,0'/>
+                    <TextBlock x:Name='HeroAc' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' MaxWidth='460'/>
+                  </StackPanel>
+                </StackPanel>
+              </StackPanel>
+              <StackPanel Orientation='Horizontal' Margin='0,18,0,0'>
+                <TextBlock Text='Preset' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,0,10,0'/>
+                <Border Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3'><WrapPanel x:Name='PresetChips'/></Border>
+              </StackPanel>
+              <TextBlock x:Name='PresetNote' FontSize='11.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' MaxWidth='520' HorizontalAlignment='Left' Margin='0,8,0,0'/>
             </StackPanel>
-            <WrapPanel Margin='0,16,0,0'>
-              <Button x:Name='Play' Style='{DynamicResource Zd.Button.Primary}' MinHeight='44' Padding='22,0' Margin='0,0,12,8' AutomationProperties.Name='Start Game'>
-                <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='15' VerticalAlignment='Center' Margin='0,1,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='16' FontWeight='SemiBold'/></StackPanel>
-              </Button>
-              <Border x:Name='GmChip' Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,8,8' VerticalAlignment='Center'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/></Border>
-              <Border x:Name='AutoChip' Style='{DynamicResource Zd.Chip}' Padding='10,4,12,4' Margin='0,0,8,8' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
-              <Border Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,0,8' VerticalAlignment='Center'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}'/></Border>
-            </WrapPanel>
-            <TextBlock x:Name='PlayNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' MaxWidth='560' HorizontalAlignment='Left' Margin='0,4,0,0'/>
-          </StackPanel>
+            <StackPanel Grid.Column='1' VerticalAlignment='Bottom' Margin='24,0,0,0' MaxWidth='400'>
+              <StackPanel Orientation='Horizontal' HorizontalAlignment='Right'>
+                <Button x:Name='StopGm' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='44' Padding='18,0' Margin='0,0,10,0' Visibility='Collapsed' AutomationProperties.Name='Stop Game Mode'>
+                  <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE71A;' FontFamily='{DynamicResource Font.Icons}' FontSize='13' VerticalAlignment='Center' Margin='0,1,8,0'/><TextBlock Text='Stop Game Mode' FontSize='14'/></StackPanel>
+                </Button>
+                <Button x:Name='Play' Style='{DynamicResource Zd.Button.Primary}' MinHeight='44' Padding='22,0' AutomationProperties.Name='Start Game'>
+                  <StackPanel Orientation='Horizontal'><TextBlock Text='&#xE768;' FontFamily='{DynamicResource Font.Icons}' FontSize='15' VerticalAlignment='Center' Margin='0,1,10,0'/><TextBlock x:Name='PlayText' Text='Start Game' FontSize='16' FontWeight='SemiBold'/></StackPanel>
+                </Button>
+              </StackPanel>
+              <WrapPanel HorizontalAlignment='Right' Margin='0,12,0,0'>
+                <Border x:Name='GmChip' Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,8,8' VerticalAlignment='Center'><TextBlock x:Name='GmChipText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/></Border>
+                <Border x:Name='AutoChip' Style='{DynamicResource Zd.Chip}' Padding='10,4,12,4' Margin='0,0,8,8' VerticalAlignment='Center'><StackPanel Orientation='Horizontal'><ToggleButton x:Name='AutoGm' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/><TextBlock x:Name='AutoGmText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center' Margin='8,0,0,0'/></StackPanel></Border>
+                <Border Style='{DynamicResource Zd.Chip}' Padding='10,6' Margin='0,0,0,8' VerticalAlignment='Center'><TextBlock x:Name='RunText' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Text.Secondary}'/></Border>
+              </WrapPanel>
+              <TextBlock x:Name='PlayNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' TextAlignment='Right' HorizontalAlignment='Right' Margin='0,2,0,0'/>
+            </StackPanel>
+          </Grid>
         </Grid>
       </Border>
-      <Border x:Name='AutoCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
-        <StackPanel>
-          <TextBlock Text='WHEN THIS GAME STARTS' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
-          <TextBlock x:Name='AutoSum' FontSize='12.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,6,0,12'/>
-          <Grid Margin='0,0,0,8'>
-            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-            <StackPanel><TextBlock Text='Apply its tweaks when it starts' FontSize='13' FontWeight='SemiBold'/><TextBlock Text='Switches on the recommended tweaks for this game that are still off. Changes to its settings files wait until the game closes.' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,20,0'/></StackPanel>
-            <ToggleButton x:Name='AutoTw' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
-          </Grid>
-          <StackPanel x:Name='AutoOpts' Margin='16,0,0,0' Visibility='Collapsed'>
-            <Grid Margin='0,0,0,8'>
-              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-              <TextBlock Text='Also change its settings files after it closes' FontSize='12.5' VerticalAlignment='Center'/>
-              <ToggleButton x:Name='AutoLater' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
-            </Grid>
-            <Grid>
-              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-              <TextBlock Text='Put the tweaks back when the game closes' FontSize='12.5' VerticalAlignment='Center'/>
-              <ToggleButton x:Name='AutoBack' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
-            </Grid>
-          </StackPanel>
-        </StackPanel>
-      </Border>
-      <Border x:Name='ServerCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
+      <!-- stats strip: the newest match report of this game (Update-GameStrip) -->
+      <Border x:Name='Strip' Style='{DynamicResource Zd.Card}' Padding='22,14' Margin='0,0,0,18' AutomationProperties.Name='Last match of this game'>
         <Grid>
           <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-          <StackPanel>
-            <TextBlock Text='GAME SERVER' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
-            <Button x:Name='ServerBtn' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='12,8' Margin='0,8,0,0'>
-              <StackPanel Orientation='Horizontal'><TextBlock x:Name='ServerText' Text='Automatic'/><TextBlock Text='&#xE70D;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Margin='10,3,0,0'/></StackPanel>
-            </Button>
-            <Popup x:Name='ServerPop' PlacementTarget='{Binding ElementName=ServerBtn}' Placement='Bottom' VerticalOffset='6' StaysOpen='False' AllowsTransparency='True' PopupAnimation='Fade'>
-              <Border CornerRadius='12' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' Padding='6' Margin='0,0,10,12'>
-                <ScrollViewer Style='{DynamicResource OverlayScroll}' MaxHeight='360' VerticalScrollBarVisibility='Auto'><StackPanel x:Name='ServerList' MinWidth='280'/></ScrollViewer>
-              </Border>
-            </Popup>
-            <TextBlock x:Name='ServerHint' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,10,0,0' MaxWidth='420' HorizontalAlignment='Left'/>
-          </StackPanel>
-          <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
-            <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
-            <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
-            <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='#A1A1A6'/></StackPanel>
+          <WrapPanel x:Name='StripStats' VerticalAlignment='Center'/>
+          <TextBlock x:Name='StripEmpty' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' TextWrapping='Wrap' Visibility='Collapsed'/>
+          <StackPanel Grid.Column='1' VerticalAlignment='Center' Margin='16,0,0,0'>
+            <TextBlock x:Name='StripWhen' FontSize='13' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Right'/>
+            <TextBlock x:Name='StripLen' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' HorizontalAlignment='Right' Margin='0,2,0,0'/>
           </StackPanel>
         </Grid>
       </Border>
-      <Border Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,18'>
-        <StackPanel>
-          <TextBlock Text='YOUR ROUTE, LIVE' FontSize='11' FontWeight='SemiBold' Foreground='#98989D'/>
-          <Grid x:Name='Route' Margin='0,16,0,0'>
-            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+      <!-- tabs: selected = primary text over a 2 px accent line (Update-GameTabs) -->
+      <Grid Margin='0,0,0,16'>
+        <Border Height='1' Background='{DynamicResource Border.Subtle}' VerticalAlignment='Bottom'/>
+        <StackPanel x:Name='Tabs' Orientation='Horizontal'/>
+      </Grid>
+      <StackPanel x:Name='TabRoute'>
+        <Border x:Name='ServerCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+            <StackPanel>
+              <TextBlock Text='GAME SERVER' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+              <Button x:Name='ServerBtn' Style='{DynamicResource Btn}' HorizontalAlignment='Left' Padding='12,8' Margin='0,8,0,0'>
+                <StackPanel Orientation='Horizontal'><TextBlock x:Name='ServerText' Text='Automatic'/><TextBlock Text='&#xE70D;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Margin='10,3,0,0'/></StackPanel>
+              </Button>
+              <Popup x:Name='ServerPop' PlacementTarget='{Binding ElementName=ServerBtn}' Placement='Bottom' VerticalOffset='6' StaysOpen='False' AllowsTransparency='True' PopupAnimation='Fade'>
+                <Border CornerRadius='12' Background='#2C2C2F' BorderBrush='#48484B' BorderThickness='1' Padding='6' Margin='0,0,10,12'>
+                  <ScrollViewer Style='{DynamicResource OverlayScroll}' MaxHeight='360' VerticalScrollBarVisibility='Auto'><StackPanel x:Name='ServerList' MinWidth='280'/></ScrollViewer>
+                </Border>
+              </Popup>
+              <TextBlock x:Name='ServerHint' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,10,0,0' MaxWidth='420' HorizontalAlignment='Left'/>
+            </StackPanel>
+            <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>
+              <StackPanel Margin='18,0'><TextBlock x:Name='PingVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms ping' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/></StackPanel>
+              <StackPanel Margin='18,0'><TextBlock x:Name='LossVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='% loss' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/></StackPanel>
+              <StackPanel Margin='18,0,4,0'><TextBlock x:Name='JitVal' Text='-' FontFamily='{DynamicResource Font.Mono}' FontSize='28' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/><TextBlock Text='ms jitter' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/></StackPanel>
+            </StackPanel>
           </Grid>
-          <TextBlock x:Name='RouteNote' FontSize='12' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,14,0,0'/>
-        </StackPanel>
-      </Border>
-      <StackPanel x:Name='Stats' Margin='0,14,0,0'/>
-    </StackPanel>
-    <Border Grid.Column='1' Style='{DynamicResource Zd.Card}' Padding='18' VerticalAlignment='Top'>
-      <StackPanel>
-        <TextBlock Text='Preset' FontSize='15' FontWeight='SemiBold'/>
-        <Border HorizontalAlignment='Left' Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3' Margin='0,12,0,8'><WrapPanel x:Name='PresetChips'/></Border>
-        <TextBlock x:Name='PresetNote' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,0,0,16'/>
-        <TextBlock Text='Game tools' FontSize='15' FontWeight='SemiBold'/>
-        <WrapPanel x:Name='ToolChips' Margin='0,12,0,8'/>
-        <StackPanel x:Name='ToolList'/>
+        </Border>
+        <Border Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,18'>
+          <StackPanel>
+            <TextBlock Text='YOUR ROUTE, LIVE' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+            <Grid x:Name='Route' Margin='0,16,0,0'>
+              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+            </Grid>
+            <TextBlock x:Name='RouteNote' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,14,0,0'/>
+          </StackPanel>
+        </Border>
       </StackPanel>
-    </Border>
-  </Grid>
+      <StackPanel x:Name='TabTweaks' Visibility='Collapsed'>
+        <Border x:Name='AutoCard' Style='{DynamicResource Zd.Card}' Padding='20' Margin='0,0,0,16'>
+          <StackPanel>
+            <TextBlock Text='WHEN THIS GAME STARTS' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+            <TextBlock x:Name='AutoSum' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,6,0,12'/>
+            <Grid Margin='0,0,0,8'>
+              <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+              <StackPanel><TextBlock Text='Apply its tweaks when it starts' FontSize='13' FontWeight='SemiBold'/><TextBlock Text='Switches on the recommended tweaks for this game that are still off. Changes to its settings files wait until the game closes.' FontSize='12' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,20,0'/></StackPanel>
+              <ToggleButton x:Name='AutoTw' Grid.Column='1' Style='{DynamicResource Switch}' VerticalAlignment='Center'/>
+            </Grid>
+            <StackPanel x:Name='AutoOpts' Margin='16,0,0,0' Visibility='Collapsed'>
+              <Grid Margin='0,0,0,8'>
+                <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+                <TextBlock Text='Also change its settings files after it closes' FontSize='12.5' VerticalAlignment='Center'/>
+                <ToggleButton x:Name='AutoLater' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
+              </Grid>
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+                <TextBlock Text='Put the tweaks back when the game closes' FontSize='12.5' VerticalAlignment='Center'/>
+                <ToggleButton x:Name='AutoBack' Grid.Column='1' Style='{DynamicResource Switch}' Width='34' Height='18' VerticalAlignment='Center'/>
+              </Grid>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+        <Border Style='{DynamicResource Zd.Card}' Padding='14,12' Margin='0,0,0,18'><StackPanel x:Name='TweakList'/></Border>
+      </StackPanel>
+      <StackPanel x:Name='TabChecks' Visibility='Collapsed'>
+        <TextBlock Text='Checks, tests and guides for this game. They look and explain; switches are under its Tweaks tab.' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,0,0,10'/>
+        <WrapPanel x:Name='ToolChips' Margin='0,0,0,6'/>
+        <Border Style='{DynamicResource Zd.Card}' Padding='14,12' Margin='0,0,0,18'><StackPanel x:Name='ToolList'/></Border>
+      </StackPanel>
+      <StackPanel x:Name='TabTrends' Visibility='Collapsed'>
+        <StackPanel x:Name='Stats'/>
+      </StackPanel>
+  </StackPanel>
 </Grid>
 "@)
     $h = @{ Root = $root }
     foreach ($n in 'Library', 'Tiles', 'MoreHead', 'MoreSub', 'MoreTiles', 'ServerCard', 'Detail', 'Back', 'Hero', 'HeroGlyph', 'HeroLogo', 'HeroTitle', 'GmChip', 'GmChipText', 'RunText', 'ServerBtn', 'ServerText', 'ServerPop', 'ServerList', 'ServerHint',
-                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats', 'AutoChip', 'AutoGm', 'AutoGmText', 'AutoCard', 'AutoSum', 'AutoTw', 'AutoOpts', 'AutoLater', 'AutoBack', 'PresetChips', 'PresetNote') { $h[$n] = $root.FindName($n) }
+                   'PingVal', 'LossVal', 'JitVal', 'Route', 'RouteNote', 'Play', 'PlayText', 'PlayNote', 'ToolChips', 'ToolList', 'Stats', 'AutoChip', 'AutoGm', 'AutoGmText', 'AutoCard', 'AutoSum', 'AutoTw', 'AutoOpts', 'AutoLater', 'AutoBack', 'PresetChips', 'PresetNote',
+                   'HeroSub', 'HeroAc', 'StopGm', 'Strip', 'StripStats', 'StripEmpty', 'StripWhen', 'StripLen', 'Tabs', 'TabRoute', 'TabTweaks', 'TabChecks', 'TabTrends', 'TweakList') { $h[$n] = $root.FindName($n) }
     $script:GamesUi = $h
+    # 2.1 tabs under the stats strip: each one shows one of the page's sections (Update-GameTabs)
+    $h.TabBtns = @{}
+    foreach ($tn in $GameTabNames) {
+        $tb = [ZdTheme]::Parse(@"
+<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Button.Ghost}' Padding='0' MinHeight='0' Margin='0,0,26,0' AutomationProperties.Name='$tn'>
+  <StackPanel>
+    <TextBlock Text='$tn' FontSize='14' Margin='2,6,2,10'/>
+    <Border Height='2' CornerRadius='1' Background='{DynamicResource AccentFill}' Visibility='Hidden'/>
+  </StackPanel>
+</Button>
+"@)
+        $tb.Tag = $tn
+        $tb.Add_Click({ param($s, $e) $script:GameTab = $s.Tag; Update-GameTabs })
+        [void]$h.Tabs.Children.Add($tb); $h.TabBtns[$tn] = $tb
+    }
+    if (-not $script:GameTab) { $script:GameTab = 'Route' }
+    $h.Strip.Add_MouseLeftButtonUp({ if ($script:GamesUi.StripReport) { Select-NavPage 'Matches' } })
+    $h.StopGm.Add_Click({
+        $window.Cursor = [Windows.Input.Cursors]::Wait
+        try { $msg = Disable-ZDGameMode; Suspend-GameModeAuto; Show-Toast "$msg".Trim() '#30D158' } catch { Show-Toast $_.Exception.Message '#FF9F0A' }
+        $window.Cursor = $null
+        Update-GameModeUi; Update-GameDetail
+    })
+    Write-StartupMark 'games page: layout parsed'
     Initialize-GameAutoUi $h
+    Write-StartupMark 'games page: auto Game Mode UI'
+    $gsw = [Diagnostics.Stopwatch]::StartNew(); $gInst = 0.0; $gParse = 0.0
     foreach ($g in $GameDefs) {
+        $t0 = $gsw.Elapsed.TotalMilliseconds
         $tile = New-GameTile $g
+        $gParse += $gsw.Elapsed.TotalMilliseconds - $t0
         if ($tile.Tag.InstalledNow) { [void]$h.Tiles.Children.Add($tile) } else { [void]$h.MoreTiles.Children.Add($tile) }
     }
+    if ($Snapshot) { [Console]::WriteLine(('STARTUP games page: {0} tiles in {1:N0} ms' -f @($GameDefs).Count, $gParse)) }
     if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
-    Start-GameArtFetch
+    Write-StartupMark 'games page: tiles added'
+    # pictures are queued once the page is on screen: handing the first job to the worker can take a moment
+    if ($Snapshot -and -not $env:ZD_PCMATRIX) { Start-GameImageFetch $GameDefs; Start-GameArtFetch }
+    else { [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ContextIdle, [Action]{ Start-GameImageFetch $GameDefs; Start-GameArtFetch; Write-StartupMark 'games page: image fetch started' }) }
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
         $n = [ZdTheme]::Parse(@"
@@ -22539,7 +24594,7 @@ function New-GamesPage {
         $script:GamesTimer.Add_Tick({ try { Update-GameDetailTick } catch { $script:GamesTimer.Stop(); Stop-RouteMonitor; Write-CrashLog $_.Exception 'game page' } })
         $script:GamesTimer.Start()
     }
-    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail; Update-GameStats } }
+    $script:PageRefresh['Games'] = { if ($script:GameSel) { $ui.PageTitle.Text = $script:GameSel.Title; Update-GameDetail; Update-GameStats; Update-GameTabs } }
     if ($env:ZD_GAME) { $g0 = $GameDefs | Where-Object { $_.Id -eq $env:ZD_GAME } | Select-Object -First 1; if ($g0) { Show-GameDetail $g0 } }
     New-PageScroll $root
 }
@@ -22552,13 +24607,16 @@ function Show-GameDetail($g) {
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.From)), 0))
     $grad.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($g.To)), 1))
     $h.HeroTitle.Text = $g.Title; $h.HeroGlyph.Text = [string]$g.Glyph
+    $h.HeroSub.Text = "$($g.Sub)"; $h.HeroAc.Text = Get-GameAcNote $g
     $art = Get-GameArt $g 'header'
     if ($art) {
         $ib = New-Object Windows.Media.ImageBrush $art; $ib.Stretch = 'UniformToFill'; $ib.AlignmentY = 'Top'
         $h.Hero.Background = $ib; $h.HeroGlyph.Visibility = 'Collapsed'
     } else { $h.Hero.Background = $grad; $h.HeroGlyph.Visibility = 'Visible' }
-    $logo = Get-GameLogo $g
-    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible' } else { $h.HeroLogo.Visibility = 'Collapsed' }
+    $h.HeroLogo.Visibility = 'Collapsed'
+    if (-not (Test-GameLogoKnown $g)) { Start-GameImageFetch @($g) }   # fills the hero logo in when it is read
+    $logo = Get-GameLogoCached $g
+    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible' }
     $h.Nodes[0].Children[1].Text = 'This PC'; $h.Nodes[1].Children[1].Text = 'Your router'; $h.Nodes[2].Children[1].Text = 'Internet provider'
     # server list: automatic first, then every server by region
     $h.ServerList.Children.Clear()
@@ -22589,6 +24647,7 @@ function Show-GameDetail($g) {
     Update-GameAutoUi
     Update-GameDetail
     Update-GameStats
+    Update-GameTabs
     if ($script:Anim) { Show-Animated $h.Detail 12 260 }
 }
 function Hide-GameDetail {
@@ -22617,6 +24676,7 @@ function Update-GameDetail {
     $gm = Test-ZDGameMode
     $h.GmChipText.Text = Get-GameModeChipText $g
     $h.GmChip.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($gm) { 'Good.Soft' } else { 'Bg.Raised' }))
+    $h.StopGm.Visibility = if ($gm) { 'Visible' } else { 'Collapsed' }
     $inst = try { [bool](& $g.Installed) } catch { $false }
     $h.Play.IsEnabled = $inst   # the 2.0 button dims itself when disabled
     $p = if ($inst) { Get-Process $g.Proc -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
@@ -22685,55 +24745,150 @@ function Update-GameTools {
     $listed = @($g.Tools | ForEach-Object { $_.Id })
     $auto = @($Tweaks | Where-Object { $gcat -and $_.Cat -eq $gcat -and $_.Toggle -and $listed -notcontains $_.Id } | ForEach-Object { @{ Id = $_.Id; Kind = 'Settings' } })
     $all = @(@($g.Tools | Where-Object { $_.Kind -eq 'Settings' }) + $auto + @($g.Tools | Where-Object { $_.Kind -ne 'Settings' }))
-    $kinds = @('All') + @($all | ForEach-Object { $_.Kind } | Select-Object -Unique | Sort-Object { @('Settings', 'Network', 'FPS', 'Repair').IndexOf($_) })
+    # 2.1: switches go to the "Tweaks for <game>" tab; checks, tests and guides to the Checks tab with the filter chips
+    $sw = New-Object Collections.ArrayList; $ck = New-Object Collections.ArrayList
+    foreach ($tool in $all) {
+        $t = $Tweaks | Where-Object { $_.Id -eq $tool.Id } | Select-Object -First 1
+        if (-not $t -or ($inst -and $t.Hidden)) { continue }
+        if ($t.Toggle) { [void]$sw.Add($t) } else { [void]$ck.Add(@{ T = $t; Kind = $tool.Kind }) }
+    }
+    $kinds = @('All') + @($ck | ForEach-Object { $_.Kind } | Select-Object -Unique | Sort-Object { @('Settings', 'Network', 'FPS', 'Repair').IndexOf($_) })
     if ($kinds -notcontains $script:GameToolKind) { $script:GameToolKind = 'All' }
     $h.ToolChips.Children.Clear()
     foreach ($k in $kinds) {
-        $c = [ZdTheme]::Parse("<Button xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Btn}' Content='$k' Padding='12,5' Margin='0,0,6,6' FontSize='12'/>")
-        $c.Tag = $k; $c.Add_Click({ param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools })
-        $c.Background = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0071E3' } else { '#15181D' }); $c.Foreground = ConvertTo-Brush $(if ($k -eq $script:GameToolKind) { '#0A0B0C' } else { '#9AA3AF' })
-        [void]$h.ToolChips.Children.Add($c)
+        [void]$h.ToolChips.Children.Add((New-Chip $k ($k -eq $script:GameToolKind) { param($s, $e) $script:GameToolKind = $s.Tag; Update-GameTools } $k))
     }
-    $h.ToolList.Children.Clear()
+    $h.ToolChips.Visibility = if ($kinds.Count -gt 2) { 'Visible' } else { 'Collapsed' }
+    $h.TweakList.Children.Clear(); $h.ToolList.Children.Clear()
+    $note = {
+        param($panel, [string]$text)
+        $tb = New-Object Windows.Controls.TextBlock; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 12.5; $tb.Margin = '8,4,8,8'; $tb.Text = $text
+        $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+        [void]$panel.Children.Add($tb)
+    }
     if (-not $inst) {
-        $tb = New-Object Windows.Controls.TextBlock; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 12; $tb.Margin = '0,0,0,10'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'
-        $tb.Text = "$($g.Title) is not installed on this PC. This is what ZeroDelay offers for it once it is:"
-        [void]$h.ToolList.Children.Add($tb)
+        foreach ($p in @($h.TweakList, $h.ToolList)) { & $note $p "$($g.Title) is not installed on this PC. This is what ZeroDelay offers for it once it is:" }
     }
-    foreach ($tool in $all) {
-        if ($script:GameToolKind -ne 'All' -and $tool.Kind -ne $script:GameToolKind) { continue }
-        $t = $Tweaks | Where-Object { $_.Id -eq $tool.Id } | Select-Object -First 1
-        if (-not $t -or ($inst -and $t.Hidden)) { continue }
-        $desc = "$($t.Desc)"; if ($desc.Length -gt 90) { $desc = $desc.Substring(0, 87).TrimEnd() + '...' }
-        $isSwitch = [bool]$t.Toggle
-        $right = if ($isSwitch) { "<ToggleButton x:Name='Sw' Grid.Column='2' Style='{DynamicResource Switch}' VerticalAlignment='Center' Margin='6,0,0,0'/>" } else { "<TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='11' Foreground='#98989D' VerticalAlignment='Center'/>" }
-        $tag = if ($isSwitch) { 'Border' } else { 'Button' }
-        $row = [ZdTheme]::Parse(@"
+    foreach ($t in $sw) { [void]$h.TweakList.Children.Add((New-GameToolRow $t $inst)) }
+    if (-not $sw.Count) { & $note $h.TweakList "No switches for $($g.Title) yet. Its checks and guides are under Checks." }
+    $shown = 0
+    foreach ($c in $ck) {
+        if ($script:GameToolKind -ne 'All' -and $c.Kind -ne $script:GameToolKind) { continue }
+        [void]$h.ToolList.Children.Add((New-GameToolRow $c.T $inst)); $shown++
+    }
+    if (-not $shown) { & $note $h.ToolList 'Nothing of this kind for this game yet.' }
+    $h.TweakCount = $sw.Count
+    Update-GameTabs
+}
+# one row in the Tweaks or Checks tab of a game page: a switch, or a button that runs the check or opens the guide
+function New-GameToolRow($t, [bool]$inst) {
+    $desc = "$($t.Desc)"; if ($desc.Length -gt 90) { $desc = $desc.Substring(0, 87).TrimEnd() + '...' }
+    $isSwitch = [bool]$t.Toggle
+    $right = if ($isSwitch) { "<ToggleButton x:Name='Sw' Grid.Column='2' Style='{DynamicResource Switch}' VerticalAlignment='Center' Margin='6,0,0,0' AutomationProperties.Name='$(Esc $t.Title)'/>" } else { "<TextBlock Grid.Column='2' Text='&#xE76C;' FontFamily='{DynamicResource Font.Icons}' FontSize='11' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>" }
+    $tag = if ($isSwitch) { 'Border' } else { 'Button' }
+    $row = [ZdTheme]::Parse(@"
 <$tag xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' $(if ($isSwitch) { "Background='Transparent' Padding='8,8' CornerRadius='10'" } else { "Style='{DynamicResource Btn}' Background='Transparent' HorizontalContentAlignment='Stretch' Padding='8,8'" }) Margin='0,0,0,2'>
   <Grid>
     <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-    <Border Width='32' Height='32' CornerRadius='9' Background='#2C2C2E' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$t.Icon)' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='14' Foreground='#0A84FF' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
+    <Border Width='32' Height='32' CornerRadius='9' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Top'><TextBlock Text='$('&#x{0:X};' -f [int][char]$t.Icon)' FontFamily='{DynamicResource Font.Icons}' FontSize='14' Foreground='{DynamicResource Accent}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
     <StackPanel Grid.Column='1' Margin='10,0,6,0'>
-      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' TextWrapping='Wrap'/>
-      <TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='#A1A1A6' TextWrapping='Wrap' Margin='0,2,0,0'/>
+      <TextBlock Text='$(Esc $t.Title)' FontSize='13' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextWrapping='Wrap'/>
+      <TextBlock Text='$(Esc $desc)' FontSize='11.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,2,0,0'/>
     </StackPanel>
     $right
   </Grid>
 </$tag>
 "@)
-        if ($isSwitch) {
-            $sw = $row.FindName('Sw'); $sw.Tag = $t
-            $sw.IsChecked = [bool]$t.State; $sw.IsEnabled = $inst -and $null -ne $t.State
-            $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools; Update-PresetChips })
-        } else {
-            $row.Tag = $t
-            $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
-            $row.IsEnabled = $inst
-        }
-        if (-not $inst) { $row.Opacity = 0.55 }
-        [void]$h.ToolList.Children.Add($row)
+    if ($isSwitch) {
+        $sw = $row.FindName('Sw'); $sw.Tag = $t
+        $sw.IsChecked = [bool]$t.State; $sw.IsEnabled = $inst -and $null -ne $t.State
+        $sw.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked); Update-GameTools; Update-PresetChips })
+    } else {
+        $row.Tag = $t
+        $row.Add_Click({ param($s, $e) $window.Cursor = [Windows.Input.Cursors]::Wait; try { Invoke-Action $s.Tag $s } finally { $window.Cursor = $null } })
+        $row.IsEnabled = $inst
     }
-    if ($h.ToolList.Children.Count -eq [int](-not $inst)) { $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Nothing of this kind for this game yet.'; $tb.Foreground = ConvertTo-Brush '#A1A1A6'; $tb.FontSize = 12; [void]$h.ToolList.Children.Add($tb) }
+    if (-not $inst) { $row.Opacity = 0.55 }
+    $row
+}
+# --- 2.1 game page: tabs, anti-cheat note and the stats strip
+$GameTabNames = @('Route', 'Tweaks', 'Checks', 'Trends')
+# anti-cheat per game, where the tweak code names it (the rest get the general note)
+$GameAntiCheat = @{ fortnite = 'Easy Anti-Cheat'; rematch = 'Easy Anti-Cheat'; rocketleague = 'Easy Anti-Cheat'; apex = 'Easy Anti-Cheat'; thefinals = 'Easy Anti-Cheat'
+                    cs2 = 'VAC'; valorant = 'Vanguard'; cod = 'Ricochet'; bf6 = 'EA Javelin'; roblox = 'Hyperion' }
+function Get-GameAcNote($g) {
+    $what = 'ZeroDelay changes Windows, the graphics driver and settings files, never the game''s program or its memory.'
+    $ac = $GameAntiCheat[$g.Id]
+    if ($ac) { "Works beside ${ac}: $what" } else { "Anti-cheat: $what" }
+}
+# shows the picked tab's section; selected = primary text over the accent line, the others secondary
+function Update-GameTabs {
+    $g = $script:GameSel; $h = $script:GamesUi; if (-not $g -or -not $h -or -not $h.TabBtns) { return }
+    if ($GameTabNames -notcontains $script:GameTab) { $script:GameTab = 'Route' }
+    foreach ($tn in $GameTabNames) {
+        $b = $h.TabBtns[$tn]; $on = $tn -eq $script:GameTab
+        $label = if ($tn -eq 'Tweaks') { "Tweaks for $($g.Title) ($([int]$h.TweakCount))" } else { $tn }
+        $txt = $b.Content.Children[0]; $txt.Text = $label
+        [Windows.Automation.AutomationProperties]::SetName($b, $label)
+        $txt.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($on) { 'Text.Primary' } else { 'Text.Secondary' }))
+        $txt.FontWeight = if ($on) { 'SemiBold' } else { 'Medium' }
+        $b.Content.Children[1].Visibility = if ($on) { 'Visible' } else { 'Hidden' }
+        $h["Tab$tn"].Visibility = if ($on) { 'Visible' } else { 'Collapsed' }
+    }
+}
+# one number in the stats strip: mono value, small unit, label under it; $Key = the colour token
+function New-GameStripStat([string]$Label, [string]$Text, [string]$Unit, [string]$Key) {
+    $sp = [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,2,36,2' AutomationProperties.Name='$(Esc "$Label $Text $Unit")'>
+  <StackPanel Orientation='Horizontal'>
+    <TextBlock Text='$(Esc $Text)' FontFamily='{DynamicResource Font.Mono}' FontSize='22' FontWeight='SemiBold' Typography.NumeralAlignment='Tabular'/>
+    <TextBlock Text='$(Esc $Unit)' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='3,0,0,4'/>
+  </StackPanel>
+  <TextBlock Text='$(Esc $Label)' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' Margin='0,1,0,0'/>
+</StackPanel>
+"@)
+    $sp.Children[0].Children[0].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $Key)
+    $sp
+}
+# the strip under the hero: the newest match report of this game ($r; $null = none yet, or still reading with $Loading)
+function Update-GameStrip($r, [bool]$Loading) {
+    $h = $script:GamesUi; if (-not $h -or -not $h.Strip) { return }
+    $h.StripStats.Children.Clear(); $h.StripWhen.Text = ''; $h.StripLen.Text = ''; $h.StripReport = $r
+    if (-not $r) {
+        $h.StripStats.Visibility = 'Collapsed'; $h.StripEmpty.Visibility = 'Visible'
+        $h.StripEmpty.Text = if ($Loading) { 'Reading your last match...' } else { 'Play a match with ZeroDelay open and your numbers show up here.' }
+        $h.Strip.Cursor = $null; $h.Strip.ToolTip = $null
+        return
+    }
+    $h.StripStats.Visibility = 'Visible'; $h.StripEmpty.Visibility = 'Collapsed'
+    $h.Strip.Cursor = [Windows.Input.Cursors]::Hand; $h.Strip.ToolTip = 'Open the match reports'
+    $avg = if ($r.Fps) { ConvertTo-StatNumber $r.Fps.Avg } else { $null }
+    $low = if ($r.Fps) { ConvertTo-StatNumber $r.Fps.Low1 } else { $null }
+    $ping = ConvertTo-StatNumber $r.PingAvg; $loss = ConvertTo-StatNumber $r.LossPct
+    $mins = ConvertTo-StatNumber $r.Minutes; $sc = ConvertTo-StatNumber $r.StutterCount
+    $spm = if ($null -ne $sc -and $mins -gt 0) { $sc / $mins } else { $null }
+    $keys = @{ good = 'Good'; warn = 'Warn'; bad = 'Bad' }
+    $items = @(
+        @{ L = 'Avg FPS'; V = $avg; F = '{0:0}'; U = ''; S = 'idle' }
+        @{ L = '1% low'; V = $low; F = '{0:0}'; U = ''; S = (Get-MatchMetricState 'low1' $low $avg) }
+        @{ L = $(if ($r.PingRegion) { "Ping · $($r.PingRegion)" } else { 'Ping' }); V = $ping; F = '{0:0}'; U = 'ms'; S = (Get-MatchMetricState 'ping' $ping) }
+        @{ L = 'Packet loss'; V = $loss; F = '{0:0.#}'; U = '%'; S = (Get-MatchMetricState 'loss' $loss) }
+        @{ L = 'Stutters'; V = $spm; F = '{0:0.#}'; U = '/min'; S = (Get-MatchMetricState 'stut' $spm) }
+    )
+    foreach ($m in $items) {
+        $txt = if ($null -eq $m.V) { '-' } else { $m.F -f $m.V }
+        $key = if ($null -eq $m.V) { 'Text.Muted' } elseif ($keys.ContainsKey($m.S)) { $keys[$m.S] } else { 'Text.Primary' }
+        [void]$h.StripStats.Children.Add((New-GameStripStat $m.L $txt $(if ($null -eq $m.V) { '' } else { $m.U }) $key))
+    }
+    $end = $null
+    try { if ($r.End) { $end = [datetime]$r.End } elseif ($r.Start) { $end = ([datetime]$r.Start).AddMinutes([double]$mins) } } catch { $end = $null }
+    if ($end) {
+        $ago = (Get-Date) - $end
+        $h.StripWhen.Text = if ($ago.TotalMinutes -lt 1) { 'just now' } elseif ($ago.TotalMinutes -lt 60) { "$([int][Math]::Floor($ago.TotalMinutes)) min ago" }
+            elseif ($ago.TotalHours -lt 24) { "$([int][Math]::Floor($ago.TotalHours)) h ago" } elseif ($ago.TotalDays -lt 2) { 'yesterday' }
+            elseif ($ago.TotalDays -lt 7) { "$([int][Math]::Floor($ago.TotalDays)) days ago" } else { $end.ToString('d MMM') }
+    }
+    $h.StripLen.Text = if ($mins) { "last match · $([int]$mins) min" } else { 'last match' }
 }
 
 # --- Boost page: how much of the recommended setup is on, the parts of the PC it covers, Boost now and Restore
@@ -22858,14 +25013,32 @@ function Update-StatusStrip([bool]$Paused) {
     $ui.StripItems.Opacity = if ($Paused) { 0.5 } else { 1 }
 }
 function New-HomePage {
-    # 2.0 Home: "how did my last matches feel, and am I set up right?"
-    # 1. last matches strip  2. setup score hero  3. heads-up banners  4. live tiles
+    # 2.1 Home: proof first (Razer Cortex's after-session report): the last match with how it compares to your usual,
+    # and when it stuttered. Then the setup score with presets, recent changes with Undo, earlier matches, live tiles.
     $root = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' MaxWidth='1060' HorizontalAlignment='Left'>
+  <Border x:Name='Last' Style='{DynamicResource Zd.Card}' CornerRadius='14' Padding='22,18' Margin='0,0,12,16' Cursor='Hand' Visibility='Collapsed' AutomationProperties.Name='Last match'>
+    <Grid>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <StackPanel Orientation='Horizontal'>
+          <TextBlock Text='LAST MATCH' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
+          <TextBlock x:Name='LastSub' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='12,0,0,0'/>
+        </StackPanel>
+        <UniformGrid x:Name='LastStats' Columns='4' Margin='0,14,0,0'/>
+        <TextBlock x:Name='LastVerdict' FontSize='12.5' Foreground='{DynamicResource Text.Secondary}' TextWrapping='Wrap' Margin='0,12,0,0'/>
+      </StackPanel>
+      <StackPanel Grid.Column='1' Width='330' Margin='24,0,0,0'>
+        <TextBlock Text='STUTTERS DURING THE MATCH' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}'/>
+        <Canvas x:Name='StutCanvas' Width='330' Height='78' Margin='0,10,0,0' ClipToBounds='True'/>
+        <TextBlock x:Name='StutNote' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='0,6,0,0'/>
+      </StackPanel>
+    </Grid>
+  </Border>
   <Grid Margin='0,0,12,12'>
     <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
     <StackPanel>
-      <TextBlock Text='Your last matches' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
+      <TextBlock x:Name='ResHead' Text='Earlier matches' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'/>
       <TextBlock x:Name='ResSub' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,0,0' TextWrapping='Wrap'/>
     </StackPanel>
     <Button x:Name='ResOpen' Grid.Column='1' Style='{DynamicResource Zd.Button.Ghost}' Content='All match reports' VerticalAlignment='Bottom'/>
@@ -22886,7 +25059,10 @@ function New-HomePage {
     </Grid>
   </Border>
 
-  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24' Margin='0,0,12,16'>
+  <Grid x:Name='SetupRow' Margin='0,0,12,16'>
+  <Grid.ColumnDefinitions><ColumnDefinition x:Name='SetupColA' Width='*'/><ColumnDefinition x:Name='SetupGap' Width='0'/><ColumnDefinition x:Name='SetupColB' Width='0'/></Grid.ColumnDefinitions>
+  <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
+  <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
       <Grid Width='120' Height='120' VerticalAlignment='Top' Margin='0,0,24,0'>
@@ -22915,10 +25091,24 @@ function New-HomePage {
             <TextBlock Text='Game Mode by itself when Fortnite starts' FontSize='13' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='10,0,0,0'/>
           </StackPanel>
         </WrapPanel>
-        <WrapPanel x:Name='AreaChips' Margin='0,10,0,-6'/>
+        <StackPanel Orientation='Horizontal' Margin='0,6,0,0'>
+          <TextBlock Text='Preset' FontSize='12.5' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,0,10,0'/>
+          <Border Background='{DynamicResource Bg.Base}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' CornerRadius='10' Padding='3'><StackPanel x:Name='Presets' Orientation='Horizontal'/></Border>
+        </StackPanel>
+        <WrapPanel x:Name='AreaChips' Margin='0,14,0,-6'/>
       </StackPanel>
     </Grid>
   </Border>
+  <Border x:Name='RecentCard' Grid.Row='1' Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='20,18' Margin='0,16,0,0'>
+    <StackPanel>
+      <Grid Margin='0,0,0,8'>
+        <TextBlock Text='RECENT CHANGES' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
+        <Button x:Name='HistOpen' Content='History' Style='{DynamicResource Zd.Button.Ghost}' HorizontalAlignment='Right' MinHeight='28'/>
+      </Grid>
+      <StackPanel x:Name='Recent'/>
+    </StackPanel>
+  </Border>
+  </Grid>
 
   <Border x:Name='Warm' CornerRadius='12' Background='{DynamicResource Info.Soft}' BorderBrush='{DynamicResource Border.Subtle}' BorderThickness='1' Padding='16,12' Margin='0,0,12,16' Visibility='Collapsed'>
     <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
@@ -22936,7 +25126,26 @@ function New-HomePage {
 </StackPanel>
 "@)
     $h = @{}
-    foreach ($n in 'ResSub', 'ResOpen', 'Matches', 'MatchScroll', 'NoMatches', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'AreaChips', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk') { $h[$n] = $root.FindName($n) }
+    foreach ($n in 'ResSub', 'ResOpen', 'Matches', 'MatchScroll', 'NoMatches', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'AreaChips', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk',
+                 'Last', 'LastSub', 'LastStats', 'LastVerdict', 'StutCanvas', 'StutNote', 'ResHead', 'Presets', 'Recent', 'HistOpen',
+                 'SetupRow', 'SetupColA', 'SetupGap', 'SetupColB', 'RecentCard') { $h[$n] = $root.FindName($n) }
+    # recent changes sit beside the setup card when the page is wide enough, under it otherwise
+    $h.SetupRow.Add_SizeChanged({ param($s, $e)
+        $u = $script:HomeUi; $wide = $s.ActualWidth -ge 1000
+        $u.SetupColA.Width = New-Object Windows.GridLength $(if ($wide) { 1.4 } else { 1 }), 'Star'
+        $u.SetupGap.Width = New-Object Windows.GridLength $(if ($wide) { 16 } else { 0 })
+        $u.SetupColB.Width = if ($wide) { New-Object Windows.GridLength 1, 'Star' } else { New-Object Windows.GridLength 0 }
+        [Windows.Controls.Grid]::SetRow($u.RecentCard, $(if ($wide) { 0 } else { 1 })); [Windows.Controls.Grid]::SetColumn($u.RecentCard, $(if ($wide) { 2 } else { 0 }))
+        $u.RecentCard.Margin = if ($wide) { '0' } else { '0,16,0,0' }
+    })
+    $h.Last.Add_MouseLeftButtonUp({ Select-NavPage 'Matches' })
+    $h.HistOpen.Add_Click({ Select-NavPage 'History' })
+    # presets (NVIDIA / AMD style): each opens Boost now with exactly that set of tweaks that are still off
+    foreach ($pz in @(@('Safe', 'Only tweaks marked Safe: recommended for most PCs.'), @('Competitive', 'Safe plus Moderate tweaks that lower input delay.'), @('Max', 'Every input-delay tweak, Advanced ones too. Read each one.'))) {
+        $b = New-Segment $pz[0] $false { param($s, $e) $list = @(Get-PresetTweaks $s.Tag); if ($list.Count) { Show-OptimizeChooser $list } else { Show-Toast "Everything in $($s.Tag) is already on." '#30D158' } } $pz[0]
+        $b.ToolTip = $pz[1]
+        [void]$h.Presets.Children.Add($b)
+    }
     $h.WarmOk.Add_Click({ $script:Backup.Custom.Remove('shaderwarm'); Save-Backup; Hide-Animated $script:HomeUi.Warm 200 })
     $script:HomeUi = $h
     $h.Go.Add_Click({ $ui.ApplyRec.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Primitives.ButtonBase]::ClickEvent))) })
@@ -23037,30 +25246,53 @@ function New-MatchCard($r) {
     $card
 }
 
+# Home is rebuilt after every change and every settings refresh (it reads the newest match reports from disk and
+# builds their cards): only while it is on screen. Otherwise it is marked stale and refreshed when it is shown
+# (PageRefresh when the page opens, the search timer when a search over it is cleared).
+function Request-HomeUpdate {
+    if (-not $script:HomeUi) { return }
+    if ($script:CurrentCat -and $script:CurrentCat.Page -eq 'Home' -and -not "$($ui.Search.Text)".Trim()) { Update-HomePage } else { $script:HomeStale = $true }
+}
 function Update-HomePage {
     $h = $script:HomeUi; if (-not $h) { return }
+    $script:HomeStale = $false
     $w = $script:Backup.Custom['shaderwarm']
     if ($w -and [int]$w.Left -gt 0) {
         $h.WarmTitle.Text = "$((Get-Culture).TextInfo.ToTitleCase("$($w.Why)".Substring(0, 1)) + "$($w.Why)".Substring(1)): expect a little stutter at first"
         $h.WarmText.Text = "Fortnite rebuilds its shaders after a game or driver update, so your next $([int]$w.Left) match$(if ([int]$w.Left -ne 1) { 'es' }) may hitch. Play a warm-up match before a cup or a benchmark; it settles by itself."
         $h.Warm.Visibility = 'Visible'
     } else { $h.Warm.Visibility = 'Collapsed' }
-    # last matches: one card each, newest first (up to 5)
-    $reps = @(Get-GameReports 'fortnite' | Select-Object -First 5)
+    # 2.1: the newest report of any game, compared with the ones before it of the same game
+    $game = 'fortnite'
+    $newest = if ($Snapshot -and $env:ZD_FAKE_MATCH) { $null } elseif (Test-Path $MatchDir) { Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -First 1 } else { $null }
+    if ($newest) { $game = Get-ReportFileGame $newest.Name }
+    $all = @(Get-GameReports $game | Select-Object -First 6)
+    Update-LastMatchCard $all $game
+    Update-RecentChanges
+    # earlier matches: one card each, newest first (up to 5)
+    $reps = @($all | Select-Object -Skip 1 -First 5)
     $h.Matches.Children.Clear()
     foreach ($r in $reps) { try { [void]$h.Matches.Children.Add((New-MatchCard $r)) } catch { Write-CrashLog $_.Exception 'home match card' } }
     $h.MatchScroll.Visibility = if ($reps.Count) { 'Visible' } else { 'Collapsed' }
     $h.NoMatches.Visibility = if ($reps.Count) { 'Collapsed' } else { 'Visible' }
-    $h.ResSub.Text = if ($reps.Count) { "Your last $($reps.Count) Fortnite match$(if ($reps.Count -ne 1) { 'es' }), newest first. Measured in the game, not estimated." } else { '' }
+    $h.ResSub.Text = if ($reps.Count) { "Your $($reps.Count) $(Get-SessionWord $game $reps.Count) of $(if ($game -eq 'fortnite') { 'Fortnite' } else { Get-GameTitle $game }) before that, newest first. Measured in the game, not estimated." } else { '' }
+    $h.ResHead.Text = 'Earlier matches'
+    if ($all.Count -and -not $reps.Count) { $h.NoMatches.Visibility = 'Collapsed'; $h.ResHead.Visibility = 'Collapsed'; $h.ResOpen.Visibility = 'Collapsed' } else { $h.ResHead.Visibility = 'Visible'; $h.ResOpen.Visibility = 'Visible' }
     # score: the share of recommended tweaks that are on (not an FPS promise)
     $rec = @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and $null -ne $_.State -and -not $_.Hidden })
     $on = @($rec | Where-Object { $_.State }).Count
     $left = $rec.Count - $on
     $pct = if ($rec.Count) { [int][Math]::Round(100 * $on / $rec.Count) } else { 100 }
-    Start-CountUp $h.Pct $pct '' 900
+    if ($rec.Count) { Start-CountUp $h.Pct $pct '' 900 }
     $circ = [Math]::PI * (120 - 10) / 10
     $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(($circ * $pct / 100), 1000))
-    if ($left -gt 0) {
+    if (-not $rec.Count -and @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and -not $_.Hidden }).Count) {
+        # the settings are still being read: no score yet (an empty list would read as "100%, all set")
+        $h.Headline.Text = 'Checking your settings...'
+        $h.Sub.Text = 'ZeroDelay reads each recommended setting first. This takes a few seconds after it starts.'
+        $h.Go.IsEnabled = $false; $h.GoText.Text = 'Boost now'
+        $h.Pct.Text = '-'; $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(0, 1000))
+    } elseif ($left -gt 0) {
         $h.Headline.Text = "$pct% of recommended setup on"
         $h.Sub.Text = "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off. Boost now lists them and you choose; a restore point comes first, and Restore undoes everything."
         $h.Go.IsEnabled = $true; $h.GoText.Text = 'Boost now'
@@ -23093,11 +25325,121 @@ function Update-HomePage {
     } else { $sp.Children[3].Text = ''; $sp.Children[4].Text = 'see This PC'; $sp.Children[4].SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted') }
 }
 
+# 2.1 Home helpers ---------------------------------------------------------------------------------------------
+# the off tweaks a preset would switch on: Safe = risk Safe and recommended; Competitive = recommended, plus Moderate
+# input-delay tweaks; Max = every recommended or input-delay tweak, Advanced included
+function Get-PresetTweaks([string]$Name) {
+    @($Tweaks | Where-Object { $_.Toggle -and $_.State -eq $false -and -not $_.Hidden -and -not (Test-CheckCard $_) } | Where-Object {
+        $r = Get-TweakRisk $_
+        switch ($Name) {
+            'Safe' { $r -eq 'Safe' }
+            'Competitive' { $_.Rec -or ($_.Lat -and $r -ne 'Advanced') }
+            default { $_.Rec -or $_.Lat }
+        }
+    })
+}
+# one number on the last-match card, with how it compares to your usual (the average of the sessions before it)
+function New-LastStat([string]$Label, $Value, [string]$Fmt, [string]$Unit, $Usual, [bool]$LowerBetter) {
+    $txt = if ($null -ne $Value) { $Fmt -f [double]$Value } else { '-' }
+    $chip = ''; $tone = $null
+    if ($null -ne $Value -and $null -ne $Usual -and [double]$Usual -gt 0) {
+        $d = ([double]$Value - [double]$Usual) / [double]$Usual * 100
+        if ([Math]::Abs($d) -lt 3) { $chip = 'same as usual' }
+        else {
+            $better = if ($LowerBetter) { $d -lt 0 } else { $d -gt 0 }
+            $chip = ('{0}{1:0}% vs usual' -f $(if ($d -gt 0) { '+' } else { [char]0x2212 }), [Math]::Abs($d)); $tone = if ($better) { 'Good' } else { 'Warn' }
+        }
+    }
+    $chipX = if ($chip) { "<Border Style='{DynamicResource Zd.Chip}' HorizontalAlignment='Left' Margin='0,6,0,0'$(if ($tone) { " Background='{DynamicResource $tone.Soft}'" })><TextBlock Text='$chip'$(if ($tone) { " Foreground='{DynamicResource $tone}'" })/></Border>" } else { '' }
+    [ZdTheme]::Parse(@"
+<StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,0,16,0'>
+  <TextBlock Text='$Label' FontSize='12' Foreground='{DynamicResource Text.Secondary}'/>
+  <StackPanel Orientation='Horizontal' Margin='0,2,0,0'>
+    <TextBlock Text='$txt' FontFamily='{DynamicResource Font.Mono}' FontSize='28' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' Typography.NumeralAlignment='Tabular'/>
+    <TextBlock Text='$Unit' FontSize='13' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Bottom' Margin='4,0,0,5'/>
+  </StackPanel>
+  $chipX
+</StackPanel>
+"@)
+}
+function Update-LastMatchCard($All, [string]$Game) {
+    $h = $script:HomeUi
+    if (-not @($All).Count) { $h.Last.Visibility = 'Collapsed'; return }
+    $r = $All[0]; $prev = @($All | Select-Object -Skip 1)
+    $num = { param($x) if ($null -eq $x) { $null } else { [double]$x } }
+    $avgOf = { param($sel) $v = @($prev | ForEach-Object { & $sel $_ } | Where-Object { $null -ne $_ }); if ($v.Count) { ($v | Measure-Object -Average).Average } else { $null } }
+    $stut = { param($x) if ($null -ne $x.StutterCount -and [double]$x.Minutes -gt 0) { [double]$x.StutterCount / [double]$x.Minutes } else { $null } }
+    $fpsA = { param($x) if ($x.Fps) { & $num $x.Fps.Avg } else { $null } }
+    $fpsL = { param($x) if ($x.Fps) { & $num $x.Fps.Low1 } else { $null } }
+    $ping = { param($x) & $num $x.PingAvg }
+    $h.LastStats.Children.Clear()
+    [void]$h.LastStats.Children.Add((New-LastStat 'Avg FPS' (& $fpsA $r) '{0:0}' '' (& $avgOf $fpsA) $false))
+    [void]$h.LastStats.Children.Add((New-LastStat '1% low' (& $fpsL $r) '{0:0}' '' (& $avgOf $fpsL) $false))
+    [void]$h.LastStats.Children.Add((New-LastStat 'Ping' (& $ping $r) '{0:0}' 'ms' (& $avgOf $ping) $true))
+    [void]$h.LastStats.Children.Add((New-LastStat 'Stutters' (& $stut $r) '{0:0.#}' '/min' (& $avgOf $stut) $true))
+    $start = [datetime]$r.Start
+    $ago = (Get-Date) - $start
+    $when = if ($ago.TotalMinutes -lt 60) { "$([int]$ago.TotalMinutes) min ago" } elseif ($start.Date -eq (Get-Date).Date) { "today $($start.ToString('HH:mm'))" } else { $start.ToString('ddd d MMM HH:mm') }
+    $h.LastSub.Text = "$(if ($Game -eq 'fortnite') { 'Fortnite' } else { Get-GameTitle $Game })  ·  $when  ·  $([int]$r.Minutes) min$(if ($r.Boosted) { '  ·  boosted' })"
+    $h.LastVerdict.Text = if ($prev.Count) { "Compared with your $($prev.Count) $(Get-SessionWord $Game $prev.Count) before it. Differences under 3% are noise. Click for the full report." } else { 'Your first report for this game: the next ones are compared with it. Click for the full report.' }
+    # stutters as bars over the length of the match: where they were and how long each froze (no invented curve)
+    $c = $h.StutCanvas; $c.Children.Clear()
+    $cw = 330; $ch = 78; $base = $ch - 14
+    $ln = New-Object Windows.Shapes.Line; $ln.X1 = 0; $ln.X2 = $cw; $ln.Y1 = $base; $ln.Y2 = $base; $ln.StrokeThickness = 1; $ln.SetResourceReference([Windows.Shapes.Shape]::StrokeProperty, 'Border.Subtle'); [void]$c.Children.Add($ln)
+    $end = [datetime]$r.End; $len = [Math]::Max(1, ($end - $start).TotalSeconds)
+    $st = @($r.Stutters)
+    foreach ($x in $st) {
+        try { $at = ([datetime]$x.At - $start).TotalSeconds } catch { continue }
+        $px = [Math]::Max(1, [Math]::Min($cw - 3, $cw * $at / $len))
+        $hh = [Math]::Min($base - 4, 8 + [double]$x.Ms / 4)
+        $b = New-Object Windows.Shapes.Rectangle; $b.Width = 3; $b.Height = $hh; $b.RadiusX = 1.5; $b.RadiusY = 1.5
+        $b.SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ([double]$x.Ms -ge 100) { 'Warn' } else { 'AccentFill' }))
+        $b.ToolTip = "$([int]$x.Ms) ms freeze$(if ($x.Busy) { " while $($x.Busy) was busy" })"
+        [Windows.Controls.Canvas]::SetLeft($b, $px - 1.5); [Windows.Controls.Canvas]::SetTop($b, $base - $hh); [void]$c.Children.Add($b)
+    }
+    foreach ($e in @(@(0, 'start'), @($cw, "$([int]$r.Minutes) min"))) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $e[1]; $tb.FontSize = 10.5; $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
+        [Windows.Controls.Canvas]::SetTop($tb, $base + 2); if ($e[0] -gt 0) { [Windows.Controls.Canvas]::SetRight($tb, 0) } else { [Windows.Controls.Canvas]::SetLeft($tb, 0) }
+        [void]$c.Children.Add($tb)
+    }
+    $h.StutNote.Text = if (-not $r.Fps) { 'Frame times were not recorded for this match.' } elseif (-not $st.Count) { 'No stutters: frame times stayed steady the whole match.' } else { "$($st.Count) freeze$(if ($st.Count -ne 1) { 's' }). Taller = longer; orange = 100 ms or more. Hover one to see what was busy." }
+    $h.Last.Visibility = 'Visible'
+}
+# the last few things ZeroDelay changed, with Undo where one click can take it back
+function Update-RecentChanges {
+    $h = $script:HomeUi; $h.Recent.Children.Clear()
+    $items = @(Get-History | Select-Object -First 4)
+    if (-not $items.Count) {
+        $tb = New-Object Windows.Controls.TextBlock; $tb.Text = 'Nothing changed yet. Everything ZeroDelay changes shows up here, and in History.'; $tb.TextWrapping = 'Wrap'; $tb.FontSize = 13
+        $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted'); [void]$h.Recent.Children.Add($tb); return
+    }
+    foreach ($it in $items) {
+        $t = if ($it.Id) { $Tweaks | Where-Object { $_.Id -eq $it.Id } | Select-Object -First 1 } else { $null }
+        $canUndo = $t -and $t.Toggle -and $it.Action -in 'on', 'off' -and $null -ne $t.State -and [bool]$t.State -eq ($it.Action -eq 'on') -and $it -eq ($items | Where-Object { $_.Id -eq $it.Id } | Select-Object -First 1)
+        $when = try { $d = [datetime]$it.Time; if ($d.Date -eq (Get-Date).Date) { $d.ToString('HH:mm') } else { $d.ToString('ddd') } } catch { '' }
+        $verb = switch ($it.Action) { 'on' { 'On: ' } 'off' { 'Off: ' } default { '' } }
+        $dot = switch ($it.Action) { 'on' { 'AccentFill' } 'off' { 'Text.Muted' } default { 'Info' } }
+        $row = [ZdTheme]::Parse(@"
+<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Margin='0,4,0,4' MinHeight='30'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+  <Ellipse Width='6' Height='6' Fill='{DynamicResource $dot}' VerticalAlignment='Center' Margin='0,0,10,0'/>
+  <TextBlock Grid.Column='1' Text='$(Esc ($verb + $it.Title))' FontSize='13' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis' VerticalAlignment='Center'/>
+  <TextBlock Grid.Column='2' Text='$when' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='10,0,8,0'/>
+  <Button x:Name='U' Grid.Column='3' Content='Undo' Style='{DynamicResource Zd.Button.Secondary}' MinHeight='28' Padding='10,0' FontSize='12' Visibility='$(if ($canUndo) { 'Visible' } else { 'Collapsed' })'/>
+</Grid>
+"@)
+        $u = $row.FindName('U'); $u.Tag = $t
+        $u.Add_Click({ param($s, $e) $tw = $s.Tag; Switch-Tweak $tw (-not [bool]$tw.State); Update-RecentChanges })
+        [void]$h.Recent.Children.Add($row)
+    }
+}
+
 # =============================================================== Navigation (1.17): six places in the menu
 # Home, Games, Tweaks, Checks, Tools and Settings. Every other page opens from inside those, and every tweak area is a
 # filter chip on the Tweaks page, so nothing is lost: Select-NavPage still takes any page or area name.
 $MainNav = @('Home', 'Games', 'Events', 'Tweaks', 'Checks', 'Tools', 'Settings')
 $CheckActions = @('Check', 'Test', 'Run test', 'Test ping')
+$CheckActions += @('Repair Windows', 'Fix updates', 'Test RAM')   # 2.1 tools: on the Checks page (Repairs, PC and Windows)
 # a card that only looks and reports (it changes nothing): these live on the Checks page
 function Test-CheckCard($t) { [bool]($t.Action -and $CheckActions -contains $t.Action) }
 # which menu item a page or area belongs to
@@ -23113,9 +25455,17 @@ function Get-NavParent([string]$Name) {
 }
 # the tweak areas shown as chips: every category that holds switches, in menu order
 function Get-TweakAreas {
+    # one pass over the cards (this ran a search through every card for each of ~40 areas, on every filter change)
+    $has = @{}
+    foreach ($t in $Tweaks) {
+        if ($t.Hidden -or ($t.Action -and $CheckActions -contains $t.Action)) { continue }
+        $has["$($t.Cat)"] = $true
+        if ($t.Potato) { $has['Potato'] = $true }
+        if ($t.Gtx) { $has['Gtx1080Ti'] = $true }
+    }
     @($Categories | Where-Object {
         -not $_.Page -and @('All', 'Latency', 'New', 'Tweaks', 'Checks') -notcontains $_.Name -and -not ($_.Requires -and -not (& $_.Requires))
-    } | Where-Object { $n = $_.Name; [bool]($Tweaks | Where-Object { -not (Test-CheckCard $_) -and -not $_.Hidden -and ($_.Cat -eq $n -or ($n -eq 'Potato' -and $_.Potato) -or ($n -eq 'Gtx1080Ti' -and $_.Gtx)) } | Select-Object -First 1) })
+    } | Where-Object { $has.ContainsKey("$($_.Name)") })
 }
 $CheckAreas = [ordered]@{
     'All' = $null
@@ -23167,6 +25517,12 @@ function New-Segment([string]$Label, [bool]$On, [scriptblock]$Click, $Tag) {
 }
 # the chip rows above the cards on Tweaks and Checks
 function Update-ChipBar {
+    # rebuilt only when what it shows changes (it runs on every filter change, and each chip is parsed from XAML)
+    $hid = New-Object Text.StringBuilder
+    if ($script:CurrentCat.Name -eq 'Tweaks') { foreach ($t in $Tweaks) { [void]$hid.Append($(if ($t.Hidden) { '1' } else { '0' })) } }
+    $key = "$($script:CurrentCat.Name)|$($script:TweakView)|$($script:TweakArea)|$($script:CheckArea)|$hid"
+    if ($key -eq $script:ChipBarKey -and ($ui.ChipAreas.Children.Count -or $ui.ChipViews.Children.Count)) { return }
+    $script:ChipBarKey = $key
     $ui.ChipViews.Children.Clear(); $ui.ChipAreas.Children.Clear()
     if ($script:CurrentCat.Name -eq 'Tweaks') {
         $ui.ChipViewsBox.Visibility = 'Visible'
@@ -23187,9 +25543,9 @@ function Update-ChipBar {
 }
 # the line under the title on Tweaks and Checks: what is shown and how to see more
 function Get-ViewNote {
-    $vis = @($Tweaks | Where-Object { $_.Card -and $_.Card.Visibility -eq 'Visible' -and -not $_.Header }).Count
+    $vis = 0; foreach ($t in $Tweaks) { if ($t.Card -and $t.Card.Visibility -eq 'Visible' -and -not $t.Header) { $vis++ } }
     if ($script:CurrentCat.Name -eq 'Tweaks') {
-        $all = @($Tweaks | Where-Object { -not (Test-CheckCard $_) -and -not $_.Hidden -and -not $_.Header }).Count
+        $all = 0; foreach ($t in $Tweaks) { if (-not ($t.Action -and $CheckActions -contains $t.Action) -and -not $t.Hidden -and -not $t.Header) { $all++ } }
         $what = switch ($script:TweakView) { 'Recommended' { 'the recommended and input-delay tweaks for this PC' } 'Latency' { 'the tweaks that change input delay, frame time or ping' } 'On' { 'what is switched on' } 'New' { 'the cards added in the latest versions' } default { 'every tweak' } }
         "Showing $vis of ${all}: $what$(if ($script:TweakArea -ne 'All') { " in $(($Categories | Where-Object { $_.Name -eq $script:TweakArea } | Select-Object -First 1).Title)" }). Tweaks change your PC; every one can be undone."
     } else {
@@ -23520,7 +25876,7 @@ function New-GameModePage {
         $script:GmPageTimer.Interval = [TimeSpan]::FromSeconds(1)
         $script:GmTick = 0
         $script:GmPageTimer.Add_Tick({
-            if ($script:CurrentCat.Name -ne 'GameMode' -or -not $window.IsVisible) { return }
+            if ($script:CurrentCat.Name -ne 'GameMode' -or -not $window.IsVisible -or $window.WindowState -eq 'Minimized') { return }   # minimized: nothing shown, nothing measured
             Update-GameModeClock
             $script:GmTick++
             if ($script:GmTick % 3 -eq 1 -and -not $script:GmStatBusy) {
@@ -25371,7 +27727,12 @@ $NvAppDir  = "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA App"
 $NvAppExe  = "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\CEF\NVIDIA App.exe"
 
 function Get-NvDriverInfo {
-    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' } | Select-Object -First 1
+    # Home reads this after every change: the WMI query (100 ms to seconds, more when WMI is busy) is asked once a minute
+    $c = $script:NvGpuRow
+    if ($c -and ((Get-Date) - $c.Time).TotalSeconds -lt 60) { $gpu = $c.Gpu } else {
+        $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' } | Select-Object -First 1
+        $script:NvGpuRow = @{ Time = Get-Date; Gpu = $gpu }
+    }
     if (-not $gpu) { return $null }
     $digits = ($gpu.DriverVersion -replace '\D', ''); $last = $digits.Substring([Math]::Max(0, $digits.Length - 5))
     $inst = '{0}.{1}' -f $last.Substring(0, 3), $last.Substring(3)
@@ -25667,6 +28028,7 @@ function New-PageScroll($content) {
 function ConvertTo-Brush([string]$c) { [ZdTheme]::Brush($c) }
 $script:CurrentCat = $Categories[0]
 function Update-Filter {
+    if ($script:SearchTimer) { $script:SearchTimer.Stop() }
     $q = $ui.Search.Text.Trim()
     $ui.SearchHint.Visibility = if ($q) { 'Collapsed' } else { 'Visible' }
     $ui.PageTitle.Text = if ($q) { "Results for `"$q`"" } else { $script:CurrentCat.Title }
@@ -25681,11 +28043,14 @@ function Update-Filter {
     $ui.ChipBar.Visibility = if ($chips) { 'Visible' } else { 'Collapsed' }
     if ($chips) { Update-ChipBar }
     if (-not $q -and $script:CurrentCat.Page) {
-        $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'; $ui.EmptyState.Visibility = 'Collapsed'
+        $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'; $ui.EmptyState.Visibility = 'Collapsed'; $ui.Detail.Visibility = 'Collapsed'
         $ui.PageHost.Content = Get-PageContent $script:CurrentCat.Page
         return
     }
     $ui.Scroller.Visibility = 'Visible'; $ui.PageHost.Visibility = 'Collapsed'
+    $det = $(if ($window.ActualWidth -gt 0) { $window.ActualWidth } else { $window.Width }) -ge 1180
+    $ui.Detail.Visibility = if ($det) { 'Visible' } else { 'Collapsed' }
+    $ui.Scroller.Margin = if ($det) { '0,0,340,0' } else { '0' }
     foreach ($t in $Tweaks) {
         $show = if ($q) { -not $t.Header -and ($t.Title -like "*$q*" -or $t.Desc -like "*$q*") }
                 elseif ($cn -eq 'Tweaks') { Test-TweakCardVisible $t }
@@ -25699,7 +28064,7 @@ function Update-Filter {
     }
     if ($chips) { $ui.LatencyNote.Text = Get-ViewNote; $ui.LatencyNote.Visibility = 'Visible' }
     # 2.0: result count, "Turn on all shown" (Tweaks only) and the empty state
-    $shown = @($Tweaks | Where-Object { $_.Card -and $_.Card.Visibility -eq 'Visible' -and -not $_.Header })
+    $shown = @(foreach ($t in $Tweaks) { if ($t.Card -and $t.Card.Visibility -eq 'Visible' -and -not $t.Header) { $t } })
     $noun = if ($cn -eq 'Checks' -and -not $q) { 'check' } else { 'card' }; if ($cn -eq 'Tweaks' -and -not $q) { $noun = 'tweak' }
     $ui.ResultCount.Text = "$($shown.Count) $noun$(if ($shown.Count -ne 1) { 's' })"
     $owned = @(Get-BoosterOwned)
@@ -25714,13 +28079,29 @@ function Update-Filter {
         $ui.ShowAllOn.Content = "Turn on all $($script:ShownOff.Count) shown"
         $ui.ShowAllOn.ToolTip = 'Opens Boost now with every card shown here that is off. You still see the list and choose before anything changes.'
     }
+    Update-GroupHeads ((-not $q) -and $cn -eq 'Tweaks')
+    if (-not $script:DetailTweak -or $script:DetailTweak.Card.Visibility -ne 'Visible') { $first = $shown | Where-Object { $_.Card.Visibility -eq 'Visible' } | Select-Object -First 1; if ($first) { Show-TweakDetail $first } }
     if (-not $shown.Count) {
         $ui.EmptyTitle.Text = if ($q) { "Nothing matches `"$q`"" } else { "No $($noun)s match these filters" }
         $ui.EmptyText.Text = if ($q) { 'Search looks at card titles and descriptions. Try a shorter word, or clear the search.' } elseif ($script:TweakView -eq 'On' -and $cn -eq 'Tweaks') { 'None of these are switched on yet.' } else { 'Try another area, or show everything.' }
         $ui.EmptyState.Visibility = 'Visible'
     } else { $ui.EmptyState.Visibility = 'Collapsed' }
 }
-$ui.Search.Add_TextChanged({ Update-Filter })
+# search: the list is filtered once typing pauses (150 ms) instead of on every key; anything else that calls
+# Update-Filter cancels the wait, so a page switch never filters twice
+$script:SearchTimer = New-Object Windows.Threading.DispatcherTimer
+$script:SearchTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+$script:SearchTimer.Add_Tick({
+    $script:SearchTimer.Stop(); Update-Filter
+    if ($script:HomeStale -and $script:CurrentCat.Page -eq 'Home' -and -not "$($ui.Search.Text)".Trim()) { Update-HomePage }
+})
+$ui.Search.Add_TextChanged({ $script:SearchTimer.Stop(); $script:SearchTimer.Start() })
+# 2.1: the details panel needs room; below 1180 px wide the list gets the whole width (re-checked when the window resizes)
+$window.Add_SizeChanged({
+    if (-not $script:CurrentCat -or $script:CurrentCat.Page) { return }
+    $want = if ($window.ActualWidth -ge 1180) { 'Visible' } else { 'Collapsed' }
+    if ($ui.Detail.Visibility -ne $want) { $ui.Detail.Visibility = $want; $ui.Scroller.Margin = if ($want -eq 'Visible') { '0,0,340,0' } else { '0' } }
+})
 $ui.EmptyReset.Add_Click({ if ($ui.Search.Text) { $ui.Search.Text = '' }; $script:TweakView = 'All'; $script:TweakArea = 'All'; $script:CheckArea = 'All'; Update-Filter; Reset-Scroll })
 # opens Boost now with exactly the shown cards that are off: the sheet is the confirmation, nothing changes before step 3
 $ui.ShowAllOn.Add_Click({
@@ -25999,7 +28380,7 @@ function Show-OptimizeChooser($List) {
 function Close-BoostSheet {
     if ($script:Bst -and $script:Bst.Running) { return }   # never close half-way through applying
     Hide-Animated $ui.Wizard 200
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
 }
 # step bar, visible panel, footer buttons and the selection count
 function Update-BoostSheet {
@@ -26111,7 +28492,7 @@ function Show-BoostResult {
     $b.Result.Visibility = 'Visible'
     $b.Result.BringIntoView()
     Show-Toast "Switched on $($b.Ok) tweak$(if ($b.Ok -ne 1) { 's' })$(if ($b.Failed) { ", $($b.Failed) skipped" })." $(if ($b.Failed) { '#FF9F0A' } else { '#30D158' })
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
 }
 function Invoke-ApplyTweaks($pick) {
     if (-not @($pick).Count) { return }
@@ -26132,7 +28513,7 @@ function Invoke-ApplyTweaks($pick) {
     if ($failed) { $msg += " Skipped: $($failed -join ', ')." }
     if (@($pick) | Where-Object { $_.Badge -eq 'restart' -and $failed -notcontains $_.Title }) { $msg += ' Restart your PC to finish.' }
     Show-Toast $msg $(if ($failed) { '#FF9F0A' } else { '#30D158' })
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
 }
 
 $script:SessionTimer = New-Object Windows.Threading.DispatcherTimer
@@ -26346,15 +28727,326 @@ $ui.RestoreAll.Add_Click({
     else { Show-Toast 'All original settings restored. Restart to fully undo restart-only tweaks.' '#30D158' }
 })
 
+# ===================================================== 2.1 Ctrl+K: search everything (Linear / Raycast / Winhance)
+# One box for tweaks, checks, tools and pages, games and settings. The index is built once, on first open; each
+# keystroke filters it in memory. Words match in any order (title, description, area); title-prefix matches rank first.
+$PalGroups = [ordered]@{ Tweak = 'Tweaks'; Check = 'Checks'; Tool = 'Tools'; Game = 'Games'; Setting = 'Settings'; WinSetting = 'Windows settings' }
+$PalPageInfo = [ordered]@{
+    Home     = 'Your PC at a glance, Boost now, your last match and recent changes.'
+    Games    = 'Your games: settings, Game Mode and match stats for each one.'
+    Tweaks   = 'Every tweak by area, with its risk and whether it is on.'
+    Checks   = 'Checks only look and report; they never change anything.'
+    Tools    = 'Every tool in one place.'
+    Events   = 'Tournaments and events.'
+    Health   = 'One scan for the problems that cost you the most.'
+    GameMode = 'Start Game: background apps closed while you play, live numbers during a match.'
+}
+$script:PalIndex = $null
+$script:PalRows = @{}
+$script:PalItems = New-Object Collections.Generic.List[object]
+$script:PalSel = -1
+$script:PalNav = $false
+# lower case, punctuation dropped ("Wi-Fi" -> "wifi", "NVIDIA:" -> "nvidia"), single spaces. -Split keeps the words
+# apart instead ("low-latency" -> "low latency"); the index holds both, so either spelling finds a word by its start.
+function ConvertTo-PalText([string]$s, [switch]$Split) {
+    $r = if ($Split) { ' ' } else { '' }
+    (("$s".ToLowerInvariant() -replace '[^\p{L}\p{N}\s]', $r) -replace '\s+', ' ').Trim()
+}
+function New-PalEntry([string]$Kind, [string]$Title, [string]$Desc, $Icon, $Ref, [string]$Extra, [int]$Order, [string]$Show) {
+    $tn = ConvertTo-PalText $Title
+    $hay = foreach ($x in $Title, $Desc, $Extra) { ConvertTo-PalText $x; ConvertTo-PalText $x -Split }
+    [pscustomobject]@{ Key = "$Kind#$Order"; Kind = $Kind; Title = $Title; Desc = $(if ($Show) { $Show } else { $Desc }); Icon = $Icon; Ref = $Ref; Order = $Order
+        TitleN = $tn; TitleW = " $tn $(ConvertTo-PalText $Title -Split)"; Hay = " $($hay -join ' ')" }
+}
+function Get-PaletteIndex {
+    if ($script:PalIndex) { return , $script:PalIndex }
+    $l = New-Object Collections.Generic.List[object]
+    $catTitle = @{}; foreach ($c in $Categories) { $catTitle["$($c.Name)"] = $c.Title }
+    $i = 0
+    foreach ($t in $Tweaks) {
+        if ($t.Header -or $t.GroupHead) { continue }
+        $kind = if (Test-CheckCard $t) { 'Check' } elseif ($t.Toggle) { 'Tweak' } else { $null }
+        if (-not $kind) { continue }
+        $area = "$($catTitle["$($t.Cat)"])"
+        $l.Add((New-PalEntry $kind "$($t.Title)" "$($t.Desc)" $t.Icon $t $area ($i++) $(if ($area) { "$area  ·  $($t.Desc)" })))
+    }
+    $pages = New-Object Collections.Generic.List[string]
+    foreach ($n in @($PalPageInfo.Keys) + @($ToolInfo.Keys)) { if (-not $pages.Contains($n)) { $pages.Add($n) } }
+    foreach ($n in $pages) {
+        $c = $Categories | Where-Object { $_.Name -eq $n } | Select-Object -First 1
+        if (-not $c) { continue }
+        if ($c.Requires) { $ok = try { [bool](& $c.Requires) } catch { $false }; if (-not $ok) { continue } }
+        $d = if ($ToolInfo.Contains($n)) { $ToolInfo[$n] } elseif ($PalPageInfo.Contains($n)) { $PalPageInfo[$n] } else { "$($c.Note)" }
+        $l.Add((New-PalEntry 'Tool' "$($c.Title)" $d $c.Icon $n $n ($i++)))
+    }
+    foreach ($g in $GameDefs) { $l.Add((New-PalEntry 'Game' "$($g.Title)" "$($g.Sub)" $g.Glyph $g "$($g.Proc) game" ($i++))) }
+    $l.Add((New-PalEntry 'Setting' 'Settings' 'Tray, start with Windows, re-apply changed settings, match reports, updates, Game Mode with any game, pause all tweaks' ([char]0xE713) 'Settings' 'options preferences' ($i++)))
+    # 2.1: Windows' own Settings pages and tools (ranked after ZeroDelay's results, see Find-PaletteResults)
+    foreach ($w in $ZdWinSettings) { $l.Add((New-PalEntry 'WinSetting' "$($w.T)" "$($w.P)" ([char]0xE8A7) $w "$($w.K) windows settings" ($i++) "Opens Windows: $($w.P)")) }
+    $script:PalIndex = $l
+    , $l
+}
+# the ranked results for a query: @{ E = entry; Group = label } in display order (grouped, best group first)
+function Find-PaletteResults([string]$Query, $Index, [int]$Max = 12) {
+    $q = ConvertTo-PalText $Query
+    if (-not $q) { return @() }
+    $toks = @($q.Split(' ') | Where-Object { $_ })
+    $gi = @{}; $k = 0; foreach ($g in $PalGroups.Keys) { $gi[$g] = $k++ }
+    $hits = New-Object Collections.Generic.List[object]
+    foreach ($e in $Index) {
+        if (($e.Kind -eq 'Tweak' -or $e.Kind -eq 'Check') -and $e.Ref.Hidden) { continue }
+        # every word must be found; one found only inside a word ("tray" in "stray") ranks after the rest
+        $ok = $true; $mid = 0
+        foreach ($tk in $toks) {
+            if ($e.Hay.IndexOf(" $tk", [StringComparison]::Ordinal) -ge 0) { continue }
+            if ($e.Hay.IndexOf($tk, [StringComparison]::Ordinal) -ge 0) { $mid++ } else { $ok = $false; break }
+        }
+        if (-not $ok) { continue }
+        $tn = $e.TitleN; $sp = $e.TitleW
+        if ($tn.StartsWith($q, [StringComparison]::Ordinal)) { $s = 0 }
+        elseif ($sp.IndexOf(" $q", [StringComparison]::Ordinal) -ge 0) { $s = 5 }     # a title word starts with the query
+        elseif ($tn.IndexOf($q, [StringComparison]::Ordinal) -ge 0) { $s = 10 }
+        else {
+            $inT = 0; $wp = 0
+            foreach ($tk in $toks) {
+                if ($tn.IndexOf($tk, [StringComparison]::Ordinal) -ge 0) { $inT++ }
+                if ($sp.IndexOf(" $tk", [StringComparison]::Ordinal) -ge 0) { $wp++ }
+            }
+            $s = if ($inT -eq $toks.Count) { 20 + [Math]::Min(9, $toks.Count - $wp) } else { 30 + 3 * ($toks.Count - $inT) }
+        }
+        if ($mid) { $s += 50 }
+        if ($e.Kind -eq 'WinSetting') { $s += 100 }   # Windows' own pages come after every ZeroDelay result
+        $hits.Add([pscustomobject]@{ E = $e; S = $s; G = $gi[$e.Kind]; O = $e.Order })
+    }
+    $sorted = @($hits | Sort-Object S, G, O)
+    # at most 6 from one group while others have matches too, then fill up to $Max
+    $pick = New-Object Collections.Generic.List[object]; $per = @{}; $took = @{}
+    foreach ($h in $sorted) { if ($pick.Count -ge $Max) { break }; if ([int]$per[$h.E.Kind] -lt 6) { $pick.Add($h); $took[$h.E.Key] = $true; $per[$h.E.Kind] = [int]$per[$h.E.Kind] + 1 } }
+    foreach ($h in $sorted) { if ($pick.Count -ge $Max) { break }; if (-not $took.ContainsKey($h.E.Key)) { $pick.Add($h); $took[$h.E.Key] = $true } }
+    $pick = @($pick | Sort-Object S, G, O)
+    $order = New-Object Collections.Generic.List[string]
+    foreach ($h in $pick) { if (-not $order.Contains($h.E.Kind)) { $order.Add($h.E.Kind) } }
+    foreach ($kd in $order) { foreach ($h in $pick) { if ($h.E.Kind -eq $kd) { @{ E = $h.E; Group = $PalGroups[$kd] } } } }
+}
+# with nothing typed: the tweaks changed most recently, then the main pages
+function Get-PaletteDefault($Index) {
+    $byId = @{}; foreach ($e in $Index) { if ($e.Kind -eq 'Tweak' -and -not $byId.ContainsKey("$($e.Ref.Id)")) { $byId["$($e.Ref.Id)"] = $e } }
+    $seen = @{}; $n = 0
+    foreach ($h in @(Get-History)) {
+        if ($n -ge 4) { break }
+        $id = "$($h.Id)"; if (-not $id -or $seen.ContainsKey($id) -or -not $byId.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        if ($byId[$id].Ref.Hidden) { continue }
+        $n++; @{ E = $byId[$id]; Group = 'Recently changed' }
+    }
+    foreach ($p in 'Home', 'Tweaks', 'Checks', 'Games', 'Tools', 'Settings') {
+        $e = $Index | Where-Object { ($_.Kind -eq 'Tool' -or $_.Kind -eq 'Setting') -and "$($_.Ref)" -eq $p } | Select-Object -First 1
+        if ($e) { @{ E = $e; Group = 'Go to' } }
+    }
+}
+function New-PaletteRowXaml($e) {
+    $ic = if ($e.Icon) { '&#x{0:X};' -f [int][char]$e.Icon } else { '&#xE721;' }
+    $risk = if ($e.Kind -eq 'Tweak') { Get-TweakRisk $e.Ref } else { $null }
+    $chip = if ($risk) { $rc = $RiskInfo[$risk]; "<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $($rc.Tone).Soft}' Margin='0,0,10,0' VerticalAlignment='Center' ToolTip='$(Esc $rc.Tip)'><TextBlock Text='$risk' Foreground='{DynamicResource $($rc.Tone)}'/></Border>" } else { '' }
+    @"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        CornerRadius='8' Padding='10,7' Margin='0,0,0,2' Background='Transparent' BorderBrush='Transparent' BorderThickness='1' Cursor='Hand' AutomationProperties.Name='$(Esc $e.Title)'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Border Width='28' Height='28' CornerRadius='7' Background='{DynamicResource Bg.Surface}' VerticalAlignment='Center'>
+      <TextBlock Text='$ic' FontFamily='{DynamicResource Font.Icons}' FontSize='14' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+    </Border>
+    <StackPanel Grid.Column='1' Margin='12,0,12,0' VerticalAlignment='Center'>
+      <TextBlock Text='$(Esc $e.Title)' FontSize='13.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'/>
+      <TextBlock Text='$(Esc $e.Desc)' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextTrimming='CharacterEllipsis' Margin='0,1,0,0'/>
+    </StackPanel>
+    <StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center'>$chip<TextBlock x:Name='State' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/></StackPanel>
+  </Grid>
+</Border>
+"@
+}
+function Get-PaletteRow($e) {
+    if ($script:PalRows.ContainsKey($e.Key)) { return $script:PalRows[$e.Key] }
+    $row = [ZdTheme]::Parse((New-PaletteRowXaml $e))
+    $row.Tag = @{ E = $e; State = $row.FindName('State') }
+    # the mouse picks a row only when it really moves (rows sliding under a still pointer while you use the arrows do not)
+    $row.Add_MouseMove({ param($s, $a)
+        $p = $a.GetPosition($window); if ($p -eq $script:PalMouse) { return }; $script:PalMouse = $p
+        $i = $script:PalItems.IndexOf($s); if ($i -ge 0 -and $i -ne $script:PalSel) { Set-PaletteSel $i $false }
+    })
+    $row.Add_MouseLeftButtonUp({ param($s, $a) $a.Handled = $true; Invoke-PaletteItem $s.Tag.E })
+    $script:PalRows[$e.Key] = $row
+    $row
+}
+# the word on the right: On / Off for tweaks (or what the apply bar will do), Installed for games
+function Update-PaletteRowState($row) {
+    $e = $row.Tag.E; $tb = $row.Tag.State; if (-not $tb) { return }
+    $txt = ''; $col = 'Text.Muted'; $bold = $false
+    switch ($e.Kind) {
+        'Tweak' {
+            $t = $e.Ref; $st = $script:Staged[$t.Id]
+            if ($st) { $txt = if ($st.On) { 'Will switch on' } else { 'Will switch off' }; $col = 'AccentFill'; $bold = $true }
+            elseif ($null -eq $t.State) { $txt = 'Not on this PC' }
+            elseif ($t.State) { $txt = 'On'; $col = 'Good'; $bold = $true }
+            else { $txt = 'Off' }
+        }
+        'Check' { $txt = 'Check' }
+        'Game' { if ($e.Ref.InstalledNow) { $txt = 'Installed' } }
+        default { $txt = 'Open' }
+    }
+    $tb.Text = $txt; $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $col)
+    $tb.FontWeight = if ($bold) { 'SemiBold' } else { 'Normal' }
+}
+function Set-PaletteSel([int]$i, [bool]$Scroll = $true) {
+    $n = $script:PalItems.Count
+    if ($script:PalSel -ge 0 -and $script:PalSel -lt $n) {
+        $old = $script:PalItems[$script:PalSel]; $old.Background = [Windows.Media.Brushes]::Transparent; $old.BorderBrush = [Windows.Media.Brushes]::Transparent
+    }
+    if (-not $n) { $script:PalSel = -1; return }
+    $i = [Math]::Max(0, [Math]::Min($n - 1, $i))
+    $script:PalSel = $i
+    $r = $script:PalItems[$i]
+    $r.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'Border.Subtle')
+    $r.SetResourceReference([Windows.Controls.Border]::BorderBrushProperty, 'Border.Strong')
+    if ($Scroll) { $r.BringIntoView() }
+}
+function Update-PaletteList {
+    $q = "$($ui.PalInput.Text)"
+    $ui.PalHint.Visibility = if ($q) { 'Collapsed' } else { 'Visible' }
+    $idx = Get-PaletteIndex
+    $items = if ($q.Trim()) { @(Find-PaletteResults $q $idx 12) } else { @(Get-PaletteDefault $idx) }
+    $ui.PalList.Children.Clear(); $script:PalItems.Clear(); $script:PalSel = -1; $script:PalNav = $false
+    $last = $null
+    foreach ($it in $items) {
+        if ($it.Group -ne $last) {
+            $lb = New-Object Windows.Controls.TextBlock
+            $lb.Text = "$($it.Group)".ToUpperInvariant(); $lb.FontSize = 11; $lb.FontWeight = 'SemiBold'
+            $lb.Margin = if ($null -eq $last) { '10,4,0,6' } else { '10,12,0,6' }
+            $lb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
+            [void]$ui.PalList.Children.Add($lb); $last = $it.Group
+        }
+        $row = Get-PaletteRow $it.E
+        $row.Background = [Windows.Media.Brushes]::Transparent; $row.BorderBrush = [Windows.Media.Brushes]::Transparent
+        Update-PaletteRowState $row
+        [void]$ui.PalList.Children.Add($row); $script:PalItems.Add($row)
+    }
+    if (-not $items.Count) {
+        $tb = New-Object Windows.Controls.TextBlock
+        $tb.Text = "Nothing matches `"$($q.Trim())`". Try fewer or shorter words."; $tb.FontSize = 13; $tb.Margin = '10,14,10,16'; $tb.TextWrapping = 'Wrap'
+        $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+        [void]$ui.PalList.Children.Add($tb)
+    }
+    $ui.PalScroll.ScrollToTop()
+    Set-PaletteSel 0 $false
+}
+function Show-Palette([string]$Text = '') {
+    if ($ui.Wizard.Visibility -eq 'Visible') { return }
+    $script:PalReturn = [Windows.Input.Keyboard]::FocusedElement
+    $ui.PalScroll.MaxHeight = [Math]::Max(160, [Math]::Min(440, $window.ActualHeight - 260))
+    $ui.Palette.Visibility = 'Visible'
+    if ("$($ui.PalInput.Text)" -ne $Text) { $ui.PalInput.Text = $Text } else { Update-PaletteList }
+    $ui.PalInput.SelectAll()
+    [void]$ui.PalInput.Focus(); [void][Windows.Input.Keyboard]::Focus($ui.PalInput)
+    [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Input, [action] { if ($ui.Palette.Visibility -eq 'Visible') { [void][Windows.Input.Keyboard]::Focus($ui.PalInput) } })
+    Show-Animated $ui.PalPanel -8 180
+}
+function Hide-Palette([bool]$Restore) {
+    if ($ui.Palette.Visibility -ne 'Visible') { return }
+    $ui.Palette.Visibility = 'Collapsed'
+    $r = $script:PalReturn; $script:PalReturn = $null
+    if ($Restore -and $r -is [Windows.UIElement] -and $r.IsVisible) { [void]$r.Focus() }
+}
+# Enter or a click: go to the thing. Tweaks and checks open on their page with the details panel and the row in view.
+function Invoke-PaletteItem($e) {
+    if (-not $e) { return }
+    Hide-Palette $false
+    switch ($e.Kind) {
+        'Tweak' {
+            $t = $e.Ref
+            $script:TweakView = 'All'; $script:TweakArea = 'All'
+            if ($script:FoldedAreas) { $script:FoldedAreas["$($t.Cat)"] = $false }
+            Select-NavPage 'Tweaks'; Update-Filter; Show-TweakDetail $t
+        }
+        'Check' {
+            $t = $e.Ref
+            $script:CheckArea = 'All'
+            Select-NavPage 'Checks'; Update-Filter; Show-TweakDetail $t
+        }
+        'Game' { Select-NavPage 'Games'; Show-GameDetail $e.Ref }
+        'WinSetting' { Open-ZdWinSetting $e.Ref }
+        default { Select-NavPage "$($e.Ref)" }
+    }
+    if (($e.Kind -eq 'Tweak' -or $e.Kind -eq 'Check') -and $e.Ref.Card) {
+        # after the list has been laid out with the new filter, so the row has a place to scroll to
+        $script:PalTarget = $e.Ref.Card
+        [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Loaded, [action] { if ($script:PalTarget) { $script:PalTarget.BringIntoView(); $script:PalTarget = $null } })
+    }
+}
+# Space on a tweak: collect the switch for the apply bar, like flipping it on its row; the palette stays open
+function Switch-PaletteTweak {
+    if ($script:PalSel -lt 0 -or $script:PalSel -ge $script:PalItems.Count) { return $false }
+    $row = $script:PalItems[$script:PalSel]; $e = $row.Tag.E
+    if ($e.Kind -ne 'Tweak') { return $false }
+    $t = $e.Ref
+    if ($null -eq $t.State) { Show-Toast "$($t.Title): not available on this PC." '#FF9F0A'; return $true }
+    $st = $script:Staged[$t.Id]
+    $cur = if ($st) { [bool]$st.On } else { [bool]$t.State }
+    Set-TweakStaged $t (-not $cur)
+    Update-PaletteRowState $row
+    $true
+}
+$ui.PalInput.Add_TextChanged({ Update-PaletteList })
+$ui.PalInput.Add_PreviewKeyDown({ param($s, $e)
+    $k = "$($e.Key)"
+    switch ($k) {
+        'Down' { Set-PaletteSel ($script:PalSel + 1); $script:PalNav = $true; $e.Handled = $true }
+        'Up' { Set-PaletteSel ($script:PalSel - 1); $script:PalNav = $true; $e.Handled = $true }
+        'Tab' { $d = if ([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) { -1 } else { 1 }; Set-PaletteSel ($script:PalSel + $d); $script:PalNav = $true; $e.Handled = $true }
+        'PageDown' { Set-PaletteSel ($script:PalSel + 5); $script:PalNav = $true; $e.Handled = $true }
+        'PageUp' { Set-PaletteSel ($script:PalSel - 5); $script:PalNav = $true; $e.Handled = $true }
+        'Return' { $e.Handled = $true; if ($script:PalSel -ge 0 -and $script:PalSel -lt $script:PalItems.Count) { Invoke-PaletteItem $script:PalItems[$script:PalSel].Tag.E } }
+        'Escape' { $e.Handled = $true; Hide-Palette $true }
+        'Space' {
+            # Space types a space while you write; once you have moved with the arrows (or with nothing typed) it switches
+            if ($script:PalNav -or -not "$($ui.PalInput.Text)".Trim()) { if (Switch-PaletteTweak) { $e.Handled = $true } }
+        }
+    }
+})
+$ui.Palette.Add_MouseLeftButtonDown({ param($s, $e) if ($e.OriginalSource -eq $s) { $e.Handled = $true; Hide-Palette $true } })   # the dimmed backdrop
+$ui.SearchKbd.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Show-Palette "$($ui.Search.Text)" })
+$ui.Search.Add_TextChanged({ $ui.SearchKbd.Visibility = if ($ui.Search.Text) { 'Collapsed' } else { 'Visible' } })
+# Ctrl+K anywhere in the window (typing in other boxes is untouched); Esc closes from anywhere while it is open
+$window.Add_PreviewKeyDown({ param($s, $e)
+    try {
+        if ($e.Key -eq [Windows.Input.Key]::K -and [Windows.Input.Keyboard]::Modifiers -eq [Windows.Input.ModifierKeys]::Control) {
+            $e.Handled = $true
+            if ($ui.Palette.Visibility -eq 'Visible') { $ui.PalInput.SelectAll(); [void]$ui.PalInput.Focus(); return }
+            $pre = if ([Windows.Input.Keyboard]::FocusedElement -eq $ui.Search) { "$($ui.Search.Text)" } else { '' }
+            Show-Palette $pre
+        } elseif ($e.Key -eq [Windows.Input.Key]::Escape -and $ui.Palette.Visibility -eq 'Visible' -and $e.OriginalSource -ne $ui.PalInput) {
+            $e.Handled = $true; Hide-Palette $true
+        }
+    } catch {}
+})
+
 Set-SplashStatus 'Building the interface'
 Initialize-Worker    # opens in the background while the cards are built
+Write-StartupMark 'worker opening'
 $catOrder = @{}; for ($i = 0; $i -lt $Categories.Count; $i++) { $catOrder[$Categories[$i].Name] = $i }
 $n = 0
 $Tweaks = @($Tweaks | Where-Object { -not ($_.Action -and $_.Requires -and -not (& $_.Requires)) })
+Write-StartupMark 'check cards this PC can use picked'
 $Tweaks = @($Tweaks | ForEach-Object { [pscustomobject]@{ T = $_; K = [int]$catOrder[$_.Cat] * 10000 + $n++ } } | Sort-Object K | ForEach-Object { $_.T })
 Set-SplashStatus 'Checking your settings'
 Start-StateRefresh { Show-AfterStartup }    # runs in the background while the cards are built
-foreach ($t in $Tweaks) { [void]$ui.Cards.Children.Add((New-Card $t)) }
+$catOrder = @{}; $ci = 0; foreach ($c in $Categories) { $catOrder["$($c.Name)"] = $ci++ }
+$ki = 0
+$lastCat = $null
+foreach ($o in @($Tweaks | ForEach-Object { [pscustomobject]@{ T = $_; O = $(if ($catOrder.ContainsKey("$($_.Cat)")) { $catOrder["$($_.Cat)"] } else { 999 }); K = $ki++ } } | Sort-Object O, K)) {
+    if ("$($o.T.Cat)" -ne $lastCat) { $lastCat = "$($o.T.Cat)"; [void]$ui.Cards.Children.Add((New-GroupHeader $lastCat)) }
+    [void]$ui.Cards.Children.Add((New-Card $o.T))
+}
+Write-StartupMark "$($ui.Cards.Children.Count) cards built"
 
 # Stretch cards so each row fills the width evenly (min ~320px per card).
 # Smooth scrolling: the mouse wheel moves a target and the view glides toward it.
@@ -26376,14 +29068,9 @@ $ui.Scroller.Add_PreviewMouseWheel({
 })
 function Reset-Scroll { $script:ScrollTimer.Stop(); $script:ScrollTarget = 0; $ui.Scroller.ScrollToVerticalOffset(0) }
 
-$ui.Cards.Add_SizeChanged({
-    $w = $ui.Cards.ActualWidth
-    $cols = [Math]::Max(1, [Math]::Floor($w / 330))
-    $cardW = [Math]::Floor($w / $cols) - 16
-    foreach ($c in $ui.Cards.Children) { $c.Width = if ($c.Tag.Header -or $c.Tag.Extra -eq 'builder') { [Math]::Max(100, $w - 16) } else { $cardW } }
-})
 $startName = if ($Page -and ($Categories | Where-Object { $_.Name -eq $Page })) { $Page } else { 'Home' }
 Select-NavPage $startName
+Write-StartupMark "start page $startName built"
 Update-GameModeUi
 if (-not $Snapshot -or $env:ZD_SNAPWAIT) { New-StatusStrip; Start-LiveTimer }
 function Complete-Startup {
@@ -26434,6 +29121,357 @@ if ($Snapshot) {
         }
         Set-Content -LiteralPath "$Snapshot.roundtrip.txt" -Value $rt -Encoding UTF8
     }
+    # CI only (a throwaway Windows VM): simulated PCs. For each profile below, the hardware and software detection is
+    # swapped for answers from that PC (graphics, CPU, chassis, network, games, other apps, NVIDIA driver, WMI). Then
+    # every card's Requires and state test runs directly (errors are not swallowed), every card is refreshed and every
+    # main page is built. Only reads: nothing is switched on. Writes one section per profile to <snapshot>.pcmatrix.txt.
+    if ($env:ZD_PCMATRIX -and $env:GITHUB_ACTIONS -eq 'true') {
+        function Get-ZdPcProfiles {
+            $eth = @{ Name = 'Ethernet'; Desc = 'Intel(R) Ethernet Controller I226-V'; Wifi = $false; Up = $true; Speed = '2.5 Gbps' }
+            $wifi = @{ Name = 'Wi-Fi'; Desc = 'Intel(R) Wi-Fi 6E AX211 160MHz'; Wifi = $true; Up = $true; Speed = '1.2 Gbps' }
+            $rtx = @{ Name = 'NVIDIA GeForce RTX 4070 SUPER'; Pnp = 'PCI\VEN_10DE&DEV_2783&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.8101'; Ram = 4293918720 }
+            @(
+                @{ Id = 'rtx-desktop'; Name = 'NVIDIA RTX desktop'; Cpu = 'Intel(R) Core(TM) i7-14700K'; Laptop = $false; Nv = 'ok'
+                   Gpus = @($rtx); Displays = @(@{ Monitor = 'ASUS VG27AQ'; Gpu = $rtx.Name; Hz = 165; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite', 'cs2'); Creator = $false; Owned = 0
+                   Software = @('Steam', 'Epic Games Launcher', 'Discord', 'NVIDIA App') }
+                @{ Id = 'nv-hybrid-laptop'; Name = 'NVIDIA laptop with Intel graphics (hybrid)'; Cpu = '13th Gen Intel(R) Core(TM) i7-13700H'; Laptop = $true; Nv = 'ok'
+                   Gpus = @(@{ Name = 'Intel(R) Iris(R) Xe Graphics'; Pnp = 'PCI\VEN_8086&DEV_A7A0&SUBSYS_00000000&REV_04\3&1'; Driver = '31.0.101.5186'; Ram = 134217728 },
+                            @{ Name = 'NVIDIA GeForce RTX 4060 Laptop GPU'; Pnp = 'PCI\VEN_10DE&DEV_28A0&SUBSYS_00000000&REV_A1\4&2'; Driver = '32.0.15.6094'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'Built-in display'; Gpu = 'Intel(R) Iris(R) Xe Graphics'; Hz = 144; Primary = $true })
+                   Adapters = @($wifi, @{ Name = 'Ethernet'; Desc = 'Realtek PCIe GbE Family Controller'; Wifi = $false; Up = $false; Speed = '0 bps' })
+                   Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'Armoury Crate', 'MyASUS') }
+                @{ Id = 'amd-x3d'; Name = 'AMD Radeon desktop with Ryzen X3D'; Cpu = 'AMD Ryzen 7 9800X3D 8-Core Processor'; Laptop = $false; Nv = 'none'
+                   Gpus = @(@{ Name = 'AMD Radeon RX 7900 XTX'; Pnp = 'PCI\VEN_1002&DEV_744C&SUBSYS_00000000&REV_C8\6&1'; Driver = '32.0.21013.1000'; Ram = 4293918720 },
+                            @{ Name = 'AMD Radeon(TM) Graphics'; Pnp = 'PCI\VEN_1002&DEV_13C0&SUBSYS_00000000&REV_C9\6&2'; Driver = '32.0.21013.1000'; Ram = 536870912 })
+                   Displays = @(@{ Monitor = 'Samsung Odyssey G7'; Gpu = 'AMD Radeon RX 7900 XTX'; Hz = 240; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('valorant', 'cs2'); Creator = $false; Owned = 0; Software = @('AMD Software', 'Riot Client', 'Steam') }
+                @{ Id = 'intel-laptop'; Name = 'Intel-only laptop (no graphics card)'; Cpu = 'Intel(R) Core(TM) Ultra 7 155H'; Laptop = $true; Nv = 'none'
+                   Gpus = @(@{ Name = 'Intel(R) Arc(TM) Graphics'; Pnp = 'PCI\VEN_8086&DEV_7D55&SUBSYS_00000000&REV_08\3&1'; Driver = '32.0.101.6078'; Ram = 134217728 })
+                   Displays = @(@{ Monitor = 'Built-in display'; Gpu = 'Intel(R) Arc(TM) Graphics'; Hz = 60; Primary = $true })
+                   Adapters = @($wifi); Wifi6 = $false; Games = @(); Creator = $false; Owned = 0; Software = @('Lenovo Vantage') }
+                @{ Id = 'gtx1080ti'; Name = 'GTX 1080 Ti desktop'; Cpu = 'Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz'; Laptop = $false; Nv = 'ok'
+                   Gpus = @(@{ Name = 'NVIDIA GeForce GTX 1080 Ti'; Pnp = 'PCI\VEN_10DE&DEV_1B06&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.8097'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'BenQ XL2546'; Gpu = 'NVIDIA GeForce GTX 1080 Ti'; Hz = 240; Primary = $true }, @{ Monitor = 'Dell U2415'; Gpu = 'NVIDIA GeForce GTX 1080 Ti'; Hz = 60; Primary = $false })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'GeForce Experience') }
+                @{ Id = 'no-driver'; Name = 'No graphics driver (Microsoft Basic Display Adapter, NVIDIA DLL missing)'; Cpu = 'Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz'; Laptop = $false; Nv = 'throw'
+                   Gpus = @(@{ Name = 'Microsoft Basic Display Adapter'; Pnp = 'PCI\VEN_10DE&DEV_2504&SUBSYS_00000000&REV_A1\4&1'; Driver = '10.0.20348.1'; Ram = 0 })
+                   Displays = @(@{ Monitor = 'Generic PnP Monitor'; Gpu = 'Microsoft Basic Display Adapter'; Hz = 60; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher') }
+                @{ Id = 'wifi-6ghz'; Name = 'Wi-Fi only, on 6 GHz'; Cpu = 'AMD Ryzen 5 7600 6-Core Processor'; Laptop = $false; Nv = 'ok'
+                   Gpus = @(@{ Name = 'NVIDIA GeForce RTX 3060'; Pnp = 'PCI\VEN_10DE&DEV_2504&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.7680'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'LG 27GP850'; Gpu = 'NVIDIA GeForce RTX 3060'; Hz = 180; Primary = $true })
+                   Adapters = @(@{ Name = 'Wi-Fi'; Desc = 'Intel(R) Wi-Fi 7 BE200 320MHz'; Wifi = $true; Up = $true; Speed = '2.4 Gbps' })
+                   Wifi6 = $true; Games = @('fortnite', 'rocketleague'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'Discord') }
+                @{ Id = 'loaded'; Name = 'Many games, ping boosters, Razer Cortex, MSI Afterburner and Adobe apps'; Cpu = 'AMD Ryzen 9 7950X3D 16-Core Processor'; Laptop = $false; Nv = 'ok'
+                   Gpus = @(@{ Name = 'NVIDIA GeForce RTX 4080'; Pnp = 'PCI\VEN_10DE&DEV_2704&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.8101'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'Alienware AW2725DF'; Gpu = 'NVIDIA GeForce RTX 4080'; Hz = 360; Primary = $true }, @{ Monitor = 'LG 27UL500'; Gpu = 'NVIDIA GeForce RTX 4080'; Hz = 60; Primary = $false })
+                   Adapters = @($eth, $wifi); Wifi6 = $false; Games = @('*'); Creator = $true; Owned = 2
+                   Software = @('ExitLag', 'GearUP Booster', 'Razer Cortex', 'MSI Afterburner', 'RivaTuner Statistics Server', 'Adobe Premiere Pro 2025', 'Adobe After Effects 2025',
+                                'Adobe Photoshop 2025', 'Adobe Creative Cloud', 'OBS Studio', 'Discord', 'Steam', 'Epic Games Launcher', 'Battle.net', 'Riot Client', 'Ubisoft Connect', 'EA app', 'Process Lasso', 'Overwolf', 'Medal') }
+                @{ Id = 'offline-empty'; Name = 'Nothing installed, offline (network adapters down)'; Cpu = 'Intel(R) Pentium(R) Gold G6400 CPU @ 4.00GHz'; Laptop = $false; Nv = 'none'
+                   Gpus = @(@{ Name = 'Intel(R) UHD Graphics 610'; Pnp = 'PCI\VEN_8086&DEV_9BA8&SUBSYS_00000000&REV_03\3&1'; Driver = '31.0.101.2111'; Ram = 1073741824 })
+                   Displays = @(@{ Monitor = 'Generic PnP Monitor'; Gpu = 'Intel(R) UHD Graphics 610'; Hz = 60; Primary = $true })
+                   Adapters = @(@{ Name = 'Ethernet'; Desc = 'Realtek PCIe GbE Family Controller'; Wifi = $false; Up = $false; Speed = '0 bps' }, @{ Name = 'Wi-Fi'; Desc = 'Realtek RTL8821CE 802.11ac PCIe Adapter'; Wifi = $true; Up = $false; Speed = '0 bps' })
+                   Wifi6 = $false; Games = @(); Creator = $false; Owned = 0; Software = @() }
+                @{ Id = 'broken-wmi'; Name = 'Broken WMI (every CIM query fails)'; Cpu = 'AMD Ryzen 7 5800X 8-Core Processor'; Laptop = $false; Nv = 'ok'; BrokenWmi = $true
+                   Gpus = @(@{ Name = 'NVIDIA GeForce RTX 3070'; Pnp = 'PCI\VEN_10DE&DEV_2484&SUBSYS_00000000&REV_A1\4&1'; Driver = '32.0.15.7680'; Ram = 4293918720 })
+                   Displays = @(@{ Monitor = 'AOC 24G2'; Gpu = 'NVIDIA GeForce RTX 3070'; Hz = 144; Primary = $true })
+                   Adapters = @($eth); Wifi6 = $false; Games = @('fortnite'); Creator = $false; Owned = 0; Software = @('Epic Games Launcher', 'Steam') }
+            )
+        }
+        # a folder that stands in for a game or app install: the exe is a copy of a small Windows exe, so icons load
+        function New-ZdPcFakeExe([string]$Path) {
+            $dir = Split-Path $Path
+            if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Force -Path $dir) }
+            $src = Join-Path "$env:WINDIR" 'System32\where.exe'
+            if ($env:WINDIR -and (Test-Path -LiteralPath $src)) { Copy-Item -LiteralPath $src -Destination $Path -Force } else { [IO.File]::WriteAllBytes($Path, [byte[]]@()) }
+            $Path
+        }
+        # what the profile scan would have saved for this PC (same shape as $ProfileScan's output)
+        function New-ZdPcSysProfile($P) {
+            $cpuVendor = if ($P.Cpu -match 'AMD|Ryzen') { 'AMD' } else { 'Intel' }
+            $gpus = @(foreach ($g in $P.Gpus) {
+                $vendor = if ($g.Pnp -match 'VEN_10DE') { 'NVIDIA' } elseif ($g.Pnp -match 'VEN_1002') { 'AMD' } elseif ($g.Pnp -match 'VEN_8086') { 'Intel' } else { 'Other' }
+                $int = ($vendor -eq 'Intel' -and $g.Name -notmatch 'Arc\(TM\) (A|B)\d') -or ($vendor -eq 'AMD' -and $g.Name -match 'Radeon\(TM\) Graphics')
+                [ordered]@{ Name = $g.Name; Vendor = $vendor; Arch = ''; Integrated = [bool]$int; VramMb = $(if ($g.Ram) { [int]($g.Ram / 1MB) } else { $null }); Driver = $g.Driver; DriverDate = '2026-09-01' }
+            })
+            $groups = [ordered]@{
+                'Game launchers' = 'Epic Games Launcher|^Steam$|Battle\.net|^EA app|Ubisoft Connect|Riot Client'
+                'Overlays and recording' = 'Discord|^Medal|Overwolf|OBS Studio|NVIDIA App|GeForce Experience|AMD Software'
+                'Monitoring and tuning' = 'MSI Afterburner|RivaTuner'
+                'Other optimizers' = 'ExitLag|GearUP|Razer Cortex|WTFast|NoPing|Process Lasso'
+                'PC maker software' = 'MyASUS|Lenovo Vantage|Armoury Crate'
+                'Streaming and voice' = 'OBS Studio'
+            }
+            $sw = [ordered]@{}
+            foreach ($k in $groups.Keys) { $hit = @($P.Software | Where-Object { $_ -match $groups[$k] }); if ($hit.Count) { $sw[$k] = $hit } }
+            $os = [Environment]::OSVersion.Version
+            $o = [ordered]@{ Version = 1; AppVersion = $AppVersion; ScannedAt = (Get-Date).ToString('o')
+                Windows = [ordered]@{ Name = 'Microsoft Windows'; Version = ''; Build = "$($os.Build).0"; Installed = '2026-01-01' }
+                Computer = [ordered]@{ Maker = 'ZeroDelay CI'; Model = $P.Name; Board = ''; Bios = ''; BiosDate = $null; Laptop = [bool]$P.Laptop }
+                Cpu = [ordered]@{ Name = $P.Cpu; Vendor = $cpuVendor; Cores = 8; Threads = 16; MaxMHz = 4200
+                                  Hybrid = [bool]($P.Cpu -match 'i[3579]-1[2-4]\d{3}|Core\(TM\) Ultra|Core Ultra'); X3D = [bool]($P.Cpu -match 'X3D'); DualDieX3D = [bool]($P.Cpu -match '79[05]0X3D|99[05]0X3D') }
+                Gpus = $gpus
+                Memory = [ordered]@{ TotalGb = 32; Sticks = 2; SpeedMts = 6000; RatedMts = 6000; Type = 'DDR5' }
+                Drives = @(); Fortnite = [ordered]@{ Path = $null; Drive = $null }; SystemDrive = $null
+                Displays = @(foreach ($d in $P.Displays) { [ordered]@{ Name = $d.Monitor; Gpu = $d.Gpu; Hz = $d.Hz; Primary = $d.Primary; Cable = 'DisplayPort' } })
+                Monitors = @(foreach ($d in $P.Displays) { [ordered]@{ Name = $d.Monitor; Cable = 'DisplayPort' } })
+                Network = @(foreach ($a in $P.Adapters | Where-Object { $_.Up }) { [ordered]@{ Name = $a.Desc; Kind = $(if ($a.Wifi) { 'Wi-Fi' } else { 'Ethernet' }); Speed = $a.Speed } })
+                Audio = @(); Input = @()
+                Security = [ordered]@{ Vbs = $false; MemoryIntegrity = $false; Hypervisor = $false; Antivirus = @('Windows Defender') }
+                Power = [ordered]@{ Plan = 'Balanced'; OnBattery = $false }
+                Apps = [ordered]@{ Programs = @($P.Software); StoreCount = 0; Store = @() }
+                Software = $sw }
+            $o | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+        }
+        # the stand-ins, all reading the current profile from $script:ZdPc. Get-CimInstance and Get-NetAdapter are
+        # shadowed so the app's own detection code (Get-CpuName, Get-GpuIds, Test-LaptopChassis, Get-UpAdapters...) runs
+        # on the profile's answers; everything that reads the driver, the display list, files or the registry is swapped.
+        $script:ZdPcMocks = [ordered]@{
+            'Get-CimInstance' = {
+                [CmdletBinding()]
+                param([Parameter(Position = 0)][string]$ClassName, [string]$Namespace, [string]$Filter, [string[]]$Property, [string]$Query, [string]$QueryDialect,
+                      [switch]$KeyOnly, [switch]$Shallow, [uint32]$OperationTimeoutSec, $CimSession, [string[]]$ComputerName, $ResourceUri, $InputObject)
+                if ($script:ZdPc.BrokenWmi) {
+                    # what a damaged WMI repository does: an error for every query (-ErrorAction Stop turns it into a throw)
+                    $PSCmdlet.WriteError((New-Object Management.Automation.ErrorRecord (New-Object InvalidOperationException "Invalid class (simulated broken WMI: $ClassName$Query)"), 'ZdPcBrokenWmi', 'InvalidOperation', $ClassName))
+                    return
+                }
+                $mine = (-not $Namespace -or $Namespace -match '^root[\\/]cimv2$') -and -not $Query
+                if ($mine -and $ClassName -eq 'Win32_VideoController') {
+                    foreach ($g in $script:ZdPc.Gpus) {
+                        $hz = ($script:ZdPc.Displays | Where-Object { $_.Gpu -eq $g.Name } | Measure-Object Hz -Maximum).Maximum
+                        [pscustomobject]@{ Name = $g.Name; Caption = $g.Name; Description = $g.Name; PNPDeviceID = $g.Pnp; DriverVersion = $g.Driver; DriverDate = (Get-Date '2026-09-01')
+                                           AdapterRAM = $g.Ram; CurrentRefreshRate = $(if ($hz) { [uint32]$hz } else { [uint32]0 }); VideoProcessor = $g.Name; Status = 'OK'; AdapterCompatibility = '' }
+                    }
+                    return
+                }
+                if ($mine -and $ClassName -eq 'Win32_Processor') {
+                    $amd = $script:ZdPc.Cpu -match 'AMD|Ryzen'
+                    [pscustomobject]@{ Name = $script:ZdPc.Cpu; Manufacturer = $(if ($amd) { 'AuthenticAMD' } else { 'GenuineIntel' }); NumberOfCores = [uint32]8; NumberOfLogicalProcessors = [uint32]16
+                                       MaxClockSpeed = [uint32]4200; CurrentClockSpeed = [uint32]4200; L2CacheSize = [uint32]8192; L3CacheSize = [uint32]32768; SocketDesignation = 'CPU 1'; ProcessorId = 'ZDCI' }
+                    return
+                }
+                if ($mine -and $ClassName -eq 'Win32_SystemEnclosure') { [pscustomobject]@{ ChassisTypes = [uint16[]]@($(if ($script:ZdPc.Laptop) { 10 } else { 3 })); Manufacturer = 'ZeroDelay CI' }; return }
+                if ($mine -and $ClassName -eq 'Win32_Battery') {
+                    if ($script:ZdPc.Laptop) { [pscustomobject]@{ Name = 'Battery'; BatteryStatus = [uint16]2; EstimatedChargeRemaining = [uint16]80; EstimatedRunTime = [uint32]71582788; DesignCapacity = $null; FullChargeCapacity = $null } }
+                    return
+                }
+                CimCmdlets\Get-CimInstance @PSBoundParameters
+            }
+            'Get-NetAdapter' = {
+                [CmdletBinding()]
+                param([Parameter(Position = 0)][string[]]$Name, [string[]]$InterfaceDescription, [uint32[]]$InterfaceIndex, [switch]$Physical, [switch]$IncludeHidden, $CimSession, [int]$ThrottleLimit, [switch]$AsJob)
+                if ($script:ZdPc.BrokenWmi) {
+                    $PSCmdlet.WriteError((New-Object Management.Automation.ErrorRecord (New-Object InvalidOperationException 'Invalid class (simulated broken WMI: MSFT_NetAdapter)'), 'ZdPcBrokenWmi', 'InvalidOperation', 'MSFT_NetAdapter'))
+                    return
+                }
+                $i = 0
+                $all = @(foreach ($a in $script:ZdPc.Adapters) {
+                    $i++
+                    $up = [bool]$a.Up
+                    [pscustomobject]@{ Name = $a.Name; InterfaceAlias = $a.Name; InterfaceDescription = $a.Desc; DriverDescription = $a.Desc; Status = $(if ($up) { 'Up' } else { 'Disconnected' })
+                        MediaConnectionState = $(if ($up) { 'Connected' } else { 'Disconnected' }); NdisPhysicalMedium = [uint32]$(if ($a.Wifi) { 9 } else { 14 })
+                        PhysicalMediaType = $(if ($a.Wifi) { 'Native 802.11' } else { '802.3' }); MediaType = '802.3'; LinkSpeed = $a.Speed
+                        ReceiveLinkSpeed = [uint64]$(if ($up) { 1000000000 } else { 0 }); TransmitLinkSpeed = [uint64]$(if ($up) { 1000000000 } else { 0 }); Speed = [uint64]$(if ($up) { 1000000000 } else { 0 })
+                        ifIndex = [uint32](9000 + $i); InterfaceIndex = [uint32](9000 + $i); InterfaceGuid = "{00000000-5A44-4349-0000-00000000000$i}"; DeviceID = "{00000000-5A44-4349-0000-00000000000$i}"
+                        PnPDeviceID = "PCI\VEN_8086&DEV_000$i\ZDCI"; MacAddress = "00-5A-44-43-49-0$i"; ComponentID = "PCI\VEN_8086&DEV_000$i"; DriverProvider = 'ZeroDelay CI'; DriverVersion = '1.0.0.0'
+                        DriverInformation = 'ZeroDelay CI'; Virtual = $false; HardwareInterface = $true; ConnectorPresent = $true; Hidden = $false }
+                })
+                if ($Name) { $all = @($all | Where-Object { $n = $_.Name; @($Name | Where-Object { $n -like $_ }).Count -gt 0 }) }
+                if ($InterfaceDescription) { $all = @($all | Where-Object { $n = $_.InterfaceDescription; @($InterfaceDescription | Where-Object { $n -like $_ }).Count -gt 0 }) }
+                if ($InterfaceIndex) { $all = @($all | Where-Object { $InterfaceIndex -contains $_.ifIndex }) }
+                $all
+            }
+            # the NVIDIA driver library: present and answering 'not set' (ok), absent (none), or throwing as if nvapi64.dll were missing (throw)
+            'Test-NvAvailable' = { $script:ZdPc.Nv -eq 'ok' }
+            'Get-NvEff' = {
+                param([string]$Profile, [uint32]$Id)
+                if ($script:ZdPc.Nv -eq 'throw') { throw (New-Object DllNotFoundException 'Unable to load DLL ''nvapi64.dll'' (simulated: no NVIDIA driver)') }
+                $rc = if ($script:ZdPc.Nv -eq 'ok') { -160 } else { -2 }
+                [pscustomobject]@{ Found = $false; Value = 0; Own = $false; Predefined = $false; Rc = $rc }
+            }
+            'Get-NvLod' = {
+                if ($script:ZdPc.Nv -eq 'throw') { throw (New-Object DllNotFoundException 'Unable to load DLL ''nvapi64.dll'' (simulated: no NVIDIA driver)') }
+                if ($script:ZdPc.Nv -eq 'ok') { 0 } else { $null }
+            }
+            'Test-NvTweak' = {
+                param($t)
+                if (-not (Test-NvAvailable)) { return $null }
+                if ($script:ZdPc.Nv -eq 'throw') { throw (New-Object DllNotFoundException 'Unable to load DLL ''nvapi64.dll'' (simulated: no NVIDIA driver)') }
+                $false
+            }
+            'Get-Displays' = {
+                @(foreach ($d in $script:ZdPc.Displays) { [pscustomobject]@{ Monitor = $d.Monitor; Gpu = $d.Gpu; Hz = [int]$d.Hz; Primary = [bool]$d.Primary; Discrete = ($d.Gpu -match $DiscreteGpuRx) } })
+            }
+            'Test-WifiOn6Ghz' = { [bool]$script:ZdPc.Wifi6 }
+            'Get-InstalledNames' = { @($script:ZdPc.Software) }
+            'Test-EpicLauncherInstalled' = { [bool](@($script:ZdPc.Software) -contains 'Epic Games Launcher') }
+            'Test-CreatorPc' = { [bool]$script:ZdPc.Creator }
+            'Get-CreatorExes' = {
+                if (-not $script:ZdPc.Creator) { return @() }
+                @('Adobe\Adobe Premiere Pro 2025\Adobe Premiere Pro.exe', 'Adobe\Adobe After Effects 2025\Support Files\AfterFX.exe', 'Adobe\Adobe Photoshop 2025\Photoshop.exe' |
+                    ForEach-Object { $f = Join-Path $script:ZdPcRoot "apps\$_"; if (-not (Test-Path -LiteralPath $f)) { [void](New-ZdPcFakeExe $f) }; $f })
+            }
+            'Get-BoosterOwned' = { @($script:ZdPc.OwnedIds) }
+            'Find-FortniteExe' = {
+                if (@($script:ZdPc.Games) -notcontains 'fortnite' -and @($script:ZdPc.Games) -notcontains '*') { return $null }
+                $f = Join-Path $script:ZdPcRoot "games\fortnite\FortniteGame\Binaries\Win64\$FortniteExeName"
+                if (-not (Test-Path -LiteralPath $f)) { [void](New-ZdPcFakeExe $f) }
+                $f
+            }
+            'Get-Cs2Dir' = {
+                if (@($script:ZdPc.Games) -notcontains 'cs2' -and @($script:ZdPc.Games) -notcontains '*') { return '' }
+                $d = Join-Path $script:ZdPcRoot 'games\cs2\Counter-Strike Global Offensive'
+                $f = Join-Path $d 'game\bin\win64\cs2.exe'
+                if (-not (Test-Path -LiteralPath $f)) { [void](New-ZdPcFakeExe $f) }
+                $d
+            }
+            'Get-GameInstallDir' = {
+                param([string]$Game)
+                if (@($script:ZdPc.Games) -notcontains $Game -and @($script:ZdPc.Games) -notcontains '*') { return $null }
+                $f = $GameFind[$Game]; if (-not $f) { return $null }
+                $d = Join-Path $script:ZdPcRoot "games\$Game"
+                $exe = if ($f.Exe) { Join-Path $d $f.Exe } else { Join-Path $d "$Game.exe" }
+                if (-not (Test-Path -LiteralPath $exe)) { [void](New-ZdPcFakeExe $exe) }
+                $d
+            }
+        }
+        function Clear-ZdPcCaches {
+            Clear-ReadCache
+            foreach ($v in 'NvOk', 'Is1080Ti', 'CpuName', 'GpuIdsCache', 'Cs2DirCache', 'GameDirCache', 'EpicInstalled', 'SteamLibs', 'TpmInfo', 'BiosInfo', 'NvBgCap',
+                           'UninstallRows', 'VrrMonitors', 'GameCatCache', 'NicMsiKeyCache', 'GameLogos', 'GameArt', 'GameArtTried', 'ExeIcons', 'AppIconCache', 'NvGpuRow') {
+                Set-Variable -Scope Script -Name $v -Value $null
+            }
+        }
+        # one timed call: an exception or a call over 3 s is written to the report. Locals start with zd so a card's
+        # script block that reads a variable it never set cannot pick up the matrix's own.
+        function Invoke-ZdPcStep([string]$ZdWhat, [scriptblock]$ZdDo) {
+            $script:ZdPcFailed = $false
+            $zdSw = [Diagnostics.Stopwatch]::StartNew(); $zdRet = $null
+            try { $zdRet = & $ZdDo }
+            catch {
+                $script:ZdPcFailed = $true; $script:ZdPcStat.Errors++
+                $zdMsg = "$($_.Exception.Message)" -replace '\s+', ' '
+                [void]$script:ZdPcLines.Add(('ERROR  {0}  {1}  (line {2})' -f $ZdWhat, $zdMsg, $_.InvocationInfo.ScriptLineNumber))
+            }
+            $zdSw.Stop(); $script:ZdPcStat.Calls++
+            $zdSec = $zdSw.Elapsed.TotalSeconds
+            if ($zdSec -gt 3) { $script:ZdPcStat.Slow++; [void]$script:ZdPcLines.Add(('SLOW   {0}  {1:N1} s' -f $ZdWhat, $zdSec)) }
+            if ($zdSec -gt $script:ZdPcStat.MaxS) { $script:ZdPcStat.MaxS = $zdSec; $script:ZdPcStat.MaxWhat = $ZdWhat }
+            $zdRet
+        }
+        function Invoke-ZdPcRequires($t) { & $t.Requires }
+        # the same order as Invoke-TweakTest, without its try/catch
+        function Invoke-ZdPcState($t) {
+            if ($t.Test) { & $t.Test } elseif ($t.Reg) { Test-RegTweak $t } elseif ($t.Ini) { Test-IniTweak $t }
+            elseif ($t.Power) { Test-PowerTweak $t } elseif ($t.Dx) { Test-DxTweak $t } elseif ($t.Tasks) { Test-TaskTweak $t }
+            elseif ($t['Remove']) { Test-RemoveTweak $t } elseif ($t.Nv) { Test-NvTweak $t } elseif ($t.Cs) { Test-CsTweak $t }
+        }
+        function Invoke-ZdPcMatrix {
+            $script:ZdPcRoot = Join-Path ([IO.Path]::GetTempPath()) 'zd-pcmatrix'
+            $zdOut = New-Object Collections.ArrayList
+            $zdProfiles = @(Get-ZdPcProfiles)
+            [void]$zdOut.Add("ZeroDelay $AppVersion simulated PC matrix on Windows build $([Environment]::OSVersion.Version.Build), PowerShell $($PSVersionTable.PSVersion)")
+            [void]$zdOut.Add("Stand-ins: $(@($script:ZdPcMocks.Keys) -join ', ')")
+            [void]$zdOut.Add('Per profile: Requires and state test of every card (called directly), Update-Card, then the pages Home, Games (+ game pages), Tweaks, Checks, Tools, Settings, Matches, Apps, ThisPC, Nvidia.')
+            # keep what the real PC had, to put it all back afterwards
+            $zdOrig = @{}
+            foreach ($zdN in $script:ZdPcMocks.Keys) {
+                $zdC = Get-Command $zdN -CommandType Function -ErrorAction SilentlyContinue
+                if ($zdC -and -not $zdC.ModuleName -and $zdN -notin 'Get-CimInstance', 'Get-NetAdapter') { $zdOrig[$zdN] = $zdC.ScriptBlock }
+            }
+            $zdSaved = @(foreach ($t in $Tweaks) { @{ Rec = $t.Rec; RecBase = $t.RecBase; TailorWhy = $t.TailorWhy; ForceHidden = $t.ForceHidden; Hidden = $t.Hidden; State = $t.State } })
+            $zdKeep = @{ SysProfile = $script:SysProfile; FortniteExe = $script:FortniteExe; GameSel = $script:GameSel; TweakView = $script:TweakView; TweakArea = $script:TweakArea; CheckArea = $script:CheckArea }
+            $zdTotal = @{ Errors = 0; Slow = 0; Calls = 0 }
+            try {
+                foreach ($zdN in $script:ZdPcMocks.Keys) { Set-Item -Path "function:script:$zdN" -Value $script:ZdPcMocks[$zdN] }
+                foreach ($zdP in $zdProfiles) {
+                    $zdP.OwnedIds = @($Tweaks | Where-Object { $_.Cat -eq 'Network' -and $_.Toggle } | Select-Object -First ([int]$zdP.Owned) | ForEach-Object { $_.Id })
+                    $script:ZdPc = $zdP
+                    $script:ZdPcLines = New-Object Collections.ArrayList
+                    $script:ZdPcStat = @{ Errors = 0; Slow = 0; Calls = 0; MaxS = 0.0; MaxWhat = '' }
+                    for ($zdI = 0; $zdI -lt $Tweaks.Count; $zdI++) { foreach ($zdK in @($zdSaved[$zdI].Keys)) { $Tweaks[$zdI][$zdK] = $zdSaved[$zdI][$zdK] } }
+                    Clear-ZdPcCaches
+                    $script:FortniteExe = Invoke-ZdPcStep 'detect Find-FortniteExe' { Find-FortniteExe }
+                    $script:SysProfile = Invoke-ZdPcStep 'profile scan stand-in' { New-ZdPcSysProfile $zdP }
+                    [void](Invoke-ZdPcStep 'Set-ProfileTailoring' { Set-ProfileTailoring })
+                    [void](Invoke-ZdPcStep 'Set-GpuTailoring' { Set-GpuTailoring })
+                    $zdDet = @(
+                        "CPU $(Invoke-ZdPcStep 'detect Get-CpuName' { Get-CpuName })"
+                        "laptop $(Invoke-ZdPcStep 'detect Test-LaptopChassis' { Test-LaptopChassis })"
+                        "AMD CPU $(Invoke-ZdPcStep 'detect Test-AmdCpu' { Test-AmdCpu })"
+                        "GPUs $(@(Invoke-ZdPcStep 'detect Get-GpuIds' { Get-GpuIds }).Count)"
+                        "1080 Ti $(Invoke-ZdPcStep 'detect Test-Gtx1080Ti' { Test-Gtx1080Ti })"
+                        "displays $(@(Invoke-ZdPcStep 'detect Get-Displays' { Get-Displays }).Count)"
+                        "refresh $(Invoke-ZdPcStep 'detect Get-RefreshRate' { Get-RefreshRate }) Hz"
+                        "adapters up $(@(Invoke-ZdPcStep 'detect Get-UpAdapters' { Get-UpAdapters }).Count)"
+                        "Wi-Fi adapters $(@(Invoke-ZdPcStep 'detect Get-WifiAdapters' { Get-WifiAdapters }).Count)"
+                        "6 GHz $(Invoke-ZdPcStep 'detect Test-WifiOn6Ghz' { Test-WifiOn6Ghz })"
+                        "NVIDIA driver $(Invoke-ZdPcStep 'detect Test-NvAvailable' { Test-NvAvailable })"
+                        "Fortnite $([bool]$script:FortniteExe)"
+                        "CS2 $(Invoke-ZdPcStep 'detect Test-Cs2Installed' { Test-Cs2Installed })"
+                        "other games $(@(foreach ($zdGk in @($GameFind.Keys)) { if (Invoke-ZdPcStep "detect Test-GameInstalled $zdGk" { Test-GameInstalled $zdGk }) { $zdGk } }).Count)"
+                        "creator $(Invoke-ZdPcStep 'detect Test-CreatorPc' { Test-CreatorPc })"
+                        "boosters $(@(Invoke-ZdPcStep 'detect Get-InstalledBoosters' { Get-InstalledBoosters }) -join '+')"
+                        "optimizers $(@(Invoke-ZdPcStep 'detect Get-InstalledOptimizers' { Get-InstalledOptimizers }) -join '+')"
+                    )
+                    [void](Invoke-ZdPcStep 'detect Get-NvDriverInfo' { Get-NvDriverInfo })
+                    [void](Invoke-ZdPcStep 'detect Get-NvDriverReport' { Get-NvDriverReport })
+                    # every card: Requires, then the state test only when Requires says the card applies (as the app does)
+                    $zdAvail = 0; $zdToggles = 0
+                    foreach ($t in $Tweaks) {
+                        if ($t.Svc -and -not (Invoke-ZdPcStep "service-key $($t.Id)" { Test-SvcKey $t.Svc })) { continue }
+                        $zdReq = $true
+                        if ($t.Requires) { $zdReq = Invoke-ZdPcStep "requires $($t.Id)" { Invoke-ZdPcRequires $t }; if ($script:ZdPcFailed) { continue } }
+                        if ($zdReq) { $zdState = Invoke-ZdPcStep "test $($t.Id)" { Invoke-ZdPcState $t }; if ($t.Toggle -and $null -ne $zdState -and -not $script:ZdPcFailed) { $zdAvail++ } }
+                    }
+                    foreach ($t in $Tweaks) { if ($t.Card) { if ($t.Toggle) { $zdToggles++ }; [void](Invoke-ZdPcStep "Update-Card $($t.Id)" { Update-Card $t }) } }
+                    $zdHidden = @($Tweaks | Where-Object { $_.Card -and $_.Toggle -and $_.Hidden }).Count
+                    # every main page, built fresh for this PC
+                    $script:Pages.Clear(); $script:GameSel = $null
+                    $zdCards = @{}
+                    foreach ($zdPage in 'Home', 'Games', 'All', 'Checks', 'Tools', 'Settings', 'Matches', 'Apps', 'ThisPC', 'Nvidia') {
+                        [void](Invoke-ZdPcStep "page $zdPage" { Select-NavPage $zdPage })
+                        if ($zdPage -in 'All', 'Checks') { $zdCards[$zdPage] = @($Tweaks | Where-Object { $_.Card -and -not $_.Header -and "$($_.Card.Visibility)" -eq 'Visible' }).Count }
+                        if ($zdPage -eq 'Games') {
+                            $zdGames = @($GameDefs | Where-Object { $_.Id -in 'fortnite', 'cs2' }) + @($GameDefs | Where-Object { $_.Id -notin 'fortnite', 'cs2' } | Select-Object -First 1)
+                            foreach ($zdG in $zdGames) { [void](Invoke-ZdPcStep "game page $($zdG.Id)" { Show-GameDetail $zdG }) }
+                            $script:GameSel = $null
+                        }
+                    }
+                    $zdSt = $script:ZdPcStat
+                    [void]$zdOut.Add('')
+                    [void]$zdOut.Add("=== $($zdP.Id): $($zdP.Name) ===")
+                    [void]$zdOut.Add("detected: $($zdDet -join ', ')")
+                    [void]$zdOut.Add("cards: $($zdCards['All']) tweak cards and $($zdCards['Checks']) check cards visible; $zdAvail of $zdToggles switches available, $zdHidden hidden as not for this PC")
+                    foreach ($zdL in $script:ZdPcLines) { [void]$zdOut.Add($zdL) }
+                    [void]$zdOut.Add(('result: {0} calls, {1} errors, {2} over 3 s; slowest: {3} ({4:N2} s)' -f $zdSt.Calls, $zdSt.Errors, $zdSt.Slow, $zdSt.MaxWhat, $zdSt.MaxS))
+                    $zdTotal.Errors += $zdSt.Errors; $zdTotal.Slow += $zdSt.Slow; $zdTotal.Calls += $zdSt.Calls
+                }
+            } catch {
+                [void]$zdOut.Add("ERROR  matrix stopped: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"); $zdTotal.Errors++
+            } finally {
+                # put the real PC back: detection, caches, the scanned profile and every card's flags
+                foreach ($zdN in $script:ZdPcMocks.Keys) {
+                    if ($zdOrig.ContainsKey($zdN)) { Set-Item -Path "function:script:$zdN" -Value $zdOrig[$zdN] } else { Remove-Item -Path "function:script:$zdN" -ErrorAction SilentlyContinue }
+                }
+                for ($zdI = 0; $zdI -lt $Tweaks.Count; $zdI++) { foreach ($zdK in @($zdSaved[$zdI].Keys)) { $Tweaks[$zdI][$zdK] = $zdSaved[$zdI][$zdK] } }
+                $script:ZdPc = $null
+                Clear-ZdPcCaches
+                foreach ($zdK in $zdKeep.Keys) { Set-Variable -Scope Script -Name $zdK -Value $zdKeep[$zdK] }
+                if ($script:Pages) { $script:Pages.Clear() }
+                Remove-Item -LiteralPath $script:ZdPcRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            [void]$zdOut.Add('')
+            [void]$zdOut.Add(('SUMMARY  {0} profiles, {1} calls, {2} errors, {3} calls over 3 s' -f $zdProfiles.Count, $zdTotal.Calls, $zdTotal.Errors, $zdTotal.Slow))
+            Set-Content -LiteralPath "$Snapshot.pcmatrix.txt" -Value $zdOut -Encoding UTF8
+        }
+        Invoke-ZdPcMatrix
+        # back to the page the snapshot was asked for, built from the real PC again
+        try { Select-NavPage $startName } catch {}
+    }
     if ($env:ZD_DEMO_RESTART) { $script:Pending = @{ Kind = 'restart'; Items = @('Let the graphics card schedule its own work', 'Consistent timer resolution') }; Update-RestartBar }
     if ($script:Glass) {
         $bg = New-Object Windows.Media.LinearGradientBrush; $bg.StartPoint = '0,0'; $bg.EndPoint = '1,1'
@@ -26443,20 +29481,37 @@ if ($Snapshot) {
     }
     $script:SnapWait = if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }
     $window.Add_ContentRendered({
+        Write-StartupMark 'first frame drawn'; [ZdWatchdog]::Step = 'snapshot: waiting to save'
         [Console]::WriteLine('SNAP rendered')
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
         $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($script:SnapWait)
         $script:SnapTimer.Add_Tick({ $script:SnapTimer.Stop(); Save-Snapshot })
         $script:SnapTimer.Start()
+        # counted from the first frame: if the 1 s timer above has not saved by then, the dispatcher timers have stalled
+        if ($script:ZdKickReady) { [ZdKick]::Every($window.Dispatcher, [int](($script:SnapWait + 8) * 1000), [Action]{ if (-not $script:SnapDone) { [Console]::WriteLine('SNAP kick: the dispatcher timer did not fire, saved from a thread-pool timer'); Save-Snapshot } }) }
     })
     # if the window never reports it rendered (seen on busy CI machines), take the picture anyway
     $script:SnapFallback = New-Object Windows.Threading.DispatcherTimer
     $script:SnapFallback.Interval = [TimeSpan]::FromSeconds($script:SnapWait + 60)
     $script:SnapFallback.Add_Tick({ $script:SnapFallback.Stop(); [Console]::WriteLine('SNAP fallback: no ContentRendered'); Save-Snapshot })
     $script:SnapFallback.Start()
+    # Windows Server 2025 CI: the window sometimes stops getting timer messages (the freeze report shows the UI thread
+    # idle in GetMessage, a tooltip never closing). A thread-pool timer posts to the dispatcher instead, which wakes it.
+    try {
+        Add-Type -ReferencedAssemblies WindowsBase -TypeDefinition @'
+public static class ZdKick {
+    static System.Threading.Timer t;
+    public static void Every(System.Windows.Threading.Dispatcher d, int ms, System.Action a) {
+        t = new System.Threading.Timer(delegate(object s) { try { d.BeginInvoke(a); } catch { } }, null, ms, ms);
+    }
+}
+'@
+        $script:ZdKickReady = $true
+    } catch { [Console]::Error.WriteLine("SNAP kick unavailable: $($_.Exception.Message)") }
     function Save-Snapshot {
         if ($script:SnapDone) { return }
         $script:SnapDone = $true
+        [ZdWatchdog]::Step = 'Save-Snapshot'
         try {
             foreach ($t in $Tweaks) { if ($t.Toggle) { [Console]::WriteLine(("{0,-10} {1,-34} {2}" -f $t.Cat, $t.Id, $(if ($null -eq $t.State) { "n/a" } else { $t.State }))) } }
             $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]$window.ActualWidth, [int]$window.ActualHeight, 96, 96, 'Pbgra32')
@@ -26518,7 +29573,9 @@ function Show-AfterStartup {
     $script:StartupDone = $true
     if ($script:StartupGuard) { $script:StartupGuard.Stop() }
     Complete-Startup
+    Write-StartupMark 'startup finished'
     if (-not $Tray -or $Snapshot) { $window.Show() } else { Close-Splash }
+    Write-StartupMark 'window shown'
     if ($script:BackupWarning -and -not $Snapshot) {
         if ($Tray) { Show-MainWindow }   # started hidden: bring the window up so the warning is seen
         [void](Show-ZdDialog $script:BackupWarning 'ZeroDelay backup' 'OK' 'Warning')
@@ -26562,14 +29619,14 @@ $window.Dispatcher.Add_UnhandledException({
     }
 })
 [AppDomain]::CurrentDomain.add_UnhandledException({ param($s, $e) Write-CrashLog $e.ExceptionObject 'fatal' })
-if (-not $Snapshot) {
-    $script:BeatTimer = New-Object Windows.Threading.DispatcherTimer
-    $script:BeatTimer.Interval = [TimeSpan]::FromSeconds(1)
-    $script:BeatTimer.Add_Tick({ [ZdWatchdog]::Beat() })
-    $script:BeatTimer.Start()
-    [ZdWatchdog]::Step = 'message loop started'
-    [ZdWatchdog]::Start($CrashLog, $AppVersion)
-}
+# the freeze detector also runs for dev renders: a render that stops responding writes the window thread's call stack
+# next to the picture (<snapshot>.hang.txt) and to the error output, so a CI timeout says what it was waiting on
+$script:BeatTimer = New-Object Windows.Threading.DispatcherTimer
+$script:BeatTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:BeatTimer.Add_Tick({ [ZdWatchdog]::Beat() })
+$script:BeatTimer.Start()
+[ZdWatchdog]::Step = 'message loop started'
+if ($Snapshot) { [ZdWatchdog]::Echo = $true; [ZdWatchdog]::Start("$Snapshot.hang.txt", $AppVersion) } else { [ZdWatchdog]::Start($CrashLog, $AppVersion) }
 try { [Windows.Threading.Dispatcher]::Run() } catch { Write-CrashLog $_.Exception 'message loop'; throw }
 if ($script:Relaunch) {
     try { $script:AppMutex.ReleaseMutex(); $script:AppMutex.Dispose() } catch {}
