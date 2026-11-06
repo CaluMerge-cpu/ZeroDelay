@@ -12615,9 +12615,14 @@ if ($script:Glass) {
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="24,0,0,0">
           <Grid Width="220" Margin="0,0,8,0">
-            <TextBox x:Name="Search" Padding="32,7,10,7" FontSize="13" Background="#2C2C2E" Foreground="#F5F5F7" BorderBrush="#38383A" CaretBrush="#F5F5F7" VerticalContentAlignment="Center"/>
+            <TextBox x:Name="Search" Padding="32,7,58,7" FontSize="13" Background="#2C2C2E" Foreground="#F5F5F7" BorderBrush="#38383A" CaretBrush="#F5F5F7" VerticalContentAlignment="Center"/>
             <TextBlock Text="&#xE721;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="13" Foreground="#98989D" Margin="12,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
             <TextBlock x:Name="SearchHint" Text="Search" FontSize="13" Foreground="#98989D" Margin="35,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+            <!-- 2.1: Ctrl+K opens the search-everything palette; the hint is also clickable -->
+            <Border x:Name="SearchKbd" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,8,0" CornerRadius="5" Padding="6,1,6,2" Cursor="Hand"
+                    Background="{DynamicResource Bg.Raised}" BorderBrush="{DynamicResource Border.Strong}" BorderThickness="1" ToolTip="Search everything (Ctrl+K)">
+              <TextBlock Text="Ctrl K" FontFamily="{DynamicResource Font.Mono}" FontSize="10.5" Foreground="{DynamicResource Text.Muted}"/>
+            </Border>
           </Grid>
           <Button x:Name="MoreBtn" Content="&#xE712;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="14" Style="{StaticResource Btn}" Margin="0,0,8,0" Padding="12,8"
                   ToolTip="Restore point and undo everything"/>
@@ -12792,6 +12797,38 @@ if ($script:Glass) {
         </Border>
       </Grid>
     </Grid>
+    <!-- 2.1 Ctrl+K: search everything (tweaks, checks, tools, games, settings). Code: Show-Palette and friends. -->
+    <Grid x:Name="Palette" Grid.ColumnSpan="2" Background="#8C000000" Visibility="Collapsed">
+      <Grid x:Name="PalPanel" Width="600" Margin="24,96,24,24" VerticalAlignment="Top" HorizontalAlignment="Center">
+        <Border CornerRadius="14" Background="{DynamicResource Bg.Raised}">
+          <Border.Effect><DropShadowEffect BlurRadius="48" ShadowDepth="16" Direction="270" Opacity="0.55" Color="Black"/></Border.Effect>
+        </Border>
+        <Border CornerRadius="14" Background="{DynamicResource Bg.Raised}" BorderBrush="{DynamicResource Border.Strong}" BorderThickness="1">
+          <DockPanel>
+            <Grid DockPanel.Dock="Top" Height="56">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBlock Text="&#xE721;" FontFamily="{DynamicResource Font.Icons}" FontSize="16" Foreground="{DynamicResource Text.Muted}" Margin="20,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+              <TextBox x:Name="PalInput" Grid.Column="1" Margin="10,0,12,0" Padding="0" FontSize="16" Background="Transparent" BorderThickness="0"
+                       Foreground="{DynamicResource Text.Primary}" CaretBrush="{DynamicResource Text.Primary}" VerticalContentAlignment="Center"
+                       AutomationProperties.Name="Search everything"/>
+              <TextBlock x:Name="PalHint" Grid.Column="1" Margin="12,0,12,0" Text="Search tweaks, checks, tools, games and settings" FontSize="16"
+                         Foreground="{DynamicResource Text.Muted}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" IsHitTestVisible="False"/>
+              <Border Grid.Column="2" Margin="0,0,16,0" CornerRadius="5" Padding="6,1,6,2" VerticalAlignment="Center" BorderBrush="{DynamicResource Border.Strong}" BorderThickness="1">
+                <TextBlock Text="Esc" FontFamily="{DynamicResource Font.Mono}" FontSize="11" Foreground="{DynamicResource Text.Muted}"/>
+              </Border>
+            </Grid>
+            <Border DockPanel.Dock="Top" Height="1" Background="{DynamicResource Border.Subtle}"/>
+            <Border DockPanel.Dock="Bottom" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="0,1,0,0" Padding="16,9,16,10">
+              <TextBlock Text="↑ ↓ move  ·  Enter open  ·  Space switch on or off  ·  Searches tweaks, checks, tools, games and settings"
+                         FontSize="11.5" Foreground="{DynamicResource Text.Muted}" TextTrimming="CharacterEllipsis"/>
+            </Border>
+            <ScrollViewer x:Name="PalScroll" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" MaxHeight="440" Padding="8,6,8,8" Focusable="False">
+              <StackPanel x:Name="PalList"/>
+            </ScrollViewer>
+          </DockPanel>
+        </Border>
+      </Grid>
+    </Grid>
   </Grid>
 </Window>
 '@)
@@ -12888,7 +12925,8 @@ foreach ($n in 'ChipViewsBox', 'ResultCount', 'ShowAllOn', 'EmptyState', 'EmptyT
             'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon', 'ToastUndo',
             'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas',
             'Detail', 'DetTitle', 'DetChips', 'DetDesc', 'DetChangesBox', 'DetChanges', 'DetWarnBox', 'DetWarn', 'DetDefault', 'DetSource',
-            'PendingBar', 'PendingText', 'PendingDiscard', 'PendingReview', 'PendingApply') { $ui[$n] = $window.FindName($n) }
+            'PendingBar', 'PendingText', 'PendingDiscard', 'PendingReview', 'PendingApply',
+            'Palette', 'PalPanel', 'PalInput', 'PalHint', 'PalScroll', 'PalList', 'SearchKbd') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
     restart  = @{ Color = '#0A84FF'; Label = 'Needs restart'; Tip = 'Takes effect after you restart the PC.' }
@@ -26996,6 +27034,304 @@ $ui.RestoreAll.Add_Click({
     $script:Backup.Custom.Remove('paused'); Save-Backup; Update-PauseCard
     if ($failed) { Show-Toast "Restored, except: $($failed -join ', ')." '#FF9F0A' }
     else { Show-Toast 'All original settings restored. Restart to fully undo restart-only tweaks.' '#30D158' }
+})
+
+# ===================================================== 2.1 Ctrl+K: search everything (Linear / Raycast / Winhance)
+# One box for tweaks, checks, tools and pages, games and settings. The index is built once, on first open; each
+# keystroke filters it in memory. Words match in any order (title, description, area); title-prefix matches rank first.
+$PalGroups = [ordered]@{ Tweak = 'Tweaks'; Check = 'Checks'; Tool = 'Tools'; Game = 'Games'; Setting = 'Settings' }
+$PalPageInfo = [ordered]@{
+    Home     = 'Your PC at a glance, Boost now, your last match and recent changes.'
+    Games    = 'Your games: settings, Game Mode and match stats for each one.'
+    Tweaks   = 'Every tweak by area, with its risk and whether it is on.'
+    Checks   = 'Checks only look and report; they never change anything.'
+    Tools    = 'Every tool in one place.'
+    Events   = 'Tournaments and events.'
+    Health   = 'One scan for the problems that cost you the most.'
+    GameMode = 'Start Game: background apps closed while you play, live numbers during a match.'
+}
+$script:PalIndex = $null
+$script:PalRows = @{}
+$script:PalItems = New-Object Collections.Generic.List[object]
+$script:PalSel = -1
+$script:PalNav = $false
+# lower case, punctuation dropped ("Wi-Fi" -> "wifi", "NVIDIA:" -> "nvidia"), single spaces. -Split keeps the words
+# apart instead ("low-latency" -> "low latency"); the index holds both, so either spelling finds a word by its start.
+function ConvertTo-PalText([string]$s, [switch]$Split) {
+    $r = if ($Split) { ' ' } else { '' }
+    (("$s".ToLowerInvariant() -replace '[^\p{L}\p{N}\s]', $r) -replace '\s+', ' ').Trim()
+}
+function New-PalEntry([string]$Kind, [string]$Title, [string]$Desc, $Icon, $Ref, [string]$Extra, [int]$Order, [string]$Show) {
+    $tn = ConvertTo-PalText $Title
+    $hay = foreach ($x in $Title, $Desc, $Extra) { ConvertTo-PalText $x; ConvertTo-PalText $x -Split }
+    [pscustomobject]@{ Key = "$Kind#$Order"; Kind = $Kind; Title = $Title; Desc = $(if ($Show) { $Show } else { $Desc }); Icon = $Icon; Ref = $Ref; Order = $Order
+        TitleN = $tn; TitleW = " $tn $(ConvertTo-PalText $Title -Split)"; Hay = " $($hay -join ' ')" }
+}
+function Get-PaletteIndex {
+    if ($script:PalIndex) { return , $script:PalIndex }
+    $l = New-Object Collections.Generic.List[object]
+    $catTitle = @{}; foreach ($c in $Categories) { $catTitle["$($c.Name)"] = $c.Title }
+    $i = 0
+    foreach ($t in $Tweaks) {
+        if ($t.Header -or $t.GroupHead) { continue }
+        $kind = if (Test-CheckCard $t) { 'Check' } elseif ($t.Toggle) { 'Tweak' } else { $null }
+        if (-not $kind) { continue }
+        $area = "$($catTitle["$($t.Cat)"])"
+        $l.Add((New-PalEntry $kind "$($t.Title)" "$($t.Desc)" $t.Icon $t $area ($i++) $(if ($area) { "$area  ·  $($t.Desc)" })))
+    }
+    $pages = New-Object Collections.Generic.List[string]
+    foreach ($n in @($PalPageInfo.Keys) + @($ToolInfo.Keys)) { if (-not $pages.Contains($n)) { $pages.Add($n) } }
+    foreach ($n in $pages) {
+        $c = $Categories | Where-Object { $_.Name -eq $n } | Select-Object -First 1
+        if (-not $c) { continue }
+        if ($c.Requires) { $ok = try { [bool](& $c.Requires) } catch { $false }; if (-not $ok) { continue } }
+        $d = if ($ToolInfo.Contains($n)) { $ToolInfo[$n] } elseif ($PalPageInfo.Contains($n)) { $PalPageInfo[$n] } else { "$($c.Note)" }
+        $l.Add((New-PalEntry 'Tool' "$($c.Title)" $d $c.Icon $n $n ($i++)))
+    }
+    foreach ($g in $GameDefs) { $l.Add((New-PalEntry 'Game' "$($g.Title)" "$($g.Sub)" $g.Glyph $g "$($g.Proc) game" ($i++))) }
+    $l.Add((New-PalEntry 'Setting' 'Settings' 'Tray, start with Windows, re-apply changed settings, match reports, updates, Game Mode with any game, pause all tweaks' ([char]0xE713) 'Settings' 'options preferences' ($i++)))
+    $script:PalIndex = $l
+    , $l
+}
+# the ranked results for a query: @{ E = entry; Group = label } in display order (grouped, best group first)
+function Find-PaletteResults([string]$Query, $Index, [int]$Max = 12) {
+    $q = ConvertTo-PalText $Query
+    if (-not $q) { return @() }
+    $toks = @($q.Split(' ') | Where-Object { $_ })
+    $gi = @{}; $k = 0; foreach ($g in $PalGroups.Keys) { $gi[$g] = $k++ }
+    $hits = New-Object Collections.Generic.List[object]
+    foreach ($e in $Index) {
+        if (($e.Kind -eq 'Tweak' -or $e.Kind -eq 'Check') -and $e.Ref.Hidden) { continue }
+        # every word must be found; one found only inside a word ("tray" in "stray") ranks after the rest
+        $ok = $true; $mid = 0
+        foreach ($tk in $toks) {
+            if ($e.Hay.IndexOf(" $tk", [StringComparison]::Ordinal) -ge 0) { continue }
+            if ($e.Hay.IndexOf($tk, [StringComparison]::Ordinal) -ge 0) { $mid++ } else { $ok = $false; break }
+        }
+        if (-not $ok) { continue }
+        $tn = $e.TitleN; $sp = $e.TitleW
+        if ($tn.StartsWith($q, [StringComparison]::Ordinal)) { $s = 0 }
+        elseif ($sp.IndexOf(" $q", [StringComparison]::Ordinal) -ge 0) { $s = 5 }     # a title word starts with the query
+        elseif ($tn.IndexOf($q, [StringComparison]::Ordinal) -ge 0) { $s = 10 }
+        else {
+            $inT = 0; $wp = 0
+            foreach ($tk in $toks) {
+                if ($tn.IndexOf($tk, [StringComparison]::Ordinal) -ge 0) { $inT++ }
+                if ($sp.IndexOf(" $tk", [StringComparison]::Ordinal) -ge 0) { $wp++ }
+            }
+            $s = if ($inT -eq $toks.Count) { 20 + [Math]::Min(9, $toks.Count - $wp) } else { 30 + 3 * ($toks.Count - $inT) }
+        }
+        if ($mid) { $s += 50 }
+        $hits.Add([pscustomobject]@{ E = $e; S = $s; G = $gi[$e.Kind]; O = $e.Order })
+    }
+    $sorted = @($hits | Sort-Object S, G, O)
+    # at most 6 from one group while others have matches too, then fill up to $Max
+    $pick = New-Object Collections.Generic.List[object]; $per = @{}; $took = @{}
+    foreach ($h in $sorted) { if ($pick.Count -ge $Max) { break }; if ([int]$per[$h.E.Kind] -lt 6) { $pick.Add($h); $took[$h.E.Key] = $true; $per[$h.E.Kind] = [int]$per[$h.E.Kind] + 1 } }
+    foreach ($h in $sorted) { if ($pick.Count -ge $Max) { break }; if (-not $took.ContainsKey($h.E.Key)) { $pick.Add($h); $took[$h.E.Key] = $true } }
+    $pick = @($pick | Sort-Object S, G, O)
+    $order = New-Object Collections.Generic.List[string]
+    foreach ($h in $pick) { if (-not $order.Contains($h.E.Kind)) { $order.Add($h.E.Kind) } }
+    foreach ($kd in $order) { foreach ($h in $pick) { if ($h.E.Kind -eq $kd) { @{ E = $h.E; Group = $PalGroups[$kd] } } } }
+}
+# with nothing typed: the tweaks changed most recently, then the main pages
+function Get-PaletteDefault($Index) {
+    $byId = @{}; foreach ($e in $Index) { if ($e.Kind -eq 'Tweak' -and -not $byId.ContainsKey("$($e.Ref.Id)")) { $byId["$($e.Ref.Id)"] = $e } }
+    $seen = @{}; $n = 0
+    foreach ($h in @(Get-History)) {
+        if ($n -ge 4) { break }
+        $id = "$($h.Id)"; if (-not $id -or $seen.ContainsKey($id) -or -not $byId.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        if ($byId[$id].Ref.Hidden) { continue }
+        $n++; @{ E = $byId[$id]; Group = 'Recently changed' }
+    }
+    foreach ($p in 'Home', 'Tweaks', 'Checks', 'Games', 'Tools', 'Settings') {
+        $e = $Index | Where-Object { ($_.Kind -eq 'Tool' -or $_.Kind -eq 'Setting') -and "$($_.Ref)" -eq $p } | Select-Object -First 1
+        if ($e) { @{ E = $e; Group = 'Go to' } }
+    }
+}
+function New-PaletteRowXaml($e) {
+    $ic = if ($e.Icon) { '&#x{0:X};' -f [int][char]$e.Icon } else { '&#xE721;' }
+    $risk = if ($e.Kind -eq 'Tweak') { Get-TweakRisk $e.Ref } else { $null }
+    $chip = if ($risk) { $rc = $RiskInfo[$risk]; "<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $($rc.Tone).Soft}' Margin='0,0,10,0' VerticalAlignment='Center' ToolTip='$(Esc $rc.Tip)'><TextBlock Text='$risk' Foreground='{DynamicResource $($rc.Tone)}'/></Border>" } else { '' }
+    @"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+        CornerRadius='8' Padding='10,7' Margin='0,0,0,2' Background='Transparent' BorderBrush='Transparent' BorderThickness='1' Cursor='Hand' AutomationProperties.Name='$(Esc $e.Title)'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Border Width='28' Height='28' CornerRadius='7' Background='{DynamicResource Bg.Surface}' VerticalAlignment='Center'>
+      <TextBlock Text='$ic' FontFamily='{DynamicResource Font.Icons}' FontSize='14' Foreground='{DynamicResource Text.Secondary}' HorizontalAlignment='Center' VerticalAlignment='Center'/>
+    </Border>
+    <StackPanel Grid.Column='1' Margin='12,0,12,0' VerticalAlignment='Center'>
+      <TextBlock Text='$(Esc $e.Title)' FontSize='13.5' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis'/>
+      <TextBlock Text='$(Esc $e.Desc)' FontSize='12' Foreground='{DynamicResource Text.Muted}' TextTrimming='CharacterEllipsis' Margin='0,1,0,0'/>
+    </StackPanel>
+    <StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Center'>$chip<TextBlock x:Name='State' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/></StackPanel>
+  </Grid>
+</Border>
+"@
+}
+function Get-PaletteRow($e) {
+    if ($script:PalRows.ContainsKey($e.Key)) { return $script:PalRows[$e.Key] }
+    $row = [ZdTheme]::Parse((New-PaletteRowXaml $e))
+    $row.Tag = @{ E = $e; State = $row.FindName('State') }
+    # the mouse picks a row only when it really moves (rows sliding under a still pointer while you use the arrows do not)
+    $row.Add_MouseMove({ param($s, $a)
+        $p = $a.GetPosition($window); if ($p -eq $script:PalMouse) { return }; $script:PalMouse = $p
+        $i = $script:PalItems.IndexOf($s); if ($i -ge 0 -and $i -ne $script:PalSel) { Set-PaletteSel $i $false }
+    })
+    $row.Add_MouseLeftButtonUp({ param($s, $a) $a.Handled = $true; Invoke-PaletteItem $s.Tag.E })
+    $script:PalRows[$e.Key] = $row
+    $row
+}
+# the word on the right: On / Off for tweaks (or what the apply bar will do), Installed for games
+function Update-PaletteRowState($row) {
+    $e = $row.Tag.E; $tb = $row.Tag.State; if (-not $tb) { return }
+    $txt = ''; $col = 'Text.Muted'; $bold = $false
+    switch ($e.Kind) {
+        'Tweak' {
+            $t = $e.Ref; $st = $script:Staged[$t.Id]
+            if ($st) { $txt = if ($st.On) { 'Will switch on' } else { 'Will switch off' }; $col = 'AccentFill'; $bold = $true }
+            elseif ($null -eq $t.State) { $txt = 'Not on this PC' }
+            elseif ($t.State) { $txt = 'On'; $col = 'Good'; $bold = $true }
+            else { $txt = 'Off' }
+        }
+        'Check' { $txt = 'Check' }
+        'Game' { if ($e.Ref.InstalledNow) { $txt = 'Installed' } }
+        default { $txt = 'Open' }
+    }
+    $tb.Text = $txt; $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $col)
+    $tb.FontWeight = if ($bold) { 'SemiBold' } else { 'Normal' }
+}
+function Set-PaletteSel([int]$i, [bool]$Scroll = $true) {
+    $n = $script:PalItems.Count
+    if ($script:PalSel -ge 0 -and $script:PalSel -lt $n) {
+        $old = $script:PalItems[$script:PalSel]; $old.Background = [Windows.Media.Brushes]::Transparent; $old.BorderBrush = [Windows.Media.Brushes]::Transparent
+    }
+    if (-not $n) { $script:PalSel = -1; return }
+    $i = [Math]::Max(0, [Math]::Min($n - 1, $i))
+    $script:PalSel = $i
+    $r = $script:PalItems[$i]
+    $r.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'Border.Subtle')
+    $r.SetResourceReference([Windows.Controls.Border]::BorderBrushProperty, 'Border.Strong')
+    if ($Scroll) { $r.BringIntoView() }
+}
+function Update-PaletteList {
+    $q = "$($ui.PalInput.Text)"
+    $ui.PalHint.Visibility = if ($q) { 'Collapsed' } else { 'Visible' }
+    $idx = Get-PaletteIndex
+    $items = if ($q.Trim()) { @(Find-PaletteResults $q $idx 12) } else { @(Get-PaletteDefault $idx) }
+    $ui.PalList.Children.Clear(); $script:PalItems.Clear(); $script:PalSel = -1; $script:PalNav = $false
+    $last = $null
+    foreach ($it in $items) {
+        if ($it.Group -ne $last) {
+            $lb = New-Object Windows.Controls.TextBlock
+            $lb.Text = "$($it.Group)".ToUpperInvariant(); $lb.FontSize = 11; $lb.FontWeight = 'SemiBold'
+            $lb.Margin = if ($null -eq $last) { '10,4,0,6' } else { '10,12,0,6' }
+            $lb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
+            [void]$ui.PalList.Children.Add($lb); $last = $it.Group
+        }
+        $row = Get-PaletteRow $it.E
+        $row.Background = [Windows.Media.Brushes]::Transparent; $row.BorderBrush = [Windows.Media.Brushes]::Transparent
+        Update-PaletteRowState $row
+        [void]$ui.PalList.Children.Add($row); $script:PalItems.Add($row)
+    }
+    if (-not $items.Count) {
+        $tb = New-Object Windows.Controls.TextBlock
+        $tb.Text = "Nothing matches `"$($q.Trim())`". Try fewer or shorter words."; $tb.FontSize = 13; $tb.Margin = '10,14,10,16'; $tb.TextWrapping = 'Wrap'
+        $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Secondary')
+        [void]$ui.PalList.Children.Add($tb)
+    }
+    $ui.PalScroll.ScrollToTop()
+    Set-PaletteSel 0 $false
+}
+function Show-Palette([string]$Text = '') {
+    if ($ui.Wizard.Visibility -eq 'Visible') { return }
+    $script:PalReturn = [Windows.Input.Keyboard]::FocusedElement
+    $ui.PalScroll.MaxHeight = [Math]::Max(160, [Math]::Min(440, $window.ActualHeight - 260))
+    $ui.Palette.Visibility = 'Visible'
+    if ("$($ui.PalInput.Text)" -ne $Text) { $ui.PalInput.Text = $Text } else { Update-PaletteList }
+    $ui.PalInput.SelectAll()
+    [void]$ui.PalInput.Focus(); [void][Windows.Input.Keyboard]::Focus($ui.PalInput)
+    [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Input, [action] { if ($ui.Palette.Visibility -eq 'Visible') { [void][Windows.Input.Keyboard]::Focus($ui.PalInput) } })
+    Show-Animated $ui.PalPanel -8 180
+}
+function Hide-Palette([bool]$Restore) {
+    if ($ui.Palette.Visibility -ne 'Visible') { return }
+    $ui.Palette.Visibility = 'Collapsed'
+    $r = $script:PalReturn; $script:PalReturn = $null
+    if ($Restore -and $r -is [Windows.UIElement] -and $r.IsVisible) { [void]$r.Focus() }
+}
+# Enter or a click: go to the thing. Tweaks and checks open on their page with the details panel and the row in view.
+function Invoke-PaletteItem($e) {
+    if (-not $e) { return }
+    Hide-Palette $false
+    switch ($e.Kind) {
+        'Tweak' {
+            $t = $e.Ref
+            $script:TweakView = 'All'; $script:TweakArea = 'All'
+            if ($script:FoldedAreas) { $script:FoldedAreas["$($t.Cat)"] = $false }
+            Select-NavPage 'Tweaks'; Update-Filter; Show-TweakDetail $t
+        }
+        'Check' {
+            $t = $e.Ref
+            $script:CheckArea = 'All'
+            Select-NavPage 'Checks'; Update-Filter; Show-TweakDetail $t
+        }
+        'Game' { Select-NavPage 'Games'; Show-GameDetail $e.Ref }
+        default { Select-NavPage "$($e.Ref)" }
+    }
+    if (($e.Kind -eq 'Tweak' -or $e.Kind -eq 'Check') -and $e.Ref.Card) {
+        # after the list has been laid out with the new filter, so the row has a place to scroll to
+        $script:PalTarget = $e.Ref.Card
+        [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Loaded, [action] { if ($script:PalTarget) { $script:PalTarget.BringIntoView(); $script:PalTarget = $null } })
+    }
+}
+# Space on a tweak: collect the switch for the apply bar, like flipping it on its row; the palette stays open
+function Switch-PaletteTweak {
+    if ($script:PalSel -lt 0 -or $script:PalSel -ge $script:PalItems.Count) { return $false }
+    $row = $script:PalItems[$script:PalSel]; $e = $row.Tag.E
+    if ($e.Kind -ne 'Tweak') { return $false }
+    $t = $e.Ref
+    if ($null -eq $t.State) { Show-Toast "$($t.Title): not available on this PC." '#FF9F0A'; return $true }
+    $st = $script:Staged[$t.Id]
+    $cur = if ($st) { [bool]$st.On } else { [bool]$t.State }
+    Set-TweakStaged $t (-not $cur)
+    Update-PaletteRowState $row
+    $true
+}
+$ui.PalInput.Add_TextChanged({ Update-PaletteList })
+$ui.PalInput.Add_PreviewKeyDown({ param($s, $e)
+    $k = "$($e.Key)"
+    switch ($k) {
+        'Down' { Set-PaletteSel ($script:PalSel + 1); $script:PalNav = $true; $e.Handled = $true }
+        'Up' { Set-PaletteSel ($script:PalSel - 1); $script:PalNav = $true; $e.Handled = $true }
+        'Tab' { $d = if ([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) { -1 } else { 1 }; Set-PaletteSel ($script:PalSel + $d); $script:PalNav = $true; $e.Handled = $true }
+        'PageDown' { Set-PaletteSel ($script:PalSel + 5); $script:PalNav = $true; $e.Handled = $true }
+        'PageUp' { Set-PaletteSel ($script:PalSel - 5); $script:PalNav = $true; $e.Handled = $true }
+        'Return' { $e.Handled = $true; if ($script:PalSel -ge 0 -and $script:PalSel -lt $script:PalItems.Count) { Invoke-PaletteItem $script:PalItems[$script:PalSel].Tag.E } }
+        'Escape' { $e.Handled = $true; Hide-Palette $true }
+        'Space' {
+            # Space types a space while you write; once you have moved with the arrows (or with nothing typed) it switches
+            if ($script:PalNav -or -not "$($ui.PalInput.Text)".Trim()) { if (Switch-PaletteTweak) { $e.Handled = $true } }
+        }
+    }
+})
+$ui.Palette.Add_MouseLeftButtonDown({ param($s, $e) if ($e.OriginalSource -eq $s) { $e.Handled = $true; Hide-Palette $true } })   # the dimmed backdrop
+$ui.SearchKbd.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Show-Palette "$($ui.Search.Text)" })
+$ui.Search.Add_TextChanged({ $ui.SearchKbd.Visibility = if ($ui.Search.Text) { 'Collapsed' } else { 'Visible' } })
+# Ctrl+K anywhere in the window (typing in other boxes is untouched); Esc closes from anywhere while it is open
+$window.Add_PreviewKeyDown({ param($s, $e)
+    try {
+        if ($e.Key -eq [Windows.Input.Key]::K -and [Windows.Input.Keyboard]::Modifiers -eq [Windows.Input.ModifierKeys]::Control) {
+            $e.Handled = $true
+            if ($ui.Palette.Visibility -eq 'Visible') { $ui.PalInput.SelectAll(); [void]$ui.PalInput.Focus(); return }
+            $pre = if ([Windows.Input.Keyboard]::FocusedElement -eq $ui.Search) { "$($ui.Search.Text)" } else { '' }
+            Show-Palette $pre
+        } elseif ($e.Key -eq [Windows.Input.Key]::Escape -and $ui.Palette.Visibility -eq 'Visible' -and $e.OriginalSource -ne $ui.PalInput) {
+            $e.Handled = $true; Hide-Palette $true
+        }
+    } catch {}
 })
 
 Set-SplashStatus 'Building the interface'
