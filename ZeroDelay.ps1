@@ -12712,8 +12712,33 @@ if ($script:Glass) {
       </StackPanel>
 
       <ScrollViewer x:Name="Scroller" Grid.Row="2" Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="18,0,2,18">
-        <WrapPanel x:Name="Cards" Margin="14,14,14,14"/>
+        <!-- 2.1: one column of rows (Windows Settings, Winhance), grouped by area; details on the right -->
+        <StackPanel x:Name="Cards" Margin="14,6,14,96" MaxWidth="1040"/>
       </ScrollViewer>
+      <Border x:Name="Detail" Grid.Row="2" HorizontalAlignment="Right" Width="340" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1,0,0,0" Visibility="Collapsed">
+        <ScrollViewer Style="{StaticResource OverlayScroll}" VerticalScrollBarVisibility="Auto" Padding="24,4,20,96">
+          <StackPanel>
+            <TextBlock Text="DETAILS" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Text.Muted}"/>
+            <TextBlock x:Name="DetTitle" Text="Pick a tweak to see what it changes." FontSize="17" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,10,0,10" Foreground="{DynamicResource Text.Primary}"/>
+            <WrapPanel x:Name="DetChips" Margin="0,0,0,8"/>
+            <TextBlock x:Name="DetDesc" FontSize="13" LineHeight="20" LineStackingStrategy="BlockLineHeight" TextWrapping="Wrap" Foreground="{DynamicResource Text.Secondary}"/>
+            <StackPanel x:Name="DetChangesBox" Visibility="Collapsed">
+              <TextBlock Text="WHAT IT CHANGES" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Text.Muted}" Margin="0,18,0,0"/>
+              <Border Background="{DynamicResource Bg.Surface}" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1" CornerRadius="8" Padding="10,8" Margin="0,8,0,0">
+                <TextBlock x:Name="DetChanges" FontFamily="Cascadia Mono, Consolas" FontSize="11.5" LineHeight="18" LineStackingStrategy="BlockLineHeight" TextWrapping="Wrap" Foreground="{DynamicResource Text.Secondary}"/>
+              </Border>
+            </StackPanel>
+            <StackPanel x:Name="DetWarnBox" Visibility="Collapsed">
+              <TextBlock Text="DON'T USE IF" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Text.Muted}" Margin="0,18,0,0"/>
+              <TextBlock x:Name="DetWarn" FontSize="13" LineHeight="20" LineStackingStrategy="BlockLineHeight" TextWrapping="Wrap" Foreground="{DynamicResource Text.Secondary}" Margin="0,8,0,0"/>
+            </StackPanel>
+            <WrapPanel Margin="0,20,0,0">
+              <Button x:Name="DetDefault" Content="Back to Windows default" Style="{StaticResource Zd.Button.Secondary}" Margin="0,0,8,8" Visibility="Collapsed"/>
+              <Button x:Name="DetSource" Content="Source &#x2197;" Style="{StaticResource Zd.Button.Secondary}" Margin="0,0,8,8" Visibility="Collapsed"/>
+            </WrapPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
       <!-- 2.0: shown when filters or search match no card -->
       <Border x:Name="EmptyState" Grid.Row="2" Visibility="Collapsed" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="32,14,32,0" MaxWidth="520"
               Background="{DynamicResource Bg.Surface}" BorderBrush="{DynamicResource Border.Subtle}" BorderThickness="1" CornerRadius="12" Padding="20">
@@ -12730,6 +12755,21 @@ if ($script:Glass) {
         <StackPanel x:Name="StripItems" Orientation="Horizontal" HorizontalAlignment="Right"/>
       </Grid>
 
+      <!-- 2.1: switches on Tweaks are collected here and applied together (Discord, Winhance review) -->
+      <Grid x:Name="PendingBar" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,22" Visibility="Collapsed">
+        <Border CornerRadius="12" Background="#15181D">
+          <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.5" Color="Black"/></Border.Effect>
+        </Border>
+        <Border CornerRadius="12" Background="#15181D" BorderBrush="#2B323B" BorderThickness="1" Padding="18,8,8,8">
+          <StackPanel Orientation="Horizontal">
+            <Ellipse Width="8" Height="8" Fill="{DynamicResource AccentFill}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+            <TextBlock x:Name="PendingText" FontSize="13.5" Foreground="{DynamicResource Text.Primary}" VerticalAlignment="Center" Margin="0,0,18,0"/>
+            <Button x:Name="PendingDiscard" Content="Discard" Style="{StaticResource Zd.Button.Ghost}" MinHeight="34" Margin="0,0,6,0"/>
+            <Button x:Name="PendingReview" Content="Review" Style="{StaticResource Zd.Button.Secondary}" MinHeight="34" Margin="0,0,6,0"/>
+            <Button x:Name="PendingApply" Content="Apply" Style="{StaticResource Zd.Button.Primary}" MinHeight="34"/>
+          </StackPanel>
+        </Border>
+      </Grid>
       <Grid x:Name="Toast" Grid.Row="2" VerticalAlignment="Bottom" HorizontalAlignment="Right" Margin="0,0,28,24" Visibility="Collapsed">
         <Border CornerRadius="12" Background="#15181D">
           <Border.Effect><DropShadowEffect BlurRadius="28" ShadowDepth="8" Direction="270" Opacity="0.45" Color="Black"/></Border.Effect>
@@ -12849,7 +12889,9 @@ $ui = @{}
 foreach ($n in 'ChipViewsBox', 'ResultCount', 'ShowAllOn', 'EmptyState', 'EmptyTitle', 'EmptyText', 'EmptyReset', 'MoreBtn', 'MorePop', 'Nav', 'Cards', 'PageTitle', 'StatusLine', 'RestoreAll', 'ApplyRec', 'Toast', 'ToastText', 'ActiveCount', 'ActiveBar', 'Search', 'SearchHint', 'LatencyNote',
             'RestartBar', 'RestartTitle', 'RestartText', 'RestartNow', 'RestartLater', 'Scroller', 'RestorePoint', 'GmPanel', 'GmStatus', 'GmSwitch',
             'PageHost', 'DriftBar', 'DriftTitle', 'DriftText', 'DriftIgnore', 'DriftFix', 'Wizard', 'WizardBody', 'ToastIcon', 'ToastUndo',
-            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas') { $ui[$n] = $window.FindName($n) }
+            'UpdateBar', 'UpdateTitle', 'UpdateText', 'UpdateLater', 'UpdateGet', 'StripItems', 'StripNote', 'BackBtn', 'BackText', 'ChipBar', 'ChipViews', 'ChipAreas',
+            'Detail', 'DetTitle', 'DetChips', 'DetDesc', 'DetChangesBox', 'DetChanges', 'DetWarnBox', 'DetWarn', 'DetDefault', 'DetSource',
+            'PendingBar', 'PendingText', 'PendingDiscard', 'PendingReview', 'PendingApply') { $ui[$n] = $window.FindName($n) }
 
 $BadgeInfo = @{
     restart  = @{ Color = '#0A84FF'; Label = 'Needs restart'; Tip = 'Takes effect after you restart the PC.' }
@@ -12990,6 +13032,167 @@ function Start-CountUp($tb, [int]$to, [string]$suffix = '', [int]$ms = 600) {
     if (-not $script:CountOn) { [Windows.Media.CompositionTarget]::add_Rendering($script:CountHandler); $script:CountOn = $true }
 }
 
+# ===================================================== 2.1 Tweaks: risk, details, collected switches, groups
+# Risk in three words (O&O ShutUp10++, WinUtil, Hone): Safe = recommended for most PCs; Moderate = helps on some PCs,
+# read "Don't use if"; Advanced = for experienced users. Cards that only show a guide or a check carry none.
+$RiskInfo = @{
+    'Safe'     = @{ Tone = 'Good'; Tip = 'Recommended for most PCs, and one click to undo.' }
+    'Moderate' = @{ Tone = 'Warn'; Tip = 'Helps on some PCs. Read "Don''t use if" in the details first.' }
+    'Advanced' = @{ Tone = 'Bad';  Tip = 'For experienced users: can cause problems on some hardware. Still one click to undo.' }
+}
+function Get-TweakRisk($t) {
+    if ($t.Header -or $t.Action -or $t.Picker -or $t.Preset) { return $null }
+    if ($t.Badge -eq 'advanced') { 'Advanced' } elseif ($t.Rec) { 'Safe' } else { 'Moderate' }
+}
+# what a tweak changes, in the words Windows uses: registry values, power plan settings, driver settings, files
+function Get-TweakChangeText($t) {
+    $l = New-Object Collections.Generic.List[string]
+    foreach ($e in @($t.Reg)) {
+        if (-not $e) { continue }
+        $def = if ($null -eq $e.D) { 'not set' } else { "$($e.D)" }
+        $l.Add("$($e.P -replace '^HKLM:\\', 'HKLM\' -replace '^HKCU:\\', 'HKCU\')\$($e.N) = $($e.V)   (Windows: $def)")
+    }
+    if ($t.Power) { $l.Add("Power plan setting $($t.Power.Set) = $($t.Power.V)   (Windows: $($t.Power.D))") }
+    if ($t.Nv) { $l.Add(('NVIDIA driver, {0}: setting 0x{1:X8} = {2}' -f $t.Nv.Profile, [int64]$t.Nv.Id, $t.Nv.V)) }
+    if ($t.Ini) { foreach ($k in $t.Ini.Keys) { $l.Add("Fortnite settings file: $k = $($t.Ini[$k][0])   (default: $(if ($null -eq $t.Ini[$k][1]) { 'not set' } else { $t.Ini[$k][1] }))") } }
+    if ($t.Tasks) { foreach ($k in @($t.Tasks)) { $l.Add("Scheduled task off: $k") } }
+    if ($t.Dx) { $l.Add("DirectX graphics setting: $($t.Dx.K) = $($t.Dx.V)") }
+    if (-not $l.Count -and ($t.On -or $t.Off)) { $l.Add('Done by ZeroDelay''s own steps (the original is saved first). The source explains what changes.') }
+    $l -join "`n"
+}
+$script:DetailTweak = $null
+function Show-TweakDetail($t) {
+    if (-not $t -or $t.Header -or $t.GroupHead) { return }
+    if ($script:DetailTweak -and $script:DetailTweak.Card) { $script:DetailTweak.Card.ClearValue([Windows.Controls.Border]::BorderBrushProperty) }
+    $script:DetailTweak = $t
+    if ($t.Card) { $t.Card.BorderBrush = $window.FindResource('AccentFill') }
+    $ui.DetTitle.Text = $t.Title
+    $ui.DetChips.Children.Clear()
+    $risk = Get-TweakRisk $t
+    $chips = @()
+    if ($risk) { $chips += , @($risk, $RiskInfo[$risk].Tone) }
+    $area = ($Categories | Where-Object { $_.Name -eq $t.Cat } | Select-Object -First 1).Title
+    if ($area) { $chips += , @($area, $null) }
+    if ($t.Badge -in 'restart', 'signout') { $chips += , @($BadgeInfo[$t.Badge].Label, $null) }
+    foreach ($c in $chips) {
+        $x = "<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Style='{DynamicResource Zd.Chip}' Margin='0,0,6,6'$(if ($c[1]) { " Background='{DynamicResource $($c[1]).Soft}'" })><TextBlock Text='$(Esc $c[0])'$(if ($c[1]) { " Foreground='{DynamicResource $($c[1])}'" })/></Border>"
+        [void]$ui.DetChips.Children.Add([ZdTheme]::Parse($x))
+    }
+    $ui.DetDesc.Text = "$($t.Desc)"
+    $ch = Get-TweakChangeText $t
+    $ui.DetChanges.Text = $ch; $ui.DetChangesBox.Visibility = if ($ch) { 'Visible' } else { 'Collapsed' }
+    $ui.DetWarn.Text = "$($t.Warn)"; $ui.DetWarnBox.Visibility = if ("$($t.Warn)".Trim()) { 'Visible' } else { 'Collapsed' }
+    $ui.DetSource.Tag = "$($t.Source)"; $ui.DetSource.Visibility = if ("$($t.Source)" -match '^https?://') { 'Visible' } else { 'Collapsed' }
+    $ui.DetDefault.Tag = $t
+    $ui.DetDefault.Visibility = if ($t.Toggle -and ($t.State -or $script:Staged.ContainsKey($t.Id))) { 'Visible' } else { 'Collapsed' }
+    $ui.DetDefault.Content = if ($script:Staged.ContainsKey($t.Id)) { 'Keep it as it is' } else { 'Back to Windows default' }
+}
+$ui.DetSource.Add_Click({ param($s, $e) if ("$($s.Tag)" -match '^https?://') { Start-Process "$($s.Tag)" } })
+$ui.DetDefault.Add_Click({ param($s, $e)
+    $t = $s.Tag; if (-not $t) { return }
+    if ($script:Staged.ContainsKey($t.Id)) { Set-TweakStaged $t ([bool]$t.State) } else { Set-TweakStaged $t $false }
+})
+
+# Switches on the Tweaks and Checks lists are collected and applied together from the bar at the bottom
+# (Discord's unsaved-changes bar, Winhance's review): Id -> wanted state. Nothing changes until Apply.
+$script:Staged = [ordered]@{}
+function Set-TweakStaged($t, [bool]$want) {
+    if ($null -eq $t.State) { Update-Card $t; return }
+    if ($want -eq [bool]$t.State) { $script:Staged.Remove($t.Id) } else { $script:Staged[$t.Id] = @{ T = $t; On = $want } }
+    Update-Card $t
+    Update-PendingBar
+    if ($script:DetailTweak -eq $t) { Show-TweakDetail $t }
+}
+function Update-PendingBar {
+    $n = $script:Staged.Count
+    if (-not $n) { if ($ui.PendingBar.Visibility -eq 'Visible') { Hide-Animated $ui.PendingBar 160 }; return }
+    $rs = @($script:Staged.Values | Where-Object { $_.T.Badge -eq 'restart' }).Count
+    $so = @($script:Staged.Values | Where-Object { $_.T.Badge -eq 'signout' }).Count
+    $ui.PendingText.Text = "$n $(if ($n -eq 1) { 'change' } else { 'changes' }) not applied yet" +
+        $(if ($rs) { "  ·  $rs $(if ($rs -eq 1) { 'needs' } else { 'need' }) a restart" } elseif ($so) { "  ·  $so $(if ($so -eq 1) { 'needs' } else { 'need' }) a sign-out" })
+    $ui.PendingApply.Content = "Apply $n"
+    if ($ui.PendingBar.Visibility -ne 'Visible') { $ui.PendingBar.Visibility = 'Visible'; Show-Animated $ui.PendingBar 16 240 }
+}
+function Clear-Staged {
+    $list = @($script:Staged.Values); $script:Staged.Clear()
+    foreach ($x in $list) { Update-Card $x.T }
+    Update-PendingBar
+}
+# applies every collected switch as one batch; one message, one Undo for the batch, History keeps each change
+function Invoke-StagedApply {
+    $list = @($script:Staged.Values); if (-not $list.Count) { return }
+    $script:Staged.Clear(); Update-PendingBar
+    $window.Cursor = [Windows.Input.Cursors]::Wait
+    $done = @(); $fail = @()
+    foreach ($x in $list) {
+        Clear-ReadCache
+        try { if ($x.On) { Invoke-TweakOn $x.T } else { Invoke-TweakOff $x.T }; $done += $x } catch { $fail += "$($x.T.Title): $($_.Exception.Message)" }
+        Update-Card $x.T
+    }
+    Update-Summary
+    $window.Cursor = $null
+    $script:LastBatch = @($done)
+    $note = if (@($done | Where-Object { $_.T.Badge -eq 'restart' }).Count) { ' Restart your PC to finish.' } elseif (@($done | Where-Object { $_.T.Badge -eq 'signout' }).Count) { ' Sign out and back in to finish.' } else { '' }
+    if ($fail.Count) { Show-Toast ("Applied $($done.Count) of $($list.Count). " + ($fail -join '  ·  ')) '#FF9F0A' }
+    else {
+        Show-Toast "Applied $($done.Count) $(if ($done.Count -eq 1) { 'change' } else { 'changes' }).$note" '#30D158' {
+            foreach ($x in $script:LastBatch) { Clear-ReadCache; try { if ($x.On) { Invoke-TweakOff $x.T } else { Invoke-TweakOn $x.T } } catch {}; Update-Card $x.T }
+            Update-Summary; Show-Toast 'Undone: everything is as it was before.' '#30D158'
+        }
+    }
+    if ($script:DetailTweak) { Show-TweakDetail $script:DetailTweak }
+}
+$ui.PendingApply.Add_Click({ Invoke-StagedApply })
+$ui.PendingDiscard.Add_Click({ Clear-Staged; if ($script:DetailTweak) { Show-TweakDetail $script:DetailTweak } })
+$ui.PendingReview.Add_Click({
+    $lines = foreach ($x in $script:Staged.Values) { "$(if ($x.On) { 'Switch on:  ' } else { 'Switch off: ' }) $($x.T.Title)$(if ($x.T.Badge -eq 'restart') { '  (restart)' } elseif ($x.T.Badge -eq 'signout') { '  (sign-out)' })" }
+    $r = Show-ZdDialog ("These changes are applied together. Each one saves the original first, and Undo takes the whole batch back.`n`n" + ($lines -join "`n")) 'Review changes' 'OKCancel' 'Question'
+    if ($r -eq 'OK') { Invoke-StagedApply }
+})
+
+# Rows are grouped by area on Tweaks, each group with a header: its name, "12/18 on" and a fold (Hone 1.4)
+$script:FoldedAreas = @{}
+$script:GroupHeads = @{}
+function New-GroupHeader([string]$Cat) {
+    $title = ($Categories | Where-Object { $_.Name -eq $Cat } | Select-Object -First 1).Title; if (-not $title) { $title = $Cat }
+    $h = [ZdTheme]::Parse(@"
+<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' Background='Transparent' Cursor='Hand' Padding='4,16,4,8' AutomationProperties.Name='$(Esc $title)'>
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <TextBlock x:Name='Chev' Text='&#xE70D;' FontFamily='{DynamicResource Font.Icons}' FontSize='11' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,1,10,0'/>
+    <TextBlock Grid.Column='1' Text='$(Esc $title)' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' VerticalAlignment='Center'/>
+    <TextBlock x:Name='Count' Grid.Column='2' FontFamily='Cascadia Mono, Consolas' FontSize='12' Foreground='{DynamicResource Text.Secondary}' VerticalAlignment='Center' Margin='0,0,12,0'/>
+    <Border Grid.Column='3' Width='80' Height='4' CornerRadius='2' Background='{DynamicResource Border.Subtle}' VerticalAlignment='Center'>
+      <Border x:Name='Bar' Height='4' CornerRadius='2' Background='{DynamicResource AccentFill}' HorizontalAlignment='Left' Width='0'/>
+    </Border>
+  </Grid>
+</Border>
+"@)
+    $h.Tag = @{ GroupHead = $true; Cat = $Cat; Chev = $h.FindName('Chev'); Count = $h.FindName('Count'); Bar = $h.FindName('Bar') }
+    $h.Add_MouseLeftButtonUp({ param($s, $e) $c = $s.Tag.Cat; $script:FoldedAreas[$c] = -not $script:FoldedAreas[$c]; Update-Filter })
+    $script:GroupHeads[$Cat] = $h
+    $h
+}
+# after Update-Filter has decided which rows show: headers for the groups that have rows, folded groups collapsed
+function Update-GroupHeads([bool]$On) {
+    $g = @{}
+    foreach ($t in $Tweaks) {
+        if (-not $t.Card -or $t.Header -or $t.Card.Visibility -ne 'Visible') { continue }
+        $c = "$($t.Cat)"; if (-not $g[$c]) { $g[$c] = @{ N = 0; Sw = 0; On = 0 } }
+        $g[$c].N++; if ($t.Toggle -and $null -ne $t.State) { $g[$c].Sw++; if ($t.State) { $g[$c].On++ } }
+    }
+    foreach ($c in @($script:GroupHeads.Keys)) {
+        $h = $script:GroupHeads[$c]; $i = $g[$c]
+        if (-not $On -or -not $i) { $h.Visibility = 'Collapsed'; continue }
+        $h.Visibility = 'Visible'
+        $fold = [bool]$script:FoldedAreas[$c] -and $script:TweakArea -eq 'All'
+        $h.Tag.Chev.Text = [string][char]$(if ($fold) { 0xE76C } else { 0xE70D })
+        $h.Tag.Count.Text = if ($i.Sw) { "$($i.On)/$($i.Sw) on" } else { "$($i.N)" }
+        $h.Tag.Bar.Width = if ($i.Sw) { 80 * $i.On / $i.Sw } else { 0 }
+        if ($fold) { foreach ($t in $Tweaks) { if ("$($t.Cat)" -eq $c -and $t.Card -and -not $t.Header) { $t.Card.Visibility = 'Collapsed' } } }
+    }
+}
+
 function New-SectionHeader($t) {
     $h = [ZdTheme]::Parse(@"
 <StackPanel xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Margin='0,24,16,12'>
@@ -13004,19 +13207,20 @@ function New-SectionHeader($t) {
 function New-Card($t) {
     if ($t.Header) { return New-SectionHeader $t }
     if ($t.Extra -eq 'builder') { return New-PotatoStudio $t }
-    # 2.0 TweakCard (design\DESIGN.md): icon, title and control on one line; what it does; "Don't use if" on the card
-    # face, not in a tooltip; tags. Named parts other code uses: Toggle, ActionBtn, Extra, Warn, ActivePill, RecTag.
+    # 2.1 row (design\DESIGN.md, stage 11): icon, title with small tags, one line of what it does, the state in words
+    # ("Optimized" / "Windows default") and the switch. "Don't use if", what it changes and the source are in the
+    # details panel on the right. Named parts other code uses: Toggle, ActionBtn, Extra, Warn, ActivePill, RecTag, StateText.
     $tags = New-Object Collections.Generic.List[string]
-    if ($t.Lat) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' ToolTip='Affects input delay, frame time or ping'><StackPanel Orientation='Horizontal'><Ellipse Width='6' Height='6' Fill='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock Text='Input delay'/></StackPanel></Border>") }
-    if ($t.Rec) { $tags.Add("<Border x:Name='RecTag' Style='{DynamicResource Zd.Chip}' ToolTip='Included when you press Boost now'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource AccentFill}' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended'/></StackPanel></Border>") }
-    if ($t.New) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource Info.Soft}'><TextBlock Text='New' Foreground='{DynamicResource Info}'/></Border>") }
-    if ($t.Badge) {
+    $risk = Get-TweakRisk $t
+    if ($risk) { $rc = $RiskInfo[$risk]; $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $($rc.Tone).Soft}' Margin='0,0,6,2' ToolTip='$(Esc $rc.Tip)'><TextBlock Text='$risk' Foreground='{DynamicResource $($rc.Tone)}'/></Border>") }
+    if ($t.Rec) { $tags.Add("<Border x:Name='RecTag' Style='{DynamicResource Zd.Chip}' Margin='0,0,6,2' ToolTip='Included when you press Boost now'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource AccentFill}' VerticalAlignment='Center' Margin='0,1,5,0'/><TextBlock Text='Recommended'/></StackPanel></Border>") }
+    if ($t.Lat) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Margin='0,0,6,2' ToolTip='Affects input delay, frame time or ping'><StackPanel Orientation='Horizontal'><Ellipse Width='6' Height='6' Fill='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,6,0'/><TextBlock Text='Input delay'/></StackPanel></Border>") }
+    if ($t.New) { $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource Info.Soft}' Margin='0,0,6,2'><TextBlock Text='New' Foreground='{DynamicResource Info}'/></Border>") }
+    if ($t.Badge -in 'restart', 'signout') {
         $b = $BadgeInfo[$t.Badge]
-        $tone = if ($t.Badge -eq 'advanced') { 'Info' } else { 'Warn' }
-        $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Background='{DynamicResource $tone.Soft}' Cursor='Help' ToolTip='$(Esc $b.Tip)'><TextBlock Text='$(Esc $b.Label)' Foreground='{DynamicResource $tone}'/></Border>")
+        $tags.Add("<Border Style='{DynamicResource Zd.Chip}' Margin='0,0,6,2' Cursor='Help' ToolTip='$(Esc $b.Tip)'><TextBlock Text='$(Esc $b.Label)'/></Border>")
     }
     $src = if ("$($t.Source)" -match '^https?://') { "$($t.Source)" } else { '' }
-    if ($src) { $tags.Add("<Border x:Name='SrcChip' Style='{DynamicResource Zd.Chip}' Cursor='Hand' ToolTip='$(Esc $src)'><TextBlock Text='Source &#x2197;'/></Border>") }
     if ($t.Id -eq 'vrrcap') { $c = Get-VrrCap; if ($c) { $t.Action = "Set $c FPS" } }
     $pill = if ($t.Preset) { "<Border x:Name='ActivePill' Background='{DynamicResource Good.Soft}' CornerRadius='6' Padding='8,2,9,3' Margin='0,0,8,0' VerticalAlignment='Center' Visibility='Collapsed'><StackPanel Orientation='Horizontal'><TextBlock Text='&#xE73E;' FontFamily='{DynamicResource Font.Icons}' FontSize='10' Foreground='{DynamicResource Good}' VerticalAlignment='Center' Margin='0,1,4,0'/><TextBlock Text='Active' FontSize='12' FontWeight='SemiBold' Foreground='{DynamicResource Good}'/></StackPanel></Border>" } else { '' }
     $control = $pill + $(if ($t.Picker) { '' } elseif ($t.Action) {
@@ -13027,37 +13231,32 @@ function New-Card($t) {
     $glyph = '&#x{0:X};' -f [int][char]$t.Icon
     $cardXaml = @"
 <Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
-        Style='{DynamicResource Zd.Card}' Width='342' Height='252' VerticalAlignment='Top' Margin='0,0,16,16' AutomationProperties.Name='$(Esc $t.Title)'>
+        Style='{DynamicResource Zd.Card}' Padding='14,12,16,12' Margin='0,0,0,8' Cursor='Hand' AutomationProperties.Name='$(Esc $t.Title)'>
   <Grid>
-    <Grid.RowDefinitions>
-      <RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/>
-    </Grid.RowDefinitions>
+    <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
     <Grid>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
-      <Border Width='32' Height='32' CornerRadius='8' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Top'>
+      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+      <Border Width='32' Height='32' CornerRadius='8' Background='{DynamicResource Bg.Raised}' VerticalAlignment='Center'>
         <TextBlock Text='$glyph' FontFamily='{DynamicResource Font.Icons}' FontSize='16' Foreground='$(if ($t.Lat) { '{DynamicResource Good}' } else { '{DynamicResource Text.Secondary}' })' HorizontalAlignment='Center' VerticalAlignment='Center'/>
       </Border>
-      <TextBlock Grid.Column='1' Text='$(Esc $t.Title)' ToolTip='$(Esc $t.Title)' FontSize='16' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}'
-                 TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='42' LineHeight='21' LineStackingStrategy='BlockLineHeight' VerticalAlignment='Center' Margin='12,0,10,0'/>
-      <StackPanel Grid.Column='2' Orientation='Horizontal' VerticalAlignment='Top'>$control</StackPanel>
+      <StackPanel Grid.Column='1' Margin='14,0,14,0' VerticalAlignment='Center'>
+        <WrapPanel>
+          <TextBlock Text='$(Esc $t.Title)' FontSize='14' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' TextTrimming='CharacterEllipsis' VerticalAlignment='Center' Margin='0,0,10,2'/>
+          $($tags -join '')
+        </WrapPanel>
+        <TextBlock Text='$(Esc $t.Desc)' ToolTip='$(Esc $t.Desc)' Foreground='{DynamicResource Text.Secondary}' FontSize='12.5' TextTrimming='CharacterEllipsis' Margin='0,2,0,0'/>
+        <Grid x:Name='Warn' Visibility='Collapsed'/>
+      </StackPanel>
+      <TextBlock x:Name='StateText' Grid.Column='2' FontSize='12' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center' Margin='0,0,14,0'/>
+      <StackPanel Grid.Column='3' Orientation='Horizontal' VerticalAlignment='Center'>$control</StackPanel>
     </Grid>
-    <TextBlock Grid.Row='1' Text='$(Esc $t.Desc)' ToolTip='$(Esc $t.Desc)' Foreground='{DynamicResource Text.Secondary}' FontSize='13.5' LineHeight='19' LineStackingStrategy='BlockLineHeight'
-               TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='57' Margin='0,10,0,0'/>
-    <Grid x:Name='Warn' Grid.Row='2' Margin='0,8,0,0' ToolTip='$(Esc "Don't use if: $($t.Warn)")' AutomationProperties.Name='$(Esc "Don't use if: $($t.Warn)")'>
-      <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
-      <TextBlock Text='&#xE946;' FontFamily='{DynamicResource Font.Icons}' FontSize='12' Foreground='{DynamicResource Text.Muted}' Margin='0,2,6,0'/>
-      <TextBlock Grid.Column='1' FontSize='12' LineHeight='17' LineStackingStrategy='BlockLineHeight' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' TextTrimming='CharacterEllipsis' MaxHeight='34'>
-        <Run Text="Don't use if:" FontWeight='SemiBold'/> <Run Text='$(Esc $t.Warn)'/>
-      </TextBlock>
-    </Grid>
-    <ContentControl x:Name='Extra' Grid.Row='3' Margin='0,10,0,0'/>
-    <WrapPanel Grid.Row='4' VerticalAlignment='Bottom' Margin='0,10,0,-6' ClipToBounds='True' MaxHeight='30'>$($tags -join '')</WrapPanel>
+    <ContentControl x:Name='Extra' Grid.Row='1' Margin='46,12,0,0'/>
   </Grid>
 </Border>
 "@
     $card = [ZdTheme]::Parse($cardXaml)
-    $sc = $card.FindName('SrcChip')
-    if ($sc) { $sc.Tag = $src; $sc.Add_MouseLeftButtonUp({ param($s, $e) Start-Process $s.Tag }) }
+    $t.StateText = $card.FindName('StateText')
+    $card.Add_MouseLeftButtonUp({ param($s, $e) Show-TweakDetail $s.Tag })
     $card.Tag = $t
     $t.Card = $card
     $t.Toggle = $card.FindName('Toggle')
@@ -13065,7 +13264,7 @@ function New-Card($t) {
 
     if ($t.Toggle) {
         $t.Toggle.Tag = $t
-        $t.Toggle.Add_Click({ param($s, $e) Switch-Tweak $s.Tag ([bool]$s.IsChecked) })
+        $t.Toggle.Add_Click({ param($s, $e) Set-TweakStaged $s.Tag ([bool]$s.IsChecked) })
     }
     if ($t.Extra -eq 'fps') {
         $panel = [ZdTheme]::Parse(@"
@@ -13102,26 +13301,22 @@ function New-Card($t) {
         $extra.Content = $script:PingText
     }
     if ($t.Extra -eq 'builder') {
-        $card.Height = 432
         $extra.Content = New-BuilderPanel $t
     }
     if ($t.Extra -eq 'preset') {
-        $card.Height = 432
         $t.PreviewHost = $extra
         Update-PresetPreview $t
     }
-    if ($t.Action -or -not $t.Warn) { $card.FindName('Warn').Visibility = 'Collapsed' }
     $btn = $card.FindName('ActionBtn')
     if ($btn) { $btn.Tag = $t; $t.ActionBtn = $btn; $btn.Add_Click({ param($s, $e) Invoke-Action $s.Tag $s }) }
     if ($t.Extra -eq 'gamemode') {
-        $card.Height = 432
         $extra.Content = New-GameModePanel $t
     }
     if ($t.Extra -eq 'session') {
-        $card.Height = 432
         $extra.Content = New-SessionPanel $t
         Update-SessionCard
     }
+    if ($null -eq $extra.Content) { $extra.Visibility = 'Collapsed' }
     $card
 }
 
@@ -13559,14 +13754,21 @@ function Update-Card($t, $Pre) {
     $reqOk = if ($Pre) { $Pre.Req } elseif ($t.Requires -and $null -eq $state) { & $t.Requires } else { $true }
     $t.Hidden = [bool]($t.ForceHidden -or ($t.Requires -and $null -eq $state -and -not $reqOk))
     if ($t.Hidden) { $t.Card.Visibility = 'Collapsed' }
+    $st = $script:Staged[$t.Id]
     if ($null -eq $state) {
         $t.Toggle.IsEnabled = $false
         $t.Toggle.IsChecked = $false
         $t.Toggle.ToolTip = 'Not available on this PC'
     } else {
         $t.Toggle.IsEnabled = $true
-        $t.Toggle.IsChecked = $state
+        $t.Toggle.IsChecked = if ($st) { $st.On } else { $state }
         $t.Toggle.ToolTip = $null
+    }
+    if ($t.StateText) {
+        # 2.1: the state in words next to the switch, so "on" is never ambiguous (the O&O complaint)
+        $t.StateText.Text = if ($st) { if ($st.On) { 'Will switch on' } else { 'Will switch off' } } elseif ($null -eq $state) { 'Not on this PC' } elseif ($state) { 'Optimized' } else { 'Windows default' }
+        $t.StateText.Foreground = $window.FindResource($(if ($st) { 'AccentFill' } elseif ($state) { 'Text.Secondary' } else { 'Text.Muted' }))
+        $t.StateText.FontWeight = if ($st) { 'SemiBold' } else { 'Normal' }
     }
 }
 
@@ -25681,11 +25883,14 @@ function Update-Filter {
     $ui.ChipBar.Visibility = if ($chips) { 'Visible' } else { 'Collapsed' }
     if ($chips) { Update-ChipBar }
     if (-not $q -and $script:CurrentCat.Page) {
-        $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'; $ui.EmptyState.Visibility = 'Collapsed'
+        $ui.Scroller.Visibility = 'Collapsed'; $ui.PageHost.Visibility = 'Visible'; $ui.EmptyState.Visibility = 'Collapsed'; $ui.Detail.Visibility = 'Collapsed'
         $ui.PageHost.Content = Get-PageContent $script:CurrentCat.Page
         return
     }
     $ui.Scroller.Visibility = 'Visible'; $ui.PageHost.Visibility = 'Collapsed'
+    $det = $window.ActualWidth -ge 1180 -or $window.ActualWidth -eq 0
+    $ui.Detail.Visibility = if ($det) { 'Visible' } else { 'Collapsed' }
+    $ui.Scroller.Margin = if ($det) { '0,0,340,0' } else { '0' }
     foreach ($t in $Tweaks) {
         $show = if ($q) { -not $t.Header -and ($t.Title -like "*$q*" -or $t.Desc -like "*$q*") }
                 elseif ($cn -eq 'Tweaks') { Test-TweakCardVisible $t }
@@ -25714,6 +25919,8 @@ function Update-Filter {
         $ui.ShowAllOn.Content = "Turn on all $($script:ShownOff.Count) shown"
         $ui.ShowAllOn.ToolTip = 'Opens Boost now with every card shown here that is off. You still see the list and choose before anything changes.'
     }
+    Update-GroupHeads ((-not $q) -and $cn -eq 'Tweaks')
+    if (-not $script:DetailTweak -or $script:DetailTweak.Card.Visibility -ne 'Visible') { $first = $shown | Where-Object { $_.Card.Visibility -eq 'Visible' } | Select-Object -First 1; if ($first) { Show-TweakDetail $first } }
     if (-not $shown.Count) {
         $ui.EmptyTitle.Text = if ($q) { "Nothing matches `"$q`"" } else { "No $($noun)s match these filters" }
         $ui.EmptyText.Text = if ($q) { 'Search looks at card titles and descriptions. Try a shorter word, or clear the search.' } elseif ($script:TweakView -eq 'On' -and $cn -eq 'Tweaks') { 'None of these are switched on yet.' } else { 'Try another area, or show everything.' }
@@ -26354,7 +26561,13 @@ $Tweaks = @($Tweaks | Where-Object { -not ($_.Action -and $_.Requires -and -not 
 $Tweaks = @($Tweaks | ForEach-Object { [pscustomobject]@{ T = $_; K = [int]$catOrder[$_.Cat] * 10000 + $n++ } } | Sort-Object K | ForEach-Object { $_.T })
 Set-SplashStatus 'Checking your settings'
 Start-StateRefresh { Show-AfterStartup }    # runs in the background while the cards are built
-foreach ($t in $Tweaks) { [void]$ui.Cards.Children.Add((New-Card $t)) }
+$catOrder = @{}; $ci = 0; foreach ($c in $Categories) { $catOrder["$($c.Name)"] = $ci++ }
+$ki = 0
+$lastCat = $null
+foreach ($o in @($Tweaks | ForEach-Object { [pscustomobject]@{ T = $_; O = $(if ($catOrder.ContainsKey("$($_.Cat)")) { $catOrder["$($_.Cat)"] } else { 999 }); K = $ki++ } } | Sort-Object O, K)) {
+    if ("$($o.T.Cat)" -ne $lastCat) { $lastCat = "$($o.T.Cat)"; [void]$ui.Cards.Children.Add((New-GroupHeader $lastCat)) }
+    [void]$ui.Cards.Children.Add((New-Card $o.T))
+}
 
 # Stretch cards so each row fills the width evenly (min ~320px per card).
 # Smooth scrolling: the mouse wheel moves a target and the view glides toward it.
@@ -26376,12 +26589,6 @@ $ui.Scroller.Add_PreviewMouseWheel({
 })
 function Reset-Scroll { $script:ScrollTimer.Stop(); $script:ScrollTarget = 0; $ui.Scroller.ScrollToVerticalOffset(0) }
 
-$ui.Cards.Add_SizeChanged({
-    $w = $ui.Cards.ActualWidth
-    $cols = [Math]::Max(1, [Math]::Floor($w / 330))
-    $cardW = [Math]::Floor($w / $cols) - 16
-    foreach ($c in $ui.Cards.Children) { $c.Width = if ($c.Tag.Header -or $c.Tag.Extra -eq 'builder') { [Math]::Max(100, $w - 16) } else { $cardW } }
-})
 $startName = if ($Page -and ($Categories | Where-Object { $_.Name -eq $Page })) { $Page } else { 'Home' }
 Select-NavPage $startName
 Update-GameModeUi
