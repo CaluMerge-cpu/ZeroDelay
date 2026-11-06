@@ -26213,7 +26213,7 @@ function Update-Filter {
         return
     }
     $ui.Scroller.Visibility = 'Visible'; $ui.PageHost.Visibility = 'Collapsed'
-    $det = $window.ActualWidth -ge 1180 -or $window.ActualWidth -eq 0
+    $det = $(if ($window.ActualWidth -gt 0) { $window.ActualWidth } else { $window.Width }) -ge 1180
     $ui.Detail.Visibility = if ($det) { 'Visible' } else { 'Collapsed' }
     $ui.Scroller.Margin = if ($det) { '0,0,340,0' } else { '0' }
     foreach ($t in $Tweaks) {
@@ -26253,6 +26253,12 @@ function Update-Filter {
     } else { $ui.EmptyState.Visibility = 'Collapsed' }
 }
 $ui.Search.Add_TextChanged({ Update-Filter })
+# 2.1: the details panel needs room; below 1180 px wide the list gets the whole width (re-checked when the window resizes)
+$window.Add_SizeChanged({
+    if (-not $script:CurrentCat -or $script:CurrentCat.Page) { return }
+    $want = if ($window.ActualWidth -ge 1180) { 'Visible' } else { 'Collapsed' }
+    if ($ui.Detail.Visibility -ne $want) { $ui.Detail.Visibility = $want; $ui.Scroller.Margin = if ($want -eq 'Visible') { '0,0,340,0' } else { '0' } }
+})
 $ui.EmptyReset.Add_Click({ if ($ui.Search.Text) { $ui.Search.Text = '' }; $script:TweakView = 'All'; $script:TweakArea = 'All'; $script:CheckArea = 'All'; Update-Filter; Reset-Scroll })
 # opens Boost now with exactly the shown cards that are off: the sheet is the confirmation, nothing changes before step 3
 $ui.ShowAllOn.Add_Click({
