@@ -13,6 +13,7 @@ param(
     [string]$Page,        # dev: category to show first
     [switch]$Tray         # start hidden in the system tray (used by "Start with Windows")
 )
+$script:ZdClock = [Diagnostics.Stopwatch]::StartNew()   # startup timing for dev renders (Write-StartupMark)
 
 # --- Self-elevate (HKLM tweaks, powercfg and network adapters need admin) ---
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -28,6 +29,9 @@ if (-not $NoElevate -and -not $principal.IsInRole([Security.Principal.WindowsBui
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+# a WMI query on the window's thread gives up after 30 s instead of waiting out WMI's own 3-minute timeout, so a busy
+# or stuck WMI service cannot freeze the window that long (the background workers keep WMI's default)
+$PSDefaultParameterValues['Get-CimInstance:OperationTimeoutSec'] = 30
 try { [Windows.Media.Animation.Timeline]::DesiredFrameRateProperty.OverrideMetadata([Windows.Media.Animation.Timeline], (New-Object Windows.FrameworkPropertyMetadata ([object][int]240))) } catch {}
 if (-not $Snapshot) {
     $created = $false
@@ -113,7 +117,9 @@ if (-not $Snapshot -and -not $Tray) {
     })
     $script:SplashHandle = $splashPs.BeginInvoke()
 }
-function Set-SplashStatus([string]$Text) { if ($script:Splash) { $script:Splash.Status = $Text } }
+function Set-SplashStatus([string]$Text) { if ($script:Splash) { $script:Splash.Status = $Text }; Write-StartupMark $Text }
+# dev renders (-Snapshot) print how long each startup stage took, so CI shows where the time to the first window goes
+function Write-StartupMark([string]$What) { if ($Snapshot) { [Console]::WriteLine(('STARTUP {0,7} ms  {1}' -f $script:ZdClock.ElapsedMilliseconds, $What)) } }
 function Close-Splash { if ($script:Splash) { $script:Splash.Close = $true } }
 $UpdateRepo = 'CaluMerge-cpu/ZeroDelay'
 
@@ -517,6 +523,8 @@ using System.Threading;
 public static class ZdWatchdog {
     static Thread ui, watcher; static long lastBeat; static string logPath = "", version = "";
     static volatile string step = "starting"; static volatile bool dumped, frozen;
+    // dev renders (-Snapshot): the report also goes to the error output, so a CI run that times out shows where
+    public static volatile bool Echo;
     public static string Step { get { return step; } set { step = value ?? ""; } }
     public static void Beat() {
         long was = Interlocked.Exchange(ref lastBeat, DateTime.UtcNow.Ticks);
@@ -546,7 +554,9 @@ public static class ZdWatchdog {
 #pragma warning restore 618
                 } catch (Exception e) { stack = "stack unavailable: " + e.Message; }
             }
-            try { System.IO.File.AppendAllText(logPath, "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window has not responded for " + Math.Round(secs) + " s. Step: " + step + "\r\n" + stack + "\r\n"); } catch { }
+            string txt = "==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  ZeroDelay " + version + "  (watchdog)\r\nThe window has not responded for " + Math.Round(secs) + " s. Step: " + step + "\r\n" + stack + "\r\n";
+            try { System.IO.File.AppendAllText(logPath, txt); } catch { }
+            if (Echo) { try { Console.Error.WriteLine("WATCHDOG " + txt); Console.Error.Flush(); } catch { } }
         }
     }
 }
@@ -13867,14 +13877,15 @@ function Update-Summary {
     $on = @($toggles | Where-Object { $_.State }).Count
     $ui.ActiveCount.Text = "$on / $($toggles.Count)"
     $ui.ActiveBar.Width = if ($toggles.Count) { 170 * $on / $toggles.Count } else { 0 }
-    $plan = Get-ActivePowerScheme
+    # the status line's plan: powercfg starts a process, and this runs after every change (a change clears the cache)
+    $plan = Get-Cached 'activescheme' { Get-ActivePowerScheme }
     $fn = if ($script:FortniteExe) { 'Fortnite found' } else { 'Fortnite not found' }
     $run = if (Test-FortniteRunning) { '  ·  Fortnite is running (close it to change game settings)' } else { '' }
     $ui.StatusLine.Text = "$fn  ·  Power plan: $($plan.Name)$run"
     $ui.RestoreAll.IsEnabled = ($script:Backup.Registry.Count -gt 0 -or $script:Backup.Custom.Count -gt 0)
     Update-RestartBar
     if ($script:CurrentCat) { Update-Filter }
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
     if ($script:ActiveUi -and $script:CurrentCat.Name -eq 'Active') { Update-ActivePage }
 }
 
@@ -14609,16 +14620,21 @@ function ConvertTo-OrderedTable($o) {
     elseif ($o) { $o.PSObject.Properties | ForEach-Object { $h[$_.Name] = $_.Value } }
     $h
 }
-function Get-Drift {
+# Id -> card (the first with that Id), for lookups in loops over many ids
+function Get-TweakIndex { $x = @{}; foreach ($t in $Tweaks) { if ($t.Id -and -not $x.ContainsKey("$($t.Id)")) { $x["$($t.Id)"] = $t } }; $x }
+# $Pre: card states already read in the background worker ($WorkerTestScript results); missing cards are read here
+function Get-Drift($Pre) {
     Clear-ReadCache
     $items = @()
+    $byId = Get-TweakIndex
     foreach ($id in Get-Applied) {
-        $t = $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+        $t = $byId["$id"]
         if (-not $t -or -not $t.Toggle) { continue }
         # Fortnite leaves out keys at their default and cannot be edited while running; skip those cases.
         if ($t.Cs -and (Test-Cs2Running)) { continue }
         if ($t.Ini -and ((Test-FortniteRunning) -or -not (Test-Path $IniPath) -or -not ($t.Ini.Keys | Where-Object { $null -ne (Get-IniValue (Get-Content $IniPath) $_) }))) { continue }
-        if ((Invoke-TweakTest $t) -eq $false) { $items += [pscustomobject]@{ Kind = 'tweak'; T = $t; Title = $t.Title } }
+        $st = if ($Pre -is [hashtable] -and $Pre.ContainsKey("$($t.Id)")) { $Pre["$($t.Id)"].State } else { Invoke-TweakTest $t }
+        if ($st -eq $false) { $items += [pscustomobject]@{ Kind = 'tweak'; T = $t; Title = $t.Title } }
     }
     $lp = $script:Backup.Custom['lastpreset']
     if ($lp -and (Test-Path $IniPath) -and -not (Test-FortniteRunning)) {
@@ -14627,7 +14643,7 @@ function Get-Drift {
     }
     $want = $script:Backup.Custom['nvlodvalue']
     if ($want -and (Test-NvAvailable)) {
-        $cur = Get-NvLod
+        $cur = if ($Pre -is [hashtable] -and $Pre.ContainsKey('__nvlod')) { $Pre.__nvlod } else { Get-NvLod }
         if ($null -ne $cur -and $cur -ne [int]$want) { $items += [pscustomobject]@{ Kind = 'nvlod'; Value = [int]$want; Title = 'NVIDIA texture blur (driver update?)' } }
     }
     $items
@@ -14647,12 +14663,32 @@ function Repair-Drift($items) {
     Update-Summary
     "Re-applied $ok setting$(if ($ok -ne 1) { 's' })." + $(if ($failed) { " Could not: $($failed -join ', ')." } else { '' })
 }
+# Every 90 s and when the window gets focus: the cards ZeroDelay switched on are re-read in the background worker
+# (one registry, WMI or driver read each: 1-2 s on the window's thread with many cards on, also while a game runs),
+# then the result is handled here. Dev renders and a missing worker read them here, as before.
 function Invoke-DriftCheck {
     [ZdWatchdog]::Step = 'Invoke-DriftCheck'
     if ($script:DriftBusy) { return }
+    $byId = Get-TweakIndex
+    $specs = @(foreach ($id in Get-Applied) { $t = $byId["$id"]; if ($t -and $t.Toggle) { ConvertTo-WorkerSpec $t } })
+    if ($Snapshot -or -not $script:Worker -or -not $specs.Count) { Complete-DriftCheck $null; return }
+    $script:DriftBusy = $true
+    $script:DriftMark = "$(@(Get-History)[0].Time)"
+    Invoke-Worker $WorkerTestScript @(, $specs) {
+        param($out, $errs)
+        $script:DriftBusy = $false
+        $r = Get-WorkerResult $out
+        # a card switched since the read: read them all again here rather than report a stale state
+        if ($r -isnot [hashtable] -or "$(@(Get-History)[0].Time)" -ne $script:DriftMark) { $r = $null }
+        Complete-DriftCheck $r
+    }
+}
+function Complete-DriftCheck($Pre) {
+    [ZdWatchdog]::Step = 'Complete-DriftCheck'
+    if ($script:DriftBusy) { return }
     $script:DriftBusy = $true
     try {
-        $items = @(Get-Drift)
+        $items = @(Get-Drift $Pre)
         $script:DriftItems = $items
         if (-not $items.Count) { $ui.DriftBar.Visibility = 'Collapsed'; return }
         $trusted = Get-RunningTrustedBoosters
@@ -17288,7 +17324,7 @@ function Invoke-UpdateCheck {
             $why = ($changes | ForEach-Object { $_.Text }) -join ' and '
             $script:Backup.Custom['shaderwarm'] = @{ Since = (Get-Date).ToString('o'); Why = $why; Left = 2 }
             Show-Toast "$((Get-Culture).TextInfo.ToTitleCase($why.Substring(0, 1)) + $why.Substring(1)). Your first match or two may stutter while shaders rebuild: play a warm-up before a cup." '#0A84FF'
-            if ($script:HomeUi) { Update-HomePage }
+            Request-HomeUpdate
             if ($script:EventsUi) { Update-EventsReady }
         }
         Save-Backup
@@ -17365,7 +17401,7 @@ function Complete-MatchReport {
     if (-not $fnRec) { $script:MatchGame = $r.Game; $script:TrendGame = $r.Game }
     if ($script:GameSel -and $script:GameSel.Id -eq $r.Game) { Update-GameStats }
     $w = $script:Backup.Custom['shaderwarm']
-    if ($fnRec -and $w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; if ($script:HomeUi) { Update-HomePage } }
+    if ($fnRec -and $w -and [int]$w.Left -gt 0) { $w.Left = [int]$w.Left - 1; if ($w.Left -le 0) { $script:Backup.Custom.Remove('shaderwarm') } else { $script:Backup.Custom['shaderwarm'] = $w }; Save-Backup; Request-HomeUpdate }
     if ($script:MatchUi) { Update-MatchesPage }
     $n = @($r.Issues).Count
     $sum = if ($n) { "$n thing$(if ($n -ne 1) { 's' }) got in the way." } else { 'Smooth session: nothing got in the way.' }
@@ -17585,7 +17621,8 @@ function Save-MatchReport($r) {
     Get-ChildItem $MatchDir -Filter '*.json' | Group-Object { Get-ReportFileGame $_.Name } | ForEach-Object { $_.Group | Sort-Object Name -Descending | Select-Object -Skip 60 } | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 function Get-MatchReports {
-    if ($Snapshot -and $env:ZD_FAKE_MATCH) { return @(New-FakeMatchReport) }
+    # dev renders: the synthetic report (a 60,000-frame analysis) is built once, not on every Home or game refresh
+    if ($Snapshot -and $env:ZD_FAKE_MATCH) { if (-not $script:FakeReports) { $script:FakeReports = @(New-FakeMatchReport) }; return $script:FakeReports }
     if (-not (Test-Path $MatchDir)) { return @() }
     @(Get-ChildItem $MatchDir -Filter '*.json' | Sort-Object Name -Descending | ForEach-Object {
         $f = $_.FullName
@@ -17729,9 +17766,11 @@ function Start-Background([string]$Script, [object[]]$ArgList = @(), [scriptbloc
     $ps = [powershell]::Create()
     [void]$ps.AddScript($Script)
     foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
-    [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $Done })
+    [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $Done; Name = (Get-JobName $Script) })
     Start-BgPoll
 }
+# the first line of a background job's code, for the freeze detector's report
+function Get-JobName([string]$Code) { $l = @("$Code".Trim() -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' / '; if ($l.Length -gt 120) { $l.Substring(0, 120) } else { $l } }
 function Start-BgPoll {
     if (-not $script:BgTimer) {
         $script:BgTimer = New-Object Windows.Threading.DispatcherTimer
@@ -17745,6 +17784,7 @@ function Start-BgPoll {
                 $errs += @($j.PS.Streams.Error)
                 $j.PS.Dispose()
                 if ($j.Worker) { $script:WorkerJob = $null }
+                [ZdWatchdog]::Step = "background result: $($j.Name)"
                 if ($j.Done) { try { & $j.Done @($out) $errs } catch { [Console]::Error.WriteLine("$_ $($_.InvocationInfo.PositionMessage)"); Show-Toast "Something went wrong: $($_.Exception.Message)" '#FF453A' } }
                 if ($j.Worker) { Start-WorkerNext }
             }
@@ -17805,7 +17845,7 @@ function Start-WorkerNext {
         #   (on its own line after param(): one-line jobs such as 'param($fn) @{ ... }' continue on the next line)
         $code = if ($job.Code -match '^\s*param\([^)]*\)') { $job.Code.Insert($Matches[0].Length, "`n`$global:ReadCache = @{}`n") } else { "`$global:ReadCache = @{}`n" + $job.Code }
         [void]$ps.AddScript($code); foreach ($a in $job.Args) { [void]$ps.AddArgument($a) }
-        [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $job.Done })
+        [void]$script:BgJobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $job.Done; Name = (Get-JobName $job.Code) })
     }
     Start-BgPoll
 }
@@ -17852,6 +17892,7 @@ function Start-StateRefresh([scriptblock]$Then) {
 }
 function Complete-StateRefresh {
     [ZdWatchdog]::Step = 'Complete-StateRefresh'
+    if (-not $script:FirstRefreshDone) { Write-StartupMark 'settings read (background)' }
         $res = $script:StateParts
         if (-not $script:StateFail -and $res.Count -gt 1) {
             $script:CurrentNvLod = $res.__nvlod
@@ -17862,7 +17903,7 @@ function Complete-StateRefresh {
         if (-not $script:FirstRefreshDone) { $script:FirstRefreshDone = $true; Test-AfterBoot; Invoke-UpdateCheck }
         Update-RestartBar
         Update-PauseCard
-        if ($script:HomeUi) { Update-HomePage }
+        # (Home was refreshed by Update-Summary above, in both branches)
         if ($script:BoostUi) { Update-BoostPage }
         if ($script:GameSel -and $script:GamesUi) { Update-GameTools }
         if ($script:StateThen) { $then = $script:StateThen; $script:StateThen = $null; & $then }
@@ -19026,7 +19067,7 @@ function Set-ProfileTailoring {
     $opt = @($p.Software.'Other optimizers')
     if ($opt.Count) { [void]$notes.Add("Other optimizers installed: $($opt -join ', '). They can change the same settings; drift alerts will tell you when they do.") }
     $script:TailorNotes = @($notes)
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
     foreach ($t in $Tweaks) {
         if (-not $t.Card) { continue }
         $tag = $t.Card.FindName('RecTag')
@@ -22740,7 +22781,92 @@ function Start-GameArtFetch {
         $script:GameArtBusy = $false
         $r = Get-WorkerResult $out; if (-not $r -or -not @($r.Got).Count) { return }
         $u = $script:GamesUi; if (-not $u) { return }
-        foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) { if (-not (Get-GameLogo $t.Tag)) { Set-GameTileArt $t } }
+        Start-GameImageFetch @(@($u.Tiles.Children) + @($u.MoreTiles.Children) | ForEach-Object { $_.Tag })
+    }
+}
+# The tile logos (the shell's icon reader: 3-4 s the first time on a fresh PC) and the downloaded art (a JPEG decode
+# per tile) are read in the background worker as frozen images, so the library opens at once and fills in; a game's
+# logo is read once per session. Dev renders read them in place so the picture is complete.
+$GameImageWorkerCode = @'
+param($Items)
+$res = @{}
+foreach ($it in $Items) {
+    $img = $null; $art = $null
+    if ($it.Logo) {
+        $hb = [ZdShellIcon]::Get($it.Logo, 256)
+        if ($hb -ne [IntPtr]::Zero) {
+            try { $img = [Windows.Interop.Imaging]::CreateBitmapSourceFromHBitmap($hb, [IntPtr]::Zero, [Windows.Int32Rect]::Empty, [Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions()); $img.Freeze() }
+            catch { $img = $null } finally { [void][ZdShellIcon]::DeleteObject($hb) }
+        }
+    }
+    if (-not $img -and $it.Art) {
+        try { $art = New-Object Windows.Media.Imaging.BitmapImage; $art.BeginInit(); $art.CacheOption = 'OnLoad'; $art.DecodePixelWidth = 600; $art.UriSource = New-Object Uri $it.Art; $art.EndInit(); $art.Freeze() } catch { $art = $null }
+    }
+    $res[$it.Id] = @{ HasLogoFile = [bool]$it.Logo; Logo = $img; Art = $art; ArtKey = $it.ArtKey }
+}
+$res
+'@
+function Test-GameLogoKnown($g) { [bool]($g -and $script:GameLogos -and $script:GameLogos.ContainsKey($g.Id)) }
+function Get-GameLogoCached($g) { if (Test-GameLogoKnown $g) { $script:GameLogos[$g.Id] } else { $null } }
+function Set-GameTileLogo($tile, $logo) {
+    $lb = $tile.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
+    $tile.FindName('Big').Visibility = 'Collapsed'; $tile.FindName('Glyph').Visibility = 'Collapsed'
+}
+function Start-GameImageFetch([object[]]$Games) {
+    if (-not $script:GameLogos) { $script:GameLogos = @{} }
+    if (-not $script:GameArt) { $script:GameArt = @{} }
+    if (-not $script:GameImgBusy) { $script:GameImgBusy = @{} }
+    $items = @(foreach ($g in @($Games)) {
+        if (-not $g -or -not $g.Id -or $script:GameImgBusy[$g.Id]) { continue }
+        $logoFile = $null
+        if (-not $script:GameLogos.ContainsKey($g.Id)) {
+            $file = try { & $g.IconFile } catch { $null }
+            if ($file -and (Test-Path -LiteralPath $file)) { $logoFile = "$file" } else { $script:GameLogos[$g.Id] = $null }
+        }
+        $artKey = $null; $artFile = $null
+        $aid = Get-GameSteamId $g
+        if ($aid) { $artKey = "$aid-capsule"; if (-not $script:GameArt[$artKey]) { $f = Get-GameArtFile $aid 'capsule'; if (Test-Path -LiteralPath $f) { $artFile = $f } } }
+        if ($logoFile -or ($artFile -and -not $script:GameLogos[$g.Id])) { @{ Id = "$($g.Id)"; Logo = $logoFile; Art = $artFile; ArtKey = $artKey } }
+    })
+    if (-not $items.Count) { Update-GameImages; return }
+    foreach ($it in $items) { $script:GameImgBusy[$it.Id] = $true }
+    if ($Snapshot -and -not $env:ZD_PCMATRIX) { Complete-GameImageFetch (& ([scriptblock]::Create($GameImageWorkerCode)) $items); return }
+    Invoke-Worker $GameImageWorkerCode @(, $items) {
+        param($out, $errs)
+        $r = Get-WorkerResult $out
+        if ($r -is [hashtable]) { Complete-GameImageFetch $r; return }
+        # no worker: read them here, as before
+        $script:GameImgBusy = @{}
+        $u = $script:GamesUi; if (-not $u) { return }
+        foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) { $lg = Get-GameLogo $t.Tag; if ($lg) { if ($t.FindName('Logo').Visibility -ne 'Visible') { Set-GameTileLogo $t $lg } } elseif (-not ($t.Background -is [Windows.Media.ImageBrush])) { Set-GameTileArt $t } }
+    }
+}
+function Complete-GameImageFetch($r) {
+    if (-not $script:GameLogos) { $script:GameLogos = @{} }
+    if (-not $script:GameArt) { $script:GameArt = @{} }
+    if (-not $script:GameImgBusy) { $script:GameImgBusy = @{} }
+    if ($r -is [hashtable]) {
+        foreach ($id in @($r.Keys)) {
+            $x = $r[$id]; $script:GameImgBusy.Remove($id)
+            if ($x.HasLogoFile) { $script:GameLogos[$id] = $x.Logo }
+            if ($x.Art -and $x.ArtKey) { $script:GameArt[$x.ArtKey] = $x.Art }
+        }
+    }
+    Update-GameImages
+}
+# tiles and the open game page take the pictures that are ready
+function Update-GameImages {
+    $u = $script:GamesUi; if (-not $u) { return }
+    foreach ($t in @($u.Tiles.Children) + @($u.MoreTiles.Children)) {
+        $g = $t.Tag; if (-not (Test-GameLogoKnown $g)) { continue }
+        $lg = $script:GameLogos[$g.Id]
+        if ($lg) { if ($t.FindName('Logo').Visibility -ne 'Visible') { Set-GameTileLogo $t $lg } }
+        elseif (-not ($t.Background -is [Windows.Media.ImageBrush])) { Set-GameTileArt $t }
+    }
+    $g = $script:GameSel
+    if ($g -and $u.Detail.Visibility -eq 'Visible' -and $u.HeroLogo.Visibility -ne 'Visible') {
+        $lg = Get-GameLogoCached $g
+        if ($lg) { $u.HeroLogo.Background = New-Object Windows.Media.ImageBrush $lg; $u.HeroLogo.Visibility = 'Visible' }
     }
 }
 
@@ -22771,13 +22897,13 @@ function New-GameTile($g) {
     $ok = try { [bool](& $g.Installed) } catch { $false }
     $g.InstalledNow = $ok
     if (-not $ok) { $b.Opacity = 0.82 }
-    $logo = Get-GameLogo $g
-    if ($logo) {
-        $lb = $b.FindName('Logo'); $lb.Background = New-Object Windows.Media.ImageBrush $logo; $lb.Visibility = 'Visible'
-        $b.FindName('Big').Visibility = 'Collapsed'; $b.FindName('Glyph').Visibility = 'Collapsed'
-    }
+    # pictures already read this session go on now; the rest come from Start-GameImageFetch (New-GamesPage)
     $b.Tag = $g
-    if (-not $logo) { Set-GameTileArt $b }
+    if (Test-GameLogoKnown $g) {
+        $logo = $script:GameLogos[$g.Id]
+        if ($logo) { Set-GameTileLogo $b $logo }
+        else { $aid = Get-GameSteamId $g; if ($aid -and $script:GameArt -and $script:GameArt["$aid-capsule"]) { Set-GameTileArt $b } }
+    }
     $badge = $b.FindName('Badge'); $bt = $b.FindName('BadgeText')
     $bt.Text = if ($ok) { 'Installed' } else { 'Not found' }
     $badge.Background = ConvertTo-Brush $(if ($ok) { '#4D1F8F4E' } else { '#40FDFDFD' })
@@ -22977,6 +23103,7 @@ function New-GamesPage {
         if ($tile.Tag.InstalledNow) { [void]$h.Tiles.Children.Add($tile) } else { [void]$h.MoreTiles.Children.Add($tile) }
     }
     if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
+    Start-GameImageFetch $GameDefs
     Start-GameArtFetch
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
@@ -23039,8 +23166,10 @@ function Show-GameDetail($g) {
         $ib = New-Object Windows.Media.ImageBrush $art; $ib.Stretch = 'UniformToFill'; $ib.AlignmentY = 'Top'
         $h.Hero.Background = $ib; $h.HeroGlyph.Visibility = 'Collapsed'
     } else { $h.Hero.Background = $grad; $h.HeroGlyph.Visibility = 'Visible' }
-    $logo = Get-GameLogo $g
-    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible' } else { $h.HeroLogo.Visibility = 'Collapsed' }
+    $h.HeroLogo.Visibility = 'Collapsed'
+    if (-not (Test-GameLogoKnown $g)) { Start-GameImageFetch @($g) }   # fills the hero logo in when it is read
+    $logo = Get-GameLogoCached $g
+    if ($logo) { $h.HeroLogo.Background = New-Object Windows.Media.ImageBrush $logo; $h.HeroLogo.Visibility = 'Visible' }
     $h.Nodes[0].Children[1].Text = 'This PC'; $h.Nodes[1].Children[1].Text = 'Your router'; $h.Nodes[2].Children[1].Text = 'Internet provider'
     # server list: automatic first, then every server by region
     $h.ServerList.Children.Clear()
@@ -23659,8 +23788,16 @@ function New-MatchCard($r) {
     $card
 }
 
+# Home is rebuilt after every change and every settings refresh (it reads the newest match reports from disk and
+# builds their cards): only while it is on screen. Otherwise it is marked stale and refreshed when it is shown
+# (PageRefresh when the page opens, the search timer when a search over it is cleared).
+function Request-HomeUpdate {
+    if (-not $script:HomeUi) { return }
+    if ($script:CurrentCat -and $script:CurrentCat.Page -eq 'Home' -and -not "$($ui.Search.Text)".Trim()) { Update-HomePage } else { $script:HomeStale = $true }
+}
 function Update-HomePage {
     $h = $script:HomeUi; if (-not $h) { return }
+    $script:HomeStale = $false
     $w = $script:Backup.Custom['shaderwarm']
     if ($w -and [int]$w.Left -gt 0) {
         $h.WarmTitle.Text = "$((Get-Culture).TextInfo.ToTitleCase("$($w.Why)".Substring(0, 1)) + "$($w.Why)".Substring(1)): expect a little stutter at first"
@@ -23853,9 +23990,17 @@ function Get-NavParent([string]$Name) {
 }
 # the tweak areas shown as chips: every category that holds switches, in menu order
 function Get-TweakAreas {
+    # one pass over the cards (this ran a search through every card for each of ~40 areas, on every filter change)
+    $has = @{}
+    foreach ($t in $Tweaks) {
+        if ($t.Hidden -or ($t.Action -and $CheckActions -contains $t.Action)) { continue }
+        $has["$($t.Cat)"] = $true
+        if ($t.Potato) { $has['Potato'] = $true }
+        if ($t.Gtx) { $has['Gtx1080Ti'] = $true }
+    }
     @($Categories | Where-Object {
         -not $_.Page -and @('All', 'Latency', 'New', 'Tweaks', 'Checks') -notcontains $_.Name -and -not ($_.Requires -and -not (& $_.Requires))
-    } | Where-Object { $n = $_.Name; [bool]($Tweaks | Where-Object { -not (Test-CheckCard $_) -and -not $_.Hidden -and ($_.Cat -eq $n -or ($n -eq 'Potato' -and $_.Potato) -or ($n -eq 'Gtx1080Ti' -and $_.Gtx)) } | Select-Object -First 1) })
+    } | Where-Object { $has.ContainsKey("$($_.Name)") })
 }
 $CheckAreas = [ordered]@{
     'All' = $null
@@ -23907,6 +24052,12 @@ function New-Segment([string]$Label, [bool]$On, [scriptblock]$Click, $Tag) {
 }
 # the chip rows above the cards on Tweaks and Checks
 function Update-ChipBar {
+    # rebuilt only when what it shows changes (it runs on every filter change, and each chip is parsed from XAML)
+    $hid = New-Object Text.StringBuilder
+    if ($script:CurrentCat.Name -eq 'Tweaks') { foreach ($t in $Tweaks) { [void]$hid.Append($(if ($t.Hidden) { '1' } else { '0' })) } }
+    $key = "$($script:CurrentCat.Name)|$($script:TweakView)|$($script:TweakArea)|$($script:CheckArea)|$hid"
+    if ($key -eq $script:ChipBarKey -and ($ui.ChipAreas.Children.Count -or $ui.ChipViews.Children.Count)) { return }
+    $script:ChipBarKey = $key
     $ui.ChipViews.Children.Clear(); $ui.ChipAreas.Children.Clear()
     if ($script:CurrentCat.Name -eq 'Tweaks') {
         $ui.ChipViewsBox.Visibility = 'Visible'
@@ -23927,9 +24078,9 @@ function Update-ChipBar {
 }
 # the line under the title on Tweaks and Checks: what is shown and how to see more
 function Get-ViewNote {
-    $vis = @($Tweaks | Where-Object { $_.Card -and $_.Card.Visibility -eq 'Visible' -and -not $_.Header }).Count
+    $vis = 0; foreach ($t in $Tweaks) { if ($t.Card -and $t.Card.Visibility -eq 'Visible' -and -not $t.Header) { $vis++ } }
     if ($script:CurrentCat.Name -eq 'Tweaks') {
-        $all = @($Tweaks | Where-Object { -not (Test-CheckCard $_) -and -not $_.Hidden -and -not $_.Header }).Count
+        $all = 0; foreach ($t in $Tweaks) { if (-not ($t.Action -and $CheckActions -contains $t.Action) -and -not $t.Hidden -and -not $t.Header) { $all++ } }
         $what = switch ($script:TweakView) { 'Recommended' { 'the recommended and input-delay tweaks for this PC' } 'Latency' { 'the tweaks that change input delay, frame time or ping' } 'On' { 'what is switched on' } 'New' { 'the cards added in the latest versions' } default { 'every tweak' } }
         "Showing $vis of ${all}: $what$(if ($script:TweakArea -ne 'All') { " in $(($Categories | Where-Object { $_.Name -eq $script:TweakArea } | Select-Object -First 1).Title)" }). Tweaks change your PC; every one can be undone."
     } else {
@@ -24260,7 +24411,7 @@ function New-GameModePage {
         $script:GmPageTimer.Interval = [TimeSpan]::FromSeconds(1)
         $script:GmTick = 0
         $script:GmPageTimer.Add_Tick({
-            if ($script:CurrentCat.Name -ne 'GameMode' -or -not $window.IsVisible) { return }
+            if ($script:CurrentCat.Name -ne 'GameMode' -or -not $window.IsVisible -or $window.WindowState -eq 'Minimized') { return }   # minimized: nothing shown, nothing measured
             Update-GameModeClock
             $script:GmTick++
             if ($script:GmTick % 3 -eq 1 -and -not $script:GmStatBusy) {
@@ -26111,7 +26262,12 @@ $NvAppDir  = "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA App"
 $NvAppExe  = "$env:ProgramFiles\NVIDIA Corporation\NVIDIA App\CEF\NVIDIA App.exe"
 
 function Get-NvDriverInfo {
-    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' } | Select-Object -First 1
+    # Home reads this after every change: the WMI query (100 ms to seconds, more when WMI is busy) is asked once a minute
+    $c = $script:NvGpuRow
+    if ($c -and ((Get-Date) - $c.Time).TotalSeconds -lt 60) { $gpu = $c.Gpu } else {
+        $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' } | Select-Object -First 1
+        $script:NvGpuRow = @{ Time = Get-Date; Gpu = $gpu }
+    }
     if (-not $gpu) { return $null }
     $digits = ($gpu.DriverVersion -replace '\D', ''); $last = $digits.Substring([Math]::Max(0, $digits.Length - 5))
     $inst = '{0}.{1}' -f $last.Substring(0, 3), $last.Substring(3)
@@ -26407,6 +26563,7 @@ function New-PageScroll($content) {
 function ConvertTo-Brush([string]$c) { [ZdTheme]::Brush($c) }
 $script:CurrentCat = $Categories[0]
 function Update-Filter {
+    if ($script:SearchTimer) { $script:SearchTimer.Stop() }
     $q = $ui.Search.Text.Trim()
     $ui.SearchHint.Visibility = if ($q) { 'Collapsed' } else { 'Visible' }
     $ui.PageTitle.Text = if ($q) { "Results for `"$q`"" } else { $script:CurrentCat.Title }
@@ -26442,7 +26599,7 @@ function Update-Filter {
     }
     if ($chips) { $ui.LatencyNote.Text = Get-ViewNote; $ui.LatencyNote.Visibility = 'Visible' }
     # 2.0: result count, "Turn on all shown" (Tweaks only) and the empty state
-    $shown = @($Tweaks | Where-Object { $_.Card -and $_.Card.Visibility -eq 'Visible' -and -not $_.Header })
+    $shown = @(foreach ($t in $Tweaks) { if ($t.Card -and $t.Card.Visibility -eq 'Visible' -and -not $t.Header) { $t } })
     $noun = if ($cn -eq 'Checks' -and -not $q) { 'check' } else { 'card' }; if ($cn -eq 'Tweaks' -and -not $q) { $noun = 'tweak' }
     $ui.ResultCount.Text = "$($shown.Count) $noun$(if ($shown.Count -ne 1) { 's' })"
     $owned = @(Get-BoosterOwned)
@@ -26465,7 +26622,15 @@ function Update-Filter {
         $ui.EmptyState.Visibility = 'Visible'
     } else { $ui.EmptyState.Visibility = 'Collapsed' }
 }
-$ui.Search.Add_TextChanged({ Update-Filter })
+# search: the list is filtered once typing pauses (150 ms) instead of on every key; anything else that calls
+# Update-Filter cancels the wait, so a page switch never filters twice
+$script:SearchTimer = New-Object Windows.Threading.DispatcherTimer
+$script:SearchTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+$script:SearchTimer.Add_Tick({
+    $script:SearchTimer.Stop(); Update-Filter
+    if ($script:HomeStale -and $script:CurrentCat.Page -eq 'Home' -and -not "$($ui.Search.Text)".Trim()) { Update-HomePage }
+})
+$ui.Search.Add_TextChanged({ $script:SearchTimer.Stop(); $script:SearchTimer.Start() })
 # 2.1: the details panel needs room; below 1180 px wide the list gets the whole width (re-checked when the window resizes)
 $window.Add_SizeChanged({
     if (-not $script:CurrentCat -or $script:CurrentCat.Page) { return }
@@ -26750,7 +26915,7 @@ function Show-OptimizeChooser($List) {
 function Close-BoostSheet {
     if ($script:Bst -and $script:Bst.Running) { return }   # never close half-way through applying
     Hide-Animated $ui.Wizard 200
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
 }
 # step bar, visible panel, footer buttons and the selection count
 function Update-BoostSheet {
@@ -26862,7 +27027,7 @@ function Show-BoostResult {
     $b.Result.Visibility = 'Visible'
     $b.Result.BringIntoView()
     Show-Toast "Switched on $($b.Ok) tweak$(if ($b.Ok -ne 1) { 's' })$(if ($b.Failed) { ", $($b.Failed) skipped" })." $(if ($b.Failed) { '#FF9F0A' } else { '#30D158' })
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
 }
 function Invoke-ApplyTweaks($pick) {
     if (-not @($pick).Count) { return }
@@ -26883,7 +27048,7 @@ function Invoke-ApplyTweaks($pick) {
     if ($failed) { $msg += " Skipped: $($failed -join ', ')." }
     if (@($pick) | Where-Object { $_.Badge -eq 'restart' -and $failed -notcontains $_.Title }) { $msg += ' Restart your PC to finish.' }
     Show-Toast $msg $(if ($failed) { '#FF9F0A' } else { '#30D158' })
-    if ($script:HomeUi) { Update-HomePage }
+    Request-HomeUpdate
 }
 
 $script:SessionTimer = New-Object Windows.Threading.DispatcherTimer
@@ -27397,9 +27562,11 @@ $window.Add_PreviewKeyDown({ param($s, $e)
 
 Set-SplashStatus 'Building the interface'
 Initialize-Worker    # opens in the background while the cards are built
+Write-StartupMark 'worker opening'
 $catOrder = @{}; for ($i = 0; $i -lt $Categories.Count; $i++) { $catOrder[$Categories[$i].Name] = $i }
 $n = 0
 $Tweaks = @($Tweaks | Where-Object { -not ($_.Action -and $_.Requires -and -not (& $_.Requires)) })
+Write-StartupMark 'check cards this PC can use picked'
 $Tweaks = @($Tweaks | ForEach-Object { [pscustomobject]@{ T = $_; K = [int]$catOrder[$_.Cat] * 10000 + $n++ } } | Sort-Object K | ForEach-Object { $_.T })
 Set-SplashStatus 'Checking your settings'
 Start-StateRefresh { Show-AfterStartup }    # runs in the background while the cards are built
@@ -27410,6 +27577,7 @@ foreach ($o in @($Tweaks | ForEach-Object { [pscustomobject]@{ T = $_; O = $(if 
     if ("$($o.T.Cat)" -ne $lastCat) { $lastCat = "$($o.T.Cat)"; [void]$ui.Cards.Children.Add((New-GroupHeader $lastCat)) }
     [void]$ui.Cards.Children.Add((New-Card $o.T))
 }
+Write-StartupMark "$($ui.Cards.Children.Count) cards built"
 
 # Stretch cards so each row fills the width evenly (min ~320px per card).
 # Smooth scrolling: the mouse wheel moves a target and the view glides toward it.
@@ -27433,6 +27601,7 @@ function Reset-Scroll { $script:ScrollTimer.Stop(); $script:ScrollTarget = 0; $u
 
 $startName = if ($Page -and ($Categories | Where-Object { $_.Name -eq $Page })) { $Page } else { 'Home' }
 Select-NavPage $startName
+Write-StartupMark "start page $startName built"
 Update-GameModeUi
 if (-not $Snapshot -or $env:ZD_SNAPWAIT) { New-StatusStrip; Start-LiveTimer }
 function Complete-Startup {
@@ -27703,7 +27872,7 @@ if ($Snapshot) {
         function Clear-ZdPcCaches {
             Clear-ReadCache
             foreach ($v in 'NvOk', 'Is1080Ti', 'CpuName', 'GpuIdsCache', 'Cs2DirCache', 'GameDirCache', 'EpicInstalled', 'SteamLibs', 'TpmInfo', 'BiosInfo', 'NvBgCap',
-                           'UninstallRows', 'VrrMonitors', 'GameCatCache', 'NicMsiKeyCache', 'GameLogos', 'GameArt', 'GameArtTried', 'ExeIcons', 'AppIconCache') {
+                           'UninstallRows', 'VrrMonitors', 'GameCatCache', 'NicMsiKeyCache', 'GameLogos', 'GameArt', 'GameArtTried', 'ExeIcons', 'AppIconCache', 'NvGpuRow') {
                 Set-Variable -Scope Script -Name $v -Value $null
             }
         }
@@ -27843,6 +28012,7 @@ if ($Snapshot) {
     }
     $script:SnapWait = if ($env:ZD_SNAPWAIT) { [double]$env:ZD_SNAPWAIT } else { 1 }
     $window.Add_ContentRendered({
+        Write-StartupMark 'first frame drawn'; [ZdWatchdog]::Step = 'snapshot: waiting to save'
         [Console]::WriteLine('SNAP rendered')
         $script:SnapTimer = New-Object Windows.Threading.DispatcherTimer
         $script:SnapTimer.Interval = [TimeSpan]::FromSeconds($script:SnapWait)
@@ -27857,6 +28027,7 @@ if ($Snapshot) {
     function Save-Snapshot {
         if ($script:SnapDone) { return }
         $script:SnapDone = $true
+        [ZdWatchdog]::Step = 'Save-Snapshot'
         try {
             foreach ($t in $Tweaks) { if ($t.Toggle) { [Console]::WriteLine(("{0,-10} {1,-34} {2}" -f $t.Cat, $t.Id, $(if ($null -eq $t.State) { "n/a" } else { $t.State }))) } }
             $bmp = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]$window.ActualWidth, [int]$window.ActualHeight, 96, 96, 'Pbgra32')
@@ -27918,7 +28089,9 @@ function Show-AfterStartup {
     $script:StartupDone = $true
     if ($script:StartupGuard) { $script:StartupGuard.Stop() }
     Complete-Startup
+    Write-StartupMark 'startup finished'
     if (-not $Tray -or $Snapshot) { $window.Show() } else { Close-Splash }
+    Write-StartupMark 'window shown'
     if ($script:BackupWarning -and -not $Snapshot) {
         if ($Tray) { Show-MainWindow }   # started hidden: bring the window up so the warning is seen
         [void](Show-ZdDialog $script:BackupWarning 'ZeroDelay backup' 'OK' 'Warning')
@@ -27962,14 +28135,14 @@ $window.Dispatcher.Add_UnhandledException({
     }
 })
 [AppDomain]::CurrentDomain.add_UnhandledException({ param($s, $e) Write-CrashLog $e.ExceptionObject 'fatal' })
-if (-not $Snapshot) {
-    $script:BeatTimer = New-Object Windows.Threading.DispatcherTimer
-    $script:BeatTimer.Interval = [TimeSpan]::FromSeconds(1)
-    $script:BeatTimer.Add_Tick({ [ZdWatchdog]::Beat() })
-    $script:BeatTimer.Start()
-    [ZdWatchdog]::Step = 'message loop started'
-    [ZdWatchdog]::Start($CrashLog, $AppVersion)
-}
+# the freeze detector also runs for dev renders: a render that stops responding writes the window thread's call stack
+# next to the picture (<snapshot>.hang.txt) and to the error output, so a CI timeout says what it was waiting on
+$script:BeatTimer = New-Object Windows.Threading.DispatcherTimer
+$script:BeatTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:BeatTimer.Add_Tick({ [ZdWatchdog]::Beat() })
+$script:BeatTimer.Start()
+[ZdWatchdog]::Step = 'message loop started'
+if ($Snapshot) { [ZdWatchdog]::Echo = $true; [ZdWatchdog]::Start("$Snapshot.hang.txt", $AppVersion) } else { [ZdWatchdog]::Start($CrashLog, $AppVersion) }
 try { [Windows.Threading.Dispatcher]::Run() } catch { Write-CrashLog $_.Exception 'message loop'; throw }
 if ($script:Relaunch) {
     try { $script:AppMutex.ReleaseMutex(); $script:AppMutex.Dispose() } catch {}
