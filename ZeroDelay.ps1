@@ -24549,10 +24549,9 @@ function New-GamesPage {
     if ($Snapshot) { [Console]::WriteLine(('STARTUP games page: {0} tiles in {1:N0} ms' -f @($GameDefs).Count, $gParse)) }
     if ($h.MoreTiles.Children.Count) { $h.MoreHead.Visibility = 'Visible'; $h.MoreSub.Visibility = 'Visible' }
     Write-StartupMark 'games page: tiles added'
-    Start-GameImageFetch $GameDefs
-    Write-StartupMark 'games page: image fetch returned'
-    Start-GameArtFetch
-    Write-StartupMark 'games page: image fetch started'
+    # pictures are queued once the page is on screen: handing the first job to the worker can take a moment
+    if ($Snapshot -and -not $env:ZD_PCMATRIX) { Start-GameImageFetch $GameDefs; Start-GameArtFetch }
+    else { [void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ContextIdle, [Action]{ Start-GameImageFetch $GameDefs; Start-GameArtFetch; Write-StartupMark 'games page: image fetch started' }) }
     # the four route stops: this PC, the router, the provider, the game server
     $h.Nodes = @(for ($i = 0; $i -lt 4; $i++) {
         $n = [ZdTheme]::Parse(@"
