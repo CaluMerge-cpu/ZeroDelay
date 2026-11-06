@@ -25059,8 +25059,9 @@ function New-HomePage {
     </Grid>
   </Border>
 
-  <Grid Margin='0,0,12,16'>
-  <Grid.ColumnDefinitions><ColumnDefinition Width='1.35*'/><ColumnDefinition Width='16'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+  <Grid x:Name='SetupRow' Margin='0,0,12,16'>
+  <Grid.ColumnDefinitions><ColumnDefinition x:Name='SetupColA' Width='*'/><ColumnDefinition x:Name='SetupGap' Width='0'/><ColumnDefinition x:Name='SetupColB' Width='0'/></Grid.ColumnDefinitions>
+  <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
   <Border Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='24'>
     <Grid>
       <Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
@@ -25098,7 +25099,7 @@ function New-HomePage {
       </StackPanel>
     </Grid>
   </Border>
-  <Border Grid.Column='2' Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='20,18'>
+  <Border x:Name='RecentCard' Grid.Row='1' Style='{DynamicResource Zd.Card}' CornerRadius='16' Padding='20,18' Margin='0,16,0,0'>
     <StackPanel>
       <Grid Margin='0,0,0,8'>
         <TextBlock Text='RECENT CHANGES' FontSize='11' FontWeight='SemiBold' Foreground='{DynamicResource Text.Muted}' VerticalAlignment='Center'/>
@@ -25126,7 +25127,17 @@ function New-HomePage {
 "@)
     $h = @{}
     foreach ($n in 'ResSub', 'ResOpen', 'Matches', 'MatchScroll', 'NoMatches', 'Ring', 'Pct', 'Headline', 'Sub', 'Go', 'GoText', 'Undo', 'Auto', 'AreaChips', 'Warm', 'WarmTitle', 'WarmText', 'WarmOk',
-                 'Last', 'LastSub', 'LastStats', 'LastVerdict', 'StutCanvas', 'StutNote', 'ResHead', 'Presets', 'Recent', 'HistOpen') { $h[$n] = $root.FindName($n) }
+                 'Last', 'LastSub', 'LastStats', 'LastVerdict', 'StutCanvas', 'StutNote', 'ResHead', 'Presets', 'Recent', 'HistOpen',
+                 'SetupRow', 'SetupColA', 'SetupGap', 'SetupColB', 'RecentCard') { $h[$n] = $root.FindName($n) }
+    # recent changes sit beside the setup card when the page is wide enough, under it otherwise
+    $h.SetupRow.Add_SizeChanged({ param($s, $e)
+        $u = $script:HomeUi; $wide = $s.ActualWidth -ge 1000
+        $u.SetupColA.Width = New-Object Windows.GridLength $(if ($wide) { 1.4 } else { 1 }), 'Star'
+        $u.SetupGap.Width = New-Object Windows.GridLength $(if ($wide) { 16 } else { 0 })
+        $u.SetupColB.Width = if ($wide) { New-Object Windows.GridLength 1, 'Star' } else { New-Object Windows.GridLength 0 }
+        [Windows.Controls.Grid]::SetRow($u.RecentCard, $(if ($wide) { 0 } else { 1 })); [Windows.Controls.Grid]::SetColumn($u.RecentCard, $(if ($wide) { 2 } else { 0 }))
+        $u.RecentCard.Margin = if ($wide) { '0' } else { '0,16,0,0' }
+    })
     $h.Last.Add_MouseLeftButtonUp({ Select-NavPage 'Matches' })
     $h.HistOpen.Add_Click({ Select-NavPage 'History' })
     # presets (NVIDIA / AMD style): each opens Boost now with exactly that set of tweaks that are still off
@@ -25272,10 +25283,16 @@ function Update-HomePage {
     $on = @($rec | Where-Object { $_.State }).Count
     $left = $rec.Count - $on
     $pct = if ($rec.Count) { [int][Math]::Round(100 * $on / $rec.Count) } else { 100 }
-    Start-CountUp $h.Pct $pct '' 900
+    if ($rec.Count) { Start-CountUp $h.Pct $pct '' 900 }
     $circ = [Math]::PI * (120 - 10) / 10
     $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(($circ * $pct / 100), 1000))
-    if ($left -gt 0) {
+    if (-not $rec.Count -and @($Tweaks | Where-Object { $_.Rec -and $_.Toggle -and -not $_.Hidden }).Count) {
+        # the settings are still being read: no score yet (an empty list would read as "100%, all set")
+        $h.Headline.Text = 'Checking your settings...'
+        $h.Sub.Text = 'ZeroDelay reads each recommended setting first. This takes a few seconds after it starts.'
+        $h.Go.IsEnabled = $false; $h.GoText.Text = 'Boost now'
+        $h.Pct.Text = '-'; $h.Ring.StrokeDashArray = New-Object Windows.Media.DoubleCollection (,[double[]]@(0, 1000))
+    } elseif ($left -gt 0) {
         $h.Headline.Text = "$pct% of recommended setup on"
         $h.Sub.Text = "$left recommended tweak$(if ($left -ne 1) { 's are' } else { ' is' }) still off. Boost now lists them and you choose; a restore point comes first, and Restore undoes everything."
         $h.Go.IsEnabled = $true; $h.GoText.Text = 'Boost now'
@@ -25367,20 +25384,20 @@ function Update-LastMatchCard($All, [string]$Game) {
     $h.LastVerdict.Text = if ($prev.Count) { "Compared with your $($prev.Count) $(Get-SessionWord $Game $prev.Count) before it. Differences under 3% are noise. Click for the full report." } else { 'Your first report for this game: the next ones are compared with it. Click for the full report.' }
     # stutters as bars over the length of the match: where they were and how long each froze (no invented curve)
     $c = $h.StutCanvas; $c.Children.Clear()
-    $W = 330; $H = 78; $base = $H - 14
-    $ln = New-Object Windows.Shapes.Line; $ln.X1 = 0; $ln.X2 = $W; $ln.Y1 = $base; $ln.Y2 = $base; $ln.StrokeThickness = 1; $ln.SetResourceReference([Windows.Shapes.Shape]::StrokeProperty, 'Border.Subtle'); [void]$c.Children.Add($ln)
+    $cw = 330; $ch = 78; $base = $ch - 14
+    $ln = New-Object Windows.Shapes.Line; $ln.X1 = 0; $ln.X2 = $cw; $ln.Y1 = $base; $ln.Y2 = $base; $ln.StrokeThickness = 1; $ln.SetResourceReference([Windows.Shapes.Shape]::StrokeProperty, 'Border.Subtle'); [void]$c.Children.Add($ln)
     $end = [datetime]$r.End; $len = [Math]::Max(1, ($end - $start).TotalSeconds)
     $st = @($r.Stutters)
     foreach ($x in $st) {
         try { $at = ([datetime]$x.At - $start).TotalSeconds } catch { continue }
-        $px = [Math]::Max(1, [Math]::Min($W - 3, $W * $at / $len))
+        $px = [Math]::Max(1, [Math]::Min($cw - 3, $cw * $at / $len))
         $hh = [Math]::Min($base - 4, 8 + [double]$x.Ms / 4)
         $b = New-Object Windows.Shapes.Rectangle; $b.Width = 3; $b.Height = $hh; $b.RadiusX = 1.5; $b.RadiusY = 1.5
         $b.SetResourceReference([Windows.Shapes.Shape]::FillProperty, $(if ([double]$x.Ms -ge 100) { 'Warn' } else { 'AccentFill' }))
         $b.ToolTip = "$([int]$x.Ms) ms freeze$(if ($x.Busy) { " while $($x.Busy) was busy" })"
         [Windows.Controls.Canvas]::SetLeft($b, $px - 1.5); [Windows.Controls.Canvas]::SetTop($b, $base - $hh); [void]$c.Children.Add($b)
     }
-    foreach ($e in @(@(0, 'start'), @($W, "$([int]$r.Minutes) min"))) {
+    foreach ($e in @(@(0, 'start'), @($cw, "$([int]$r.Minutes) min"))) {
         $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $e[1]; $tb.FontSize = 10.5; $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'Text.Muted')
         [Windows.Controls.Canvas]::SetTop($tb, $base + 2); if ($e[0] -gt 0) { [Windows.Controls.Canvas]::SetRight($tb, 0) } else { [Windows.Controls.Canvas]::SetLeft($tb, 0) }
         [void]$c.Children.Add($tb)
