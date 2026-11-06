@@ -2138,7 +2138,7 @@ function Enable-ZDGameMode {
         $cur = Get-ActivePowerScheme
         if ($cur.Name -notmatch 'ZeroDelay') {
             $zd = Get-ZeroDelayPlanGuid
-            if (-not $zd) { Invoke-TweakOn ($Tweaks | Where-Object { $_.Id -eq 'zdplan' }); $zd = Get-ZeroDelayPlanGuid }
+            if (-not $zd) { Invoke-TweakOn ($Tweaks | Where-Object { $_.Id -eq 'zdplan' }); $zd = Get-ZeroDelayPlanGuid; $state.MadeZdPlan = $true }
             else { powercfg /setactive $zd }
             if ($zd) { $state.PrevPlan = $cur.Guid; $done += 'ZeroDelay power plan' }
         }
@@ -2197,7 +2197,11 @@ function Disable-ZDGameMode {
         for ($i = 0; $i -lt 3 -and -not $ok; $i++) { try { $ok = Set-NvInstantReplay $true } catch { Start-Sleep -Seconds 3 } }
         if ($ok) { $back += 'Instant Replay' } else { $back += 'NOT Instant Replay (turn it back on with Alt+Z)' }
     }
-    if ($state.PrevPlan -and (Get-ActivePowerScheme).Name -match 'ZeroDelay') {
+    $zdT = $Tweaks | Where-Object { $_.Id -eq 'zdplan' } | Select-Object -First 1
+    if ($state.MadeZdPlan -and $zdT -and @(Get-Applied) -contains 'zdplan' -and (Get-ActivePowerScheme).Name -match 'ZeroDelay') {
+        # Game Mode made the ZeroDelay plan: switching the card off puts the previous plan back and removes the plan again
+        try { Invoke-TweakOff $zdT; $back += 'previous power plan' } catch {}
+    } elseif ($state.PrevPlan -and (Get-ActivePowerScheme).Name -match 'ZeroDelay') {
         if (powercfg /list | Where-Object { $_ -match $state.PrevPlan }) { powercfg /setactive $state.PrevPlan; $back += 'previous power plan' }
     }
     foreach ($pp in @($state.Priorities)) {
@@ -7986,7 +7990,7 @@ $Tweaks = @(
            elseif ($mine -and ($list | Where-Object { $_ -match [regex]::Escape($mine) })) { $target = $mine }   # non-English name, made earlier
            else {
                $out = powercfg -duplicatescheme $UltimateTemplate 2>$null
-               if ($LASTEXITCODE -eq 0 -and "$out" -match $GuidRx) { $target = $Matches[0] } else { $target = $HighPerfGuid }
+               if ($LASTEXITCODE -eq 0 -and "$out" -match $GuidRx) { $target = $Matches[0]; $script:Backup.Custom['power:made'] = $true } else { $target = $HighPerfGuid }
            }
            powercfg /setactive $target 2>$null
            if ($LASTEXITCODE -ne 0) { throw 'Windows refused the plan (common on Modern Standby laptops).' }
@@ -7996,9 +8000,17 @@ $Tweaks = @(
            $prev = $script:Backup.Custom['power']
            if (-not $prev -or -not (powercfg /list | Where-Object { $_ -match $prev })) { $prev = Get-FallbackPlan }
            if (-not $prev) { throw 'No other power plan to switch back to.' }
-           powercfg /setactive $prev 2>$null
+           $mine = "$($script:Backup.Custom['power:plan'])"
+           $zb = $script:Backup.Custom['zdplan']
+           if ((Get-ActivePowerScheme).Name -match 'ZeroDelay' -and $zb -and $mine -and "$($zb.Prev)" -eq $mine) {
+               # the ZeroDelay plan is on top of this one: it stays active, and goes back to the plan from before Ultimate
+               $script:Backup.Custom['zdplan'] = @{ Prev = "$prev" }
+           } elseif ((Get-ActivePowerScheme).Name -notmatch 'ZeroDelay') { powercfg /setactive $prev 2>$null }
+           # a copy of the Ultimate template this card made is removed again, so the plan list is as before
+           if ($script:Backup.Custom['power:made'] -and $mine -and $mine -ne "$((Get-ActivePowerScheme).Guid)") { powercfg -delete $mine 2>$null | Out-Null }
            $script:Backup.Custom.Remove('power')
            $script:Backup.Custom.Remove('power:plan')
+           $script:Backup.Custom.Remove('power:made')
        } }
 
     @{ Id = 'gamemode'; Cat = 'System'; Icon = [char]0xE7FC; Rec = $true
@@ -25330,11 +25342,12 @@ function Update-HomePage {
 # input-delay tweaks; Max = every recommended or input-delay tweak, Advanced included
 function Get-PresetTweaks([string]$Name) {
     @($Tweaks | Where-Object { $_.Toggle -and $_.State -eq $false -and -not $_.Hidden -and -not (Test-CheckCard $_) } | Where-Object {
-        $r = Get-TweakRisk $_
+        $t = $_; $r = Get-TweakRisk $t
+        # (inside switch, $_ is the switch value, not the tweak: use $t)
         switch ($Name) {
             'Safe' { $r -eq 'Safe' }
-            'Competitive' { $_.Rec -or ($_.Lat -and $r -ne 'Advanced') }
-            default { $_.Rec -or $_.Lat }
+            'Competitive' { [bool]($t.Rec -or ($t.Lat -and $r -ne 'Advanced')) }
+            default { [bool]($t.Rec -or $t.Lat) }
         }
     })
 }
@@ -29032,6 +29045,13 @@ $window.Add_PreviewKeyDown({ param($s, $e)
 Set-SplashStatus 'Building the interface'
 Initialize-Worker    # opens in the background while the cards are built
 Write-StartupMark 'worker opening'
+# The first jobs handed to the worker pay a one-time start-up cost (2.5 to 4 s measured on CI) on the UI thread. Three
+# empty jobs once the window is idle pay it while nobody waits, so the first page that uses the worker opens at once.
+[void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ApplicationIdle, [Action]{
+    Write-StartupMark 'worker warm-up queued'
+    for ($wi = 0; $wi -lt 3; $wi++) { Invoke-Worker 'param() $null' @() { param($out, $errs) } }
+    Write-StartupMark 'worker warm-up returned'
+})
 $catOrder = @{}; for ($i = 0; $i -lt $Categories.Count; $i++) { $catOrder[$Categories[$i].Name] = $i }
 $n = 0
 $Tweaks = @($Tweaks | Where-Object { -not ($_.Action -and $_.Requires -and -not (& $_.Requires)) })
