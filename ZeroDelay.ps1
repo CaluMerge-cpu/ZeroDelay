@@ -39,7 +39,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '2.1.0'
+$AppVersion = '2.1.1'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -2138,7 +2138,7 @@ function Enable-ZDGameMode {
         $cur = Get-ActivePowerScheme
         if ($cur.Name -notmatch 'ZeroDelay') {
             $zd = Get-ZeroDelayPlanGuid
-            if (-not $zd) { Invoke-TweakOn ($Tweaks | Where-Object { $_.Id -eq 'zdplan' }); $zd = Get-ZeroDelayPlanGuid }
+            if (-not $zd) { Invoke-TweakOn ($Tweaks | Where-Object { $_.Id -eq 'zdplan' }); $zd = Get-ZeroDelayPlanGuid; $state.MadeZdPlan = $true }
             else { powercfg /setactive $zd }
             if ($zd) { $state.PrevPlan = $cur.Guid; $done += 'ZeroDelay power plan' }
         }
@@ -2197,7 +2197,11 @@ function Disable-ZDGameMode {
         for ($i = 0; $i -lt 3 -and -not $ok; $i++) { try { $ok = Set-NvInstantReplay $true } catch { Start-Sleep -Seconds 3 } }
         if ($ok) { $back += 'Instant Replay' } else { $back += 'NOT Instant Replay (turn it back on with Alt+Z)' }
     }
-    if ($state.PrevPlan -and (Get-ActivePowerScheme).Name -match 'ZeroDelay') {
+    $zdT = $Tweaks | Where-Object { $_.Id -eq 'zdplan' } | Select-Object -First 1
+    if ($state.MadeZdPlan -and $zdT -and @(Get-Applied) -contains 'zdplan' -and (Get-ActivePowerScheme).Name -match 'ZeroDelay') {
+        # Game Mode made the ZeroDelay plan: switching the card off puts the previous plan back and removes the plan again
+        try { Invoke-TweakOff $zdT; $back += 'previous power plan' } catch {}
+    } elseif ($state.PrevPlan -and (Get-ActivePowerScheme).Name -match 'ZeroDelay') {
         if (powercfg /list | Where-Object { $_ -match $state.PrevPlan }) { powercfg /setactive $state.PrevPlan; $back += 'previous power plan' }
     }
     foreach ($pp in @($state.Priorities)) {
@@ -7986,7 +7990,7 @@ $Tweaks = @(
            elseif ($mine -and ($list | Where-Object { $_ -match [regex]::Escape($mine) })) { $target = $mine }   # non-English name, made earlier
            else {
                $out = powercfg -duplicatescheme $UltimateTemplate 2>$null
-               if ($LASTEXITCODE -eq 0 -and "$out" -match $GuidRx) { $target = $Matches[0] } else { $target = $HighPerfGuid }
+               if ($LASTEXITCODE -eq 0 -and "$out" -match $GuidRx) { $target = $Matches[0]; $script:Backup.Custom['power:made'] = $true } else { $target = $HighPerfGuid }
            }
            powercfg /setactive $target 2>$null
            if ($LASTEXITCODE -ne 0) { throw 'Windows refused the plan (common on Modern Standby laptops).' }
@@ -7996,9 +8000,17 @@ $Tweaks = @(
            $prev = $script:Backup.Custom['power']
            if (-not $prev -or -not (powercfg /list | Where-Object { $_ -match $prev })) { $prev = Get-FallbackPlan }
            if (-not $prev) { throw 'No other power plan to switch back to.' }
-           powercfg /setactive $prev 2>$null
+           $mine = "$($script:Backup.Custom['power:plan'])"
+           $zb = $script:Backup.Custom['zdplan']
+           if ((Get-ActivePowerScheme).Name -match 'ZeroDelay' -and $zb -and $mine -and "$($zb.Prev)" -eq $mine) {
+               # the ZeroDelay plan is on top of this one: it stays active, and goes back to the plan from before Ultimate
+               $script:Backup.Custom['zdplan'] = @{ Prev = "$prev" }
+           } elseif ((Get-ActivePowerScheme).Name -notmatch 'ZeroDelay') { powercfg /setactive $prev 2>$null }
+           # a copy of the Ultimate template this card made is removed again, so the plan list is as before
+           if ($script:Backup.Custom['power:made'] -and $mine -and $mine -ne "$((Get-ActivePowerScheme).Guid)") { powercfg -delete $mine 2>$null | Out-Null }
            $script:Backup.Custom.Remove('power')
            $script:Backup.Custom.Remove('power:plan')
+           $script:Backup.Custom.Remove('power:made')
        } }
 
     @{ Id = 'gamemode'; Cat = 'System'; Icon = [char]0xE7FC; Rec = $true
@@ -17756,6 +17768,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.1.1' = @(
+        @{ T = 'Presets fixed'; D = 'The Competitive and Max presets on Home now pick their tweaks (they opened with nothing in 2.1.0). Safe was not affected.' }
+        @{ T = 'Power plans put back exactly'; D = 'Switching the Ultimate Performance card off removes the copy of the plan it made, your original plan comes back whatever order the Ultimate and ZeroDelay plans are switched off in, and Game Mode no longer leaves the ZeroDelay plan behind when it ends.' }
+        @{ T = 'No pause on the first game page'; D = 'The background helper starts up right after ZeroDelay opens, so the first page that uses it opens at once.' }
+    )
     '2.1.0' = @(
         @{ T = 'Tweaks, easier to read'; D = 'One list grouped by area, each with how many are on. Every tweak says Safe, Moderate or Advanced and what is true now (Optimized or Windows default). Click one to see exactly what it changes and when not to use it. Switches are collected and applied together from the bar at the bottom, with one Undo.' }
         @{ T = 'Proof on Home'; D = 'Your last match comes first, with how its FPS, 1% lows, ping and stutters compare to your usual, and when it stuttered. Presets Safe, Competitive and Max, and your recent changes with Undo.' }
@@ -25330,11 +25347,12 @@ function Update-HomePage {
 # input-delay tweaks; Max = every recommended or input-delay tweak, Advanced included
 function Get-PresetTweaks([string]$Name) {
     @($Tweaks | Where-Object { $_.Toggle -and $_.State -eq $false -and -not $_.Hidden -and -not (Test-CheckCard $_) } | Where-Object {
-        $r = Get-TweakRisk $_
+        $t = $_; $r = Get-TweakRisk $t
+        # (inside switch, $_ is the switch value, not the tweak: use $t)
         switch ($Name) {
             'Safe' { $r -eq 'Safe' }
-            'Competitive' { $_.Rec -or ($_.Lat -and $r -ne 'Advanced') }
-            default { $_.Rec -or $_.Lat }
+            'Competitive' { [bool]($t.Rec -or ($t.Lat -and $r -ne 'Advanced')) }
+            default { [bool]($t.Rec -or $t.Lat) }
         }
     })
 }
@@ -29032,6 +29050,13 @@ $window.Add_PreviewKeyDown({ param($s, $e)
 Set-SplashStatus 'Building the interface'
 Initialize-Worker    # opens in the background while the cards are built
 Write-StartupMark 'worker opening'
+# The first jobs handed to the worker pay a one-time start-up cost (2.5 to 4 s measured on CI) on the UI thread. Three
+# empty jobs once the window is idle pay it while nobody waits, so the first page that uses the worker opens at once.
+[void]$window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ApplicationIdle, [Action]{
+    Write-StartupMark 'worker warm-up queued'
+    for ($wi = 0; $wi -lt 3; $wi++) { Invoke-Worker 'param() $null' @() { param($out, $errs) } }
+    Write-StartupMark 'worker warm-up returned'
+})
 $catOrder = @{}; for ($i = 0; $i -lt $Categories.Count; $i++) { $catOrder[$Categories[$i].Name] = $i }
 $n = 0
 $Tweaks = @($Tweaks | Where-Object { -not ($_.Action -and $_.Requires -and -not (& $_.Requires)) })
@@ -29102,6 +29127,100 @@ if ($Snapshot) {
     if ($env:ZD_FAKE_UPDATE) { Start-UpdateCheck }
     # CI only (a throwaway Windows VM): switch every registry and power-plan tweak that applies on, check it reads as on,
     # switch it off and check every value and key is exactly as before. Writes one line per tweak to <snapshot>.roundtrip.txt.
+    # CI only (throwaway Windows VM): performance modes. Presets Safe / Competitive / Max applied and undone as one batch,
+    # power plans switched in different orders, the Settings power mode slider, and Game Mode on and off. After each
+    # step the machine must be exactly as before. Writes <snapshot>.modes.txt; lines start with OK / FAIL / NOTE.
+    if ($env:ZD_MODES -and $env:GITHUB_ACTIONS -eq 'true' -and $IsAdmin) {
+        $mo = New-Object Collections.Generic.List[string]
+        $planState = { $a = Get-ActivePowerScheme; $all = @(powercfg /list | Where-Object { $_ -match $GuidRx } | ForEach-Object { if ($_ -match $GuidRx) { $Matches[0] } }); @{ Active = "$($a.Guid)"; Name = "$($a.Name)"; Count = $all.Count; Zd = @(powercfg /list | Where-Object { $_ -match 'ZeroDelay' }).Count } }
+        $sameP = { param($a, $b) $a.Active -eq $b.Active -and $a.Count -eq $b.Count -and $a.Zd -eq $b.Zd }
+        $tw = { param($id) $Tweaks | Where-Object { $_.Id -eq $id } | Select-Object -First 1 }
+        $step = { param($what, [scriptblock]$do) try { & $do; $true } catch { $mo.Add("FAIL  $what  error: $($_.Exception.Message)"); $false } }
+        # what the presets may switch on this VM: never the network adapter, services, apps or Explorer (the runner needs them)
+        $unsafe = 'NetAdapter|netsh|Stop-Service|Set-Service|Remove-AppxPackage|explorer|Restart-Computer|bcdedit|Disable-PnpDevice|Set-NetIPInterface'
+        $regSnap = { param($list) @(foreach ($t in $list) { foreach ($e in @($t.Reg)) { if (-not $e) { continue }; $k = Get-Item -LiteralPath $e.P -ErrorAction SilentlyContinue
+            if ($k -and ($k.GetValueNames() -contains $e.N)) { "$($e.P)|$($e.N)=$(@($k.GetValue($e.N, $null, 'DoNotExpandEnvironmentNames')) -join ',')" } else { "$($e.P)|$($e.N)=<none>" } } }) -join "`n" }
+        foreach ($t in $Tweaks) { if ($t.Toggle) { $t.State = Invoke-TweakTest $t } }
+        $p0 = & $planState
+        $mo.Add("NOTE  start: power plan '$($p0.Name)' ($($p0.Count) plans)")
+
+        # 1. presets: apply the whole set, check it reads as on, undo the batch in reverse order, check it is all back
+        foreach ($pz in 'Safe', 'Competitive', 'Max') {
+            $list = @(Get-PresetTweaks $pz | Where-Object { -not ("$($_.On)" -match $unsafe) -and $_.Cat -ne 'Network' -and -not $_.After })
+            $before = @{}; foreach ($t in $list) { $before[$t.Id] = $t.State }
+            $snap0 = & $regSnap $list; $pp0 = & $planState
+            $done = New-Object Collections.Generic.List[object]; $notOn = @()
+            foreach ($t in $list) { Clear-ReadCache; if (& $step "$pz apply $($t.Id)" { Invoke-TweakOn $t }) { $done.Add($t) } }
+            Clear-ReadCache
+            foreach ($t in $done) { if ((Invoke-TweakTest $t) -ne $true) { $notOn += $t.Id } }
+            for ($i = $done.Count - 1; $i -ge 0; $i--) { Clear-ReadCache; [void](& $step "$pz undo $($done[$i].Id)" { Invoke-TweakOff $done[$i] }) }
+            Clear-ReadCache
+            $notBack = @(foreach ($t in $list) { $now = Invoke-TweakTest $t; if ($now -ne $before[$t.Id]) { "$($t.Id) ($($before[$t.Id]) -> $now)" } })
+            $snap1 = & $regSnap $list; $pp1 = & $planState
+            if ($notOn) { $mo.Add("FAIL  ${pz}: switched on but reads off: $($notOn -join ', ')") }
+            if ($notBack) { $mo.Add("FAIL  ${pz}: not back after undo: $($notBack -join ', ')") }
+            if ($snap0 -ne $snap1) { $mo.Add("FAIL  ${pz}: registry values differ after undo") }
+            if (-not (& $sameP $pp0 $pp1)) { $mo.Add("FAIL  ${pz}: power plans differ after undo ('$($pp0.Name)' -> '$($pp1.Name)', $($pp0.Count) -> $($pp1.Count) plans)") }
+            if (-not $notOn -and -not $notBack -and $snap0 -eq $snap1 -and (& $sameP $pp0 $pp1)) { $mo.Add("OK    $pz preset: $($done.Count) of $($list.Count) applied and undone cleanly") }
+        }
+
+        # 2. power plans in different orders
+        $zd = & $tw 'zdplan'; $ul = & $tw 'power'
+        $seqs = @(
+            @{ N = 'ZeroDelay plan on, off'; S = @(@($zd, 1), @($zd, 0)) }
+            @{ N = 'Ultimate plan on, off'; S = @(@($ul, 1), @($ul, 0)) }
+            @{ N = 'Ultimate on, ZeroDelay on, ZeroDelay off, Ultimate off'; S = @(@($ul, 1), @($zd, 1), @($zd, 0), @($ul, 0)) }
+            @{ N = 'Ultimate on, ZeroDelay on, Ultimate off, ZeroDelay off'; S = @(@($ul, 1), @($zd, 1), @($ul, 0), @($zd, 0)) }
+        )
+        foreach ($q in $seqs) {
+            if (-not $zd -or -not $ul) { $mo.Add('NOTE  power plan cards not found'); break }
+            $a = & $planState; $ok = $true
+            foreach ($st in $q.S) { Clear-ReadCache; $ok = (& $step "$($q.N): $($st[0].Id) $(if ($st[1]) { 'on' } else { 'off' })" { if ($st[1]) { Invoke-TweakOn $st[0] } else { Invoke-TweakOff $st[0] } }) -and $ok }
+            $b = & $planState
+            if (& $sameP $a $b) { $mo.Add("OK    $($q.N): back to '$($b.Name)'") }
+            else { $mo.Add("FAIL  $($q.N): '$($a.Name)' ($($a.Count) plans) -> '$($b.Name)' ($($b.Count) plans, $($b.Zd) ZeroDelay)"); powercfg /setactive $a.Active 2>$null | Out-Null }
+        }
+
+        # 3. the Settings power mode slider (only exists on the Balanced plan)
+        $pm = & $tw 'powermode'
+        if ($pm) {
+            $bal = '381b4222-f694-41f0-9685-ff5bb260df2e'; $was = (Get-ActivePowerScheme).Guid
+            powercfg /setactive $bal 2>$null | Out-Null
+            $g0 = try { "$([PowerOverlay]::Get())" } catch { '' }
+            if (-not $g0) { $mo.Add('NOTE  power mode slider: not available on this machine') }
+            else {
+                [void](& $step 'power mode on' { Invoke-TweakOn $pm }); $mid = "$([PowerOverlay]::Get())"
+                [void](& $step 'power mode off' { Invoke-TweakOff $pm }); $g1 = "$([PowerOverlay]::Get())"
+                if ($mid -eq "$([PowerOverlay]::BestPerformance)" -and $g1 -eq $g0) { $mo.Add('OK    power mode slider: Best performance, then back') } else { $mo.Add("FAIL  power mode slider: $g0 -> $mid -> $g1") }
+            }
+            powercfg /setactive $was 2>$null | Out-Null
+        }
+
+        # 4. Game Mode on and off, alone and with the ZeroDelay plan already on
+        $toastK = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications'
+        foreach ($case in 'alone', 'with the ZeroDelay plan on') {
+            if ($case -ne 'alone') { [void](& $step 'zdplan on before Game Mode' { Invoke-TweakOn $zd }) }
+            $a = & $planState; $t0 = Get-RegValue $toastK 'ToastEnabled'; $applied0 = @(Get-Applied) -join ','
+            $m1 = ''; $m2 = ''
+            [void](& $step "Game Mode on ($case)" { $script:m1 = Enable-ZDGameMode })
+            $on = Test-ZDGameMode; $mid = & $planState; $tMid = Get-RegValue $toastK 'ToastEnabled'
+            [void](& $step "Game Mode off ($case)" { $script:m2 = Disable-ZDGameMode })
+            $b = & $planState; $t1 = Get-RegValue $toastK 'ToastEnabled'; $applied1 = @(Get-Applied) -join ','
+            $why = @()
+            if (-not $on) { $why += 'did not turn on' }
+            if ($mid.Name -notmatch 'ZeroDelay') { $why += "plan during Game Mode was '$($mid.Name)'" }
+            if ("$tMid" -ne '0') { $why += "notifications not silenced ($tMid)" }
+            if (Test-ZDGameMode) { $why += 'still on after off' }
+            if (-not (& $sameP $a $b)) { $why += "plan '$($a.Name)' ($($a.Count)) -> '$($b.Name)' ($($b.Count), $($b.Zd) ZeroDelay)" }
+            if ("$t0" -ne "$t1") { $why += "notifications setting $t0 -> $t1" }
+            if ($applied0 -ne $applied1) { $why += "applied list changed: [$applied0] -> [$applied1]" }
+            if ($why) { $mo.Add("FAIL  Game Mode ($case): $($why -join '; ')") } else { $mo.Add("OK    Game Mode ($case): on, ZeroDelay plan and quiet notifications, then everything back") }
+            if ($case -ne 'alone') { [void](& $step 'zdplan off after Game Mode' { Invoke-TweakOff $zd }) }
+        }
+        $pEnd = & $planState
+        if (& $sameP $p0 $pEnd) { $mo.Add("OK    end: power plan '$($pEnd.Name)' as at the start ($($pEnd.Count) plans)") } else { $mo.Add("FAIL  end: '$($p0.Name)' ($($p0.Count) plans) -> '$($pEnd.Name)' ($($pEnd.Count) plans, $($pEnd.Zd) ZeroDelay)") }
+        Set-Content -LiteralPath "$Snapshot.modes.txt" -Value $mo -Encoding UTF8
+    }
     if ($env:ZD_ROUNDTRIP -and $env:GITHUB_ACTIONS -eq 'true' -and $IsAdmin) {
         $readReg = { param($t) @(foreach ($e in $t.Reg) { $k = Get-Item -LiteralPath $e.P -ErrorAction SilentlyContinue
             if ($k -and ($k.GetValueNames() -contains $e.N)) { "$($e.P)|$($e.N)|$($k.GetValueKind($e.N))|$(@($k.GetValue($e.N, $null, 'DoNotExpandEnvironmentNames')) -join ',')" }
@@ -29126,6 +29245,11 @@ if ($Snapshot) {
     # every card's Requires and state test runs directly (errors are not swallowed), every card is refreshed and every
     # main page is built. Only reads: nothing is switched on. Writes one section per profile to <snapshot>.pcmatrix.txt.
     if ($env:ZD_PCMATRIX -and $env:GITHUB_ACTIONS -eq 'true') {
+        # the real app warms the worker up once its window is idle (see 'worker warm-up'); this hook runs before the window
+        # exists, so it does the same first, or the first page that uses the worker pays the one-time cost
+        $zdWarm = [Diagnostics.Stopwatch]::StartNew()
+        for ($wi = 0; $wi -lt 3; $wi++) { Invoke-Worker 'param() $null' @() { param($out, $errs) } }
+        [Console]::WriteLine(('PCMATRIX worker warm-up: {0} ms' -f $zdWarm.ElapsedMilliseconds))
         function Get-ZdPcProfiles {
             $eth = @{ Name = 'Ethernet'; Desc = 'Intel(R) Ethernet Controller I226-V'; Wifi = $false; Up = $true; Speed = '2.5 Gbps' }
             $wifi = @{ Name = 'Wi-Fi'; Desc = 'Intel(R) Wi-Fi 6E AX211 160MHz'; Wifi = $true; Up = $true; Speed = '1.2 Gbps' }

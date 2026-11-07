@@ -81,6 +81,45 @@ jobs:
           "`n$ok switched on and back off cleanly, $($fail.Count) failed, $(@($r | Where-Object { $_ -like 'SKIP*' }).Count) skipped (not applicable here or already on)."
           if ($fail.Count) { exit 1 }
 
+      - name: Performance modes (presets, power plans, power mode slider, Game Mode) applied and undone
+        id: modes
+        continue-on-error: true
+        shell: powershell
+        env:
+          ZD_MODES: '1'
+        run: |
+          $out = New-Item -ItemType Directory -Force snapshots
+          $png = Join-Path $out 'modes.png'
+          $p = Start-Process powershell.exe -PassThru -NoNewWindow -RedirectStandardError "$out\modes.err.txt" -ArgumentList @(
+            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "$PWD\ZeroDelay.ps1", '-NoElevate', '-Snapshot', $png)
+          if (-not $p.WaitForExit(900000)) { Stop-Process -Id $p.Id -Force; throw 'Timed out after 15 minutes.' }
+          $f = "$png.modes.txt"
+          if (-not (Test-Path $f)) { Get-Content "$out\modes.err.txt" -ErrorAction SilentlyContinue; throw 'No modes report was written.' }
+          $r = @(Get-Content $f); $r
+          $fail = @($r | Where-Object { $_ -like 'FAIL*' })
+          "`n$(@($r | Where-Object { $_ -like 'OK*' }).Count) passed, $($fail.Count) failed."
+          if ($fail.Count) { exit 1 }
+
+      - name: How much CPU and memory ZeroDelay itself uses while open
+        continue-on-error: true
+        shell: powershell
+        run: |
+          # the real app, not a snapshot: live tiles, timers and the background worker all running
+          $p = Start-Process powershell.exe -PassThru -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "$PWD\ZeroDelay.ps1", '-NoElevate')
+          Start-Sleep -Seconds 60
+          if ($p.HasExited) { throw "ZeroDelay exited by itself (code $($p.ExitCode))." }
+          $cores = [Environment]::ProcessorCount
+          $ids = @($p.Id) + @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" | ForEach-Object { $_.ProcessId })
+          $cpu0 = (Get-Process -Id $ids -ErrorAction SilentlyContinue | Measure-Object CPU -Sum).Sum
+          Start-Sleep -Seconds 30
+          $procs = @(Get-Process -Id $ids -ErrorAction SilentlyContinue)
+          $cpu1 = ($procs | Measure-Object CPU -Sum).Sum
+          $pct = [Math]::Round(100 * ($cpu1 - $cpu0) / 30 / $cores, 2)
+          $mb = [Math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB)
+          "ZeroDelay open and idle for 30 s: $pct% of the whole CPU ($cores cores), $mb MB of memory."
+          Stop-Process -Id $ids -Force -ErrorAction SilentlyContinue
+          if ($pct -gt 3) { "Over 3% CPU while idle."; exit 1 }
+
       - name: Simulate different PCs (graphics, drivers, network, games, other apps, broken WMI) and check every card and page
         id: pcmatrix
         continue-on-error: true
@@ -140,6 +179,13 @@ jobs:
         shell: powershell
         run: |
           'A simulated PC failed; see "Simulate different PCs" and the pcmatrix artifact.'
+          exit 1
+
+      - name: Fail the run if a performance mode did not undo cleanly
+        if: steps.modes.outcome == 'failure'
+        shell: powershell
+        run: |
+          'A performance mode left something changed; see "Performance modes".'
           exit 1
 
       - name: Checksum

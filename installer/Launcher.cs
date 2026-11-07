@@ -11,8 +11,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("ZeroDelay - Fortnite latency optimizer")]
 [assembly: AssemblyCompany("ZeroDelay contributors")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.1.1.0")]
+[assembly: AssemblyFileVersion("2.1.1.0")]
 
 static class Launcher
 {

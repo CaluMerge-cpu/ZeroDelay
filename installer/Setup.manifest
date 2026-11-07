@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="2.1.0.0" name="ZeroDelay.Setup"/>
+  <assemblyIdentity version="2.1.1.0" name="ZeroDelay.Setup"/>
   <!-- ZeroDelay installs to Program Files, which only administrators can change. That keeps the files the
        elevated app runs (ZeroDelay.ps1 and the "Start with Windows" task) out of reach of normal programs. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
