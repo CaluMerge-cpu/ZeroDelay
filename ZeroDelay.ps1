@@ -29463,6 +29463,7 @@ if ($Snapshot) {
         $ptHadPP = $script:Backup.Custom.ContainsKey('pauseprefs'); $ptPP = $script:Backup.Custom['pauseprefs']
         $ptWasOn = Test-ZDGameMode
         $script:ZdPtReal = $null
+        try { Initialize-ZdProc } catch {}   # compiled on first use in the app
         $ptHasT = [bool]('ZdProc' -as [type])
         $ptStep = { param($what, [scriptblock]$do) try { & $do; $true } catch { $pz.Add("FAIL  $what  error: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"); $false } }
         $ptSize = { param($o) try { (New-Object IO.FileInfo $o.File).Length } catch { -1 } }
