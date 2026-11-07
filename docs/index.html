@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZeroDelay — less input delay, no placebo</title>
-<meta name="description" content="ZeroDelay is a free, open-source Windows optimizer for Fortnite, Counter-Strike 2 and more. Every tweak is explained, measured and can be undone.">
+<meta name="description" content="ZeroDelay is a free, open-source optimizer for Windows and Mac, for Fortnite, Counter-Strike 2 and more. Every tweak is explained, measured and can be undone.">
 <meta property="og:title" content="ZeroDelay">
 <meta property="og:description" content="A free Windows optimizer for Fortnite and Counter-Strike 2. Every tweak explained, measured and reversible.">
 <meta property="og:image" content="img/home.jpg">
@@ -28,6 +28,7 @@
     <div class="links">
       <a href="#what">What it does</a>
       <a href="#games">Games</a>
+      <a href="#mac">Mac</a>
       <a href="#install">Install</a>
       <a href="#faq">FAQ</a>
       <a href="#changes">Changes</a>
@@ -38,13 +39,17 @@
 
 <main id="top">
   <section class="hero">
-    <p class="eyebrow"><span>New: version 2.1</span><span>Free</span><span>Open source</span><span>Windows 10 and 11</span></p>
+    <p class="eyebrow"><span>New: version 2.1</span><span>Free</span><span>Open source</span><span>Windows 10 and 11</span><span>New: Mac</span></p>
     <h1>Less input delay.<br><em>No placebo.</em></h1>
     <p class="lede">ZeroDelay tunes Windows, your graphics driver and your games for lower input delay, steadier frames and cleaner ping. Every change says what it does, when not to use it, and comes back with one click.</p>
     <div class="cta">
       <a class="btn primary" id="dl" href="https://github.com/CaluMerge-cpu/ZeroDelay/releases/latest/download/ZeroDelay-Setup.exe">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16"/></svg>
         Download for Windows
+      </a>
+      <a class="btn ghost" href="#mac">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5V16H4zM2 16h20l-1 3H3z"/></svg>
+        Get it for Mac
       </a>
       <a class="btn ghost" href="#install">How to install</a>
     </div>
@@ -163,8 +168,50 @@
     </ul>
   </section>
 
+  <section id="mac" class="mac reveal">
+    <div class="mac-head">
+      <p class="kicker">New · ZeroDelay for Mac</p>
+      <h2>The same rules, on a Mac</h2>
+      <p class="sub">A native Mac app for macOS 13 Ventura or later, on Apple Silicon and Intel. Fewer tweaks than on Windows, because macOS leaves less to change. The ones it has are real, explained, and come back with one click.</p>
+    </div>
+    <figure class="shot glass"><img loading="lazy" src="img/mac-home.jpg" width="1100" height="708" alt="ZeroDelay for Mac Home: last ping test, what is worth fixing, and active changes"></figure>
+    <div class="mac-grid">
+      <div class="card glass">
+        <h3>5 tweaks, each with Undo</h3>
+        <ul>
+          <li>Pointer acceleration off</li>
+          <li>Low Power Mode off while you play</li>
+          <li>Pause Time Machine backups</li>
+          <li>External display at its fastest refresh rate</li>
+          <li>AirDrop radio off until restart, for steadier Wi-Fi ping</li>
+        </ul>
+      </div>
+      <div class="card glass">
+        <h3>Checks that only look</h3>
+        <p>Ping, jitter and loss to your router and to the internet side by side, so you can tell a Wi-Fi problem from a provider problem. Wi-Fi signal and band, heat and throttling, memory and swap, what is busy right now, and games running through Rosetta.</p>
+      </div>
+      <div class="card glass">
+        <h3>Nothing hidden</h3>
+        <p>No kernel extension, no background helper, nothing that touches games or anti-cheat. Changes that need your password ask with the normal macOS prompt, once per Apply. Placebo like RAM cleaners and network sysctls is left out on purpose.</p>
+      </div>
+    </div>
+    <div class="cta">
+      <a class="btn primary" id="mac-dl" href="https://github.com/CaluMerge-cpu/ZeroDelay-Mac/releases/latest/download/ZeroDelay-Mac.zip">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16"/></svg>
+        Download for Mac
+      </a>
+      <a class="btn ghost" href="https://github.com/CaluMerge-cpu/ZeroDelay-Mac" rel="noopener">Source on GitHub</a>
+    </div>
+    <p class="meta"><span id="mac-ver">Latest version</span><span id="mac-size"></span><span id="mac-date"></span></p>
+    <p class="hash" id="mac-hashrow" hidden><span>SHA-256</span><code id="mac-hash"></code><button id="mac-copy" type="button">Copy</button></p>
+    <ol class="steps mac-steps">
+      <li class="glass"><span class="n">1</span><div><h3>Download and unzip</h3><p>Open <code>ZeroDelay-Mac.zip</code> and drag <b>ZeroDelay</b> into Applications.</p></div></li>
+      <li class="glass"><span class="n">2</span><div><h3>Allow it once</h3><p>The app is not notarized by Apple yet, so macOS stops it the first time. Open <b>System Settings → Privacy &amp; Security</b>, scroll down and click <b>Open Anyway</b>.</p></div></li>
+    </ol>
+  </section>
+
   <section id="install" class="install reveal">
-    <h2>Install in a minute</h2>
+    <h2>Install on Windows in a minute</h2>
     <ol class="steps">
       <li class="glass"><span class="n">1</span><div><h3>Download</h3><p>Get <code>ZeroDelay-Setup.exe</code> with the button above. The SHA-256 under it lets you check the file is the one published on GitHub.</p></div></li>
       <li class="glass"><span class="n">2</span><div><h3>Get past SmartScreen</h3><p>Windows warns about apps without a paid code-signing certificate. Click <b>More info</b>, then <b>Run anyway</b>. The full source is on GitHub if you want to read it first.</p></div></li>
@@ -178,6 +225,7 @@
     <details class="glass"><summary>Can it get me banned?</summary><p>ZeroDelay never touches anti-cheat, game files or game memory. It changes Windows settings, your graphics driver's settings for a game, and the game's own settings file, the same file the in-game menu writes. Where a publisher asks players not to edit that file, ZeroDelay shows you the menu setting instead of changing it.</p></details>
     <details class="glass"><summary>How do I undo something?</summary><p>Switch the card off and the saved original comes back. <b>Restore</b> on Home undoes everything ZeroDelay changed. If you made a restore point at the start, Windows can roll back to it too.</p></details>
     <details class="glass"><summary>Will it give me more FPS?</summary><p>It depends on your PC. ZeroDelay does not promise numbers; the score on Home counts the recommended tweaks that are on. Your match reports and the benchmark show what actually changed for you.</p></details>
+    <details class="glass"><summary>Is there a Mac version?</summary><p>Yes, <a href="#mac">ZeroDelay for Mac</a>. It is a separate, native app with its own <a href="https://github.com/CaluMerge-cpu/ZeroDelay-Mac" rel="noopener">source on GitHub</a>. macOS lets apps change much less than Windows does, so it has 5 tweaks and 9 checks rather than hundreds, and it says plainly what each one can and cannot do.</p></details>
     <details class="glass"><summary>Does it collect data?</summary><p>No accounts and no analytics. It contacts GitHub to check for updates, Epic's status page and game servers when you run a ping or route test, and Intel's GitHub when you choose to download PresentMon for the latency test.</p></details>
     <details class="glass"><summary>Why does Windows warn about it?</summary><p>Code-signing certificates cost several hundred euros a year, and ZeroDelay is free. Every release lists its SHA-256 so you can check the download matches the published file.</p></details>
     <details class="glass"><summary>Does it work with other optimizers and ping boosters?</summary><p>It works alongside GearUP, ExitLag, WTFast and NoPing. When it finds another optimizer installed, it shows what it would change instead of fighting over the same settings.</p></details>
@@ -192,8 +240,8 @@
 </main>
 
 <footer class="foot">
-  <p>ZeroDelay is free and open source under the MIT licence. <a href="https://github.com/CaluMerge-cpu/ZeroDelay">Source on GitHub</a>.</p>
-  <p class="muted">Not affiliated with Epic Games, Valve, Riot Games, Blizzard, Ubisoft, NetEase, Konami, 2K, Sloclap, Steel City Interactive, NVIDIA, AMD or Microsoft. Game names belong to their owners.</p>
+  <p>ZeroDelay for Windows and Mac is free and open source. <a href="https://github.com/CaluMerge-cpu/ZeroDelay">Source on GitHub</a>.</p>
+  <p class="muted">Not affiliated with Epic Games, Valve, Riot Games, Blizzard, Ubisoft, NetEase, Konami, 2K, Sloclap, Steel City Interactive, NVIDIA, AMD, Microsoft or Apple. Game names belong to their owners.</p>
 </footer>
 
 <script src="app.js"></script>

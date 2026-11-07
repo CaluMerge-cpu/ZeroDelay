@@ -72,6 +72,24 @@
     }
   }
 
+  // ZeroDelay for Mac: its own repo and release
+  async function loadMac() {
+    try {
+      const res = await fetch('https://api.github.com/repos/CaluMerge-cpu/ZeroDelay-Mac/releases/latest', { headers: { Accept: 'application/vnd.github+json' } });
+      if (!res.ok) throw new Error(res.status);
+      const r = await res.json();
+      const asset = (r.assets || []).find((a) => /\.zip$/i.test(a.name));
+      if (asset) { $('mac-dl').href = asset.browser_download_url; $('mac-size').textContent = fmtSize(asset.size); }
+      $('mac-ver').textContent = 'Version ' + r.tag_name.replace(/^v/, '') + ' · macOS 13 or later';
+      $('mac-date').textContent = fmtDate(r.published_at);
+      const sha = (r.body || '').match(/SHA-256:\s*`?([A-Fa-f0-9]{64})`?/);
+      if (sha) { $('mac-hash').textContent = sha[1].toUpperCase(); $('mac-hashrow').hidden = false; }
+    } catch (e) {}
+  }
+  $('mac-copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('mac-hash').textContent); $('mac-copy').textContent = 'Copied'; setTimeout(() => { $('mac-copy').textContent = 'Copy'; }, 1600); } catch (e) {}
+  });
+
   // copy the checksum
   $('copy').addEventListener('click', async () => {
     try { await navigator.clipboard.writeText($('hash').textContent); $('copy').textContent = 'Copied'; setTimeout(() => { $('copy').textContent = 'Copy'; }, 1600); } catch (e) {}
@@ -97,4 +115,5 @@
   document.querySelectorAll('.reveal').forEach((el) => io ? io.observe(el) : el.classList.add('in'));
 
   load();
+  loadMac();
 })();
