@@ -39,7 +39,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '2.1.1'
+$AppVersion = '2.2.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -2095,8 +2095,9 @@ function Test-GameSession { Test-Path $SessionFile }
 # --- ZeroDelay Game Mode: one switch that prepares the PC for a match and undoes it afterwards.
 $GameModeFile = Join-Path $DataDir 'game-mode.json'
 $GameModeSteps = [ordered]@{
-    apps     = @{ Name = 'Close or pause background apps';            Default = $true }
-    plan     = @{ Name = 'Switch to the ZeroDelay power plan';         Default = $true }
+    apps     = @{ Name = 'Close the apps you pick';                   Default = $true }
+    pause    = @{ Name = 'Pause background apps';                     Default = $true }
+    plan    = @{ Name = 'Switch to the ZeroDelay power plan';         Default = $true }
     priority = @{ Name = 'Lower priority of apps left open';           Default = $true }
     dnd      = @{ Name = 'Silence Windows notifications';              Default = $true }
     updates  = @{ Name = 'Pause Windows Update downloads';             Default = $true }
@@ -2119,6 +2120,195 @@ function Test-ZDGameMode { Test-Path $GameModeFile }
 function Get-ZeroDelayPlanGuid {
     $line = powercfg /list | Where-Object { $_ -match 'ZeroDelay' } | Select-Object -First 1
     if ($line -and $line -match $GuidRx) { $Matches[0] } else { $null }
+}
+
+# --- 2.2: Game Mode pauses background apps (every thread frozen, nothing closed) and wakes them when it ends.
+# Only apps with no window are paused, so nothing you can see freezes. Apps on the safe list below are paused by
+# default; anything else running in the background is listed on the Game Mode page, off until you switch it on.
+# Never paused: Windows, security, anti-cheat, drivers, input software (a paused keyboard or mouse hook stalls
+# every key press on the PC), voice and audio, overlays, launchers games need, VPNs and ping boosters.
+# A paused app stays paused if ZeroDelay is killed, so every pause is written to game-mode.json before it happens
+# and Resume-ZDPaused runs when Game Mode ends, when ZeroDelay exits and when it starts again.
+$GameModeNeverPause = @(
+    # Windows core, shell and input
+    'system', 'idle', 'registry', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'lsaiso', 'svchost', 'dwm', 'explorer', 'sihost', 'fontdrvhost',
+    'ctfmon', 'audiodg', 'runtimebroker', 'textinputhost', 'shellexperiencehost', 'startmenuexperiencehost', 'searchhost', 'searchapp', 'searchindexer',
+    'searchprotocolhost', 'dllhost', 'conhost', 'openconsole', 'windowsterminal', 'taskhostw', 'applicationframehost', 'systemsettings', 'logonui', 'lockapp',
+    'consent', 'wmiprvse', 'spoolsv', 'memory compression', 'dashost', 'wudfhost', 'aggregatorhost', 'backgroundtaskhost', 'taskmgr', 'sgrmbroker',
+    'trustedinstaller', 'tiworker', 'msiexec', 'mousocoreworker', 'useroobebroker', 'tabtip', 'gamebar', 'gamebarftserver', 'gamebarpresencewriter',
+    'xboxgamebarwidgets', 'powershell', 'pwsh', 'msedgewebview2', 'vmmem', 'vmcompute', 'zerodelay*',
+    # security and antivirus
+    'msmpeng', 'nissrv', 'mpdefendercoreservice', 'securityhealthservice', 'securityhealthsystray', 'smartscreen', 'mssense', 'avp', 'avpui', 'avastsvc',
+    'avastui', 'avgsvc', 'avgui', 'bdservicehost', 'bdagent', 'ekrn', 'egui', 'mbamservice', 'mbam', 'ccsvchst', 'mcshield', 'sentinelagent', 'csfalconservice',
+    # anti-cheat
+    'easyanticheat*', 'beservice*', 'vgc', 'vgtray', 'faceit*', 'eseaclient', 'eaanticheat*', 'pnkbstra', 'pnkbstrb', 'gamemon*', 'sguard*', 'ace-*', 'xigncode*', 'zakynthos*', '*anticheat*',
+    # graphics drivers
+    'nvcontainer', 'nvdisplay.container', 'nvidia share', 'nvidia overlay', 'nvidia app', 'nvsphelper64', 'nvidia broadcast', 'radeonsoftware', 'amdrsserv', 'amdow',
+    'amdrssrcext', 'atiesrxx', 'atieclxx', 'amdfendrsr', 'igfx*', 'igcc', 'onapp.igcc.winservice', 'intelgraphicssoftware',
+    # mice, keyboards, lighting (macros and hooks)
+    'lghub*', 'logioptionsplus*', 'razer*', 'rzsynapse', 'icue', 'corsair*', 'steelseries*', 'wootility', 'armourycrate*', 'lightingservice', 'signalrgb', 'openrgb',
+    # voice, streaming, capture, overlays
+    'discord*', 'obs64', 'obs32', 'streamlabs*', 'ts3client_win64', 'teamspeak*', 'mumble', 'medal*', 'overwolf*', 'gameoverlayui', 'eosoverlayrenderer*',
+    'msiafterburner', 'rtss*', 'encoderserver', 'spotify',
+    # launchers and DRM games need
+    'steam', 'steamwebhelper', 'steamservice', 'epicgameslauncher', 'epicwebhelper', 'battle.net', 'agent', 'eadesktop', 'eabackgroundservice', 'upc', 'uplaywebcore',
+    'ubisoftconnect', 'riotclient*', 'launcher', 'rockstarservice', 'socialclubhelper', 'galaxyclient', 'xboxapp', 'xboxpcapp', 'gamingservices', 'gamingservicesnet',
+    # network, ping boosters, VPNs
+    'exitlag*', 'noping*', 'wtfast*', 'haste', 'mudfish', 'gearup*', 'openvpn*', 'nordvpn*', 'expressvpn*', 'protonvpn*', 'wireguard', 'mullvad*', 'tailscale*', 'warp-svc',
+    # audio chain
+    'voicemeeter*', 'audiorepeater', 'steelseriessonar', 'wavelink', 'peace', 'krisp', 'nahimic*',
+    # accessibility, hotkeys, password managers
+    'narrator', 'magnify', 'osk', 'nvda', 'jfw', 'zoomtext', 'autohotkey*', 'powertoys*', '1password', 'bitwarden', 'keepass*'
+)
+# Background apps that are safe and worth pausing while you play: cloud sync, Adobe helpers, updaters, torrents.
+$GameModePauseSafe = @{
+    'onedrive' = 'Cloud sync'; 'filecoauth' = 'Cloud sync'; 'dropbox' = 'Cloud sync'; 'googledrivefs' = 'Cloud sync'; 'icloudservices' = 'Cloud sync'
+    'iclouddrive' = 'Cloud sync'; 'icloudphotos' = 'Cloud sync'; 'megasync' = 'Cloud sync'
+    'creative cloud' = 'Adobe'; 'ccxprocess' = 'Adobe'; 'cclibrary' = 'Adobe'; 'coresync' = 'Adobe'; 'adobeipcbroker' = 'Adobe'; 'adobe desktop service' = 'Adobe'
+    'adobenotificationclient' = 'Adobe'; 'adobearm' = 'Updater'; 'acrotray' = 'Adobe'
+    'googleupdate' = 'Updater'; 'microsoftedgeupdate' = 'Updater'; 'jusched' = 'Updater'; 'jucheck' = 'Updater'
+    'qbittorrent' = 'Downloads'; 'utorrent' = 'Downloads'; 'bittorrent' = 'Downloads'
+}
+function Initialize-ZdProc {
+    if ('ZdProc' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+// Freeze and wake a whole process (every thread) the way Resource Monitor's "Suspend process" does.
+public static class ZdProc {
+    [DllImport("kernel32", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("ntdll")] static extern int NtSuspendProcess(IntPtr h);
+    [DllImport("ntdll")] static extern int NtResumeProcess(IntPtr h);
+    [DllImport("kernel32")] static extern int GetPackageFullName(IntPtr h, ref uint len, IntPtr name);
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32")] static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32")] static extern uint GetWindowThreadProcessId(IntPtr h, out int pid);
+    [DllImport("user32")] static extern int GetWindowLong(IntPtr h, int index);
+    [DllImport("dwmapi")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+    static bool Call(int pid, bool suspend) {
+        IntPtr h = OpenProcess(0x0800 /* PROCESS_SUSPEND_RESUME */, false, pid);
+        if (h == IntPtr.Zero) return false;
+        try { return (suspend ? NtSuspendProcess(h) : NtResumeProcess(h)) >= 0; }
+        finally { CloseHandle(h); }
+    }
+    public static bool Suspend(int pid) { return Call(pid, true); }
+    public static bool Resume(int pid) { return Call(pid, false); }
+    // Store and packaged apps: Windows already suspends them in the background, so ZeroDelay leaves them alone
+    public static bool IsPackaged(int pid) {
+        IntPtr h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+        if (h == IntPtr.Zero) return true;
+        try { uint len = 0; int r = GetPackageFullName(h, ref len, IntPtr.Zero); return r != 15700 /* APPMODEL_ERROR_NO_PACKAGE */; }
+        finally { CloseHandle(h); }
+    }
+    // processes that own a window you can see or bring back (minimized counts; tool windows and hidden ones do not)
+    public static int[] WindowPids() {
+        var list = new List<int>();
+        EnumWindows(delegate (IntPtr h, IntPtr l) {
+            if (!IsWindowVisible(h) || GetWindowTextLength(h) == 0) return true;
+            if ((GetWindowLong(h, -20) & 0x80) != 0) return true;   // WS_EX_TOOLWINDOW
+            int cloaked = 0; if (DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) return true;
+            int pid; GetWindowThreadProcessId(h, out pid); list.Add(pid); return true;
+        }, IntPtr.Zero);
+        return list.ToArray();
+    }
+}
+'@
+}
+function Test-NeverPause([string]$Name) {
+    $n = $Name.ToLowerInvariant()
+    foreach ($p in $GameModeNeverPause) { if ($n -like $p) { return $true } }
+    $false
+}
+# every process Game Mode could pause now, one entry per process: Id, Name, Path, MemMb, Start (start time ticks,
+# so a reused process id is never touched), Why (what it is) and On (paused when Game Mode starts)
+function Get-ZDPauseCandidates {
+    Initialize-ZdProc
+    $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $win = @{}; foreach ($w in [ZdProc]::WindowPids()) { $win[[int]$w] = $true }
+    $games = @{}; foreach ($g in $GameDefs) { foreach ($n in Get-GameProcNames $g) { $games["$n".ToLowerInvariant()] = $true } }
+    foreach ($b in $Boosters.Values) { foreach ($n in @($b.Proc)) { $games["$n".ToLowerInvariant()] = $true } }
+    $windir = "$env:SystemRoot".TrimEnd('\') + '\'
+    $prefs = ConvertTo-Map $script:Backup.Custom['pauseprefs']
+    if ($null -eq $script:ZdAncestors) {   # whatever started ZeroDelay (its launcher, a terminal) is never paused
+        $script:ZdAncestors = @{}; $cur = $PID
+        for ($i = 0; $i -lt 6; $i++) {
+            $pp = try { (Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction Stop).ParentProcessId } catch { $null }
+            if (-not $pp -or $script:ZdAncestors.ContainsKey([int]$pp)) { break }
+            $script:ZdAncestors[[int]$pp] = $true; $cur = $pp
+        }
+    }
+    $byName = @{}
+    foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+        if ($p.Id -eq $PID -or $p.Id -le 4 -or $p.SessionId -ne $session -or $script:ZdAncestors.ContainsKey([int]$p.Id)) { continue }
+        $n = "$($p.ProcessName)"; $k = $n.ToLowerInvariant()
+        if ($games.ContainsKey($k) -or ($games.Keys | Where-Object { $k -like $_ }) -or (Test-NeverPause $n) -or $MemNoClose -contains $n) { continue }
+        $path = try { $p.Path } catch { $null }
+        if (-not $path -or $path.StartsWith($windir, [StringComparison]::OrdinalIgnoreCase) -or $path -match '(?i)\\WindowsApps\\') { continue }
+        $start = try { $p.StartTime.Ticks } catch { 0 }
+        if (-not $start) { continue }
+        if (-not $byName.ContainsKey($k)) { $byName[$k] = New-Object Collections.ArrayList }
+        [void]$byName[$k].Add([pscustomobject]@{ Id = $p.Id; Name = $n; Path = $path; MemMb = [int]($p.WorkingSet64 / 1MB); Start = $start; Why = ''; On = $false })
+    }
+    foreach ($k in @($byName.Keys)) {
+        $procs = @($byName[$k])
+        # an app with any window you can see is in use: none of its processes are paused, so it never freezes on screen
+        if ($procs | Where-Object { $win.ContainsKey([int]$_.Id) }) { continue }
+        if ($procs | Where-Object { try { [ZdProc]::IsPackaged([int]$_.Id) } catch { $false } }) { continue }
+        $safe = $GameModePauseSafe[$k]
+        $mem = ($procs | Measure-Object MemMb -Sum).Sum
+        if (-not $safe -and -not $prefs.ContainsKey($k) -and $mem -lt 40) { continue }   # tiny helpers are not worth listing
+        $on = if ($prefs.ContainsKey($k)) { [bool]$prefs[$k] } else { [bool]$safe }
+        foreach ($c in $procs) { $c.Why = $(if ($safe) { $safe } else { 'Background app' }); $c.On = $on; $c }
+    }
+}
+# the same, one row per app for the Game Mode page: Key (lower-case name), Name, Count, MemMb, Why, On, Safe
+function Get-ZDPauseApps {
+    @(Get-ZDPauseCandidates) | Group-Object { $_.Name.ToLowerInvariant() } | ForEach-Object {
+        $f = $_.Group[0]
+        [pscustomobject]@{ Key = $_.Name; Name = $f.Name; Count = $_.Count; MemMb = [int](($_.Group | Measure-Object MemMb -Sum).Sum); Why = $f.Why; On = $f.On; Safe = [bool]$GameModePauseSafe[$_.Name] }
+    } | Sort-Object @{ e = { -not $_.Safe } }, @{ e = { -$_.MemMb } }
+}
+# pauses every candidate that is on; each one is written to the state file before it is paused. Returns the app names.
+function Suspend-ZDBackground($State) {
+    Initialize-ZdProc
+    $paused = New-Object Collections.ArrayList
+    foreach ($c in @(Get-ZDPauseCandidates | Where-Object { $_.On })) {
+        [void]$paused.Add(@{ Id = $c.Id; Name = $c.Name; Start = $c.Start })
+        $State.Paused = @($paused); $State | ConvertTo-Json -Depth 5 | Set-Content $GameModeFile -Encoding UTF8
+        if (-not [ZdProc]::Suspend([int]$c.Id)) { $paused.RemoveAt($paused.Count - 1) }
+    }
+    $State.Paused = @($paused)
+    $State | ConvertTo-Json -Depth 5 | Set-Content $GameModeFile -Encoding UTF8
+    @($paused | ForEach-Object { $_.Name } | Select-Object -Unique)
+}
+# wakes everything Game Mode paused (from $State, or game-mode.json) once, and forgets it. Returns the app names.
+function Resume-ZDPaused($State = $null) {
+    if (-not $State) {
+        if (-not (Test-Path $GameModeFile)) { return @() }
+        try { $State = Get-Content $GameModeFile -Raw | ConvertFrom-Json } catch { return @() }
+    }
+    $list = @($State.Paused | Where-Object { $_ })
+    if (-not $list.Count) { return @() }
+    Initialize-ZdProc
+    $names = @()
+    foreach ($e in $list) {
+        $p = Get-Process -Id ([int]$e.Id) -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        $st = try { $p.StartTime.Ticks } catch { 0 }
+        if ("$st" -ne "$($e.Start)") { continue }   # the app closed and another one got its process id
+        if ([ZdProc]::Resume([int]$e.Id)) { $names += "$($e.Name)" }
+    }
+    if (Test-Path $GameModeFile) {
+        try {
+            $o = Get-Content $GameModeFile -Raw | ConvertFrom-Json
+            if ($o.PSObject.Properties['Paused']) { $o.PSObject.Properties.Remove('Paused'); $o | ConvertTo-Json -Depth 5 | Set-Content $GameModeFile -Encoding UTF8 }
+        } catch {}
+    }
+    @($names | Select-Object -Unique)
 }
 function Enable-ZDGameMode {
     [ZdWatchdog]::Step = 'Enable-ZDGameMode'
@@ -2161,6 +2351,13 @@ function Enable-ZDGameMode {
         $state.Priorities = $changed
         if ($changed.Count) { $done += "$($changed.Count) background processes lowered" }
     }
+    if ($prefs.pause) {
+        try {
+            $pn = @(Suspend-ZDBackground $state)
+            $state.PausedNames = $pn
+            if ($pn.Count) { $done += "paused $($pn -join ', ')" }
+        } catch { Write-CrashLog $_.Exception 'pause background apps' }
+    }
     if ($prefs.dnd) {
         $state.ToastPrev = Get-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled'
         Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0 'DWord'
@@ -2191,6 +2388,7 @@ function Disable-ZDGameMode {
     if (-not (Test-ZDGameMode)) { return 'Game Mode is already off.' }
     $state = Get-Content $GameModeFile -Raw | ConvertFrom-Json
     $back = @()
+    try { $woke = @(Resume-ZDPaused $state); if ($woke.Count) { $back += "woke $($woke -join ', ')" } } catch { Write-CrashLog $_.Exception 'resume paused apps' }
     if ($state.Session) { $m = Stop-GameSession; if ($m -match 'Reopened: (.+)\.') { $back += "reopened $($Matches[1])" } }
     if ($state.NvReplayPaused) {
         $ok = $false
@@ -2696,7 +2894,7 @@ function Update-PresetChips {
 $script:SettingsFileVersion = 1
 # preferences that travel to another PC. Everything else in $script:Backup.Custom is a backup of this PC's own
 # values (original registry, file and driver settings, per-card originals, logs, measurements, tokens) and stays here.
-$script:ExportPrefKeys = @('accent', 'autofix', 'autoupdate', 'closetotray', 'eventsregion', 'pingregion', 'glass', 'matchreport', 'sessionprefs',
+$script:ExportPrefKeys = @('accent', 'autofix', 'autoupdate', 'closetotray', 'eventsregion', 'pingregion', 'glass', 'matchreport', 'sessionprefs', 'pauseprefs',
                            'theme', 'tourgame', 'trustedboosters', 'wizarddone', 'traytipshown', 'nvsyncmode', 'sens', 'rl-statsapi-rec', 'gameauto', 'gametweaks')
 $script:ExportPrefPrefixes = @('gameserver_', 'nav_', 'tour-ics-', 'preset:')
 function Test-ExportPrefKey([string]$Key) {
@@ -17768,6 +17966,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.2.0' = @(
+        @{ T = 'Game Mode pauses background apps'; D = 'When Game Mode starts it freezes background apps that have no window, such as OneDrive, Dropbox, Google Drive, Adobe helpers and updaters, and wakes them when Game Mode ends or the game closes. Nothing is closed. The Game Mode page lists what it pauses, with a switch for each app.' }
+        @{ T = 'Never paused'; D = 'Windows, antivirus, anti-cheat, graphics drivers, mouse and keyboard software, Discord and voice apps, overlays, game launchers, VPNs and ping boosters are never paused, and neither is any app with a window you can see.' }
+        @{ T = 'Always woken up'; D = 'Paused apps are woken when ZeroDelay exits, and if ZeroDelay is closed suddenly they are woken the next time it starts.' }
+    )
     '2.1.1' = @(
         @{ T = 'Presets fixed'; D = 'The Competitive and Max presets on Home now pick their tweaks (they opened with nothing in 2.1.0). Safe was not affected.' }
         @{ T = 'Power plans put back exactly'; D = 'Switching the Ultimate Performance card off removes the copy of the plan it made, your original plan comes back whatever order the Ultimate and ZeroDelay plans are switched off in, and Game Mode no longer leaves the ZeroDelay plan behind when it ends.' }
@@ -25691,6 +25894,7 @@ function New-ToolTile([string]$Name, [bool]$Pinned) {
 # =============================================================== Game Mode page (booster dashboard)
 $GmStepInfo = [ordered]@{
     apps     = @{ Icon = 0xE71D; Tint = '#5E5CE6'; Desc = 'Closes the apps you pick below and reopens them afterwards.' }
+    pause    = @{ Icon = 0xE769; Tint = '#64D2FF'; Desc = 'Freezes background apps with no window (cloud sync, Adobe, updaters) and wakes them when you stop. Nothing is closed.' }
     plan     = @{ Icon = 0xE945; Tint = '#FF9F0A'; Desc = 'Full CPU speed and no parked cores while you play.' }
     priority = @{ Icon = 0xE9D9; Tint = '#0A84FF'; Desc = 'Discord, browsers and launchers step back to below-normal priority.' }
     dnd      = @{ Icon = 0xE708; Tint = '#BF5AF2'; Desc = 'No Windows pop-ups in the middle of a fight.' }
@@ -25961,14 +26165,14 @@ function Update-GameModePage {
     if ($on) {
         $g.AppsVal.Text = "$([int]$st.ClosedCount)"; $g.AppsLbl.Text = 'Apps closed'
         $g.MemVal.Text = ('{0:0.0}' -f ([double]$st.FreedMb / 1024))
-        $g.DoneText.Text = if (@($st.Done).Count -or $st.Session) { 'Everything is put back when you stop Game Mode' + $(if ($prefs.autooff) { ' or close Fortnite.' } else { '.' }) } else { '' }
+        $g.DoneText.Text = if (@($st.Done).Count -or $st.Session -or @($st.PausedNames).Count) { $(if (@($st.PausedNames).Count) { "Paused: $(@($st.PausedNames) -join ', '). " } else { '' }) + 'Everything is put back when you stop Game Mode' + $(if ($prefs.autooff) { ' or close Fortnite.' } else { '.' }) } else { '' }
     } else {
         $would = @($SessionApps | Where-Object { $prefs[$_.Key] -and $script:GmRunningPaths -and $script:GmRunningPaths.ContainsKey($_.Key) }).Count
         $g.AppsVal.Text = "$would"; $g.AppsLbl.Text = 'Apps it will close'
         $g.MemVal.Text = '0.0'
         $g.DoneText.Text = 'Start Game turns on Game Mode and launches Fortnite through the Epic Games Launcher. The round button switches Game Mode on or off without launching anything.'
     }
-    $g.StepsVal.Text = "$(@('apps', 'plan', 'priority', 'dnd', 'updates', 'dns', 'nvreplay' | Where-Object { $prefs[$_] }).Count)/7"
+    $g.StepsVal.Text = "$(@('apps', 'pause', 'plan', 'priority', 'dnd', 'updates', 'dns', 'nvreplay' | Where-Object { $prefs[$_] }).Count)/8"
     Update-GameModeClock
 }
 function Update-GameModeTools {
@@ -25995,7 +26199,7 @@ function Update-GameModeTools {
     $f = $script:GmFilter
     if ($f -in 'all', 'steps') {
         [void]$rows.Add((Head 'BOOST STEPS'))
-        foreach ($k in 'apps', 'plan', 'priority', 'dnd', 'updates', 'dns', 'nvreplay') { [void]$rows.Add((Row $GameModeSteps[$k].Name "G_$k" $GmStepInfo[$k].Desc (Glyph $GmStepInfo[$k].Icon $GmStepInfo[$k].Tint) $false)) }
+        foreach ($k in 'apps', 'pause', 'plan', 'priority', 'dnd', 'updates', 'dns', 'nvreplay') { [void]$rows.Add((Row $GameModeSteps[$k].Name "G_$k" $GmStepInfo[$k].Desc (Glyph $GmStepInfo[$k].Icon $GmStepInfo[$k].Tint) $false)) }
     }
     $shown = @()
     if ($f -in 'all', 'apps') {
@@ -26008,6 +26212,18 @@ function Update-GameModeTools {
             $icon = "<Grid Width='34' Height='34'><Border x:Name='GT_$i' CornerRadius='9' Background='$tint'><TextBlock Text='$letter' FontSize='15' FontWeight='SemiBold' Foreground='{DynamicResource Text.Primary}' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border><Image x:Name='GI_$i' Width='30' Height='30' RenderOptions.BitmapScalingMode='HighQuality'/></Grid>"
             [void]$rows.Add((Row $a.Name "S_$($a.Key)" $(if ($a.Pause) { 'Paused, not closed' } else { '' }) $icon ([bool]($script:GmRunningPaths -and $script:GmRunningPaths.ContainsKey($a.Key)))))
             $i++
+        }
+    }
+    $pauseApps = @()
+    if ($f -in 'all', 'apps') {
+        $pauseApps = @(try { Get-ZDPauseApps } catch { @() })
+        [void]$rows.Add((Head 'APPS IT PAUSES'))
+        if (-not $pauseApps.Count) { [void]$rows.Add("<TextBlock Text='No background apps to pause right now. Apps with a window, Windows, anti-cheat, voice and launchers are never paused.' FontSize='11.5' Foreground='{DynamicResource Text.Muted}' TextWrapping='Wrap' Margin='4,0,0,8'/>") }
+        $j = 0
+        foreach ($a in $pauseApps) {
+            $desc = "$($a.Why), $(Format-Size ([double]$a.MemMb * 1MB))" + $(if ($a.Count -gt 1) { ", $($a.Count) processes" } else { '' }) + $(if (-not $a.Safe) { '. Not on the safe list: if it misbehaves while paused, switch it off.' } else { '' })
+            [void]$rows.Add((Row $a.Name "P_$j" $desc (Glyph 0xE769 '#64D2FF') $true))
+            $j++
         }
     }
     if ($f -in 'all', 'auto') {
@@ -26026,6 +26242,11 @@ function Update-GameModeTools {
         $sw.Add_Click({ param($s, $e) $p = Get-SessionPrefs; $p[$s.Tag] = [bool]$s.IsChecked; $script:Backup.Custom['sessionprefs'] = $p; Save-Backup; Update-GameModePage })
         $img = Get-SessionAppIcon $a
         if ($img) { $panel.FindName("GI_$i").Source = $img; $panel.FindName("GT_$i").Visibility = 'Collapsed' }
+    }
+    for ($j = 0; $j -lt $pauseApps.Count; $j++) {
+        $sw = $panel.FindName("P_$j"); if (-not $sw) { continue }
+        $sw.IsChecked = [bool]$pauseApps[$j].On; $sw.Tag = $pauseApps[$j].Key
+        $sw.Add_Click({ param($s, $e) $p = ConvertTo-Map $script:Backup.Custom['pauseprefs']; $p[$s.Tag] = [bool]$s.IsChecked; $script:Backup.Custom['pauseprefs'] = $p; Save-Backup })
     }
     $g.Tools.Children.Clear(); [void]$g.Tools.Children.Add($panel)
 }
@@ -28551,6 +28772,7 @@ if ((Test-GameSession) -and -not (Test-ZDGameMode)) { $script:SessionTimer.Start
 
 # Game Mode watcher: turns on when a game you play starts and off when it closes (while ZeroDelay is open); also applies
 # and puts back a game's tweaks when you asked for that on its page. One process lookup per tick (Invoke-GameAutoTick).
+if (-not $Snapshot) { try { $woke = @(Resume-ZDPaused); if ($woke.Count) { Write-StartupMark "woke apps left paused: $($woke -join ', ')" } } catch {} }   # after a crash or a hard kill
 Initialize-GameAuto   # $script:GmSuppress (set when you switch Game Mode off by hand during a game), the tweak record
 $script:GmTimer = New-Object Windows.Threading.DispatcherTimer
 $script:GmTimer.Interval = [TimeSpan]::FromSeconds(4)
@@ -29240,6 +29462,296 @@ if ($Snapshot) {
         }
         Set-Content -LiteralPath "$Snapshot.roundtrip.txt" -Value $rt -Encoding UTF8
     }
+    # CI only (a throwaway Windows VM): Game Mode "pause background apps". Small dummy programs that append one byte to a
+    # file every 100 ms stand in for background apps: a file that stops growing means the program is paused. Checks the
+    # candidate list, Game Mode on (pause step only) and off, turning it on twice, crash recovery through Resume-ZDPaused,
+    # the PID reuse guard (Start ticks) and that a never-pause name (Discord) keeps running. Only the dummies are ever
+    # paused: Get-ZDPauseCandidates is wrapped for the run so nothing the runner needs can be frozen.
+    # Writes <snapshot>.pause.txt; lines start with OK / FAIL / NOTE.
+    if ($env:ZD_PAUSE -and $env:GITHUB_ACTIONS -eq 'true' -and $IsAdmin) {
+        $pz = New-Object Collections.Generic.List[string]
+        $ptDir = Join-Path $env:TEMP "zdpause-$PID"
+        $ptProcs = New-Object Collections.Generic.List[object]          # every dummy this hook started: @{ Id; Name; File; Path; Ticks; P }
+        $ptHadPrefs = $script:Backup.Custom.ContainsKey('gamemodeprefs'); $ptPrefs = $script:Backup.Custom['gamemodeprefs']
+        $ptHadPP = $script:Backup.Custom.ContainsKey('pauseprefs'); $ptPP = $script:Backup.Custom['pauseprefs']
+        $ptWasOn = Test-ZDGameMode
+        $script:ZdPtReal = $null
+        try { Initialize-ZdProc } catch {}   # compiled on first use in the app
+        $ptHasT = [bool]('ZdProc' -as [type])
+        $ptStep = { param($what, [scriptblock]$do) try { & $do; $true } catch { $pz.Add("FAIL  $what  error: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"); $false } }
+        $ptSize = { param($o) try { (New-Object IO.FileInfo $o.File).Length } catch { -1 } }
+        # bytes each dummy wrote in $Ms (after a short settle, so a write already in flight does not count)
+        $ptGrowth = { param($list, [int]$Ms = 1500)
+            Start-Sleep -Milliseconds 300
+            $a = @{}; foreach ($o in $list) { $a[$o.Id] = & $ptSize $o }
+            Start-Sleep -Milliseconds $Ms
+            $r = @{}; foreach ($o in $list) { $r[$o.Id] = (& $ptSize $o) - $a[$o.Id] }
+            $r }
+        $ptDesc = { param($g, $list) ($list | ForEach-Object { "$($_.Name)=+$($g[$_.Id])" }) -join ' ' }
+        $ptState = { if (Test-Path -LiteralPath $GameModeFile) { try { Get-Content -LiteralPath $GameModeFile -Raw | ConvertFrom-Json } catch { $null } } else { $null } }
+        $ptBase = { param($n) ("$n" -replace '(?i)\.exe$', '').ToLowerInvariant() }
+        try {
+            # ---- 0. what the contract needs
+            $miss = @()
+            foreach ($n in 'Get-ZDPauseCandidates', 'Resume-ZDPaused') { if (-not (Get-Command $n -CommandType Function -ErrorAction SilentlyContinue)) { $miss += "function $n" } }
+            if (-not $ptHasT) { $miss += 'type [ZdProc]' }
+            if (-not $GameModeSteps.Contains('pause')) { $miss += "Game Mode step 'pause'" }
+            if ($null -eq $GameModeNeverPause) { $miss += '$GameModeNeverPause' }
+            if ($miss) { throw "missing: $($miss -join ', ')" }
+            if (-not @($GameModeNeverPause | Where-Object { 'discord' -like "$_" }).Count) { $pz.Add('FAIL  $GameModeNeverPause has no entry matching Discord') }
+            if ($ptWasOn) { $pz.Add('NOTE  Game Mode was on when the hook started: switched off first'); [void](Disable-ZDGameMode) }
+            $hostP = Get-Process -Id $PID
+            $pz.Add("NOTE  host: PID $PID, session $($hostP.SessionId), $($hostP.Path)")
+
+            # ---- 1. dummy background programs: a tiny console exe that appends 'x' to the file in its first argument
+            [void](New-Item -ItemType Directory -Force -Path $ptDir)
+            $ptExe = Join-Path $ptDir 'ZdPauseDummy.exe'; $ptMode = 'cs'
+            try {
+                Add-Type -OutputType ConsoleApplication -OutputAssembly $ptExe -ErrorAction Stop -TypeDefinition @'
+using System; using System.IO; using System.Threading;
+public static class ZdPauseDummyMain {
+    public static void Main(string[] a) { while (true) { try { File.AppendAllText(a[0], "x"); } catch { } Thread.Sleep(100); } }
+}
+'@
+            } catch { $ptMode = 'ps'; $ptExe = Join-Path $PSHOME 'powershell.exe'; $pz.Add("NOTE  could not compile the dummy exe ($($_.Exception.Message)): using copies of powershell.exe") }
+            # start a copy named <Name>.exe in its own folder. Through 'cmd /c start /b' so its parent has exited (like an
+            # app started at sign-in) rather than being a child of ZeroDelay; started directly if that does not work.
+            $ptStart = { param([string]$Name)
+                $d = Join-Path $ptDir $Name; [void](New-Item -ItemType Directory -Force -Path $d)
+                $exe = Join-Path $d "$Name.exe"; Copy-Item -LiteralPath $ptExe -Destination $exe -Force
+                $f = Join-Path $ptDir "$Name.log"; [IO.File]::WriteAllText($f, '')
+                $p = $null
+                if ($ptMode -eq 'cs') {
+                    Start-Process -FilePath "$env:WINDIR\System32\cmd.exe" -ArgumentList '/d', '/c', "start `"`" /b `"$exe`" `"$f`"" -WindowStyle Hidden
+                    for ($i = 0; $i -lt 50 -and -not $p; $i++) {
+                        Start-Sleep -Milliseconds 100
+                        $p = Get-Process -Name $Name -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -like "*\zdpause-$PID\$Name\$Name.exe" } catch { $false } } | Select-Object -First 1
+                    }
+                    if (-not $p) { $p = Start-Process -FilePath $exe -ArgumentList "`"$f`"" -WindowStyle Hidden -PassThru }
+                } else {
+                    $p = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-NonInteractive', '-Command', "`$f='$f'; while(1){ [IO.File]::AppendAllText(`$f,'x'); Start-Sleep -Milliseconds 100 }"
+                }
+                $o = @{ Id = $p.Id; Name = $Name; File = $f; Path = $exe; P = $p; Ticks = 0L }
+                $ptProcs.Add($o)
+                $o }
+            $dA = & $ptStart 'ZdTestSync'; $dB = & $ptStart 'ZdTestIndexer'; $dC = & $ptStart 'ZdTestUpdater'
+            $dN = & $ptStart 'Discord'              # never-pause by name
+            $dR = & $ptStart 'ZdTestReuse'          # suspended by hand: nesting and PID reuse guard
+            $dX = & $ptStart 'ZdTestGone'           # killed: a stale entry for a process that no longer exists
+            $pausable = @($dA, $dB, $dC); $all = @($dA, $dB, $dC, $dN, $dR)
+            # wait until every dummy writes (powershell copies take a few seconds to start)
+            $t0 = Get-Date
+            while (((Get-Date) - $t0).TotalSeconds -lt 25) { if (-not @($all + $dX | Where-Object { (& $ptSize $_) -lt 3 }).Count) { break }; Start-Sleep -Milliseconds 250 }
+            foreach ($o in $all + $dX) { try { $o.Ticks = (Get-Process -Id $o.Id -ErrorAction Stop).StartTime.Ticks } catch {} }
+            $xId = $dX.Id; $xTicks = $dX.Ticks
+            Stop-Process -Id $dX.Id -Force -ErrorAction SilentlyContinue
+            $g = & $ptGrowth $all
+            $dead = @($all | Where-Object { $g[$_.Id] -lt 3 })
+            if ($dead) { throw "dummies not writing: $(& $ptDesc $g $dead)" }
+            $pz.Add("OK    $($all.Count) dummies running ($ptMode): $(& $ptDesc $g $all)")
+
+            # ---- 2. the real candidate list on this VM. The dummies are unknown and tiny (under 40 MB), so they are only
+            #         listed because the user switched them on in pauseprefs; Discord is switched on too, and must still be left out
+            $script:Backup.Custom['pauseprefs'] = @{ zdtestsync = $true; zdtestindexer = $true; zdtestupdater = $true; discord = $true; zdtestreuse = $false }
+            $real = @(Get-ZDPauseCandidates)
+            $realIds = @($real | ForEach-Object { [int]$_.Id })
+            $pz.Add("NOTE  Get-ZDPauseCandidates on this VM: $($real.Count): $((@($real | Select-Object -First 20 | ForEach-Object { "$($_.Name)[$($_.Id)]" }) -join ', '))$(if ($real.Count -gt 20) { ', ...' })")
+            $shape = @(foreach ($c in $real) { foreach ($k in 'Id', 'Name', 'Path', 'MemMb', 'Why', 'Start', 'On') {
+                $has = if ($c -is [hashtable]) { $c.ContainsKey($k) } else { [bool]$c.PSObject.Properties[$k] }
+                if (-not $has) { "$($c.Name)[$($c.Id)] no $k" } } })
+            if ($shape) { $pz.Add("FAIL  candidate shape: $(($shape | Select-Object -First 8) -join '; ')") } elseif ($real.Count) { $pz.Add('OK    every candidate has Id, Name, Path, MemMb, Why, Start, On') }
+            if ($realIds -contains $PID) { $pz.Add('FAIL  ZeroDelay itself is a candidate') } else { $pz.Add('OK    ZeroDelay itself is not a candidate') }
+            if ($realIds -contains $dN.Id) { $pz.Add('FAIL  never-pause Discord.exe (in a temp folder, on in pauseprefs) is a candidate') } else { $pz.Add('OK    never-pause Discord.exe is not a candidate, even when on in pauseprefs') }
+            $win = @($real | Where-Object { "$($_.Path)" -like "$env:WINDIR\*" })
+            if ($win) { $pz.Add("FAIL  candidates under $env:WINDIR`: $(($win | ForEach-Object { $_.Name }) -join ', ')") } else { $pz.Add("OK    no candidate under $env:WINDIR") }
+            $s0 = @(foreach ($c in $real) { $pp = Get-Process -Id ([int]$c.Id) -ErrorAction SilentlyContinue; if ($pp -and $pp.SessionId -eq 0) { $c.Name } })
+            if ($s0) { if ($hostP.SessionId -ne 0) { $pz.Add("FAIL  session 0 (service) candidates: $($s0 -join ', ')") } else { $pz.Add("NOTE  session 0 candidates (host itself is in session 0): $($s0 -join ', ')") } }
+            else { $pz.Add('OK    no session 0 (service) candidate') }
+            $anc = @(); $cur = $PID
+            for ($i = 0; $i -lt 8; $i++) { $w = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue; if (-not $w -or -not $w.ParentProcessId) { break }; $cur = [int]$w.ParentProcessId; $anc += $cur }
+            $ancHit = @($real | Where-Object { $anc -contains [int]$_.Id } | ForEach-Object { "$($_.Name)[$($_.Id)]" })
+            if ($ancHit) { $pz.Add("NOTE  parents of ZeroDelay are candidates (here the CI runner): $($ancHit -join ', ')") }
+            $miss = @(foreach ($o in $pausable) { $c = @($real | Where-Object { [int]$_.Id -eq $o.Id }) | Select-Object -First 1
+                if (-not $c) { "$($o.Name) not listed" } elseif ($c.On -ne $true) { "$($o.Name) listed but On = $($c.On)" }
+                elseif ("$($c.Start)" -ne "$($o.Ticks)") { "$($o.Name) Start $($c.Start) vs StartTime.Ticks $($o.Ticks)" } })
+            if ($miss) { $pz.Add("FAIL  dummies switched on in pauseprefs: $($miss -join '; ') (added by the test wrapper so the rest still runs)") }
+            else { $pz.Add('OK    dummies switched on in pauseprefs are candidates with On = true and Start = StartTime.Ticks') }
+            $c = @($real | Where-Object { [int]$_.Id -eq $dR.Id }) | Select-Object -First 1
+            if ($c -and $c.On -eq $true) { $pz.Add('FAIL  ZdTestReuse is off in pauseprefs but On = true') } else { $pz.Add("OK    ZdTestReuse off in pauseprefs: $(if ($c) { 'listed, off' } else { 'not listed' })") }
+
+            # ---- 3. only the dummies may be paused from here on
+            $script:ZdPtReal = ${function:Get-ZDPauseCandidates}
+            $script:ZdPtWatch = @($pausable + $dN + $dR | ForEach-Object { $_.Id })
+            $script:ZdPtAdd = $pausable
+            $script:ZdPtHash = [bool]@($real | Where-Object { $_ -is [hashtable] }).Count
+            Set-Item -Path function:script:Get-ZDPauseCandidates -Value {
+                $keep = New-Object Collections.Generic.List[object]
+                foreach ($c in @(& $script:ZdPtReal)) { if ($script:ZdPtWatch -contains [int]$c.Id) { $keep.Add($c) } }
+                foreach ($d in $script:ZdPtAdd) {
+                    if (@($keep | Where-Object { [int]$_.Id -eq $d.Id }).Count) { continue }
+                    $h = @{ Id = $d.Id; Name = $d.Name; Path = $d.Path; MemMb = 1; Start = $d.Ticks; Why = 'CI test dummy'; On = $true }
+                    if ($script:ZdPtHash) { $keep.Add($h) } else { $keep.Add([pscustomobject]$h) }
+                }
+                $keep.ToArray()
+            }
+            $only = @{}; foreach ($k in $GameModeSteps.Keys) { $only[$k] = $false }; $only['pause'] = $true
+            $script:Backup.Custom['gamemodeprefs'] = $only
+
+            # safety: anything in the state file that is not a dummy is resumed at once and reported
+            $ptStray = { param($st, $when)
+                $stray = @(@($st.Paused) | Where-Object { $_ -and $script:ZdPtWatch -notcontains [int]$_.Id })
+                if ($stray) { $pz.Add("FAIL  $when`: paused something that is not a test dummy: $(($stray | ForEach-Object { "$($_.Name)[$($_.Id)]" }) -join ', ') (resumed)"); foreach ($s in $stray) { try { [void][ZdProc]::Resume([int]$s.Id) } catch {} } } }
+            # the state entries must name the dummies with their real start ticks
+            $ptCheckState = { param($st, $when)
+                $ent = @($st.Paused | Where-Object { $_ })
+                if (-not $ent.Count) { $pz.Add("FAIL  $when`: state file has no Paused entries"); return }
+                $bad = @()
+                foreach ($o in $pausable) {
+                    $e = @($ent | Where-Object { [int]$_.Id -eq $o.Id })
+                    if ($e.Count -ne 1) { $bad += "$($o.Name): $($e.Count) entries"; continue }
+                    if ((& $ptBase $e[0].Name) -ne (& $ptBase $o.Name)) { $bad += "$($o.Name): Name '$($e[0].Name)'" }
+                    $st0 = "$($e[0].Start)"
+                    if ($st0 -ne "$($o.Ticks)") {
+                        $utc = try { "$((Get-Process -Id $o.Id).StartTime.ToUniversalTime().Ticks)" } catch { '' }
+                        if ($st0 -eq $utc) { $pz.Add("NOTE  $when`: Start of $($o.Name) is UTC ticks (StartTime.ToUniversalTime().Ticks), not StartTime.Ticks") } else { $bad += "$($o.Name): Start '$st0' vs StartTime.Ticks $($o.Ticks)" }
+                    }
+                }
+                if (@($ent | Where-Object { [int]$_.Id -eq $dN.Id }).Count) { $bad += 'Discord (never-pause) is in Paused' }
+                if ($bad) { $pz.Add("FAIL  $when`: state Paused entries: $($bad -join '; ')") } else { $pz.Add("OK    $when`: state lists the $($pausable.Count) dummies with Id, Name and Start ticks") } }
+
+            # ---- 4. Game Mode on (pause step only)
+            if (& $ptStep 'Game Mode on (pause)' { $script:ZdPtMsg = Enable-ZDGameMode }) {
+                $pz.Add("NOTE  on: $script:ZdPtMsg")
+                $st = & $ptState
+                if (-not $st) { $pz.Add('FAIL  on: no game-mode.json') } else { & $ptStray $st 'on'; & $ptCheckState $st 'on' }
+                $g = & $ptGrowth $all
+                $run = @($pausable | Where-Object { $g[$_.Id] -ne 0 })
+                if ($run) { $pz.Add("FAIL  on: still writing: $(& $ptDesc $g $run)") } else { $pz.Add("OK    on: dummies paused ($(& $ptDesc $g $pausable))") }
+                if ($g[$dN.Id] -ge 3) { $pz.Add("OK    on: never-pause Discord keeps running (+$($g[$dN.Id]))") } else { $pz.Add("FAIL  on: never-pause Discord stopped (+$($g[$dN.Id]))") }
+                if ($g[$dR.Id] -lt 3) { $pz.Add("FAIL  on: a dummy that was not a candidate stopped (ZdTestReuse +$($g[$dR.Id]))") }
+
+                # ---- 5. on again while on: must not suspend a second time (NtSuspendProcess counts nest)
+                [void](& $ptStep 'Game Mode on again' { $script:ZdPtMsg = Enable-ZDGameMode })
+                $pz.Add("NOTE  on again: $script:ZdPtMsg")
+                $st2 = & $ptState
+                if ($st2 -and @($st2.Paused).Count -ne @($st.Paused).Count) { $pz.Add("FAIL  on again: Paused entries $(@($st.Paused).Count) -> $(@($st2.Paused).Count)") }
+
+                # ---- 6. off: one resume must be enough
+                [void](& $ptStep 'Game Mode off' { $script:ZdPtMsg = Disable-ZDGameMode })
+                $pz.Add("NOTE  off: $script:ZdPtMsg")
+                $g = & $ptGrowth $all
+                $stuck = @($pausable | Where-Object { $g[$_.Id] -lt 3 })
+                if (-not $stuck) { $pz.Add("OK    off: dummies running again ($(& $ptDesc $g $pausable))") }
+                else {
+                    foreach ($o in $stuck) { try { [void][ZdProc]::Resume($o.Id) } catch {} }
+                    $g2 = & $ptGrowth $stuck
+                    $two = @($stuck | Where-Object { $g2[$_.Id] -ge 3 })
+                    if ($two) { $pz.Add("FAIL  off: still paused; running only after a second Resume, so they were suspended twice: $(($two | ForEach-Object { $_.Name }) -join ', ')") }
+                    $pz.Add("FAIL  off: still paused: $(& $ptDesc $g $stuck)")
+                }
+                if (Test-ZDGameMode) { $pz.Add('FAIL  off: game-mode.json still there') }
+            }
+
+            # ---- 7. on, off, on, off again (nothing left over from the first round)
+            [void](& $ptStep 'Game Mode on (2nd round)' { [void](Enable-ZDGameMode) })
+            $st = & $ptState; if ($st) { & $ptStray $st 'on (2nd round)' }
+            $g = & $ptGrowth $pausable
+            $run = @($pausable | Where-Object { $g[$_.Id] -ne 0 })
+            [void](& $ptStep 'Game Mode off (2nd round)' { [void](Disable-ZDGameMode) })
+            $g2 = & $ptGrowth $pausable
+            $stuck = @($pausable | Where-Object { $g2[$_.Id] -lt 3 })
+            if ($run -or $stuck) { $pz.Add("FAIL  2nd round: on $(& $ptDesc $g $pausable) / off $(& $ptDesc $g2 $pausable)") } else { $pz.Add('OK    2nd round: paused on, running after off') }
+            foreach ($o in $stuck) { try { [void][ZdProc]::Resume($o.Id) } catch {} }
+
+            # ---- 8. crash: Game Mode on, then ZeroDelay ends without switching it off. game-mode.json is left behind;
+            #         the next start (or the exit handler) calls Resume-ZDPaused, which resumes what the file lists.
+            if (& $ptStep 'Game Mode on (before crash)' { [void](Enable-ZDGameMode) }) {
+                $st = & $ptState; if ($st) { & $ptStray $st 'on (before crash)' }
+                $g = & $ptGrowth $pausable
+                if (@($pausable | Where-Object { $g[$_.Id] -ne 0 }).Count) { $pz.Add("FAIL  crash: dummies not paused before the crash ($(& $ptDesc $g $pausable))") }
+                Copy-Item -LiteralPath $GameModeFile -Destination (Join-Path $ptDir 'game-mode.crash.json') -Force -ErrorAction SilentlyContinue
+                [void](& $ptStep 'Resume-ZDPaused after crash' { Resume-ZDPaused })
+                $g = & $ptGrowth $pausable
+                $stuck = @($pausable | Where-Object { $g[$_.Id] -lt 3 })
+                if ($stuck) { $pz.Add("FAIL  crash: Resume-ZDPaused left paused: $(& $ptDesc $g $stuck)"); foreach ($o in $stuck) { try { [void][ZdProc]::Resume($o.Id) } catch {} } }
+                else { $pz.Add("OK    crash: Resume-ZDPaused resumed everything in game-mode.json ($(& $ptDesc $g $pausable))") }
+                $st = & $ptState
+                $pz.Add("NOTE  crash: after Resume-ZDPaused game-mode.json $(if (-not $st) { 'is gone' } elseif (@($st.Paused | Where-Object { $_ }).Count) { "still lists $(@($st.Paused).Count) Paused" } else { 'is kept with Paused emptied' })")
+                if (Test-ZDGameMode) { [void](& $ptStep 'Game Mode off after crash recovery' { [void](Disable-ZDGameMode) }) }
+                $g = & $ptGrowth $pausable
+                if (@($pausable | Where-Object { $g[$_.Id] -lt 3 }).Count) { $pz.Add("FAIL  crash: off after Resume-ZDPaused paused something again ($(& $ptDesc $g $pausable))") } else { $pz.Add('OK    crash: off after recovery leaves the dummies running') }
+            }
+            # same, with the state passed in (the file already gone): Resume-ZDPaused $State
+            if (& $ptStep 'Game Mode on (crash, state passed in)' { [void](Enable-ZDGameMode) }) {
+                $st = & $ptState; if ($st) { & $ptStray $st 'on (crash 2)' }
+                Remove-Item -LiteralPath $GameModeFile -Force -ErrorAction SilentlyContinue
+                $g = & $ptGrowth $pausable
+                if (@($pausable | Where-Object { $g[$_.Id] -ne 0 }).Count) { $pz.Add("FAIL  crash 2: dummies not paused before the crash ($(& $ptDesc $g $pausable))") }
+                [void](& $ptStep 'Resume-ZDPaused $State' { [void](Resume-ZDPaused $st) })
+                $g = & $ptGrowth $pausable
+                $stuck = @($pausable | Where-Object { $g[$_.Id] -lt 3 })
+                if ($stuck) { $pz.Add("FAIL  crash 2: Resume-ZDPaused `$State left paused: $(& $ptDesc $g $stuck)"); foreach ($o in $stuck) { try { [void][ZdProc]::Resume($o.Id) } catch {} } }
+                else { $pz.Add('OK    crash 2: Resume-ZDPaused with the saved state (file removed) resumed everything') }
+            }
+            [void](& $ptStep 'Resume-ZDPaused without game-mode.json' { if (-not (Test-ZDGameMode)) { Resume-ZDPaused } })
+
+            # ---- 9. NtSuspendProcess nests: suspend twice, resume once = still paused (why Game Mode must not suspend twice)
+            [void][ZdProc]::Suspend($dR.Id); [void][ZdProc]::Suspend($dR.Id); [void][ZdProc]::Resume($dR.Id)
+            $g = & $ptGrowth @($dR)
+            if ($g[$dR.Id] -eq 0) { $pz.Add('OK    nesting: Suspend x2 + Resume x1 leaves the process paused (counts nest)') } else { $pz.Add("NOTE  nesting: Suspend x2 + Resume x1 left it running (+$($g[$dR.Id])): counts do not nest here") }
+            [void][ZdProc]::Resume($dR.Id)
+            $g = & $ptGrowth @($dR)
+            if ($g[$dR.Id] -ge 3) { $pz.Add('OK    nesting: a second Resume runs it again') } else { $pz.Add("FAIL  nesting: still paused after Suspend x2 + Resume x2 (+$($g[$dR.Id]))") }
+            $ok = [ZdProc]::Resume($dR.Id)
+            $g = & $ptGrowth @($dR)
+            if ($g[$dR.Id] -ge 3) { $pz.Add("OK    Resume on a running process is harmless (returned $ok)") } else { $pz.Add('FAIL  Resume on a running process stopped it') }
+            $ok = [ZdProc]::Suspend(2147483000)
+            if ($ok) { $pz.Add('FAIL  Suspend of a PID that does not exist returned true') } else { $pz.Add('OK    Suspend of a PID that does not exist returns false') }
+
+            # ---- 10. PID reuse guard: an entry whose Start does not match the process now holding that PID is left alone
+            if (Test-ZDGameMode) { [void](Disable-ZDGameMode) }
+            [void][ZdProc]::Suspend($dR.Id)
+            $fake = @{ Started = (Get-Date).ToString('o'); Done = @(); Paused = @(
+                @{ Id = $dR.Id; Name = $dR.Name; Start = [int64]$dR.Ticks + 10000000 }   # same PID, Start 1 s off: another process now
+                @{ Id = $xId; Name = $dX.Name; Start = [int64]$xTicks }                     # process that has exited
+            ) }
+            $fake | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $GameModeFile -Encoding UTF8
+            [void](& $ptStep 'Resume-ZDPaused with a stale PID' { Resume-ZDPaused })
+            $g = & $ptGrowth @($dR)
+            if ($g[$dR.Id] -eq 0) { $pz.Add('OK    PID reuse: entry with other Start ticks was not resumed') } else { $pz.Add("FAIL  PID reuse: Resume-ZDPaused resumed a process whose Start ticks differ (+$($g[$dR.Id]))") }
+            if (Test-ZDGameMode) {
+                [void](& $ptStep 'Game Mode off with a stale PID' { [void](Disable-ZDGameMode) })
+                $g = & $ptGrowth @($dR)
+                if ($g[$dR.Id] -eq 0) { $pz.Add('OK    PID reuse: Game Mode off left it alone too') } else { $pz.Add("FAIL  PID reuse: Disable-ZDGameMode resumed a process whose Start ticks differ (+$($g[$dR.Id]))") }
+            }
+            # positive control: the right Start ticks are resumed
+            @{ Started = (Get-Date).ToString('o'); Done = @(); Paused = @(@{ Id = $dR.Id; Name = $dR.Name; Start = [int64]$dR.Ticks }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $GameModeFile -Encoding UTF8
+            [void](& $ptStep 'Resume-ZDPaused with the right Start' { Resume-ZDPaused })
+            $g = & $ptGrowth @($dR)
+            if ($g[$dR.Id] -ge 3) { $pz.Add('OK    PID reuse: entry with matching Start ticks was resumed') } else { $pz.Add("FAIL  PID reuse: entry with matching Start ticks was not resumed (+$($g[$dR.Id]))"); [void][ZdProc]::Resume($dR.Id) }
+            if (Test-ZDGameMode) { [void](& $ptStep 'Game Mode off (end)' { [void](Disable-ZDGameMode) }) }
+        } catch {
+            $pz.Add("FAIL  pause test stopped: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))")
+        } finally {
+            if ($script:ZdPtReal) { Set-Item -Path function:script:Get-ZDPauseCandidates -Value $script:ZdPtReal }
+            if (Test-ZDGameMode) { try { [void](Disable-ZDGameMode) } catch { Remove-Item -LiteralPath $GameModeFile -Force -ErrorAction SilentlyContinue } }
+            if ($ptHadPrefs) { $script:Backup.Custom['gamemodeprefs'] = $ptPrefs } else { $script:Backup.Custom.Remove('gamemodeprefs') }
+            if ($ptHadPP) { $script:Backup.Custom['pauseprefs'] = $ptPP } else { $script:Backup.Custom.Remove('pauseprefs') }
+            foreach ($o in $ptProcs) {
+                if ($ptHasT) { for ($i = 0; $i -lt 4; $i++) { try { [void][ZdProc]::Resume([int]$o.Id) } catch {} } }
+                $p = Get-Process -Id $o.Id -ErrorAction SilentlyContinue
+                if ($p -and ($o.Ticks -eq 0 -or $p.StartTime.Ticks -eq $o.Ticks)) { Stop-Process -Id $o.Id -Force -ErrorAction SilentlyContinue }
+            }
+            # anything else still running from the test folder (a dummy found late). By folder name: TEMP may be an 8.3 short path
+            Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -like "*\zdpause-$PID\*" } catch { $false } } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 300
+            Remove-Item -LiteralPath $ptDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($ptWasOn) { $pz.Add('NOTE  Game Mode was on at the start and is left off') }
+            $f = @($pz | Where-Object { $_ -like 'FAIL*' }).Count; $k = @($pz | Where-Object { $_ -like 'OK*' }).Count
+            $pz.Add("NOTE  summary: $k OK, $f FAIL")
+            Set-Content -LiteralPath "$Snapshot.pause.txt" -Value $pz -Encoding UTF8
+        }
+    }
     # CI only (a throwaway Windows VM): simulated PCs. For each profile below, the hardware and software detection is
     # swapped for answers from that PC (graphics, CPU, chassis, network, games, other apps, NVIDIA driver, WMI). Then
     # every card's Requires and state test runs directly (errors are not swallowed), every card is refreshed and every
@@ -29685,6 +30197,7 @@ $window.Add_Closed({
     try { Stop-GameNetTrace } catch {}
     try { Stop-ProveRecording } catch {}
     if ($script:PingMonJob) { Stop-PingMonitor }
+    try { [void](Resume-ZDPaused) } catch {}   # apps Game Mode paused must not stay frozen after ZeroDelay exits
     Save-Backup
     if ($script:TrayIcon) { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() }
     $window.Dispatcher.InvokeShutdown()
@@ -29742,7 +30255,7 @@ $window.Dispatcher.Add_UnhandledException({
         try { Show-Toast "Something went wrong: $($e.Exception.Message) ZeroDelay kept running; details are in crash.log." '#FF9F0A' } catch {}
     }
 })
-[AppDomain]::CurrentDomain.add_UnhandledException({ param($s, $e) Write-CrashLog $e.ExceptionObject 'fatal' })
+[AppDomain]::CurrentDomain.add_UnhandledException({ param($s, $e) Write-CrashLog $e.ExceptionObject 'fatal'; try { [void](Resume-ZDPaused) } catch {} })
 # the freeze detector also runs for dev renders: a render that stops responding writes the window thread's call stack
 # next to the picture (<snapshot>.hang.txt) and to the error output, so a CI timeout says what it was waiting on
 $script:BeatTimer = New-Object Windows.Threading.DispatcherTimer
