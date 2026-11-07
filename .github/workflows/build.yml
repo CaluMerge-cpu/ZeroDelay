@@ -100,6 +100,25 @@ jobs:
           "`n$(@($r | Where-Object { $_ -like 'OK*' }).Count) passed, $($fail.Count) failed."
           if ($fail.Count) { exit 1 }
 
+      - name: Game Mode pauses background apps and wakes them again
+        id: pause
+        continue-on-error: true
+        shell: powershell
+        env:
+          ZD_PAUSE: '1'
+        run: |
+          $out = New-Item -ItemType Directory -Force snapshots
+          $png = Join-Path $out 'pause.png'
+          $p = Start-Process powershell.exe -PassThru -NoNewWindow -RedirectStandardError "$out\pause.err.txt" -ArgumentList @(
+            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "$PWD\ZeroDelay.ps1", '-NoElevate', '-Snapshot', $png)
+          if (-not $p.WaitForExit(600000)) { Stop-Process -Id $p.Id -Force; throw 'Timed out after 10 minutes.' }
+          $f = "$png.pause.txt"
+          if (-not (Test-Path $f)) { Get-Content "$out\pause.err.txt" -ErrorAction SilentlyContinue; throw 'No pause report was written.' }
+          $r = @(Get-Content $f); $r
+          $fail = @($r | Where-Object { $_ -like 'FAIL*' })
+          "`n$(@($r | Where-Object { $_ -like 'OK*' }).Count) passed, $($fail.Count) failed."
+          if ($fail.Count) { exit 1 }
+
       - name: How much CPU and memory ZeroDelay itself uses while open
         continue-on-error: true
         shell: powershell
@@ -179,6 +198,13 @@ jobs:
         shell: powershell
         run: |
           'A simulated PC failed; see "Simulate different PCs" and the pcmatrix artifact.'
+          exit 1
+
+      - name: Fail the run if Game Mode did not pause and wake apps cleanly
+        if: steps.pause.outcome == 'failure'
+        shell: powershell
+        run: |
+          'Pausing background apps failed; see "Game Mode pauses background apps".'
           exit 1
 
       - name: Fail the run if a performance mode did not undo cleanly
