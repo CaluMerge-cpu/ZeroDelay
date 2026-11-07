@@ -39,7 +39,7 @@ if (-not $Snapshot) {
     $script:ShowSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Local\ZeroDelayShow')
     if (-not $created) { [void]$script:ShowSignal.Set(); exit }
 }
-$AppVersion = '2.1.1'
+$AppVersion = '2.2.0'
 
 # --- Loading screen. Runs on its own thread with its own dispatcher, so it keeps animating while the app loads.
 $script:Splash = $null
@@ -2233,9 +2233,17 @@ function Get-ZDPauseCandidates {
     foreach ($b in $Boosters.Values) { foreach ($n in @($b.Proc)) { $games["$n".ToLowerInvariant()] = $true } }
     $windir = "$env:SystemRoot".TrimEnd('\') + '\'
     $prefs = ConvertTo-Map $script:Backup.Custom['pauseprefs']
+    if ($null -eq $script:ZdAncestors) {   # whatever started ZeroDelay (its launcher, a terminal) is never paused
+        $script:ZdAncestors = @{}; $cur = $PID
+        for ($i = 0; $i -lt 6; $i++) {
+            $pp = try { (Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction Stop).ParentProcessId } catch { $null }
+            if (-not $pp -or $script:ZdAncestors.ContainsKey([int]$pp)) { break }
+            $script:ZdAncestors[[int]$pp] = $true; $cur = $pp
+        }
+    }
     $byName = @{}
     foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
-        if ($p.Id -eq $PID -or $p.Id -le 4 -or $p.SessionId -ne $session) { continue }
+        if ($p.Id -eq $PID -or $p.Id -le 4 -or $p.SessionId -ne $session -or $script:ZdAncestors.ContainsKey([int]$p.Id)) { continue }
         $n = "$($p.ProcessName)"; $k = $n.ToLowerInvariant()
         if ($games.ContainsKey($k) -or ($games.Keys | Where-Object { $k -like $_ }) -or (Test-NeverPause $n) -or $MemNoClose -contains $n) { continue }
         $path = try { $p.Path } catch { $null }
@@ -17958,6 +17966,11 @@ function Watch-UpdateDownload {
 
 # --- What's new: shown once after an update (not after a fresh install, which gets the setup wizard).
 $WhatsNew = @{
+    '2.2.0' = @(
+        @{ T = 'Game Mode pauses background apps'; D = 'When Game Mode starts it freezes background apps that have no window, such as OneDrive, Dropbox, Google Drive, Adobe helpers and updaters, and wakes them when Game Mode ends or the game closes. Nothing is closed. The Game Mode page lists what it pauses, with a switch for each app.' }
+        @{ T = 'Never paused'; D = 'Windows, antivirus, anti-cheat, graphics drivers, mouse and keyboard software, Discord and voice apps, overlays, game launchers, VPNs and ping boosters are never paused, and neither is any app with a window you can see.' }
+        @{ T = 'Always woken up'; D = 'Paused apps are woken when ZeroDelay exits, and if ZeroDelay is closed suddenly they are woken the next time it starts.' }
+    )
     '2.1.1' = @(
         @{ T = 'Presets fixed'; D = 'The Competitive and Max presets on Home now pick their tweaks (they opened with nothing in 2.1.0). Safe was not affected.' }
         @{ T = 'Power plans put back exactly'; D = 'Switching the Ultimate Performance card off removes the copy of the plan it made, your original plan comes back whatever order the Ultimate and ZeroDelay plans are switched off in, and Game Mode no longer leaves the ZeroDelay plan behind when it ends.' }
